@@ -77,3 +77,7 @@ size_t cMyfile::getFileSize(){
 bool cMyfile::writeLine(const std::string& line) {
     return write(line + '\n');
 }
+
+#ifdef OBFU_ATTRS_END
+OBFU_ATTRS_END
+#endif

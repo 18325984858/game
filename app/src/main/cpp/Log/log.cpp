@@ -3,3 +3,7 @@
 //
 
 #include "log.h"
+
+#ifdef OBFU_ATTRS_END
+OBFU_ATTRS_END
+#endif

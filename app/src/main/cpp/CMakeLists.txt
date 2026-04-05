@@ -5,11 +5,27 @@
 # Sets the minimum CMake version required for this project.
 cmake_minimum_required(VERSION 3.22.1)
 
+option(USE_WINDOWS_LLVM_FRONTEND "Use custom Windows LLVM clang frontend binaries" OFF)
+option(ENABLE_WINDOWS_LLVM_OBFUSCATION "Enable Polaris/OLLVM compile passes when using the Windows LLVM frontend" OFF)
+set(WINDOWS_LLVM_BASE_PASSES "sub,strcry" CACHE STRING "Base obfuscation passes for all frontend-enabled native targets" FORCE)
+set(WINDOWS_LLVM_MEDIUM_PASSES "bcf,sub,strcry" CACHE STRING "Extra obfuscation passes for medium-sensitivity sources" FORCE)
+set(WINDOWS_LLVM_HEAVY_PASSES "bcf,sub,strcry" CACHE STRING "Extra obfuscation passes for high-sensitivity sources" FORCE)
+
 # Declares the project name. The project name can be accessed via ${ PROJECT_NAME},
 # Since this is the top level CMakeLists.txt, the project name is also accessible
 # with ${CMAKE_PROJECT_NAME} (both CMake variables are in-sync within the top level
 # build script scope).
 project("dobbyproject")
+
+if(USE_WINDOWS_LLVM_FRONTEND)
+        message(STATUS "Windows LLVM frontend enabled")
+        message(STATUS "WINDOWS_LLVM_ROOT=${WINDOWS_LLVM_ROOT}")
+        message(STATUS "CMAKE_C_COMPILER=${CMAKE_C_COMPILER}")
+        message(STATUS "CMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}")
+        message(STATUS "CMAKE_C_COMPILER_LAUNCHER=${CMAKE_C_COMPILER_LAUNCHER}")
+        message(STATUS "CMAKE_CXX_COMPILER_LAUNCHER=${CMAKE_CXX_COMPILER_LAUNCHER}")
+        message(STATUS "ENABLE_WINDOWS_LLVM_OBFUSCATION=${ENABLE_WINDOWS_LLVM_OBFUSCATION}")
+endif()
 
 ######################################################################################################
 # 设置自定义输出文件名
@@ -88,18 +104,20 @@ find_library(
 # used in the AndroidManifest.xml file.
 add_library(${CMAKE_PROJECT_NAME} SHARED
         # List C/C++ source files with relative paths to this CMakeLists.txt.
-        native-lib.cpp
-        start.cpp
-        "Draw/Draw.cpp"
+        unityGame/native-lib.cpp
+        unityGame/start.cpp
+        "unityGame/Draw/Draw.cpp"
         "Log/log.cpp"
-        "Symbol/Symbol.cpp"
+        "unityGame/Symbol/Symbol.cpp"
         "File/file.cpp"
-        "UnityApi/unityapi.cpp"
-        "li2cppDumper/li2cppdumper.cpp"
-        "lol/lolm.cpp"
-        "interface/interface.cpp"
-        "il2cppHeader/il2cppHeader.cpp"
+        "unityGame/UnityApi/unityapi.cpp"
+        "unityGame/li2cppDumper/li2cppdumper.cpp"
+        "unityGame/lol/lolm.cpp"
+        "unityGame/interface/interface.cpp"
+        "unityGame/il2cppHeader/il2cppHeader.cpp"
         "Injector/Injector.cpp"
+        "ueGame/libUE4Struct/ilbUE4Struct.cpp"
+        "ueGame/libUE4Dumper/UE4Dumper.cpp"
 )
 
 # Specifies libraries CMake should link to your target library. You
@@ -124,6 +142,37 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
         AndroidSurfaceImgui/third_party/imgui
 )
 
+if(USE_WINDOWS_LLVM_FRONTEND AND ENABLE_WINDOWS_LLVM_OBFUSCATION)
+        message(STATUS "Windows LLVM obfuscation enabled")
+        message(STATUS "WINDOWS_LLVM_BASE_PASSES=${WINDOWS_LLVM_BASE_PASSES}")
+        message(STATUS "WINDOWS_LLVM_MEDIUM_PASSES=${WINDOWS_LLVM_MEDIUM_PASSES}")
+        message(STATUS "WINDOWS_LLVM_HEAVY_PASSES=${WINDOWS_LLVM_HEAVY_PASSES}")
+
+        # 强制包含注解头，使 Polaris pass 对所有函数生效
+        target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE OBFU_ENABLE_ANNOTATIONS)
+        target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE
+                "-include" "${CMAKE_CURRENT_SOURCE_DIR}/unityGame/obfu_attrs.h"
+                "-mllvm"
+                "-passes=${WINDOWS_LLVM_BASE_PASSES}"
+        )
+
+        set_source_files_properties(
+                "unityGame/Draw/Draw.cpp"
+                "unityGame/Symbol/Symbol.cpp"
+                "unityGame/li2cppDumper/li2cppdumper.cpp"
+                "ueGame/libUE4Struct/ilbUE4Struct.cpp"
+                "ueGame/libUE4Dumper/UE4Dumper.cpp"
+                PROPERTIES COMPILE_OPTIONS "-mllvm;-passes=${WINDOWS_LLVM_MEDIUM_PASSES}"
+        )
+
+        set_source_files_properties(
+                unityGame/start.cpp
+                "unityGame/lol/lolm.cpp"
+                "unityGame/interface/interface.cpp"
+                PROPERTIES COMPILE_OPTIONS "-mllvm;-passes=${WINDOWS_LLVM_HEAVY_PASSES}"
+        )
+endif()
+
 ######################################################################################################
 # 独立注入器可执行文件 (需要通过 su 以 root 运行)
 # 伪装为 .so 文件, 让 Gradle 自动打包进 APK
@@ -138,6 +187,15 @@ target_link_libraries(injector
         log
         ${dl-lib}
 )
+
+if(USE_WINDOWS_LLVM_FRONTEND AND ENABLE_WINDOWS_LLVM_OBFUSCATION)
+        target_compile_definitions(injector PRIVATE OBFU_ENABLE_ANNOTATIONS)
+        target_compile_options(injector PRIVATE
+                "-include" "${CMAKE_CURRENT_SOURCE_DIR}/unityGame/obfu_attrs.h"
+                "-mllvm"
+                "-passes=${WINDOWS_LLVM_BASE_PASSES}"
+        )
+endif()
 
 # 重命名为 libinjector.so, Gradle 只打包 lib*.so 到 APK
 set_target_properties(injector PROPERTIES

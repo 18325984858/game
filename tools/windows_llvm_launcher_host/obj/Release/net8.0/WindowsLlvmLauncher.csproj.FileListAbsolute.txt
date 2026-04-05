@@ -1,0 +1,15 @@
+C:\Users\Song\Desktop\file\lol\il2cppDumper\tools\windows_llvm_launcher_host\obj\Release\net8.0\WindowsLlvmLauncher.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\Song\Desktop\file\lol\il2cppDumper\tools\windows_llvm_launcher_host\obj\Release\net8.0\WindowsLlvmLauncher.AssemblyInfoInputs.cache
+C:\Users\Song\Desktop\file\lol\il2cppDumper\tools\windows_llvm_launcher_host\obj\Release\net8.0\WindowsLlvmLauncher.AssemblyInfo.cs
+C:\Users\Song\Desktop\file\lol\il2cppDumper\tools\windows_llvm_launcher_host\obj\Release\net8.0\WindowsLlvmLauncher.csproj.CoreCompileInputs.cache
+C:\Users\Song\Desktop\file\lol\il2cppDumper\tools\windows_llvm_launcher_host\obj\Release\net8.0\WindowsLlvmLauncher.sourcelink.json
+C:\Users\Song\Desktop\file\lol\il2cppDumper\tools\windows_llvm_launcher_host\bin\Release\net8.0\WindowsLlvmLauncher.exe
+C:\Users\Song\Desktop\file\lol\il2cppDumper\tools\windows_llvm_launcher_host\bin\Release\net8.0\WindowsLlvmLauncher.deps.json
+C:\Users\Song\Desktop\file\lol\il2cppDumper\tools\windows_llvm_launcher_host\bin\Release\net8.0\WindowsLlvmLauncher.runtimeconfig.json
+C:\Users\Song\Desktop\file\lol\il2cppDumper\tools\windows_llvm_launcher_host\bin\Release\net8.0\WindowsLlvmLauncher.dll
+C:\Users\Song\Desktop\file\lol\il2cppDumper\tools\windows_llvm_launcher_host\bin\Release\net8.0\WindowsLlvmLauncher.pdb
+C:\Users\Song\Desktop\file\lol\il2cppDumper\tools\windows_llvm_launcher_host\obj\Release\net8.0\WindowsLlvmLauncher.dll
+C:\Users\Song\Desktop\file\lol\il2cppDumper\tools\windows_llvm_launcher_host\obj\Release\net8.0\refint\WindowsLlvmLauncher.dll
+C:\Users\Song\Desktop\file\lol\il2cppDumper\tools\windows_llvm_launcher_host\obj\Release\net8.0\WindowsLlvmLauncher.pdb
+C:\Users\Song\Desktop\file\lol\il2cppDumper\tools\windows_llvm_launcher_host\obj\Release\net8.0\WindowsLlvmLauncher.genruntimeconfig.cache
+C:\Users\Song\Desktop\file\lol\il2cppDumper\tools\windows_llvm_launcher_host\obj\Release\net8.0\ref\WindowsLlvmLauncher.dll

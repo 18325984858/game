@@ -1,12 +1,36 @@
+:: ============================================================
+::  Dobby Project - ±àÒë & °²×° & ÔËÐÐ ½Å±¾
+:: ============================================================
+::
+::  ÓÃ·¨: build_and_run.bat [ÃüÁî] [llvm]
+::
+::  ÃüÁî:
+::    (ÎÞ²ÎÊý)   ±àÒë + °²×° + Æô¶¯ (Ä¬ÈÏ)
+::    build      ½ö±àÒë Debug APK
+::    native     ½ö±àÒë Native .so
+::    install    ½ö°²×°µ½Éè±¸
+::    run        ½öÆô¶¯Ó¦ÓÃ
+::    release    ±àÒë Release APK
+::    logcat     ¸½¼Ó logcat µ½Ó¦ÓÃ½ø³Ì
+::    clean      ÇåÀí¹¹½¨²úÎï
+::    help       ÏÔÊ¾´Ë°ïÖú
+::
+::  Ñ¡Ïî:
+::    llvm       ÆôÓÃ LLVM »ìÏý±àÒë (¿ÉÓëÈÎÒâÃüÁî×éºÏ)
+::
+::  Ê¾Àý:
+::    build_and_run.bat              ÆÕÍ¨±àÒë+°²×°+ÔËÐÐ
+::    build_and_run.bat llvm         LLVM»ìÏý±àÒë+°²×°+ÔËÐÐ
+::    build_and_run.bat build llvm   ½öLLVM»ìÏý±àÒë
+::    build_and_run.bat llvm build   Í¬ÉÏ (Ë³ÐòÎÞ¹Ø)
+::    build_and_run.bat logcat       ¸½¼Ólogcat²é¿´ÈÕÖ¾
+::    build_and_run.bat native llvm  ½öLLVM±àÒënative .so
+::
+:: ============================================================
 @echo off
-chcp 65001 >nul 2>&1
 setlocal EnableDelayedExpansion
 
-:: ============================================================
-::  Dobby Project - ç¼–è¯‘ & å®‰è£… & è¿è¡Œ è„šæœ¬
-:: ============================================================
-
-:: --- é…ç½®åŒº ---
+:: --- ÅäÖÃÇø ---
 set "JAVA_HOME=C:\Program Files\Android\Android Studio\jbr"
 set "PATH=%JAVA_HOME%\bin;%PATH%"
 set "ADB=%LOCALAPPDATA%\Android\Sdk\platform-tools\adb.exe"
@@ -14,106 +38,185 @@ set "ADB_DEVICE="
 set "PACKAGE=com.example.dobbyproject"
 set "ACTIVITY=%PACKAGE%/.MainActivity"
 set "APK_PATH=app\build\outputs\apk\debug\app-debug.apk"
+set "SCRIPT_DIR=%~dp0"
+set "DEFAULT_LLVM_ROOT=%SCRIPT_DIR%Windows-llvm"
+if "%DEFAULT_LLVM_ROOT:~-1%"=="\" set "DEFAULT_LLVM_ROOT=%DEFAULT_LLVM_ROOT:~0,-1%"
+set "LLVM_ROOT=%DEFAULT_LLVM_ROOT%"
 
-:: --- è§£æžå‚æ•° ---
-if "%~1"=="" goto :build_install_run
-if /i "%~1"=="build"   goto :build_only
-if /i "%~1"=="install"  goto :install_only
-if /i "%~1"=="run"      goto :run_only
-if /i "%~1"=="clean"    goto :clean
-if /i "%~1"=="release"  goto :build_release
-if /i "%~1"=="help"     goto :help
-echo [é”™è¯¯] æœªçŸ¥å‚æ•°: %~1
+:: --- LLVM »ìÏý¿ª¹Ø ---
+set "USE_LLVM=0"
+set "LLVM_ARGS="
+set "BUILD_LABEL=Normal"
+
+:: --- ½âÎö²ÎÊý£¨Ö§³ÖÈÎÒâÎ»ÖÃµÄ llvm ±êÖ¾£© ---
+set "CMD="
+for %%A in (%*) do (
+    if /i "%%A"=="llvm" (
+        set "USE_LLVM=1"
+    ) else if not defined CMD (
+        set "CMD=%%A"
+    )
+)
+
+:: --- Èç¹ûÆôÓÃ LLVM£¬Ð£Ñé¹¤¾ßÁ´²¢ÉèÖÃ²ÎÊý ---
+if "%USE_LLVM%"=="1" (
+    set "BUILD_LABEL=LLVM Obfuscated"
+    if not exist "%LLVM_ROOT%\bin\clang.exe" (
+        echo [´íÎó] Windows-llvm clang Î´ÕÒµ½: "%LLVM_ROOT%\bin\clang.exe"
+        echo [ÌáÊ¾] ÇëÈ·ÈÏ Windows-llvm Ä¿Â¼´æÔÚ£¬»òÐÞ¸Ä½Å±¾ÖÐ LLVM_ROOT Â·¾¶
+        exit /b 1
+    )
+    if not exist "%SCRIPT_DIR%tools\windows_llvm_launcher_host\WindowsLlvmLauncher.exe" (
+        echo [´íÎó] Launcher host Î´ÕÒµ½: "%SCRIPT_DIR%tools\windows_llvm_launcher_host\WindowsLlvmLauncher.exe"
+        echo [ÌáÊ¾] ÔËÐÐ: dotnet publish .\tools\windows_llvm_launcher_host\WindowsLlvmLauncher.csproj -c Release -o .\tools\windows_llvm_launcher_host
+        exit /b 1
+    )
+    set "LLVM_ARGS=-PuseWindowsLlvmFrontend=true -PwindowsLlvmRoot=%LLVM_ROOT% -PenableWindowsLlvmObfuscation=true"
+    echo [ÅäÖÃ] LLVM »ìÏý±àÒëÒÑÆôÓÃ
+    echo [ÅäÖÃ] LLVM Â·¾¶: %LLVM_ROOT%
+) else (
+    echo [ÅäÖÃ] ÆÕÍ¨±àÒëÄ£Ê½
+)
+
+if not defined CMD goto :build_install_run
+if /i "%CMD%"=="build"   goto :build_only
+if /i "%CMD%"=="native"   goto :build_native
+if /i "%CMD%"=="install"  goto :install_only
+if /i "%CMD%"=="run"      goto :run_only
+if /i "%CMD%"=="logcat"   goto :logcat
+if /i "%CMD%"=="clean"    goto :clean
+if /i "%CMD%"=="release"  goto :build_release
+if /i "%CMD%"=="help"     goto :help
+echo [´íÎó] Î´Öª²ÎÊý: %CMD%
 goto :help
 
 :: ============================================================
 :help
 echo.
-echo ç”¨æ³•: build_and_run.bat [å‘½ä»¤]
+echo ÓÃ·¨: build_and_run.bat [ÃüÁî] [llvm]
 echo.
-echo å‘½ä»¤:
-echo   (æ— å‚æ•°)   ç¼–è¯‘ + å®‰è£… + å¯åŠ¨ (é»˜è®¤)
-echo   build      ä»…ç¼–è¯‘ Debug APK
-echo   install    ä»…å®‰è£…åˆ°è®¾å¤‡
-echo   run        ä»…å¯åŠ¨åº”ç”¨
-echo   release    ç¼–è¯‘ Release APK
-echo   clean      æ¸…ç†æž„å»ºäº§ç‰©
-echo   help       æ˜¾ç¤ºæ­¤å¸®åŠ©
+echo ÃüÁî:
+echo   (ÎÞ²ÎÊý)   ±àÒë + °²×° + Æô¶¯ (Ä¬ÈÏ)
+echo   build      ½ö±àÒë Debug APK
+echo   native     ½ö±àÒë Native .so
+echo   install    ½ö°²×°µ½Éè±¸
+echo   run        ½öÆô¶¯Ó¦ÓÃ
+echo   release    ±àÒë Release APK
+echo   logcat     ¸½¼Ó logcat µ½Ó¦ÓÃ½ø³Ì
+echo   clean      ÇåÀí¹¹½¨²úÎï
+echo   help       ÏÔÊ¾´Ë°ïÖú
+echo.
+echo Ñ¡Ïî:
+echo   llvm       ÆôÓÃ LLVM »ìÏý±àÒë (¿ÉÓëÈÎÒâÃüÁî×éºÏ)
+echo.
+echo Ê¾Àý:
+echo   build_and_run.bat              ÆÕÍ¨±àÒë+°²×°+ÔËÐÐ
+echo   build_and_run.bat llvm          LLVM»ìÏý±àÒë+°²×°+ÔËÐÐ
+echo   build_and_run.bat build llvm    ½öLLVM»ìÏý±àÒë
+echo   build_and_run.bat llvm build    Í¬ÉÏ (Ë³ÐòÎÞ¹Ø)
+echo   build_and_run.bat logcat        ¸½¼Ólogcat²é¿´ÈÕÖ¾
+echo   build_and_run.bat native llvm   ½öLLVM±àÒënative .so
 echo.
 goto :eof
 
 :: ============================================================
 :clean
-echo [1/1] æ¸…ç†æž„å»ºäº§ç‰©...
+echo [1/1] ÇåÀí¹¹½¨²úÎï...
 call gradlew.bat clean
-if %errorlevel% neq 0 (echo [é”™è¯¯] æ¸…ç†å¤±è´¥ & exit /b 1)
-echo [å®Œæˆ] æ¸…ç†æˆåŠŸ
+if %errorlevel% neq 0 (echo [´íÎó] ÇåÀíÊ§°Ü & exit /b 1)
+echo [Íê³É] ÇåÀí³É¹¦
 goto :eof
 
 :: ============================================================
 :build_only
-echo [1/1] ç¼–è¯‘ Debug APK...
-call gradlew.bat assembleDebug
-if %errorlevel% neq 0 (echo [é”™è¯¯] ç¼–è¯‘å¤±è´¥ & exit /b 1)
-echo [å®Œæˆ] APK ä½äºŽ: %APK_PATH%
+echo [1/1] ±àÒë Debug APK (%BUILD_LABEL%)...
+call gradlew.bat assembleDebug %LLVM_ARGS%
+if %errorlevel% neq 0 (echo [´íÎó] ±àÒëÊ§°Ü & exit /b 1)
+echo [Íê³É] APK Î»ÓÚ: %APK_PATH%
+goto :eof
+
+:: ============================================================
+:build_native
+echo [1/1] ±àÒë Native .so (%BUILD_LABEL%)...
+call gradlew.bat :app:externalNativeBuildDebug %LLVM_ARGS%
+if %errorlevel% neq 0 (echo [´íÎó] Native ±àÒëÊ§°Ü & exit /b 1)
+echo [Íê³É] Native Debug ¹¹½¨Íê³É
 goto :eof
 
 :: ============================================================
 :build_release
-echo [1/1] ç¼–è¯‘ Release APK...
-call gradlew.bat assembleRelease
-if %errorlevel% neq 0 (echo [é”™è¯¯] ç¼–è¯‘å¤±è´¥ & exit /b 1)
-echo [å®Œæˆ] Release APK ä½äºŽ: app\build\outputs\apk\release\
+echo [1/1] ±àÒë Release APK (%BUILD_LABEL%)...
+call gradlew.bat assembleRelease %LLVM_ARGS%
+if %errorlevel% neq 0 (echo [´íÎó] ±àÒëÊ§°Ü & exit /b 1)
+echo [Íê³É] Release APK Î»ÓÚ: app\build\outputs\apk\release\
 goto :eof
 
 :: ============================================================
 :install_only
-echo [1/1] å®‰è£…åˆ°è®¾å¤‡...
+echo [1/1] °²×°µ½Éè±¸...
 "%ADB%" %ADB_DEVICE% install -r "%APK_PATH%"
 if errorlevel 1 (
-    echo [æç¤º] ç­¾åä¸åŒ¹é…, å°è¯•å¸è½½åŽé‡æ–°å®‰è£…...
+    echo [ÌáÊ¾] Ç©Ãû²»Æ¥Åä, ³¢ÊÔÐ¶ÔØºóÖØÐÂ°²×°...
     "%ADB%" %ADB_DEVICE% uninstall %PACKAGE%
     "%ADB%" %ADB_DEVICE% install "%APK_PATH%"
-    if !errorlevel! neq 0 (echo [é”™è¯¯] å®‰è£…å¤±è´¥ & exit /b 1)
+    if !errorlevel! neq 0 (echo [´íÎó] °²×°Ê§°Ü & exit /b 1)
 )
-echo [å®Œæˆ] å®‰è£…æˆåŠŸ
+echo [Íê³É] °²×°³É¹¦
 goto :eof
 
 :: ============================================================
 :run_only
-echo [1/1] å¯åŠ¨åº”ç”¨...
+echo [1/1] Æô¶¯Ó¦ÓÃ...
 "%ADB%" %ADB_DEVICE% shell am start -n %ACTIVITY%
-if %errorlevel% neq 0 (echo [é”™è¯¯] å¯åŠ¨å¤±è´¥ & exit /b 1)
-echo [å®Œæˆ] åº”ç”¨å·²å¯åŠ¨
+if %errorlevel% neq 0 (echo [´íÎó] Æô¶¯Ê§°Ü & exit /b 1)
+echo [Íê³É] Ó¦ÓÃÒÑÆô¶¯
+goto :eof
+
+:: ============================================================
+:logcat
+set "APP_PID="
+for /f "usebackq delims=" %%P in (`"%ADB%" %ADB_DEVICE% shell pidof %PACKAGE% 2^>nul`) do (
+    set "APP_PID=%%P"
+)
+if not defined APP_PID (
+    echo [´íÎó] Î´ÕÒµ½Ó¦ÓÃ½ø³Ì: %PACKAGE%
+    echo [ÌáÊ¾] ÇëÏÈÆô¶¯Ó¦ÓÃ: %~nx0 run
+    exit /b 1
+)
+echo [logcat] °ó¶¨ PID: !APP_PID! (%PACKAGE%)
+echo [logcat] Ctrl+C Í£Ö¹
+echo ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
+"%ADB%" %ADB_DEVICE% logcat -c
+"%ADB%" %ADB_DEVICE% logcat --pid=!APP_PID!
 goto :eof
 
 :: ============================================================
 :build_install_run
-echo ====== ç¼–è¯‘ + å®‰è£… + è¿è¡Œ ======
+echo ====== %BUILD_LABEL% ±àÒë + °²×° + ÔËÐÐ ======
 echo.
 
-echo [1/3] ç¼–è¯‘ Debug APK...
-call gradlew.bat assembleDebug
-if %errorlevel% neq 0 (echo [é”™è¯¯] ç¼–è¯‘å¤±è´¥ & exit /b 1)
-echo [1/3] ç¼–è¯‘æˆåŠŸ
+echo [1/3] ±àÒë Debug APK (%BUILD_LABEL%)...
+call gradlew.bat assembleDebug %LLVM_ARGS%
+if %errorlevel% neq 0 (echo [´íÎó] ±àÒëÊ§°Ü & exit /b 1)
+echo [1/3] ±àÒë³É¹¦
 echo.
 
-echo [2/3] å®‰è£…åˆ°è®¾å¤‡...
+echo [2/3] °²×°µ½Éè±¸...
 "%ADB%" %ADB_DEVICE% install -r "%APK_PATH%"
 if errorlevel 1 (
-    echo [æç¤º] ç­¾åä¸åŒ¹é…, å°è¯•å¸è½½åŽé‡æ–°å®‰è£…...
+    echo [ÌáÊ¾] Ç©Ãû²»Æ¥Åä, ³¢ÊÔÐ¶ÔØºóÖØÐÂ°²×°...
     "%ADB%" %ADB_DEVICE% uninstall %PACKAGE%
     "%ADB%" %ADB_DEVICE% install "%APK_PATH%"
-    if !errorlevel! neq 0 (echo [é”™è¯¯] å®‰è£…å¤±è´¥ & exit /b 1)
+    if !errorlevel! neq 0 (echo [´íÎó] °²×°Ê§°Ü & exit /b 1)
 )
-echo [2/3] å®‰è£…æˆåŠŸ
+echo [2/3] °²×°³É¹¦
 echo.
 
-echo [3/3] å¯åŠ¨åº”ç”¨...
+echo [3/3] Æô¶¯Ó¦ÓÃ...
 "%ADB%" %ADB_DEVICE% shell am start -n %ACTIVITY%
-if %errorlevel% neq 0 (echo [é”™è¯¯] å¯åŠ¨å¤±è´¥ & exit /b 1)
-echo [3/3] åº”ç”¨å·²å¯åŠ¨
+if %errorlevel% neq 0 (echo [´íÎó] Æô¶¯Ê§°Ü & exit /b 1)
+echo [3/3] Ó¦ÓÃÒÑÆô¶¯
 echo.
 
-echo ====== å…¨éƒ¨å®Œæˆ ======
+echo ====== È«²¿Íê³É ======
 goto :eof

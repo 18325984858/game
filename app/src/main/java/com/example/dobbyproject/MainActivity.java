@@ -43,8 +43,10 @@ import androidx.appcompat.app.AppCompatActivity;
 import android.os.Bundle;
 import android.widget.Button;
 import android.widget.CheckBox;
+import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
+import android.view.View;
 
 import java.io.BufferedReader;
 import java.io.DataOutputStream;
@@ -110,6 +112,32 @@ public class MainActivity extends AppCompatActivity {
         CheckBox cbDumper = findViewById(R.id.cb_dumper);
         CheckBox cbHeader = findViewById(R.id.cb_header);
         CheckBox cbLog = findViewById(R.id.cb_log);
+
+        // ── 折叠区域: lol手游 ──
+        TextView tvSectionHeader = findViewById(R.id.tv_section_lol_header);
+        LinearLayout layoutLolContent = findViewById(R.id.layout_lol_content);
+        tvSectionHeader.setOnClickListener(v -> {
+            if (layoutLolContent.getVisibility() == View.VISIBLE) {
+                layoutLolContent.setVisibility(View.GONE);
+                tvSectionHeader.setText("▶ lol手游");
+            } else {
+                layoutLolContent.setVisibility(View.VISIBLE);
+                tvSectionHeader.setText("▼ lol手游");
+            }
+        });
+
+        // ── 折叠区域: 和平精英 ──
+        TextView tvPubgHeader = findViewById(R.id.tv_section_pubg_header);
+        LinearLayout layoutPubgContent = findViewById(R.id.layout_pubg_content);
+        tvPubgHeader.setOnClickListener(v -> {
+            if (layoutPubgContent.getVisibility() == View.VISIBLE) {
+                layoutPubgContent.setVisibility(View.GONE);
+                tvPubgHeader.setText("▶ 和平精英");
+            } else {
+                layoutPubgContent.setVisibility(View.VISIBLE);
+                tvPubgHeader.setText("▼ 和平精英");
+            }
+        });
 
         Button btnSelinux = findViewById(R.id.btn_selinux);
         Button btnInputPerm = findViewById(R.id.btn_input_perm);

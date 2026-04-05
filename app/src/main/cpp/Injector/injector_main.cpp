@@ -22,3 +22,7 @@ int main(int argc, char* argv[]) {
     fprintf(stdout, "[Injector] 结果: %d\n", ret);
     return ret;
 }
+
+#ifdef OBFU_ATTRS_END
+OBFU_ATTRS_END
+#endif

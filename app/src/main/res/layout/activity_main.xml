@@ -52,38 +52,135 @@
         android:background="#CCCCCC"
         android:layout_marginBottom="16dp" />
 
-    <!-- 可选: il2cppDumper / il2cppHeader -->
-    <CheckBox
-        android:id="@+id/cb_dumper"
+    <!-- 可折叠区域: lol手游 -->
+    <LinearLayout
+        android:id="@+id/section_lol"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="启用 il2cppDumper (导出 dump)"
-        android:checked="false"
-        android:layout_marginBottom="4dp" />
+        android:orientation="vertical"
+        android:background="#1AFFFFFF"
+        android:padding="12dp"
+        android:layout_marginBottom="16dp">
 
-    <CheckBox
-        android:id="@+id/cb_header"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="启用 il2cppHeader (导出头文件)"
-        android:checked="false"
-        android:layout_marginBottom="4dp" />
+        <TextView
+            android:id="@+id/tv_section_lol_header"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="▶ lol手游"
+            android:textSize="16sp"
+            android:textStyle="bold"
+            android:textColor="#FFFFFF"
+            android:clickable="true"
+            android:focusable="true"
+            android:padding="4dp" />
 
-    <CheckBox
-        android:id="@+id/cb_log"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="启用日志输出"
-        android:checked="true"
-        android:layout_marginBottom="16dp" />
+        <LinearLayout
+            android:id="@+id/layout_lol_content"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:visibility="gone"
+            android:paddingTop="8dp">
 
-    <!-- 启动游戏 -->
-    <Button
-        android:id="@+id/btn_launch"
+            <!-- 可选: il2cppDumper / il2cppHeader -->
+            <CheckBox
+                android:id="@+id/cb_dumper"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="启用 il2cppDumper (导出 dump)"
+                android:checked="false"
+                android:layout_marginBottom="4dp" />
+
+            <CheckBox
+                android:id="@+id/cb_header"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="启用 il2cppHeaderDumper (导出头文件)"
+                android:checked="false"
+                android:layout_marginBottom="4dp" />
+
+            <CheckBox
+                android:id="@+id/cb_log"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="启用日志输出"
+                android:checked="true"
+                android:layout_marginBottom="8dp" />
+
+            <!-- 启动游戏 -->
+            <Button
+                android:id="@+id/btn_launch"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="启动游戏" />
+
+        </LinearLayout>
+
+    </LinearLayout>
+
+    <!-- 可折叠区域: 和平精英 -->
+    <LinearLayout
+        android:id="@+id/section_pubg"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="④ 启动游戏"
-        android:layout_marginBottom="16dp" />
+        android:orientation="vertical"
+        android:background="#1AFFFFFF"
+        android:padding="12dp"
+        android:layout_marginBottom="16dp">
+
+        <TextView
+            android:id="@+id/tv_section_pubg_header"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="▶ 和平精英"
+            android:textSize="16sp"
+            android:textStyle="bold"
+            android:textColor="#FFFFFF"
+            android:clickable="true"
+            android:focusable="true"
+            android:padding="4dp" />
+
+        <LinearLayout
+            android:id="@+id/layout_pubg_content"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:visibility="gone"
+            android:paddingTop="8dp">
+
+            <CheckBox
+                android:id="@+id/cb_pubg_dumper"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="启用 ueDumper (导出 dump)"
+                android:checked="false"
+                android:layout_marginBottom="4dp" />
+
+            <CheckBox
+                android:id="@+id/cb_pubg_header"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="启用 ueHeader (导出头文件)"
+                android:checked="false"
+                android:layout_marginBottom="4dp" />
+
+            <CheckBox
+                android:id="@+id/cb_pubg_log"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="启用日志输出"
+                android:checked="true"
+                android:layout_marginBottom="8dp" />
+
+            <Button
+                android:id="@+id/btn_pubg_launch"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="启动游戏" />
+
+        </LinearLayout>
+
+    </LinearLayout>
 
     <!-- 状态显示 -->
     <TextView

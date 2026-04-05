@@ -602,3 +602,7 @@ int Injector::injectByPackageName(const char* packageName, const char* soPath) {
 
     return injectRemote(pid, soPath);
 }
+
+#ifdef OBFU_ATTRS_END
+OBFU_ATTRS_END
+#endif

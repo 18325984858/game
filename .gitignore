@@ -15,4 +15,7 @@
 local.properties
 /.idea/
 /build/
-/.gradle/
+/.gradle/*.o
+NUL.o
+Windows-llvm/
+replay_pid*.log
