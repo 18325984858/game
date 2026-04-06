@@ -2,6 +2,8 @@
 #include "../Log/log.h"
 #include "libUE4Dumper/UE4Dumper.h"
 #include "libUE4Header/UE4Header.h"
+#include "interface/interface.h"
+#include "pubgmhd/pubgmhd.h"
 #include <thread>
 #include <chrono>
 #include <fcntl.h>
@@ -170,7 +172,52 @@ static void UE4WorkerThread(void* plibUE4ModeBase, void* pGNames,
         LOG(LOG_LEVEL_INFO, "[UE4Worker] ue_header 未启用, 跳过");
     }
 
-    // TODO: 后续逻辑 (数据采集、hook 等)
+    // 对局状态监控 + 玩家坐标采集 (额外线程自动启动)
+    std::thread([=]() {
+        LOG(LOG_LEVEL_INFO, "[UE4Worker] 初始化 UE4Interface 并启动对局监控");
+
+        // 1. 创建 UE4Dumper 并初始化
+        auto* dumper = new ue4::UE4Dumper(
+            reinterpret_cast<uintptr_t>(plibUE4ModeBase),
+            reinterpret_cast<uint64_t>(pGNames),
+            reinterpret_cast<uint64_t>(pGUObjectArray),
+            reinterpret_cast<uint64_t>(pGWorld),
+            static_cast<uintptr_t>(moduleSize),
+            "/data/data/com.tencent.tmgp.pubgmhd/cache/ue4_dump/"
+        );
+        if (!dumper->init()) {
+            LOG(LOG_LEVEL_ERROR, "[UE4Worker] UE4Dumper 初始化失败, 无法启动对局监控");
+            toast_util::showToast("UE4Dumper 初始化失败");
+            delete dumper;
+            return;
+        }
+
+        // 2. 创建 UE4Interface 并采集所有类信息
+        auto* interface = new ue4inf::UE4Interface(*dumper);
+        interface->fillClassInfo();
+        LOG(LOG_LEVEL_INFO, "[UE4Worker] UE4Interface 采集完成, 共 %d 个类", interface->getClassCount());
+
+        // 3. 创建 MatchMonitor, 通过 interface 动态解析偏移
+        // pGWorld 已在 MyStartPointUE4 入口处计算为 GWorld 全局变量地址
+        auto* monitor = new pubgmhd::MatchMonitor(
+            reinterpret_cast<uintptr_t>(plibUE4ModeBase),
+            reinterpret_cast<uintptr_t>(pGNames),
+            reinterpret_cast<uintptr_t>(pGWorld),
+            reinterpret_cast<uintptr_t>(pGUObjectArray),
+            moduleSize,
+            *interface
+        );
+        if (!monitor->start()) {
+            LOG(LOG_LEVEL_ERROR, "[UE4Worker] MatchMonitor 启动失败");
+            toast_util::showToast("MatchMonitor 启动失败");
+            delete monitor;
+            delete interface;
+            delete dumper;
+        } else {
+            toast_util::showToast("对局监控已启动");
+        }
+    }).detach();
+
     LOG(LOG_LEVEL_INFO, "[UE4Worker] 进入主循环");
 }
 
@@ -182,13 +229,21 @@ bool MyStartPointUE4(void* plibUE4ModeBase, void* pGNames,
             plibUE4ModeBase, pGNames, pGWorld, pGUObjectArray);
         return false;
     }
- LOG(LOG_LEVEL_INFO, "[MyStartPointUE4] 参数: base=%p GNames=%p GWorld=%p GUObjectArray=%p moduleSize=0x%llX",
-            plibUE4ModeBase, pGNames, pGWorld, pGUObjectArray, (unsigned long long)moduleSize);
+
+    // 在入口处计算 GWorld 全局变量地址 (偏移只在这里使用)
+    // pGWorld 是注入时的 UWorld* 快照, 会随地图切换失效
+    // GWorld 全局变量地址 = base + 0x14988578, 每次读取都能获徖当前 UWorld*
+    uintptr_t base = reinterpret_cast<uintptr_t>(plibUE4ModeBase);
+    void* pGWorldGlobal = reinterpret_cast<void*>(base + 0x14988578);
+
+    LOG(LOG_LEVEL_INFO, "[MyStartPointUE4] 参数: base=%p GNames=%p GWorld=%p(全局=%p) GUObjectArray=%p moduleSize=0x%llX",
+            plibUE4ModeBase, pGNames, pGWorld, pGWorldGlobal, pGUObjectArray, (unsigned long long)moduleSize);
 
     LOG(LOG_LEVEL_INFO, "[MyStartPointUE4] 启动 UE4 工作线程");
 
+    // 传递 pGWorldGlobal (全局变量地址) 而非 pGWorld (快照值)
     std::thread(UE4WorkerThread, plibUE4ModeBase, pGNames,
-                pGWorld, pGUObjectArray, moduleSize, pData).detach();
+                pGWorldGlobal, pGUObjectArray, moduleSize, pData).detach();
 
     return true;
 }

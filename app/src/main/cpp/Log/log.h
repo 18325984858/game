@@ -52,7 +52,23 @@ inline bool g_runtimeLogEnabled = true;
             } \
         } while (0)
 
-#else
+/**
+ * @def LOGT(tag, level, fmt, ...)
+ * @brief \u5e26\u81ea\u5b9a\u4e49 logcat tag \u7684\u65e5\u5fd7\u8f93\u51fa\u5b8f\uff0c\u65b9\u4fbf\u6309\u6a21\u5757\u8fc7\u6ee4
+ * @param tag   logcat tag \u5b57\u7b26\u4e32 (\u5982 "MatchMonitor")
+ * @param level \u65e5\u5fd7\u7ea7\u522b
+ * @param fmt   \u683c\u5f0f\u5316\u5b57\u7b26\u4e32
+ */
+#define LOGT(tag, level, fmt, ...) \
+        do { \
+            if (g_runtimeLogEnabled && level >= CURRENT_LOG_LEVEL) { \
+                int priority = ANDROID_LOG_INFO; \
+                if (level == LOG_LEVEL_INFO) priority = ANDROID_LOG_INFO; \
+                else if (level == LOG_LEVEL_WARN) priority = ANDROID_LOG_WARN; \
+                else if (level == LOG_LEVEL_ERROR) priority = ANDROID_LOG_ERROR; \
+                __android_log_print(priority, tag, "%s:%d: " fmt, __FILE__, __LINE__, ##__VA_ARGS__); \
+            } \
+        } while (0)
 #define LOG(level, fmt, ...)  // 如果禁用日志，则宏什么都不做
 #endif
 

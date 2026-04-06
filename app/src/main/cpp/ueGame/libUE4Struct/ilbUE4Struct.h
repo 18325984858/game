@@ -421,15 +421,6 @@ enum EObjectFlags : uint32_t {
     RF_Transient          = 0x00000040,
 };
 
-// =====================================================================
-//  全局变量偏移 (相对 libUE4.so 基址)
-// =====================================================================
-namespace GlobalOffsets {
-    constexpr uintptr_t GNames         = 0x146F9F30;
-    constexpr uintptr_t GUObjectArray  = 0x14706480;
-    constexpr uintptr_t GWorld         = 0x14988578;
-}
-
 } // namespace ue4
 
 #endif // ILB_UE4_STRUCT_H
