@@ -127,6 +127,41 @@ int32_t UE4Interface::getFieldOffset(const std::string& className, const std::st
     return info ? info->offset : -1;
 }
 
+int32_t UE4Interface::getFieldOffsetInHierarchy(const std::string& className, const std::string& fieldName) const {
+    const UEFieldInfo* info = findFieldInHierarchy(className, fieldName);
+    return info ? info->offset : -1;
+}
+
+const UEFieldInfo* UE4Interface::findFieldInHierarchy(const std::string& className, const std::string& fieldName, std::string* outOwnerClass) const {
+    const UEClassData* cls = findClass(className);
+    if (!cls) return nullptr;
+
+    // 先搜索当前类的字段
+    for (const auto& f : cls->fields) {
+        if (f.name == fieldName) {
+            if (outOwnerClass) *outOwnerClass = cls->className;
+            return &f;
+        }
+    }
+
+    // 沿继承链向上搜索父类
+    std::string superName = cls->superName;
+    int depth = 0;
+    while (!superName.empty() && depth < 30) {
+        const UEClassData* superCls = findClass(superName);
+        if (!superCls) break;
+        for (const auto& f : superCls->fields) {
+            if (f.name == fieldName) {
+                if (outOwnerClass) *outOwnerClass = superCls->className;
+                return &f;
+            }
+        }
+        superName = superCls->superName;
+        depth++;
+    }
+    return nullptr;
+}
+
 const UEFieldInfo* UE4Interface::getFieldInfo(const std::string& className, const std::string& fieldName) const {
     const UEClassData* cls = findClass(className);
     if (!cls) return nullptr;

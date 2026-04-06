@@ -85,6 +85,12 @@ public:
     /// 按类名+字段名查找字段偏移 (返回 -1 表示未找到)
     int32_t getFieldOffset(const std::string& className, const std::string& fieldName) const;
 
+    /// 按类名+字段名查找字段偏移, 自动搜索父类继承链 (返回 -1 表示未找到)
+    int32_t getFieldOffsetInHierarchy(const std::string& className, const std::string& fieldName) const;
+
+    /// 按类名+字段名查找字段信息, 自动搜索父类继承链 (返回 nullptr 表示未找到)
+    const UEFieldInfo* findFieldInHierarchy(const std::string& className, const std::string& fieldName, std::string* outOwnerClass = nullptr) const;
+
     /// 按类名+字段名查找完整字段信息 (返回 nullptr 表示未找到)
     const UEFieldInfo* getFieldInfo(const std::string& className, const std::string& fieldName) const;
 

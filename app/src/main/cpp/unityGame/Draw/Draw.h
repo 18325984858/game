@@ -6,6 +6,9 @@
 
 // touch_input 中供绘制使用的函数 (实现在 start.cpp)
 namespace touch_input {
+    void init();
+    void processEvents(float screenW, float screenH);
+    void drawDebugIndicator();
     const char* getRotationLabel();
     void cycleRotation();
     int getRotation();

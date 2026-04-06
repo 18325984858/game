@@ -688,7 +688,7 @@ namespace touch_input {
     }
 
     /** @brief 尝试打开触摸设备, 失败则每 5 秒自动重试 */
-    static void init() {
+    void init() {
         // 已成功打开
         if (s_fd >= 0) return;
 
@@ -789,7 +789,7 @@ namespace touch_input {
      *   ROTATION_180: screenX = (1-rawX) * W,       screenY = (1-rawY) * H
     *   ROTATION_270: screenX = rawY * W,            screenY = (1-rawX) * H (顺时针90°)
      */
-    static void processEvents(float screenW, float screenH) {
+    void processEvents(float screenW, float screenH) {
         if (s_fd < 0) return;
         struct input_event ev{};
         bool posUpdated = false;  // 本轮 SYN_REPORT 是否收到位置更新
@@ -893,7 +893,7 @@ namespace touch_input {
         }
     }
 
-    static void drawDebugIndicator() {
+    void drawDebugIndicator() {
         if (s_fd < 0 || s_curX < 0.0f) return;
         if (!s_touching) return;  // 仅在触摸时显示
         auto* dl = ImGui::GetForegroundDrawList();

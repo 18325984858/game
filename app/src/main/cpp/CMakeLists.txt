@@ -120,6 +120,7 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
         "ueGame/libUE4Dumper/UE4Dumper.cpp"
         "ueGame/libUE4Header/UE4Header.cpp"
         "ueGame/interface/interface.cpp"
+        "ueGame/Draw/UE4Draw.cpp"
         "ueGame/pubgmhd/pubgmhd.cpp"
         "ueGame/uestart.cpp"
 )

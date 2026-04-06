@@ -1,6 +1,7 @@
 #include "pubgmhd.h"
 #include "../libUE4Struct/ilbUE4Struct.h"
 #include "../interface/interface.h"
+#include "../Draw/UE4Draw.h"
 #include "../../Log/log.h"
 
 #include <thread>
@@ -125,21 +126,23 @@ bool ResolvedOffsets::isValid() const {
 // =====================================================================
 // 辅助: 查找偏移, 失败时打印警告
 #define RESOLVE_OFFSET(target, className, fieldName) do { \
-    int32_t _off = m_interface.getFieldOffset(className, fieldName); \
-    if (_off >= 0) { target = _off; } \
+    int32_t _off = m_interface.getFieldOffsetInHierarchy(className, fieldName); \
+    if (_off >= 0) { target = _off; \
+        MLOG(LOG_LEVEL_INFO, "[InitOffsets] %s.%s = 0x%X", className, fieldName, _off); } \
     else { MLOG(LOG_LEVEL_WARN, "[InitOffsets] 未找到 %s.%s", className, fieldName); } \
 } while(0)
 
-// 辅助: 尝试多个类名查找同一字段 (第一个匹配即返回)
+// 辅助: 尝试多个类名查找同一字段, 沿继承链搜索 (第一个匹配即返回)
 #define RESOLVE_OFFSET_MULTI(target, fieldName, ...) do { \
     const char* _classes[] = { __VA_ARGS__ }; \
+    std::string _owner; \
     for (auto* _cn : _classes) { \
-        int32_t _off = m_interface.getFieldOffset(_cn, fieldName); \
-        if (_off >= 0) { target = _off; \
-            MLOG(LOG_LEVEL_INFO, "[InitOffsets] %s.%s = 0x%X", _cn, fieldName, _off); \
+        const ue4inf::UEFieldInfo* _fi = m_interface.findFieldInHierarchy(_cn, fieldName, &_owner); \
+        if (_fi) { target = _fi->offset; \
+            MLOG(LOG_LEVEL_INFO, "[InitOffsets] %s.%s = 0x%X (via %s)", _cn, fieldName, _fi->offset, _owner.c_str()); \
             break; } \
     } \
-    if (target < 0) { MLOG(LOG_LEVEL_WARN, "[InitOffsets] 未找到 %s (尝试了 %zu 个类)", fieldName, sizeof(_classes)/sizeof(_classes[0])); } \
+    if (target < 0) { MLOG(LOG_LEVEL_WARN, "[InitOffsets] 未找到 %s (尝试了 %zu 个类+继承链)", fieldName, sizeof(_classes)/sizeof(_classes[0])); } \
 } while(0)
 
 bool MatchMonitor::initOffsets() {
@@ -182,8 +185,18 @@ bool MatchMonitor::initOffsets() {
     RESOLVE_OFFSET(m_off.Actor_RootComponent,     "Actor", "RootComponent");
     RESOLVE_OFFSET_MULTI(m_off.Actor_NetCullDistSq, "NetCullDistanceSquared", "Actor", "Character", "Pawn");
 
-    // SceneComponent
-    RESOLVE_OFFSET(m_off.SceneComp_Translation,   "SceneComponent", "RelativeLocation");
+    // SceneComponent — 使用 ComponentToWorld.Translation (世界坐标, 非 RelativeLocation)
+    // ComponentToWorld 是 FTransform, Translation 在 FTransform+0x10
+    {
+        int32_t ctw = m_interface.getFieldOffsetInHierarchy("SceneComponent", "ComponentToWorld");
+        if (ctw >= 0) {
+            m_off.SceneComp_Translation = ctw + 0x10; // FTransform.Translation offset
+            MLOG(LOG_LEVEL_INFO, "[InitOffsets] SceneComponent.ComponentToWorld+0x10 = 0x%X", m_off.SceneComp_Translation);
+        } else {
+            MLOG(LOG_LEVEL_WARN, "[InitOffsets] ComponentToWorld 未找到, 回退 0x200");
+            m_off.SceneComp_Translation = 0x200;
+        }
+    }
 
     // UAEPlayerController
     RESOLVE_OFFSET_MULTI(m_off.PC_bIsObserver,         "bIsObserver",         "UAEPlayerController", "STExtraPlayerController");
@@ -300,22 +313,29 @@ std::string MatchMonitor::getNameByIndex(int index) {
 }
 
 std::string MatchMonitor::readFName(uintptr_t addr) {
+    if (addr == 0 || addr < 0x10000) return "<invalid>";
     auto* fn = reinterpret_cast<ue4::FName*>(addr);
-    std::string base = getNameByIndex(fn->ComparisonIndex);
+    int32_t idx = fn->ComparisonIndex;
+    int32_t num = fn->Number;
+    if (idx < 0 || idx >= m_numNames) return "<invalid>";
+    std::string base = getNameByIndex(idx);
     if (base.empty()) return "<invalid>";
-    if (fn->Number == 0) return base;
-    return base + "_" + std::to_string(fn->Number - 1);
+    if (num == 0) return base;
+    return base + "_" + std::to_string(num - 1);
 }
 
 std::string MatchMonitor::readObjName(uintptr_t objPtr) {
+    if (objPtr == 0 || objPtr < 0x10000) return "<invalid>";
     auto* obj = reinterpret_cast<ue4::UObjectBase*>(objPtr);
     return readFName(reinterpret_cast<uintptr_t>(&obj->NamePrivate));
 }
 
 std::string MatchMonitor::readClassName(uintptr_t objPtr) {
+    if (objPtr == 0 || objPtr < 0x10000) return "<no_class>";
     auto* obj = reinterpret_cast<ue4::UObjectBase*>(objPtr);
-    if (!obj->ClassPrivate) return "<no_class>";
-    return readObjName(reinterpret_cast<uintptr_t>(obj->ClassPrivate));
+    uintptr_t clsPtr = reinterpret_cast<uintptr_t>(obj->ClassPrivate);
+    if (clsPtr == 0 || clsPtr < 0x10000) return "<no_class>";
+    return readObjName(clsPtr);
 }
 
 // =====================================================================
@@ -351,15 +371,16 @@ std::string MatchMonitor::readFString(uintptr_t addr) {
 MatchState MatchMonitor::getMatchState() {
     MatchState ms;
     uintptr_t worldPtr = safeReadPtr(m_gWorld);
-    if (worldPtr == 0) {
+    if (worldPtr == 0 || worldPtr < 0x10000) {
         ms.state = "NO_WORLD";
         return ms;
     }
     ms.worldName = readObjName(worldPtr);
+    if (m_off.World_GameState < 0) { ms.state = "Unknown"; return ms; }
     uintptr_t gsPtr = safeReadPtr(worldPtr + m_off.World_GameState);
     ms.gameStatePtr = gsPtr;
 
-    if (gsPtr != 0) {
+    if (gsPtr != 0 && gsPtr > 0x10000 && m_off.GS_MatchState >= 0) {
         ms.state = readFName(gsPtr + m_off.GS_MatchState);
     } else {
         ms.state = "Unknown";
@@ -381,8 +402,9 @@ MatchState MatchMonitor::getMatchState() {
 bool MatchMonitor::getActorLocation(uintptr_t actorPtr, FVector3& outLoc) {
     if (actorPtr == 0) return false;
     uintptr_t rootComp = safeReadPtr(actorPtr + m_off.Actor_RootComponent);
-    if (rootComp == 0) return false;
+    if (rootComp == 0 || rootComp < 0x10000) return false;
     int off = m_off.SceneComp_Translation;
+    if (off < 0) return false;
     outLoc.x = safeReadFloat(rootComp + off);
     outLoc.y = safeReadFloat(rootComp + off + 4);
     outLoc.z = safeReadFloat(rootComp + off + 8);
@@ -411,9 +433,10 @@ bool MatchMonitor::isSubclassOf(uintptr_t classPtr, const char* targetName) {
 // =====================================================================
 uintptr_t MatchMonitor::getLocalPlayerController() {
     uintptr_t worldPtr = safeReadPtr(m_gWorld);
-    if (worldPtr == 0) return 0;
+    if (worldPtr == 0 || worldPtr < 0x10000) return 0;
+    if (m_off.World_GameState < 0 || m_off.GS_PlayerArray < 0) return 0;
     uintptr_t gsPtr = safeReadPtr(worldPtr + m_off.World_GameState);
-    if (gsPtr == 0) return 0;
+    if (gsPtr == 0 || gsPtr < 0x10000) return 0;
     uintptr_t arrayData = safeReadPtr(gsPtr + m_off.GS_PlayerArray);
     int32_t arrayNum = safeReadS32(gsPtr + m_off.GS_PlayerArray + 8);
     if (arrayData == 0 || arrayNum <= 0) return 0;
@@ -494,8 +517,11 @@ bool MatchMonitor::setObserverType(EObserverType type) {
 //  网络可见范围修改
 // =====================================================================
 void MatchMonitor::patchActorNetCull(uintptr_t actorPtr) {
-    writeMemFloat(actorPtr + m_off.Actor_NetCullDistSq, MAX_CULL_DIST_SQ);
-    writeMemFloat(actorPtr + m_off.Char_CurrentNetCullDistSq, MAX_CULL_DIST_SQ);
+    if (actorPtr == 0) return;
+    if (m_off.Actor_NetCullDistSq >= 0)
+        writeMemFloat(actorPtr + m_off.Actor_NetCullDistSq, MAX_CULL_DIST_SQ);
+    if (m_off.Char_CurrentNetCullDistSq >= 0)
+        writeMemFloat(actorPtr + m_off.Char_CurrentNetCullDistSq, MAX_CULL_DIST_SQ);
 }
 
 // =====================================================================
@@ -505,7 +531,7 @@ int MatchMonitor::scanCharacters() {
     auto* objArray = reinterpret_cast<ue4::FUObjectArray*>(m_gUObjectArray);
     int numChunks = objArray->getNumChunks();
     int totalNum = objArray->getTotalNum();
-    if (numChunks <= 0 || totalNum <= 0) return 0;
+    if (numChunks <= 0 || numChunks > 1000 || totalNum <= 0 || totalNum > 5000000) return 0;
 
     int globalIdx = 0;
     int newCharsFound = 0;
@@ -582,11 +608,11 @@ int MatchMonitor::updatePlayerList(uintptr_t gameStatePtr) {
     uintptr_t arrayData = safeReadPtr(gameStatePtr + m_off.GS_PlayerArray);
     int32_t arrayNum = safeReadS32(gameStatePtr + m_off.GS_PlayerArray + 8);
 
-    // 读取 GameState 的全局玩家计数
-    int32_t totalPlayerNum = safeReadS32(gameStatePtr + m_off.GS_TotalPlayerNum);
-    int32_t playerNum = safeReadS32(gameStatePtr + m_off.GS_PlayerNum);
-    int32_t aliveNum = safeReadS32(gameStatePtr + m_off.GS_AlivePlayerNum);
-    int32_t aliveRealNum = safeReadS32(gameStatePtr + m_off.GS_AliveRealPlayerNum);
+    // 读取 GameState 的全局玩家计数 (偏移可能未解析, 安全检查)
+    int32_t totalPlayerNum = m_off.GS_TotalPlayerNum >= 0 ? safeReadS32(gameStatePtr + m_off.GS_TotalPlayerNum) : 0;
+    int32_t playerNum = m_off.GS_PlayerNum >= 0 ? safeReadS32(gameStatePtr + m_off.GS_PlayerNum) : 0;
+    int32_t aliveNum = m_off.GS_AlivePlayerNum >= 0 ? safeReadS32(gameStatePtr + m_off.GS_AlivePlayerNum) : 0;
+    int32_t aliveRealNum = m_off.GS_AliveRealPlayerNum >= 0 ? safeReadS32(gameStatePtr + m_off.GS_AliveRealPlayerNum) : 0;
 
     if (arrayNum != m_lastReportedArrayNum || totalPlayerNum != m_lastReportedTotal) {
         MLOG(LOG_LEVEL_INFO, "[PlayerCount] PlayerArray=%d TotalPlayerNum=%d PlayerNum=%d AlivePlayerNum=%d AliveRealPlayerNum=%d",
@@ -765,6 +791,60 @@ void MatchMonitor::pollPlayers() {
         writeLog(logBuf);
     }
     writeLog("");
+
+    // 推送数据到绘制层
+    ue4draw::DrawGameData drawData;
+    drawData.inMatch = true;
+    drawData.worldName = ms.worldName;
+    drawData.matchState = ms.state;
+    drawData.myTeamID = m_myTeamID;
+    drawData.aliveCount = aliveCount;
+    drawData.totalCount = m_playerList.size();
+    // 获取自己的位置 (PlayerArray[0])
+    PlayerNode* myNode = m_playerList.head();
+    if (myNode) {
+        drawData.myPosX = myNode->pos.x;
+        drawData.myPosY = myNode->pos.y;
+        drawData.myPosZ = myNode->pos.z;
+    }
+    // 读取相机数据: PlayerController(+0x658) -> PlayerCameraManager -> CameraCache.POV
+    uintptr_t pc = getLocalPlayerController();
+    if (pc != 0) {
+        uintptr_t pcm = safeReadPtr(pc + 0x658);  // PlayerController.PlayerCameraManager
+        if (pcm != 0) {
+            // CameraCache.POV.Location @ PCM+0x650 (3 floats)
+            drawData.camLocX = safeReadFloat(pcm + 0x650);
+            drawData.camLocY = safeReadFloat(pcm + 0x654);
+            drawData.camLocZ = safeReadFloat(pcm + 0x658);
+            // CameraCache.POV.Rotation @ PCM+0x668 (Pitch, Yaw, Roll)
+            drawData.camPitch = safeReadFloat(pcm + 0x668);
+            drawData.camYaw   = safeReadFloat(pcm + 0x66C);
+            drawData.camRoll  = safeReadFloat(pcm + 0x670);
+            // DefaultFOV @ PCM+0x5E0
+            drawData.camFOV = safeReadFloat(pcm + 0x5E0);
+            if (drawData.camFOV <= 0.0f || drawData.camFOV > 170.0f) drawData.camFOV = 90.0f;
+        }
+    }
+    // 填充所有玩家
+    cur = m_playerList.head();
+    while (cur) {
+        ue4draw::DrawPlayerInfo dp;
+        dp.playerKey = cur->playerKey;
+        dp.teamID = cur->teamID;
+        dp.playerName = cur->playerName;
+        dp.isAI = cur->isAI;
+        dp.isAlive = (cur->liveState == 0 && cur->health > 0);
+        dp.health = cur->health;
+        dp.healthMax = cur->healthMax;
+        dp.kills = cur->kills;
+        dp.posX = cur->pos.x;
+        dp.posY = cur->pos.y;
+        dp.posZ = cur->pos.z;
+        dp.isTeammate = (m_myTeamID > 0 && cur->teamID == m_myTeamID);
+        drawData.players.push_back(dp);
+        cur = cur->next;
+    }
+    ue4draw::SharedUE4Data::getInstance().pushData(drawData);
 }
 
 // =====================================================================
@@ -793,6 +873,7 @@ void MatchMonitor::pollMatchStateLoop() {
 
             if (m_isInMatch && !wasInMatch) {
                 MLOG(LOG_LEVEL_INFO, "进入对局! State=%s World=%s", ms.state.c_str(), ms.worldName.c_str());
+                ue4draw::SharedUE4Data::getInstance().setInMatch(true);
                 m_playerList.clear();
                 m_characterClassSet.clear();
                 m_myTeamID = -1;
@@ -806,6 +887,10 @@ void MatchMonitor::pollMatchStateLoop() {
                 detectObserverType();
             } else if (!m_isInMatch && wasInMatch) {
                 MLOG(LOG_LEVEL_INFO, "★ 离开对局! 共追踪 %d 名玩家", m_playerList.size());
+                // 推送空数据清除绘制
+                ue4draw::DrawGameData emptyData;
+                emptyData.inMatch = false;
+                ue4draw::SharedUE4Data::getInstance().pushData(emptyData);
                 closeLog();
                 m_playerList.clear();
             }
