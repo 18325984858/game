@@ -97,6 +97,7 @@ public class MainActivity extends AppCompatActivity {
     private boolean fontDone = false;
     private boolean launchDone = false;
     private TextView tvStatus;
+    private CheckBox cbPubgDumper;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -112,6 +113,7 @@ public class MainActivity extends AppCompatActivity {
         CheckBox cbDumper = findViewById(R.id.cb_dumper);
         CheckBox cbHeader = findViewById(R.id.cb_header);
         CheckBox cbLog = findViewById(R.id.cb_log);
+        cbPubgDumper = findViewById(R.id.cb_pubg_dumper);
 
         // ── 折叠区域: lol手游 ──
         TextView tvSectionHeader = findViewById(R.id.tv_section_lol_header);
@@ -143,6 +145,28 @@ public class MainActivity extends AppCompatActivity {
         Button btnInputPerm = findViewById(R.id.btn_input_perm);
         Button btnFont = findViewById(R.id.btn_deploy_font);
         Button btnLaunch = findViewById(R.id.btn_launch);
+        Button btnPubgLaunch = findViewById(R.id.btn_pubg_launch);
+
+        // ── 和平精英启动按钮 ──
+        btnPubgLaunch.setOnClickListener(v -> {
+            if (!selinuxDone) {
+                Toast.makeText(this, "请先设置宽容模式", Toast.LENGTH_SHORT).show();
+                return;
+            }
+            btnPubgLaunch.setEnabled(false);
+
+            boolean enableUeDumper = cbPubgDumper.isChecked();
+            boolean enableLog = cbLog.isChecked();
+
+            clearDumpMarkers();
+            writeFiletoTargetPubg();
+            launchAndInjectPubg(enableUeDumper, enableLog);
+
+            String options = enableUeDumper ? " [UE4 Dumper]" : "";
+            btnPubgLaunch.setText("✅ 游戏已启动" + options);
+            updateStatus("和平精英启动中..." + options);
+            Toast.makeText(this, "正在启动和平精英并注入..." + options, Toast.LENGTH_SHORT).show();
+        });
 
         // ── 启动时初始化检测 ──
         updateStatus("正在检测环境...");
@@ -763,7 +787,8 @@ public class MainActivity extends AppCompatActivity {
                 DataOutputStream cfgOs = new DataOutputStream(cfgP.getOutputStream());
                 String cfgContent = "dumper=" + (enableDumper ? "1" : "0") + "\n"
                                   + "header=" + (enableHeader ? "1" : "0") + "\n"
-                                  + "log=" + (enableLog ? "1" : "0") + "\n";
+                                  + "log=" + (enableLog ? "1" : "0") + "\n"
+                                  + "ue_dumper=" + (cbPubgDumper.isChecked() ? "1" : "0") + "\n";
                 cfgOs.writeBytes("echo '" + cfgContent + "' > /data/local/tmp/dobby_config.txt\n");
                 cfgOs.writeBytes("chmod 644 /data/local/tmp/dobby_config.txt\n");
                 cfgOs.writeBytes("exit\n");
@@ -912,5 +937,120 @@ public class MainActivity extends AppCompatActivity {
             }
         }
         LogUtil.e("所有 su 方式均失败，无法拷贝 SO 文件", null);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  和平精英 (PUBG Mobile) 注入流程
+    // ═══════════════════════════════════════════════════════════════════
+
+    private static final String PUBG_PACKAGE = "com.tencent.tmgp.pubgmhd";
+
+    /**
+     * 拷贝 SO 到和平精英目标目录
+     */
+    public void writeFiletoTargetPubg() {
+        String srcFile = g_nativeLibPath + (g_nativeLibPath.endsWith("/") ? "" : "/") + "libdobbyproject.so";
+        String dstDir = "/data/data/" + PUBG_PACKAGE + "/files";
+        String dstFile = dstDir + "/libdobbyproject.so";
+
+        LogUtil.i("[PUBG] 源文件: " + srcFile);
+        LogUtil.i("[PUBG] 拷贝 SO -> " + dstFile);
+
+        String cmd = "mkdir -p " + dstDir + "\n" +
+                "cp -f " + srcFile + " " + dstFile + "\n" +
+                "chmod 777 " + dstFile + "\n" +
+                "sync\nexit\n";
+
+        String[] suVariants = {"su -M", "su -mm", "su"};
+        for (String suCmd : suVariants) {
+            try {
+                Process p = Runtime.getRuntime().exec(suCmd);
+                DataOutputStream os = new DataOutputStream(p.getOutputStream());
+                os.writeBytes(cmd);
+                os.flush();
+                int exitCode = p.waitFor();
+                if (exitCode == 0) {
+                    LogUtil.i("[PUBG] ✓ " + suCmd + " 拷贝成功");
+                    return;
+                }
+            } catch (Exception e) {
+                LogUtil.i("[PUBG] " + suCmd + " 不可用");
+            }
+        }
+        LogUtil.e("[PUBG] 所有 su 方式均失败", null);
+    }
+
+    /**
+     * 启动和平精英并注入 (PUBG 模式)
+     */
+    public void launchAndInjectPubg(boolean enableUeDumper, boolean enableLog) {
+        String soPath = "/data/data/" + PUBG_PACKAGE + "/files/libdobbyproject.so";
+        String injectorDst = "/data/local/tmp/injector";
+
+        new Thread(() -> {
+            try {
+                // 1. 部署 injector
+                LogUtil.i("[PUBG] 部署 injector");
+                Process deployP = Runtime.getRuntime().exec("su");
+                DataOutputStream deployOs = new DataOutputStream(deployP.getOutputStream());
+                deployOs.writeBytes("cp -f " + g_nativeLibPath + "/libinjector.so " + injectorDst + "\n");
+                deployOs.writeBytes("chmod 755 " + injectorDst + "\n");
+                deployOs.writeBytes("exit\n");
+                deployOs.flush();
+                deployP.waitFor();
+
+                // 2. 启动和平精英
+                LogUtil.i("[PUBG] 启动和平精英");
+                Process launchP = Runtime.getRuntime().exec("su");
+                DataOutputStream launchOs = new DataOutputStream(launchP.getOutputStream());
+                launchOs.writeBytes("monkey -p " + PUBG_PACKAGE + " -c android.intent.category.LAUNCHER 1 2>/dev/null\n");
+                launchOs.writeBytes("exit\n");
+                launchOs.flush();
+                launchP.waitFor();
+
+                // 3. 等待游戏初始化
+                LogUtil.i("[PUBG] 等待 15 秒游戏初始化...");
+                Thread.sleep(15000);
+
+                // 4. 写入配置文件
+                Process cfgP = Runtime.getRuntime().exec("su");
+                DataOutputStream cfgOs = new DataOutputStream(cfgP.getOutputStream());
+                String cfgContent = "ue_dumper=" + (enableUeDumper ? "1" : "0") + "\n"
+                                  + "log=" + (enableLog ? "1" : "0") + "\n";
+                cfgOs.writeBytes("echo '" + cfgContent + "' > /data/local/tmp/dobby_config.txt\n");
+                cfgOs.writeBytes("chmod 644 /data/local/tmp/dobby_config.txt\n");
+                cfgOs.writeBytes("exit\n");
+                cfgOs.flush();
+                cfgP.waitFor();
+
+                // 5. 执行注入 (pubg 模式)
+                LogUtil.i("[PUBG] 执行注入: " + injectorDst + " " + PUBG_PACKAGE + " " + soPath + " pubg");
+                Process p = Runtime.getRuntime().exec("su");
+                DataOutputStream os = new DataOutputStream(p.getOutputStream());
+                os.writeBytes(injectorDst + " " + PUBG_PACKAGE + " " + soPath + " pubg\n");
+                os.writeBytes("exit\n");
+                os.flush();
+
+                BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream()));
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    LogUtil.i("[PUBG] " + line);
+                }
+                int exitCode = p.waitFor();
+                LogUtil.i("[PUBG] 注入完成, exitCode=" + exitCode);
+
+                runOnUiThread(() -> {
+                    if (exitCode == 0) {
+                        updateStatus("和平精英注入成功");
+                    } else {
+                        updateStatus("和平精英注入失败 (code=" + exitCode + ")");
+                    }
+                });
+
+            } catch (Exception e) {
+                LogUtil.e("[PUBG] 注入异常: " + e.getMessage(), e);
+                runOnUiThread(() -> updateStatus("和平精英注入异常"));
+            }
+        }).start();
     }
 }

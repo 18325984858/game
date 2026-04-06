@@ -48,13 +48,20 @@
 
 namespace Injector {
 
+    /// 注入模式
+    enum InjectMode {
+        MODE_LOL  = 0,   // lol手游 (il2cpp, 调用 MyStartPoint)
+        MODE_PUBG = 1,   // 和平精英 (UE4, 调用 MyStartPointUE4)
+    };
+
     /**
      * 通过 ptrace 将指定 SO 注入到目标进程
      * @param pid         目标进程 PID
      * @param soPath      要注入的 SO 文件绝对路径
+     * @param mode        注入模式 (MODE_LOL / MODE_PUBG)
      * @return            0 成功, 负值失败
      */
-    int injectRemote(pid_t pid, const char* soPath);
+    int injectRemote(pid_t pid, const char* soPath, InjectMode mode = MODE_LOL);
 
     /**
      * 通过包名查找目标进程 PID
@@ -67,8 +74,9 @@ namespace Injector {
      * 完整注入流程: 查找进程 + ptrace 注入 SO
      * @param packageName 目标包名
      * @param soPath      SO 文件路径
+     * @param mode        注入模式 (MODE_LOL / MODE_PUBG)
      * @return            0 成功, 负值失败
      */
-    int injectByPackageName(const char* packageName, const char* soPath);
+    int injectByPackageName(const char* packageName, const char* soPath, InjectMode mode = MODE_LOL);
 
 } // namespace Injector

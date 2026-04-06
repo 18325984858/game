@@ -339,8 +339,8 @@ static int ptrace_call(pid_t pid, uint64_t funcAddr, uint64_t* params, int param
 // injectRemote — 核心注入函数
 // ═══════════════════════════════════════════════════════════════════════════════
 
-int Injector::injectRemote(pid_t pid, const char* soPath) {
-    LOG(LOG_LEVEL_INFO, "[Injector] 开始注入 pid=%d so=%s", pid, soPath);
+int Injector::injectRemote(pid_t pid, const char* soPath, InjectMode mode) {
+    LOG(LOG_LEVEL_INFO, "[Injector] 开始注入 pid=%d so=%s mode=%s", pid, soPath, mode == MODE_PUBG ? "PUBG" : "LOL");
 
     // ── 1. Attach 到目标进程 ──
     if (ptrace(PTRACE_ATTACH, pid, nullptr, nullptr) < 0) {
@@ -435,14 +435,57 @@ int Injector::injectRemote(pid_t pid, const char* soPath) {
 
         LOG(LOG_LEVEL_INFO, "[Injector] ✓ dlopen 成功! handle=%llx", (unsigned long long)dlopenResult);
 
-        // ── 6. 远程调用 dlsym 查找 MyStartPoint ──
+        // ── 6. 远程调用 dlsym 查找入口函数 ──
         uint64_t remoteDlsymAddr = getRemoteFuncAddr(pid, "libdl.so", (void*)dlsym);
         if (remoteDlsymAddr == 0) {
             LOG(LOG_LEVEL_ERROR, "[Injector] 无法找到远程 dlsym 地址");
             goto cleanup;
         }
 
-        // 将函数名写入远程内存
+        if (mode == MODE_PUBG) {
+            // ═══ PUBG (UE4) 注入路径 ═══
+            const char* funcName = "MyStartPointUE4";
+            if (ptrace_writedata(pid, remoteMem, funcName, strlen(funcName) + 1) < 0) {
+                LOG(LOG_LEVEL_ERROR, "[Injector] 写入函数名失败");
+                goto cleanup;
+            }
+
+            uint64_t dlsymParams[2] = { dlopenResult, remoteMem };
+            uint64_t funcAddr = 0;
+            if (ptrace_call(pid, remoteDlsymAddr, dlsymParams, 2, &funcAddr) < 0 || funcAddr == 0) {
+                LOG(LOG_LEVEL_ERROR, "[Injector] dlsym 查找 MyStartPointUE4 失败");
+                goto cleanup;
+            }
+            LOG(LOG_LEVEL_INFO, "[Injector] MyStartPointUE4 地址: %llx", (unsigned long long)funcAddr);
+
+            // 获取 libUE4.so 基址
+            uint64_t ue4Base = getRemoteModuleBase(pid, "libUE4.so");
+            if (ue4Base == 0) {
+                LOG(LOG_LEVEL_ERROR, "[Injector] 无法找到 libUE4.so 基址");
+                goto cleanup;
+            }
+            LOG(LOG_LEVEL_INFO, "[Injector] libUE4.so 基址: %llx", (unsigned long long)ue4Base);
+
+            // 读取 GNames/GUObjectArray/GWorld 指针
+            uint64_t pGNames        = ptrace_peekptr(pid, ue4Base + 0x146F9F30);
+            uint64_t pGUObjectArray = ue4Base + 0x14706480;  // 结构体地址, 不解引用
+            uint64_t pGWorld        = ptrace_peekptr(pid, ue4Base + 0x14988578);
+
+            LOG(LOG_LEVEL_INFO, "[Injector] GNames:        %llx", (unsigned long long)pGNames);
+            LOG(LOG_LEVEL_INFO, "[Injector] GUObjectArray: %llx", (unsigned long long)pGUObjectArray);
+            LOG(LOG_LEVEL_INFO, "[Injector] GWorld:        %llx", (unsigned long long)pGWorld);
+
+            // 调用 MyStartPointUE4(libUE4Base, pGNames, pGWorld, pGUObjectArray, NULL)
+            uint64_t startParams[5] = { ue4Base, pGNames, pGWorld, pGUObjectArray, 0 };
+            LOG(LOG_LEVEL_INFO, "[Injector] 调用 MyStartPointUE4...");
+            uint64_t startRet = 0;
+            if (ptrace_call(pid, funcAddr, startParams, 5, &startRet) < 0) {
+                LOG(LOG_LEVEL_ERROR, "[Injector] MyStartPointUE4 调用失败");
+                goto cleanup;
+            }
+            LOG(LOG_LEVEL_INFO, "[Injector] ✓ MyStartPointUE4 返回: %lld", (long long)startRet);
+        } else {
+        // ═══ LOL (il2cpp) 注入路径 ═══
         {
             const char* funcName = "_Z12MyStartPointPvS_S_S_S_";
             if (ptrace_writedata(pid, remoteMem, funcName, strlen(funcName) + 1) < 0) {
@@ -500,6 +543,7 @@ int Injector::injectRemote(pid_t pid, const char* soPath) {
             }
             LOG(LOG_LEVEL_INFO, "[Injector] ✓ MyStartPoint 返回: %lld", (long long)startRet);
         }
+        } // end LOL branch
 
 cleanup:
         // ── 9. 远程调用 munmap 释放临时内存 ──
@@ -583,8 +627,9 @@ pid_t Injector::findPidByName(const char* packageName) {
 // injectByPackageName — 完整注入: 查找 PID + ptrace 注入
 // ═══════════════════════════════════════════════════════════════════════════════
 
-int Injector::injectByPackageName(const char* packageName, const char* soPath) {
-    LOG(LOG_LEVEL_INFO, "[Injector] 开始注入 package=%s so=%s", packageName, soPath);
+int Injector::injectByPackageName(const char* packageName, const char* soPath, InjectMode mode) {
+    LOG(LOG_LEVEL_INFO, "[Injector] 开始注入 package=%s so=%s mode=%s",
+        packageName, soPath, mode == MODE_PUBG ? "PUBG" : "LOL");
 
     // 等待目标进程启动, 每秒检查一次, 最多等待 15 秒
     pid_t pid = -1;
@@ -600,7 +645,7 @@ int Injector::injectByPackageName(const char* packageName, const char* soPath) {
         return -1;
     }
 
-    return injectRemote(pid, soPath);
+    return injectRemote(pid, soPath, mode);
 }
 
 #ifdef OBFU_ATTRS_END

@@ -50,7 +50,7 @@ android {
         // 支持 ARM + x86 模拟器架构
         externalNativeBuild {
             cmake {
-                abiFilters.addAll(listOf("arm64-v8a", "armeabi-v7a", "x86", "x86_64"))
+                abiFilters.addAll(listOf("arm64-v8a"))//, "armeabi-v7a", "x86", "x86_64"))
                 if (enableWindowsLlvmFrontend) {
                     val cmakeLlvmRoot = windowsLlvmRoot!!.replace('\\', '/')
                     arguments += listOf(

@@ -52,6 +52,15 @@
         android:background="#CCCCCC"
         android:layout_marginBottom="16dp" />
 
+    <!-- 全局日志开关 -->
+    <CheckBox
+        android:id="@+id/cb_log"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="启用日志输出"
+        android:checked="true"
+        android:layout_marginBottom="12dp" />
+
     <!-- 可折叠区域: lol手游 -->
     <LinearLayout
         android:id="@+id/section_lol"
@@ -97,14 +106,6 @@
                 android:layout_height="wrap_content"
                 android:text="启用 il2cppHeaderDumper (导出头文件)"
                 android:checked="false"
-                android:layout_marginBottom="4dp" />
-
-            <CheckBox
-                android:id="@+id/cb_log"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:text="启用日志输出"
-                android:checked="true"
                 android:layout_marginBottom="8dp" />
 
             <!-- 启动游戏 -->
@@ -162,14 +163,6 @@
                 android:layout_height="wrap_content"
                 android:text="启用 ueHeader (导出头文件)"
                 android:checked="false"
-                android:layout_marginBottom="4dp" />
-
-            <CheckBox
-                android:id="@+id/cb_pubg_log"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:text="启用日志输出"
-                android:checked="true"
                 android:layout_marginBottom="8dp" />
 
             <Button

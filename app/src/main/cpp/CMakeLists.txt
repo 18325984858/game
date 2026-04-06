@@ -105,7 +105,7 @@ find_library(
 add_library(${CMAKE_PROJECT_NAME} SHARED
         # List C/C++ source files with relative paths to this CMakeLists.txt.
         unityGame/native-lib.cpp
-        unityGame/start.cpp
+        unityGame/unitystart.cpp
         "unityGame/Draw/Draw.cpp"
         "Log/log.cpp"
         "unityGame/Symbol/Symbol.cpp"
@@ -118,6 +118,7 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
         "Injector/Injector.cpp"
         "ueGame/libUE4Struct/ilbUE4Struct.cpp"
         "ueGame/libUE4Dumper/UE4Dumper.cpp"
+        "ueGame/uestart.cpp"
 )
 
 # Specifies libraries CMake should link to your target library. You
@@ -166,7 +167,7 @@ if(USE_WINDOWS_LLVM_FRONTEND AND ENABLE_WINDOWS_LLVM_OBFUSCATION)
         )
 
         set_source_files_properties(
-                unityGame/start.cpp
+                unityGame/unitystart.cpp
                 "unityGame/lol/lolm.cpp"
                 "unityGame/interface/interface.cpp"
                 PROPERTIES COMPILE_OPTIONS "-mllvm;-passes=${WINDOWS_LLVM_HEAVY_PASSES}"

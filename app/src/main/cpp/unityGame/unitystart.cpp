@@ -2,7 +2,7 @@
 // Created by Song on 2025/11/10.
 //
 
-#include "start.h"
+#include "unitystart.h"
 #include "../Log/log.h"
 #include "./lol/lolm.h"
 #include "./il2cppHeader/il2cppHeader.h"
@@ -1454,6 +1454,46 @@ static DobbyConfig readDobbyConfig() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+//  JNI Toast 工具 — 在安卓主线程显示下方弹框
+// ═══════════════════════════════════════════════════════════════════════════════
+namespace toast_util {
+    static void showToast(const char* msg) {
+        JavaVM* vm = touch_input::getJavaVM();
+        if (!vm) return;
+        JNIEnv* env = nullptr;
+        bool attached = false;
+        jint stat = vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
+        if (stat == JNI_EDETACHED) {
+            if (vm->AttachCurrentThread(&env, nullptr) != JNI_OK) return;
+            attached = true;
+        } else if (!env) return;
+
+        jclass atClass = env->FindClass("android/app/ActivityThread");
+        if (!atClass || env->ExceptionCheck()) { env->ExceptionClear(); if (attached) vm->DetachCurrentThread(); return; }
+        jmethodID curApp = env->GetStaticMethodID(atClass, "currentApplication", "()Landroid/app/Application;");
+        jobject ctx = curApp ? env->CallStaticObjectMethod(atClass, curApp) : nullptr;
+        env->DeleteLocalRef(atClass);
+        if (!ctx || env->ExceptionCheck()) { env->ExceptionClear(); if (attached) vm->DetachCurrentThread(); return; }
+
+        jclass toastClass = env->FindClass("android/widget/Toast");
+        jmethodID makeText = toastClass ? env->GetStaticMethodID(toastClass, "makeText",
+            "(Landroid/content/Context;Ljava/lang/CharSequence;I)Landroid/widget/Toast;") : nullptr;
+        jstring jmsg = env->NewStringUTF(msg);
+        jobject toast = (makeText && jmsg) ? env->CallStaticObjectMethod(toastClass, makeText, ctx, jmsg, 1) : nullptr;
+        if (toast) {
+            jmethodID show = env->GetMethodID(toastClass, "show", "()V");
+            if (show) env->CallVoidMethod(toast, show);
+        }
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (jmsg) env->DeleteLocalRef(jmsg);
+        if (toast) env->DeleteLocalRef(toast);
+        if (toastClass) env->DeleteLocalRef(toastClass);
+        env->DeleteLocalRef(ctx);
+        if (attached) vm->DetachCurrentThread();
+    }
+} // namespace toast_util
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // MyStartPoint — 注入入口
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1475,25 +1515,41 @@ bool MyStartPoint(void *pli2cppModeBase, void *pCodeRegistration, void *pMetadat
         if (config.enableHeader) {
             std::thread([=]() {
                 LOG(LOG_LEVEL_INFO, "[MyStartPoint] [线程] 启用 il2cppHeader — 导出头文件");
-                li2cppHeader::li2cppHeader il2cppH(pli2cppModeBase, pCodeRegistration,
-                                                   pMetadataRegistration, pGlobalMetadataHeader, pMetadataImagesTable);
-                il2cppH.start();
-                LOG(LOG_LEVEL_INFO, "[MyStartPoint] [线程] il2cppHeader 完成");
-                // 写入完成标记
-                int fd = open("/data/local/tmp/dobby_header_done", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-                if (fd >= 0) { write(fd, "done", 4); close(fd); }
+                try {
+                    li2cppHeader::li2cppHeader il2cppH(pli2cppModeBase, pCodeRegistration,
+                                                       pMetadataRegistration, pGlobalMetadataHeader, pMetadataImagesTable);
+                    il2cppH.start();
+                    LOG(LOG_LEVEL_INFO, "[MyStartPoint] [线程] il2cppHeader 完成");
+                    toast_util::showToast("il2cppHeader 导出完成");
+                    int fd = open("/data/local/tmp/dobby_header_done", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                    if (fd >= 0) { write(fd, "done", 4); close(fd); }
+                } catch (const std::exception& e) {
+                    LOG(LOG_LEVEL_ERROR, "[MyStartPoint] il2cppHeader 异常: %s", e.what());
+                    toast_util::showToast("il2cppHeader 导出失败");
+                } catch (...) {
+                    LOG(LOG_LEVEL_ERROR, "[MyStartPoint] il2cppHeader 未知异常");
+                    toast_util::showToast("il2cppHeader 导出失败");
+                }
             }).detach();
         }
         if (config.enableDumper) {
             std::thread([=]() {
                 LOG(LOG_LEVEL_INFO, "[MyStartPoint] [线程] 启用 il2cppDumper — 导出 dump");
-                li2cpp::li2cppDumper il2cppD(pli2cppModeBase, pCodeRegistration,
-                                             pMetadataRegistration, pGlobalMetadataHeader, pMetadataImagesTable);
-                il2cppD.initInfo();
-                LOG(LOG_LEVEL_INFO, "[MyStartPoint] [线程] il2cppDumper 完成");
-                // 写入完成标记
-                int fd = open("/data/local/tmp/dobby_dumper_done", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-                if (fd >= 0) { write(fd, "done", 4); close(fd); }
+                try {
+                    li2cpp::li2cppDumper il2cppD(pli2cppModeBase, pCodeRegistration,
+                                                 pMetadataRegistration, pGlobalMetadataHeader, pMetadataImagesTable);
+                    il2cppD.initInfo();
+                    LOG(LOG_LEVEL_INFO, "[MyStartPoint] [线程] il2cppDumper 完成");
+                    toast_util::showToast("il2cppDumper 导出完成");
+                    int fd = open("/data/local/tmp/dobby_dumper_done", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                    if (fd >= 0) { write(fd, "done", 4); close(fd); }
+                } catch (const std::exception& e) {
+                    LOG(LOG_LEVEL_ERROR, "[MyStartPoint] il2cppDumper 异常: %s", e.what());
+                    toast_util::showToast("il2cppDumper 导出失败");
+                } catch (...) {
+                    LOG(LOG_LEVEL_ERROR, "[MyStartPoint] il2cppDumper 未知异常");
+                    toast_util::showToast("il2cppDumper 导出失败");
+                }
             }).detach();
         }
 
