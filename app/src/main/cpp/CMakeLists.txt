@@ -118,6 +118,7 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
         "Injector/Injector.cpp"
         "ueGame/libUE4Struct/ilbUE4Struct.cpp"
         "ueGame/libUE4Dumper/UE4Dumper.cpp"
+        "ueGame/libUE4Header/UE4Header.cpp"
         "ueGame/uestart.cpp"
 )
 

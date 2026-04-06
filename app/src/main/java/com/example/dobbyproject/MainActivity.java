@@ -98,6 +98,7 @@ public class MainActivity extends AppCompatActivity {
     private boolean launchDone = false;
     private TextView tvStatus;
     private CheckBox cbPubgDumper;
+    private CheckBox cbPubgHeader;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -114,6 +115,7 @@ public class MainActivity extends AppCompatActivity {
         CheckBox cbHeader = findViewById(R.id.cb_header);
         CheckBox cbLog = findViewById(R.id.cb_log);
         cbPubgDumper = findViewById(R.id.cb_pubg_dumper);
+        cbPubgHeader = findViewById(R.id.cb_pubg_header);
 
         // ── 折叠区域: lol手游 ──
         TextView tvSectionHeader = findViewById(R.id.tv_section_lol_header);
@@ -156,13 +158,16 @@ public class MainActivity extends AppCompatActivity {
             btnPubgLaunch.setEnabled(false);
 
             boolean enableUeDumper = cbPubgDumper.isChecked();
+            boolean enableUeHeader = cbPubgHeader.isChecked();
             boolean enableLog = cbLog.isChecked();
 
             clearDumpMarkers();
             writeFiletoTargetPubg();
-            launchAndInjectPubg(enableUeDumper, enableLog);
+            launchAndInjectPubg(enableUeDumper, enableUeHeader, enableLog);
 
-            String options = enableUeDumper ? " [UE4 Dumper]" : "";
+            String options = "";
+            if (enableUeDumper) options += " [UE4 Dumper]";
+            if (enableUeHeader) options += " [UE4 Header]";
             btnPubgLaunch.setText("✅ 游戏已启动" + options);
             updateStatus("和平精英启动中..." + options);
             Toast.makeText(this, "正在启动和平精英并注入..." + options, Toast.LENGTH_SHORT).show();
@@ -983,7 +988,7 @@ public class MainActivity extends AppCompatActivity {
     /**
      * 启动和平精英并注入 (PUBG 模式)
      */
-    public void launchAndInjectPubg(boolean enableUeDumper, boolean enableLog) {
+    public void launchAndInjectPubg(boolean enableUeDumper, boolean enableUeHeader, boolean enableLog) {
         String soPath = "/data/data/" + PUBG_PACKAGE + "/files/libdobbyproject.so";
         String injectorDst = "/data/local/tmp/injector";
 
@@ -1016,6 +1021,7 @@ public class MainActivity extends AppCompatActivity {
                 Process cfgP = Runtime.getRuntime().exec("su");
                 DataOutputStream cfgOs = new DataOutputStream(cfgP.getOutputStream());
                 String cfgContent = "ue_dumper=" + (enableUeDumper ? "1" : "0") + "\n"
+                                  + "ue_header=" + (enableUeHeader ? "1" : "0") + "\n"
                                   + "log=" + (enableLog ? "1" : "0") + "\n";
                 cfgOs.writeBytes("echo '" + cfgContent + "' > /data/local/tmp/dobby_config.txt\n");
                 cfgOs.writeBytes("chmod 644 /data/local/tmp/dobby_config.txt\n");

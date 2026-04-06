@@ -1,8 +1,48 @@
 ﻿#include "UE4Dumper.h"
 #include "../libUE4Struct/ilbUE4Struct.h"
+#include "../../Log/log.h"
 #include <algorithm>
 #include <cerrno>
 #include <sys/stat.h>
+#include <csignal>
+#include <csetjmp>
+
+// =====================================================================
+//  安全内存读取 — 使用 SIGSEGV 信号捕获防止崩溃
+// =====================================================================
+static thread_local sigjmp_buf s_safeReadJmpBuf;
+static thread_local volatile sig_atomic_t s_safeReadActive = 0;
+static struct sigaction s_oldSigsegvAction;
+static struct sigaction s_oldSigbusAction;
+static bool s_safeReadGuardInstalled = false;
+
+static void safeReadSignalHandler(int sig, siginfo_t* info, void* ctx) {
+    if (s_safeReadActive) {
+        s_safeReadActive = 0;
+        siglongjmp(s_safeReadJmpBuf, sig);
+    }
+    // 转发给原处理器
+    struct sigaction* old = (sig == SIGSEGV) ? &s_oldSigsegvAction : &s_oldSigbusAction;
+    if (old->sa_flags & SA_SIGINFO) {
+        old->sa_sigaction(sig, info, ctx);
+    } else if (old->sa_handler != SIG_DFL && old->sa_handler != SIG_IGN) {
+        old->sa_handler(sig);
+    } else {
+        signal(sig, SIG_DFL);
+        raise(sig);
+    }
+}
+
+static void installSafeReadGuard() {
+    if (s_safeReadGuardInstalled) return;
+    struct sigaction sa{};
+    sa.sa_sigaction = safeReadSignalHandler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, &s_oldSigsegvAction);
+    sigaction(SIGBUS,  &sa, &s_oldSigbusAction);
+    s_safeReadGuardInstalled = true;
+}
 
 // =====================================================================
 //  UE4.18 GNames / GUObjectArray / GWorld Dump — C++ 实现
@@ -15,14 +55,14 @@ namespace ue4 {
 
 UE4Dumper::UE4Dumper(uintptr_t moduleBase, uint64_t dqGNames,
                      uint64_t dqGUObjectArray, uint64_t dqGWorld,
-                     std::string outputPath)
+                     uintptr_t moduleSize, std::string outputPath)
     : m_moduleBase(moduleBase)
     , m_GNames(static_cast<uintptr_t>(dqGNames))
     , m_GWorld(static_cast<uintptr_t>(dqGWorld))
     , m_GUObjectArray(static_cast<uintptr_t>(dqGUObjectArray))
     , m_numNames(0)
     , m_initialized(false)
-    , m_moduleSize(0)
+    , m_moduleSize(moduleSize)
     , m_outputPath(std::move(outputPath))
 {
 }
@@ -56,28 +96,47 @@ void UE4Dumper::setOutputPath(const std::string& path) {
     m_outputPath = path;
 }
 
-// ===================== 安全内存读取 ===================================
+// ===================== 安全内存读取 (信号捕获保护) ====================
 
 uintptr_t UE4Dumper::safeReadPtr(uintptr_t addr) {
     if (addr == 0) return 0;
+    installSafeReadGuard();
     uintptr_t val = 0;
-    if (memcpy(&val, reinterpret_cast<void*>(addr), sizeof(uintptr_t))) {
-        return val;
+    if (sigsetjmp(s_safeReadJmpBuf, 1) != 0) {
+        s_safeReadActive = 0;
+        return 0;
     }
-    return 0;
+    s_safeReadActive = 1;
+    memcpy(&val, reinterpret_cast<void*>(addr), sizeof(uintptr_t));
+    s_safeReadActive = 0;
+    return val;
 }
 
 int32_t UE4Dumper::safeReadS32(uintptr_t addr) {
     if (addr == 0) return 0;
+    installSafeReadGuard();
     int32_t val = 0;
+    if (sigsetjmp(s_safeReadJmpBuf, 1) != 0) {
+        s_safeReadActive = 0;
+        return 0;
+    }
+    s_safeReadActive = 1;
     memcpy(&val, reinterpret_cast<void*>(addr), sizeof(int32_t));
+    s_safeReadActive = 0;
     return val;
 }
 
 uint32_t UE4Dumper::safeReadU32(uintptr_t addr) {
     if (addr == 0) return 0;
+    installSafeReadGuard();
     uint32_t val = 0;
+    if (sigsetjmp(s_safeReadJmpBuf, 1) != 0) {
+        s_safeReadActive = 0;
+        return 0;
+    }
+    s_safeReadActive = 1;
     memcpy(&val, reinterpret_cast<void*>(addr), sizeof(uint32_t));
+    s_safeReadActive = 0;
     return val;
 }
 
@@ -181,6 +240,28 @@ bool UE4Dumper::init() {
     const char* name0 = getNameByIndex(0);
     if (name0 == nullptr || strcmp(name0, "None") != 0) {
         return false;
+    }
+
+    // 自动获取模块大小 (从 /proc/self/maps 读取)
+    if (m_moduleBase != 0 && m_moduleSize == 0) {
+        char line[512];
+        FILE* maps = fopen("/proc/self/maps", "r");
+        if (maps) {
+            uintptr_t maxEnd = m_moduleBase;
+            while (fgets(line, sizeof(line), maps)) {
+                if (strstr(line, "libUE4.so") != nullptr) {
+                    uintptr_t start = 0, end = 0;
+                    if (sscanf(line, "%lx-%lx", &start, &end) == 2) {
+                        if (end > maxEnd) maxEnd = end;
+                    }
+                }
+            }
+            fclose(maps);
+            if (maxEnd > m_moduleBase) {
+                m_moduleSize = maxEnd - m_moduleBase;
+                LOG(LOG_LEVEL_INFO, "[UE4Dumper] libUE4.so size: 0x%lX", (unsigned long)m_moduleSize);
+            }
+        }
     }
 
     m_initialized = true;
@@ -435,8 +516,10 @@ std::vector<UE4Dumper::FieldInfo> UE4Dumper::collectDeclaredFields(uintptr_t typ
             fi.typeName = mapped ? mapped : cc;
 
             fi.enumPath = getBoundEnumPath(reinterpret_cast<uintptr_t>(child));
-            if (fi.typeName == "uint8" && !fi.enumPath.empty()) {
-                fi.typeName = "enum";
+            if (!fi.enumPath.empty()) {
+                // 使用实际枚举类型名 (取路径最后一段)
+                auto dot = fi.enumPath.rfind('.');
+                fi.typeName = (dot != std::string::npos) ? fi.enumPath.substr(dot + 1) : fi.enumPath;
             }
 
             fi.offset   = prop->Offset_Internal;
@@ -494,6 +577,13 @@ std::vector<UE4Dumper::FuncInfo> UE4Dumper::collectDeclaredFunctions(uintptr_t t
                     std::string pn = readObjectFName(reinterpret_cast<uintptr_t>(fparam));
                     const char* mapped = getPropTypeName(pc);
                     std::string pt = mapped ? mapped : pc;
+
+                    // 如果是枚举属性, 替换为实际枚举类型名
+                    std::string enumPath = getBoundEnumPath(reinterpret_cast<uintptr_t>(fparam));
+                    if (!enumPath.empty()) {
+                        auto dot = enumPath.rfind('.');
+                        pt = (dot != std::string::npos) ? enumPath.substr(dot + 1) : enumPath;
+                    }
 
                     uint32_t pfLo = static_cast<uint32_t>(paramProp->PropertyFlags & 0xFFFFFFFF);
                     if (pfLo & 0x400) {
@@ -556,6 +646,159 @@ void UE4Dumper::dumpEnumValues(uintptr_t objPtr, FILE* fp) {
     }
 }
 
+// ---- 构建 UFunction 地址→名称映射 (用于 vtable 反查) ----
+void UE4Dumper::buildNativeFuncMap(const std::vector<uintptr_t>& targets) {
+    m_nativeFuncMap.clear();
+    installSafeReadGuard();
+    for (auto typePtr : targets) {
+        if (sigsetjmp(s_safeReadJmpBuf, 1) != 0) {
+            s_safeReadActive = 0;
+            continue; // 跳过导致崩溃的类型
+        }
+        s_safeReadActive = 1;
+        auto funcs = collectDeclaredFunctions(typePtr);
+        s_safeReadActive = 0;
+        for (auto& fi : funcs) {
+            if (fi.funcPtr != 0 && isModulePtr(fi.funcPtr)) {
+                m_nativeFuncMap[fi.funcPtr] = fi.ownerName + "::" + fi.funcName;
+            }
+        }
+    }
+}
+
+std::string UE4Dumper::lookupVTableFuncName(uintptr_t funcAddr) const {
+    auto it = m_nativeFuncMap.find(funcAddr);
+    if (it != m_nativeFuncMap.end()) return it->second;
+    return "";
+}
+
+// ---- 查找 ClassDefaultObject (CDO) ----
+uintptr_t UE4Dumper::findClassDefaultObject(uintptr_t classPtr) {
+    constexpr int scanStart = 0x28;
+    constexpr int scanEnd   = 0x400;
+    constexpr uint32_t RF_CDO = 0x10;
+
+    for (int off = scanStart; off < scanEnd; off += sizeof(uintptr_t)) {
+        uintptr_t candidate = safeReadPtr(classPtr + off);
+        if (candidate == 0) continue;
+
+        uint32_t flags = safeReadU32(candidate + offsetof(UObjectBase, ObjectFlags));
+        if ((flags & RF_CDO) == 0) continue;
+
+        uintptr_t objClass = safeReadPtr(candidate + offsetof(UObjectBase, ClassPrivate));
+        if (objClass != classPtr) continue;
+
+        return candidate;
+    }
+    return 0;
+}
+
+// ---- 虚函数表 dump ----
+void UE4Dumper::dumpClassVTable(uintptr_t classPtr, uintptr_t superPtr, FILE* fp) {
+    uintptr_t cdo = findClassDefaultObject(classPtr);
+    if (cdo == 0) return;
+
+    uintptr_t vtable = safeReadPtr(cdo);
+    if (vtable == 0) return;
+
+    uintptr_t superVTable = 0;
+    if (superPtr != 0) {
+        uintptr_t superCdo = findClassDefaultObject(superPtr);
+        if (superCdo != 0) {
+            superVTable = safeReadPtr(superCdo);
+        }
+    }
+
+    auto hierarchy = buildTypeHierarchy(classPtr);
+    std::string inheritText;
+    for (size_t i = 0; i < hierarchy.size(); i++) {
+        if (i > 0) inheritText += " -> ";
+        inheritText += hierarchy[i].name;
+    }
+
+    fprintf(fp, "\n\t// C++ VTable (diff vs parent, via CDO)\n");
+    fprintf(fp, "\t// Inheritance: %s\n", inheritText.c_str());
+    fprintf(fp, "\t// CDO: 0x%lX  VTable: 0x%lX\n",
+            (unsigned long)cdo, (unsigned long)vtable);
+
+    std::string className = readObjectFName(classPtr);
+    bool sawModuleEntry = false;
+    int invalidRun = 0;
+    int dumpedCount = 0;
+
+    for (int slot = 0; slot < VTABLE_MAX_SLOTS; slot++) {
+        uintptr_t slotOff = slot * sizeof(uintptr_t);
+
+        // 每个 slot 独立保护, 防止单个坏指针终止整个 vtable dump
+        if (sigsetjmp(s_safeReadJmpBuf, 1) != 0) {
+            s_safeReadActive = 0;
+            if (sawModuleEntry) { invalidRun++; if (invalidRun >= VTABLE_STOP_AFTER_INVALID) break; }
+            continue;
+        }
+        s_safeReadActive = 1;
+
+        uintptr_t target = safeReadPtr(vtable + slotOff);
+
+        if (target == 0 || !isModulePtr(target)) {
+            if (sawModuleEntry) {
+                invalidRun++;
+                if (invalidRun >= VTABLE_STOP_AFTER_INVALID) break;
+            }
+            continue;
+        }
+
+        sawModuleEntry = true;
+        invalidRun = 0;
+
+        if (superVTable != 0) {
+            uintptr_t superTarget = safeReadPtr(superVTable + slotOff);
+            if (superTarget == target) continue;
+        }
+
+        std::string implClass = className;
+        for (int i = (int)hierarchy.size() - 2; i >= 0; i--) {
+            uintptr_t ancestorCdo = findClassDefaultObject(hierarchy[i].ptr);
+            if (ancestorCdo == 0) continue;
+            uintptr_t ancestorVt = safeReadPtr(ancestorCdo);
+            if (ancestorVt == 0) continue;
+            uintptr_t ancestorTarget = safeReadPtr(ancestorVt + slotOff);
+            if (ancestorTarget == target) {
+                implClass = hierarchy[i].name;
+            } else {
+                break;
+            }
+        }
+
+        bool inherited = (implClass != className);
+        std::string offsetText = getModuleOffsetText(target);
+
+        // 尝试通过 UFunction::Func 反查函数名
+        std::string funcName = lookupVTableFuncName(target);
+        if (!funcName.empty()) {
+            // 有 UFunction 匹配, 使用真实函数名
+            fprintf(fp, "\tvirtual void %s(); // [Slot: 0x%lX] [Offset: %s] [%s]\n",
+                    funcName.c_str(),
+                    (unsigned long)slotOff,
+                    offsetText.c_str(),
+                    inherited ? "inherited" : "override");
+        } else {
+            // 无匹配, 使用 sub_类名_偏移 命名
+            fprintf(fp, "\tvirtual void sub_%s_%s(); // [Slot: 0x%lX] [%s]\n",
+                    implClass.c_str(),
+                    offsetText.c_str(),
+                    (unsigned long)slotOff,
+                    inherited ? "inherited" : "override");
+        }
+
+        dumpedCount++;
+        s_safeReadActive = 0;
+    }
+
+    if (dumpedCount == 0) {
+        fprintf(fp, "\t// (no vtable overrides)\n");
+    }
+}
+
 // ---- 单个类型 dump ----
 void UE4Dumper::dumpType(uintptr_t objPtr, FILE* fp) {
     std::string typeCN = readClassName(objPtr);
@@ -607,6 +850,11 @@ void UE4Dumper::dumpType(uintptr_t objPtr, FILE* fp) {
                 fprintf(fp, " [RepNotify: %s]", f.repNotifyFunc.c_str());
             fprintf(fp, " [Owner: %s]\n", f.ownerName.c_str());
         }
+    }
+
+    // 虚函数表 (仅 class)
+    if (isClass) {
+        dumpClassVTable(objPtr, reinterpret_cast<uintptr_t>(structObj->SuperStruct), fp);
     }
 
     // 函数
@@ -675,6 +923,9 @@ bool UE4Dumper::dumpSDK(const char* filePath) {
         }
     }, &cctx);
 
+    // 构建 UFunction 地址→名称映射 (用于 vtable 虚函数名反查)
+    buildNativeFuncMap(cctx.targets);
+
     FILE* fp = fopen(path.c_str(), "w");
     if (!fp) return false;
 
@@ -685,7 +936,14 @@ bool UE4Dumper::dumpSDK(const char* filePath) {
     fprintf(fp, "// Total: %zu types\n\n", cctx.targets.size());
 
     for (auto& objPtr : cctx.targets) {
+        if (sigsetjmp(s_safeReadJmpBuf, 1) != 0) {
+            s_safeReadActive = 0;
+            fprintf(fp, "}; // CRASHED\n\n");
+            continue;
+        }
+        s_safeReadActive = 1;
         dumpType(objPtr, fp);
+        s_safeReadActive = 0;
     }
 
     fclose(fp);

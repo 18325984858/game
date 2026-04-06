@@ -211,6 +211,27 @@ static uint64_t getRemoteModuleBase(pid_t pid, const char* moduleName) {
     return 0;
 }
 
+// 获取目标进程中模块的大小 (所有映射段的最大结束地址 - 基址)
+static uint64_t getRemoteModuleSize(pid_t pid, const char* moduleName) {
+    char path[256];
+    snprintf(path, sizeof(path), "/proc/%d/maps", pid);
+    FILE* fp = fopen(path, "r");
+    if (!fp) return 0;
+
+    uint64_t minStart = UINT64_MAX, maxEnd = 0;
+    char line[512];
+    while (fgets(line, sizeof(line), fp)) {
+        if (strstr(line, moduleName)) {
+            uint64_t start = 0, end = 0;
+            sscanf(line, "%llx-%llx", (unsigned long long*)&start, (unsigned long long*)&end);
+            if (start < minStart) minStart = start;
+            if (end > maxEnd) maxEnd = end;
+        }
+    }
+    fclose(fp);
+    return (maxEnd > minStart) ? (maxEnd - minStart) : 0;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // 获取本进程某个模块的基地址
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -466,6 +487,10 @@ int Injector::injectRemote(pid_t pid, const char* soPath, InjectMode mode) {
             }
             LOG(LOG_LEVEL_INFO, "[Injector] libUE4.so 基址: %llx", (unsigned long long)ue4Base);
 
+            // 获取 libUE4.so 模块大小
+            uint64_t ue4Size = getRemoteModuleSize(pid, "libUE4.so");
+            LOG(LOG_LEVEL_INFO, "[Injector] libUE4.so 大小: 0x%llx", (unsigned long long)ue4Size);
+
             // 读取 GNames/GUObjectArray/GWorld 指针
             uint64_t pGNames        = ptrace_peekptr(pid, ue4Base + 0x146F9F30);
             uint64_t pGUObjectArray = ue4Base + 0x14706480;  // 结构体地址, 不解引用
@@ -475,11 +500,11 @@ int Injector::injectRemote(pid_t pid, const char* soPath, InjectMode mode) {
             LOG(LOG_LEVEL_INFO, "[Injector] GUObjectArray: %llx", (unsigned long long)pGUObjectArray);
             LOG(LOG_LEVEL_INFO, "[Injector] GWorld:        %llx", (unsigned long long)pGWorld);
 
-            // 调用 MyStartPointUE4(libUE4Base, pGNames, pGWorld, pGUObjectArray, NULL)
-            uint64_t startParams[5] = { ue4Base, pGNames, pGWorld, pGUObjectArray, 0 };
+            // 调用 MyStartPointUE4(libUE4Base, pGNames, pGWorld, pGUObjectArray, moduleSize, NULL)
+            uint64_t startParams[6] = { ue4Base, pGNames, pGWorld, pGUObjectArray, ue4Size, 0 };
             LOG(LOG_LEVEL_INFO, "[Injector] 调用 MyStartPointUE4...");
             uint64_t startRet = 0;
-            if (ptrace_call(pid, funcAddr, startParams, 5, &startRet) < 0) {
+            if (ptrace_call(pid, funcAddr, startParams, 6, &startRet) < 0) {
                 LOG(LOG_LEVEL_ERROR, "[Injector] MyStartPointUE4 调用失败");
                 goto cleanup;
             }

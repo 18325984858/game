@@ -19,7 +19,7 @@ namespace ue4 {
 // ---- Dumper 类 ----
 class UE4Dumper {
 public:
-    UE4Dumper(uintptr_t moduleBase, uint64_t dqGNames, uint64_t dqGUObjectArray, uint64_t dqGWorld, std::string outputPath = "");
+    UE4Dumper(uintptr_t moduleBase, uint64_t dqGNames, uint64_t dqGUObjectArray, uint64_t dqGWorld, uintptr_t moduleSize = 0, std::string outputPath = "");
     ~UE4Dumper();
 
     /// 设置 libUE4.so 基址
@@ -71,6 +71,20 @@ public:
     std::string readClassName(uintptr_t objPtr);
     std::string readFullPath(uintptr_t objPtr);
 
+    // ---- FName 工具 (公开给 UE4Header 使用) ----
+    std::string fnameToString(int nameIdx, int number);
+
+    // ---- GUObjectArray 遍历 (公开给 UE4Header 使用) ----
+    typedef void (*ForEachCallback)(uintptr_t objPtr, int globalIdx, void* userData);
+    int forEachUObject(uintptr_t arrayBase, ForEachCallback cb, void* userData);
+
+    // ---- VTable 工具 (公开给 UE4Header 使用) ----
+    uintptr_t findClassDefaultObject(uintptr_t classPtr);
+    static uintptr_t safeReadPtr(uintptr_t addr);
+    bool isModulePtr(uintptr_t ptr);
+    std::string lookupVTableFuncName(uintptr_t funcAddr) const;
+    std::string getModuleOffsetText(uintptr_t ptr);
+
 private:
     // ---- 成员: 三大全局指针 + libUE4 基址 (均由外部赋值) ----
     uintptr_t m_moduleBase;     // libUE4.so 基址
@@ -84,7 +98,6 @@ private:
     std::string m_outputPath;  // 输出目录路径, 默认为""
 
     // ---- 安全内存读取 ----
-    static uintptr_t safeReadPtr(uintptr_t addr);
     static int32_t safeReadS32(uintptr_t addr);
     static uint32_t safeReadU32(uintptr_t addr);
 
@@ -93,14 +106,11 @@ private:
 
     // ---- FName 解析 ----
     const char* getNameByIndex(int index);
-    std::string fnameToString(int nameIdx, int number);
 
     // ---- UObject 工具 (内部) ----
     std::string getPackageName(uintptr_t objPtr);
     std::string outerChain(uintptr_t objPtr);
     std::string getObjectPath(uintptr_t objPtr);
-    bool isModulePtr(uintptr_t ptr);
-    std::string getModuleOffsetText(uintptr_t ptr);
 
     // ---- SDK dump: 属性类型映射 ----
     static const char* getPropTypeName(const std::string& className);
@@ -138,6 +148,16 @@ private:
     // ---- SDK dump: 枚举值 ----
     void dumpEnumValues(uintptr_t objPtr, FILE* fp);
 
+    // ---- SDK dump: 虚函数表 ----
+    static constexpr int VTABLE_MAX_SLOTS = 768;
+    static constexpr int VTABLE_STOP_AFTER_INVALID = 32;
+
+    void dumpClassVTable(uintptr_t classPtr, uintptr_t superPtr, FILE* fp);
+
+    // ---- SDK dump: UFunction 地址→名称映射 (用于 vtable 反查) ----
+    std::unordered_map<uintptr_t, std::string> m_nativeFuncMap;
+    void buildNativeFuncMap(const std::vector<uintptr_t>& targets);
+
     // ---- SDK dump: 类型写入 ----
     void dumpType(uintptr_t objPtr, FILE* fp);
 
@@ -147,10 +167,6 @@ private:
         std::string name;
     };
     std::vector<HierarchyEntry> buildTypeHierarchy(uintptr_t typePtr);
-
-    // ---- GUObjectArray 遍历回调 ----
-    typedef void (*ForEachCallback)(uintptr_t objPtr, int globalIdx, void* userData);
-    int forEachUObject(uintptr_t arrayBase, ForEachCallback cb, void* userData);
 };
 
 } // namespace ue4

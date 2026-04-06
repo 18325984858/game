@@ -1,6 +1,7 @@
 #include "uestart.h"
 #include "../Log/log.h"
 #include "libUE4Dumper/UE4Dumper.h"
+#include "libUE4Header/UE4Header.h"
 #include <thread>
 #include <chrono>
 #include <fcntl.h>
@@ -96,11 +97,22 @@ static bool readUeDumperEnabled() {
     return strstr(buf, "ue_dumper=1") != nullptr;
 }
 
+static bool readUeHeaderEnabled() {
+    int fd = open("/data/local/tmp/dobby_config.txt", O_RDONLY);
+    if (fd < 0) return false;
+    char buf[256] = {};
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return false;
+    buf[n] = '\0';
+    return strstr(buf, "ue_header=1") != nullptr;
+}
+
 static void UE4WorkerThread(void* plibUE4ModeBase, void* pGNames,
-                            void* pGWorld, void* pGUObjectArray, void* pData) {
+                            void* pGWorld, void* pGUObjectArray, uint64_t moduleSize, void* pData) {
     LOG(LOG_LEVEL_INFO, "[UE4Worker] 工作线程启动");
-    LOG(LOG_LEVEL_INFO, "[UE4Worker] libUE4Base=%p GNames=%p GWorld=%p GUObjectArray=%p",
-        plibUE4ModeBase, pGNames, pGWorld, pGUObjectArray);
+    LOG(LOG_LEVEL_INFO, "[UE4Worker] libUE4Base=%p GNames=%p GWorld=%p GUObjectArray=%p moduleSize=0x%llX",
+        plibUE4ModeBase, pGNames, pGWorld, pGUObjectArray, (unsigned long long)moduleSize);
 
     // 检查界面上的 "启用 ueDumper (导出 dump)" 按钮状态
     if (readUeDumperEnabled()) {
@@ -111,6 +123,7 @@ static void UE4WorkerThread(void* plibUE4ModeBase, void* pGNames,
                 reinterpret_cast<uint64_t>(pGNames),
                 reinterpret_cast<uint64_t>(pGUObjectArray),
                 reinterpret_cast<uint64_t>(pGWorld),
+                static_cast<uintptr_t>(moduleSize),
                 "/data/data/com.tencent.tmgp.pubgmhd/cache/ue4_dump/"
             );
 
@@ -132,7 +145,30 @@ static void UE4WorkerThread(void* plibUE4ModeBase, void* pGNames,
         LOG(LOG_LEVEL_INFO, "[UE4Worker] ue_dumper 未启用, 跳过 dump");
     }
 
-
+    // 检查 ue_header 开关: 生成 IDA 头文件和脚本
+    if (readUeHeaderEnabled()) {
+        LOG(LOG_LEVEL_INFO, "[UE4Worker] ue_header 已启用, 创建 header 生成线程");
+        std::thread([=]() {
+            ue4::UE4Dumper dumper(
+                reinterpret_cast<uintptr_t>(plibUE4ModeBase),
+                reinterpret_cast<uint64_t>(pGNames),
+                reinterpret_cast<uint64_t>(pGUObjectArray),
+                reinterpret_cast<uint64_t>(pGWorld),
+                static_cast<uintptr_t>(moduleSize),
+                "/data/data/com.tencent.tmgp.pubgmhd/cache/ue4_dump/"
+            );
+            if (!dumper.init()) {
+                LOG(LOG_LEVEL_ERROR, "[UE4Worker] UE4Header 初始化失败");
+                toast_util::showToast("UE4Header 初始化失败");
+            } else {
+                ue4::UE4Header header(dumper, "/data/data/com.tencent.tmgp.pubgmhd/cache/ue4_dump/");
+                header.start();
+                toast_util::showToast("UE4 Header 生成完成");
+            }
+        }).detach();
+    } else {
+        LOG(LOG_LEVEL_INFO, "[UE4Worker] ue_header 未启用, 跳过");
+    }
 
     // TODO: 后续逻辑 (数据采集、hook 等)
     LOG(LOG_LEVEL_INFO, "[UE4Worker] 进入主循环");
@@ -140,19 +176,19 @@ static void UE4WorkerThread(void* plibUE4ModeBase, void* pGNames,
 
 extern "C" __attribute__((visibility("default")))
 bool MyStartPointUE4(void* plibUE4ModeBase, void* pGNames,
-                     void* pGWorld, void* pGUObjectArray, void* pData) {
+                     void* pGWorld, void* pGUObjectArray, uint64_t moduleSize, void* pData) {
     if (!plibUE4ModeBase || !pGNames || !pGWorld || !pGUObjectArray) {
         LOG(LOG_LEVEL_ERROR, "[MyStartPointUE4] 参数为空: base=%p GNames=%p GWorld=%p GUObjectArray=%p",
             plibUE4ModeBase, pGNames, pGWorld, pGUObjectArray);
         return false;
     }
- LOG(LOG_LEVEL_ERROR, "[MyStartPointUE4] 参数: base=%p GNames=%p GWorld=%p GUObjectArray=%p",
-            plibUE4ModeBase, pGNames, pGWorld, pGUObjectArray);
+ LOG(LOG_LEVEL_INFO, "[MyStartPointUE4] 参数: base=%p GNames=%p GWorld=%p GUObjectArray=%p moduleSize=0x%llX",
+            plibUE4ModeBase, pGNames, pGWorld, pGUObjectArray, (unsigned long long)moduleSize);
 
     LOG(LOG_LEVEL_INFO, "[MyStartPointUE4] 启动 UE4 工作线程");
 
     std::thread(UE4WorkerThread, plibUE4ModeBase, pGNames,
-                pGWorld, pGUObjectArray, pData).detach();
+                pGWorld, pGUObjectArray, moduleSize, pData).detach();
 
     return true;
 }
