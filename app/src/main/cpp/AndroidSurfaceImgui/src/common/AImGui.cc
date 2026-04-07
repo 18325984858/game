@@ -709,16 +709,22 @@ namespace android
                         }
                     }
 
+                    int totalCmdCount = 0;
+                    for (int cmdListIndex = 0; cmdListIndex < drawData->CmdListsCount; ++cmdListIndex)
+                        totalCmdCount += drawData->CmdLists[cmdListIndex]->CmdBuffer.Size;
+
+                    if (0 == drawData->CmdListsCount || 0 == totalCmdCount)
+                    {
+                        m_renderState = RenderState::ReadData;
+                        break;
+                    }
+
                     glClear(GL_COLOR_BUFFER_BIT);
                     ImGui_ImplOpenGL3_RenderDrawData(drawData);
                     eglSwapBuffers(m_defaultDisplay, m_eglSurface);
                     m_renderFrameCount++;
                     if (0 == (m_renderFrameCount % 180))
                     {
-                        int totalCmdCount = 0;
-                        for (int cmdListIndex = 0; cmdListIndex < drawData->CmdListsCount; ++cmdListIndex)
-                            totalCmdCount += drawData->CmdLists[cmdListIndex]->CmdBuffer.Size;
-
                         LogInfo("[AImGui] Server rendered frames=%llu packets=%llu drawLists=%d cmds=%d decoded=%zu",
                                 static_cast<unsigned long long>(m_renderFrameCount),
                                 static_cast<unsigned long long>(m_renderPacketCount),

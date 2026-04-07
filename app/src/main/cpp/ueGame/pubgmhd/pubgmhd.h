@@ -23,7 +23,7 @@ namespace pubgmhd {
 //  引擎常量
 // =====================================================================
 static constexpr int POLL_INTERVAL_MS         = 250;
-static constexpr int PLAYER_POLL_INTERVAL_MS  = 16;
+static constexpr int PLAYER_POLL_INTERVAL_MS  = 8;
 static constexpr int MONITOR_IDLE_SLEEP_MS    = 1;
 static constexpr int STATE_LOG_INTERVAL_MS    = 1000;
 static constexpr int PLAYER_LOG_INTERVAL_MS   = 1000;

@@ -46,6 +46,49 @@ bool hasValidWorldPoint(float x, float y, float z) {
         && (std::fabs(x) > 1.0f || std::fabs(y) > 1.0f || std::fabs(z) > 1.0f);
 }
 
+bool hasValidCameraPose(const DrawGameData& data) {
+    return hasValidWorldPoint(data.camLocX, data.camLocY, data.camLocZ)
+        && isValidNumber(data.camPitch)
+        && isValidNumber(data.camYaw)
+        && isValidNumber(data.camRoll)
+        && isValidNumber(data.camFOV);
+}
+
+DrawGameData stabilizeRenderData(const DrawGameData& data) {
+    static bool s_hasLastCamera = false;
+    static DrawGameData s_lastCameraData;
+
+    DrawGameData resolved = data;
+    if (!data.inMatch) {
+        s_hasLastCamera = false;
+        return resolved;
+    }
+
+    if (hasValidCameraPose(data)) {
+        s_lastCameraData.camLocX = data.camLocX;
+        s_lastCameraData.camLocY = data.camLocY;
+        s_lastCameraData.camLocZ = data.camLocZ;
+        s_lastCameraData.camPitch = data.camPitch;
+        s_lastCameraData.camYaw = data.camYaw;
+        s_lastCameraData.camRoll = data.camRoll;
+        s_lastCameraData.camFOV = data.camFOV;
+        s_hasLastCamera = true;
+        return resolved;
+    }
+
+    if (s_hasLastCamera) {
+        resolved.camLocX = s_lastCameraData.camLocX;
+        resolved.camLocY = s_lastCameraData.camLocY;
+        resolved.camLocZ = s_lastCameraData.camLocZ;
+        resolved.camPitch = s_lastCameraData.camPitch;
+        resolved.camYaw = s_lastCameraData.camYaw;
+        resolved.camRoll = s_lastCameraData.camRoll;
+        resolved.camFOV = s_lastCameraData.camFOV;
+    }
+
+    return resolved;
+}
+
 float sanitizeAngleDegrees(float value) {
     return isValidNumber(value) ? std::remainder(value, 360.0f) : 0.0f;
 }
@@ -78,6 +121,10 @@ float distanceMeters(float x1, float y1, float z1, float x2, float y2, float z2)
 
 float playerDistanceMeters(const DrawPlayerInfo& player, const ViewPoint& viewPoint) {
     return distanceMeters(player.posX, player.posY, player.posZ, viewPoint.x, viewPoint.y, viewPoint.z);
+}
+
+bool hasUsablePlayerPosition(const DrawPlayerInfo& player) {
+    return hasValidWorldPoint(player.posX, player.posY, player.posZ);
 }
 
 bool transformWorldToCamera(const DrawGameData& data,
@@ -229,6 +276,7 @@ float UE4Overlay::distance3D(float x1, float y1, float z1, float x2, float y2, f
 //  主绘制入口
 // =====================================================================
 void UE4Overlay::drawOverlay(const DrawGameData& data) {
+    const DrawGameData renderData = stabilizeRenderData(data);
     ImGuiIO& io = ImGui::GetIO();
     float screenW = io.DisplaySize.x;
     float screenH = io.DisplaySize.y;
@@ -239,26 +287,26 @@ void UE4Overlay::drawOverlay(const DrawGameData& data) {
     static bool s_lastInMatch = false;
     static Clock::time_point s_lastSummaryLog;
 
-    if (!s_hasLastMatchState || s_lastInMatch != data.inMatch) {
+    if (!s_hasLastMatchState || s_lastInMatch != renderData.inMatch) {
         DLOG(LOG_LEVEL_INFO,
              "match state changed: inMatch=%d world=%s state=%s alive=%d/%d players=%zu",
-             data.inMatch ? 1 : 0,
-             data.worldName.c_str(),
-             data.matchState.c_str(),
-             data.aliveCount,
-             data.totalCount,
-             data.players.size());
-        s_lastInMatch = data.inMatch;
+             renderData.inMatch ? 1 : 0,
+             renderData.worldName.c_str(),
+             renderData.matchState.c_str(),
+             renderData.aliveCount,
+             renderData.totalCount,
+             renderData.players.size());
+        s_lastInMatch = renderData.inMatch;
         s_hasLastMatchState = true;
     }
 
     // 对局中时绘制 ESP 和小地图
-    if (data.inMatch) {
+    if (renderData.inMatch) {
         if (m_enableESP) {
-            espDrawCount = drawESP(data, screenW, screenH);
+            espDrawCount = drawESP(renderData, screenW, screenH);
         }
         if (m_enableMinimap) {
-            minimapDrawCount = drawMinimap(data, screenW, screenH);
+            minimapDrawCount = drawMinimap(renderData, screenW, screenH);
         }
 
         if (shouldLogEvery(s_lastSummaryLog, std::chrono::milliseconds(2000))) {
@@ -266,22 +314,22 @@ void UE4Overlay::drawOverlay(const DrawGameData& data) {
                  "overlay summary: screen=%.0fx%.0f tracked=%zu alive=%d/%d esp=%d minimap=%d cam=(%.0f, %.0f, %.0f) fov=%.1f",
                  screenW,
                  screenH,
-                 data.players.size(),
-                 data.aliveCount,
-                 data.totalCount,
+                 renderData.players.size(),
+                 renderData.aliveCount,
+                 renderData.totalCount,
                  espDrawCount,
                  minimapDrawCount,
-                 data.camLocX,
-                 data.camLocY,
-                 data.camLocZ,
-                 data.camFOV);
+                 renderData.camLocX,
+                 renderData.camLocY,
+                 renderData.camLocZ,
+                 renderData.camFOV);
         }
     }
 
     drawTouchPointOverlay(m_enableTouchPoint, screenW, screenH);
 
     // 控制菜单始终显示
-    drawMenu(data);
+    drawMenu(renderData);
 }
 
 // =====================================================================
@@ -320,6 +368,7 @@ void UE4Overlay::drawMenu(const DrawGameData& data) {
         settingsChanged |= ImGui::Checkbox("小地图", &m_enableMinimap);
         if (m_enableMinimap) {
             settingsChanged |= ImGui::SliderFloat("地图大小", &m_minimapSize, 100.0f, 400.0f, "%.0f");
+            settingsChanged |= ImGui::SliderFloat("雷达范围", &m_minimapRangeMeters, 60.0f, 500.0f, "%.0f m");
         }
         settingsChanged |= ImGui::Checkbox("边缘箭头", &m_enableFallbackESP);
         settingsChanged |= ImGui::Checkbox("玩家列表", &m_enablePlayerList);
@@ -399,7 +448,7 @@ void UE4Overlay::drawMenu(const DrawGameData& data) {
 
         if (settingsChanged) {
             DLOG(LOG_LEVEL_INFO,
-                 "settings updated: esp=%s snap=%s hp=%s name=%s dist=%s teammate=%s minimap=%s edgeArrow=%s playerList=%s touch=%s mapSize=%.0f maxDist=%.0f",
+                 "settings updated: esp=%s snap=%s hp=%s name=%s dist=%s teammate=%s minimap=%s edgeArrow=%s playerList=%s touch=%s mapSize=%.0f mapRange=%.0f maxDist=%.0f",
                  onOff(m_enableESP),
                  onOff(m_enableSnapline),
                  onOff(m_enableHP),
@@ -411,6 +460,7 @@ void UE4Overlay::drawMenu(const DrawGameData& data) {
                  onOff(m_enablePlayerList),
                  onOff(m_enableTouchPoint),
                  m_minimapSize,
+                 m_minimapRangeMeters,
                  m_espMaxDist);
         }
     }
@@ -468,12 +518,12 @@ int UE4Overlay::drawESP(const DrawGameData& data, float screenW, float screenH) 
 
     ViewPoint viewPoint;
     const bool hasViewPoint = tryGetViewPoint(data, viewPoint);
-    const bool hasPreciseCamera = hasValidWorldPoint(data.camLocX, data.camLocY, data.camLocZ)
-        || hasValidWorldPoint(data.myPosX, data.myPosY, data.myPosZ);
+    const bool hasPreciseCamera = hasValidCameraPose(data);
 
     for (const auto& p : data.players) {
         if (!p.isAlive) continue;
         if (p.isTeammate && !m_enableTeammate) continue;
+        if (!hasUsablePlayerPosition(p)) continue;
 
         if (!hasViewPoint) continue;
 
@@ -485,19 +535,20 @@ int UE4Overlay::drawESP(const DrawGameData& data, float screenW, float screenH) 
         bool rendered = false;
 
         if (hasPreciseCamera) {
+            constexpr float kCharacterHalfHeight = 88.0f;
             float footSX = 0.0f;
             float footSY = 0.0f;
             float headSX = 0.0f;
             float headSY = 0.0f;
-            if (worldToScreen(data, p.posX, p.posY, p.posZ, screenW, screenH, footSX, footSY)
-                && worldToScreen(data, p.posX, p.posY, p.posZ + 180.0f, screenW, screenH, headSX, headSY)) {
+            if (worldToScreen(data, p.posX, p.posY, p.posZ - kCharacterHalfHeight, screenW, screenH, footSX, footSY)
+                && worldToScreen(data, p.posX, p.posY, p.posZ + kCharacterHalfHeight, screenW, screenH, headSX, headSY)) {
                 const float boxH = std::fabs(footSY - headSY);
-                const float boxW = boxH * 0.5f;
+                const float boxW = boxH * 0.48f;
                 const float cx = (footSX + headSX) * 0.5f;
                 const float topY = std::min(footSY, headSY);
                 const float botY = std::max(footSY, headSY);
 
-                if (boxH >= 5.0f
+                if (boxH >= 10.0f && boxH <= screenH * 0.9f
                     && cx >= -boxW && cx <= screenW + boxW
                     && topY >= -boxH && botY <= screenH + boxH) {
                     preciseRenderedCount++;
@@ -586,6 +637,17 @@ int UE4Overlay::drawMinimap(const DrawGameData& data, float screenW, float scree
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 origin(mapX, mapY);
+    const float cx = mapX + mapSize / 2.0f;
+    const float cy = mapY + mapSize / 2.0f;
+    const float radarRadius = std::max(mapSize * 0.5f - 10.0f, 20.0f);
+    const float rangeMeters = std::max(m_minimapRangeMeters, 60.0f);
+    constexpr float DEG2RAD = 3.14159265358979f / 180.0f;
+    const float yawRad = sanitizeAngleDegrees(data.camYaw) * DEG2RAD;
+    const float forwardX = std::cos(yawRad);
+    const float forwardY = std::sin(yawRad);
+    const float rightX = -forwardY;
+    const float rightY = forwardX;
+    const bool hasSelfPos = hasValidWorldPoint(data.myPosX, data.myPosY, data.myPosZ);
 
     // 背景
     dl->AddRectFilled(origin, ImVec2(mapX + mapSize, mapY + mapSize),
@@ -593,10 +655,9 @@ int UE4Overlay::drawMinimap(const DrawGameData& data, float screenW, float scree
     dl->AddRect(origin, ImVec2(mapX + mapSize, mapY + mapSize),
                 IM_COL32(100, 100, 100, 255), 0, 0, 1.5f);
 
-    // 地图范围 (PUBG 8x8km = 800000 UE units)
-    constexpr float MAP_WORLD_SIZE = 800000.0f;
-    float cx = mapX + mapSize / 2.0f;
-    float cy = mapY + mapSize / 2.0f;
+    dl->AddCircle(ImVec2(cx, cy), radarRadius, IM_COL32(140, 140, 140, 220), 48, 1.5f);
+    dl->AddLine(ImVec2(cx - radarRadius, cy), ImVec2(cx + radarRadius, cy), IM_COL32(90, 90, 90, 140), 1.0f);
+    dl->AddLine(ImVec2(cx, cy - radarRadius), ImVec2(cx, cy + radarRadius), IM_COL32(90, 90, 90, 140), 1.0f);
 
     // 绘制自己 (白色十字)
     dl->AddLine(ImVec2(cx - 5, cy), ImVec2(cx + 5, cy), IM_COL32(255, 255, 255, 255), 2.0f);
@@ -607,12 +668,17 @@ int UE4Overlay::drawMinimap(const DrawGameData& data, float screenW, float scree
     for (const auto& p : data.players) {
         if (!p.isAlive) continue;
         if (p.isTeammate && !m_enableTeammate) continue;
+        if (!hasSelfPos || !hasUsablePlayerPosition(p)) continue;
 
-        // 世界坐标 -> 小地图坐标 (以自己为中心)
-        float dx = (p.posX - data.myPosX) / MAP_WORLD_SIZE * mapSize;
-        float dy = (p.posY - data.myPosY) / MAP_WORLD_SIZE * mapSize;
-        float px = cx + dy;  // Y轴对应左右
-        float py = cy - dx;  // X轴对应前后
+        const float dxMeters = (p.posX - data.myPosX) / 100.0f;
+        const float dyMeters = (p.posY - data.myPosY) / 100.0f;
+        const float rightMeters = dxMeters * rightX + dyMeters * rightY;
+        const float forwardMeters = dxMeters * forwardX + dyMeters * forwardY;
+        const float radialDistance = std::sqrt(rightMeters * rightMeters + forwardMeters * forwardMeters);
+        if (!isValidNumber(radialDistance) || radialDistance > rangeMeters) continue;
+
+        float px = cx + (rightMeters / rangeMeters) * radarRadius;
+        float py = cy - (forwardMeters / rangeMeters) * radarRadius;
 
         // 限制在小地图范围内
         if (px < mapX || px > mapX + mapSize || py < mapY || py > mapY + mapSize) continue;
@@ -631,7 +697,7 @@ int UE4Overlay::drawMinimap(const DrawGameData& data, float screenW, float scree
 
     // 标题
     char title[64];
-    snprintf(title, sizeof(title), "存活: %d", data.aliveCount);
+    snprintf(title, sizeof(title), "存活: %d | %dm", data.aliveCount, static_cast<int>(rangeMeters));
     dl->AddText(ImVec2(mapX + 4, mapY + 2), IM_COL32(200, 200, 200, 220), title);
 
     ImGui::End();

@@ -580,6 +580,9 @@ int MatchMonitor::scanCharacters() {
             uint32_t playerKey = safeReadU32(objPtr + m_off.Char_PlayerKey);
             if (playerKey == 0) continue;
 
+            // PlayerArray 已经更新过的玩家以其数据为准，避免位置在两个来源间来回跳变。
+            if (m_playerList.findByKey(playerKey) != nullptr) continue;
+
             int32_t teamID = safeReadS32(objPtr + m_off.Char_TeamID);
             float health = safeReadFloat(objPtr + m_off.Char_Health);
             float healthMax = safeReadFloat(objPtr + m_off.Char_HealthMax);
@@ -847,8 +850,11 @@ void MatchMonitor::pollPlayers() {
             drawData.camPitch = safeReadFloat(pcm + 0x668);
             drawData.camYaw   = safeReadFloat(pcm + 0x66C);
             drawData.camRoll  = safeReadFloat(pcm + 0x670);
-            // DefaultFOV @ PCM+0x5E0
-            drawData.camFOV = safeReadFloat(pcm + 0x5E0);
+            // CameraCache.POV.FOV @ PCM+0x674, fallback to DefaultFOV @ PCM+0x5E0
+            drawData.camFOV = safeReadFloat(pcm + 0x674);
+            if (drawData.camFOV <= 0.0f || drawData.camFOV > 170.0f) {
+                drawData.camFOV = safeReadFloat(pcm + 0x5E0);
+            }
             if (drawData.camFOV <= 0.0f || drawData.camFOV > 170.0f) drawData.camFOV = 90.0f;
         }
     }

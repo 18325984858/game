@@ -104,6 +104,7 @@ private:
     bool m_enablePlayerList = true;    // 玩家坐标/血量调试面板
     bool m_enableTouchPoint = true;    // 手指按下绘制触点
     float m_minimapSize    = 200.0f;   // 小地图大小
+    float m_minimapRangeMeters = 180.0f; // 小地图半径对应的现实距离 (米)
     float m_espMaxDist     = 500.0f;   // ESP 最大显示距离 (米)
     int m_lastPreciseESP   = 0;
     int m_lastFallbackESP  = 0;
