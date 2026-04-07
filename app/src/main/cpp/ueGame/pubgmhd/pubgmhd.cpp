@@ -6,6 +6,9 @@
 
 #include <thread>
 #include <chrono>
+#include <algorithm>
+#include <array>
+#include <cctype>
 #include <cstring>
 #include <cstdio>
 #include <cmath>
@@ -20,6 +23,103 @@
 namespace pubgmhd {
 
 using Clock = std::chrono::steady_clock;
+
+namespace {
+
+constexpr int32_t kFallbackSkinnedMeshSkeletalMeshOffset = 0x7F0;
+constexpr int32_t kSkeletalMeshRefBoneInfoOffset = 0x238;
+
+struct FQuatNative {
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+    float w = 1.0f;
+};
+
+struct FTransformNative {
+    FQuatNative rotation;
+    FVector3 translation;
+    float translationPad = 0.0f;
+    FVector3 scale3D{1.0f, 1.0f, 1.0f};
+    float scalePad = 0.0f;
+};
+
+static_assert(sizeof(FTransformNative) == 0x30, "FTransformNative size mismatch");
+
+bool isFiniteVector(const FVector3& value) {
+    return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
+}
+
+FVector3 rotateVectorByQuat(const FQuatNative& quat, const FVector3& vector) {
+    const FVector3 quatVector{quat.x, quat.y, quat.z};
+    const FVector3 uv{
+        quatVector.y * vector.z - quatVector.z * vector.y,
+        quatVector.z * vector.x - quatVector.x * vector.z,
+        quatVector.x * vector.y - quatVector.y * vector.x,
+    };
+    const FVector3 uuv{
+        quatVector.y * uv.z - quatVector.z * uv.y,
+        quatVector.z * uv.x - quatVector.x * uv.z,
+        quatVector.x * uv.y - quatVector.y * uv.x,
+    };
+    return {
+        vector.x + ((uv.x * quat.w) + uuv.x) * 2.0f,
+        vector.y + ((uv.y * quat.w) + uuv.y) * 2.0f,
+        vector.z + ((uv.z * quat.w) + uuv.z) * 2.0f,
+    };
+}
+
+FVector3 transformPosition(const FTransformNative& transform, const FVector3& point) {
+    const FVector3 scaled{
+        point.x * transform.scale3D.x,
+        point.y * transform.scale3D.y,
+        point.z * transform.scale3D.z,
+    };
+    const FVector3 rotated = rotateVectorByQuat(transform.rotation, scaled);
+    return {
+        rotated.x + transform.translation.x,
+        rotated.y + transform.translation.y,
+        rotated.z + transform.translation.z,
+    };
+}
+
+std::string toLowerAscii(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return value;
+}
+
+bool matchesAnyBoneName(const std::string& name, std::initializer_list<const char*> candidates) {
+    const std::string loweredName = toLowerAscii(name);
+    for (const char* candidate : candidates) {
+        if (loweredName == candidate) {
+            return true;
+        }
+    }
+    return false;
+}
+
+enum SkeletonPointSlot : size_t {
+    SkeletonHead = 0,
+    SkeletonNeck,
+    SkeletonChest,
+    SkeletonPelvis,
+    SkeletonShoulderLeft,
+    SkeletonElbowLeft,
+    SkeletonHandLeft,
+    SkeletonShoulderRight,
+    SkeletonElbowRight,
+    SkeletonHandRight,
+    SkeletonThighLeft,
+    SkeletonKneeLeft,
+    SkeletonFootLeft,
+    SkeletonThighRight,
+    SkeletonKneeRight,
+    SkeletonFootRight,
+};
+
+} // namespace
 
 bool shouldLogEvery(Clock::time_point& lastLogTime, std::chrono::milliseconds interval) {
     const auto now = Clock::now();
@@ -78,6 +178,9 @@ PlayerNode* PlayerList::upsert(uint32_t playerKey, const PlayerNode& data) {
         node->healthMax  = data.healthMax;
         node->kills      = data.kills;
         node->pos        = data.pos;
+        node->characterPtr = data.characterPtr;
+        node->hasSkeleton = data.hasSkeleton;
+        node->skeletonPoints = data.skeletonPoints;
         return node;
     }
     node = new PlayerNode();
@@ -90,6 +193,9 @@ PlayerNode* PlayerList::upsert(uint32_t playerKey, const PlayerNode& data) {
     node->healthMax  = data.healthMax;
     node->kills      = data.kills;
     node->pos        = data.pos;
+    node->characterPtr = data.characterPtr;
+    node->hasSkeleton = data.hasSkeleton;
+    node->skeletonPoints = data.skeletonPoints;
 
     if (!m_head) {
         m_head = node;
@@ -201,10 +307,12 @@ bool MatchMonitor::initOffsets() {
     {
         int32_t ctw = m_interface.getFieldOffsetInHierarchy("SceneComponent", "ComponentToWorld");
         if (ctw >= 0) {
+            m_off.SceneComp_ComponentToWorld = ctw;
             m_off.SceneComp_Translation = ctw + 0x10; // FTransform.Translation offset
             MLOG(LOG_LEVEL_INFO, "[InitOffsets] SceneComponent.ComponentToWorld+0x10 = 0x%X", m_off.SceneComp_Translation);
         } else {
             MLOG(LOG_LEVEL_WARN, "[InitOffsets] ComponentToWorld 未找到, 回退 0x200");
+            m_off.SceneComp_ComponentToWorld = 0x1F0;
             m_off.SceneComp_Translation = 0x200;
         }
     }
@@ -218,6 +326,7 @@ bool MatchMonitor::initOffsets() {
     RESOLVE_OFFSET_MULTI(m_off.Char_TeamID,        "TeamID",             "UAECharacter", "STExtraCharacter", "STExtraBaseCharacter");
     RESOLVE_OFFSET_MULTI(m_off.Char_PlayerKey,     "PlayerKey",          "UAECharacter", "STExtraCharacter", "STExtraBaseCharacter");
     RESOLVE_OFFSET_MULTI(m_off.Char_PlayerName,    "PlayerName",         "UAECharacter", "STExtraCharacter", "STExtraBaseCharacter");
+    RESOLVE_OFFSET_MULTI(m_off.Char_Mesh,          "Mesh",               "Character", "UAECharacter", "STExtraCharacter", "STExtraBaseCharacter");
 
     // STExtraCharacter
     RESOLVE_OFFSET_MULTI(m_off.Char_Health,        "Health",             "STExtraCharacter", "UAECharacter", "STExtraBaseCharacter");
@@ -226,6 +335,17 @@ bool MatchMonitor::initOffsets() {
 
     // STExtraBaseCharacter
     RESOLVE_OFFSET_MULTI(m_off.Char_CurrentNetCullDistSq, "CurrentNetCullDistanceSquared", "STExtraBaseCharacter", "STExtraCharacter", "UAECharacter");
+
+    // SkeletalMeshComponent / SkinnedMeshComponent
+    RESOLVE_OFFSET_MULTI(m_off.SkelComp_CachedComponentSpaceTransforms, "CachedComponentSpaceTransforms", "SkeletalMeshComponent", "SkinnedMeshComponent");
+    RESOLVE_OFFSET_MULTI(m_off.SkinnedMeshComp_SkeletalMesh, "SkeletalMesh", "SkinnedMeshComponent", "SkeletalMeshComponent");
+    if (m_off.SkinnedMeshComp_SkeletalMesh < 0) {
+        RESOLVE_OFFSET_MULTI(m_off.SkinnedMeshComp_SkeletalMesh, "SkeletalMeshAsset", "SkinnedMeshComponent", "SkeletalMeshComponent");
+    }
+    if (m_off.SkinnedMeshComp_SkeletalMesh < 0) {
+        m_off.SkinnedMeshComp_SkeletalMesh = kFallbackSkinnedMeshSkeletalMeshOffset;
+        MLOG(LOG_LEVEL_WARN, "[InitOffsets] SkinnedMeshComponent.SkeletalMesh 未找到, 回退 0x%X", m_off.SkinnedMeshComp_SkeletalMesh);
+    }
 
     MLOG(LOG_LEVEL_INFO, "[InitOffsets] 解析完成, isValid=%d", m_off.isValid());
     MLOG(LOG_LEVEL_INFO, "[InitOffsets] World.GameState=0x%X GS.PlayerArray=0x%X PS.PlayerKey=0x%X",
@@ -424,6 +544,134 @@ bool MatchMonitor::getActorLocation(uintptr_t actorPtr, FVector3& outLoc) {
     return true;
 }
 
+bool MatchMonitor::resolveSkeletonIndices(uintptr_t skeletalMeshPtr, std::array<int, PLAYER_SKELETON_POINT_COUNT>& outIndices) {
+    auto cacheIt = m_skeletonIndexCache.find(skeletalMeshPtr);
+    if (cacheIt != m_skeletonIndexCache.end()) {
+        outIndices = cacheIt->second;
+        return true;
+    }
+
+    outIndices.fill(-1);
+    if (skeletalMeshPtr == 0) {
+        return false;
+    }
+
+    const uintptr_t boneInfoData = safeReadPtr(skeletalMeshPtr + kSkeletalMeshRefBoneInfoOffset);
+    const int32_t boneInfoNum = safeReadS32(skeletalMeshPtr + kSkeletalMeshRefBoneInfoOffset + 8);
+    if (boneInfoData == 0 || boneInfoNum <= 0 || boneInfoNum > 512) {
+        return false;
+    }
+
+    for (int32_t boneIndex = 0; boneIndex < boneInfoNum; ++boneIndex) {
+        const uintptr_t boneInfoPtr = boneInfoData + static_cast<uintptr_t>(boneIndex) * 16ULL;
+        const std::string boneName = readFName(boneInfoPtr);
+        if (boneName.empty() || boneName == "<invalid>") {
+            continue;
+        }
+
+        if (outIndices[SkeletonHead] < 0 && matchesAnyBoneName(boneName, {"head", "head_01"})) {
+            outIndices[SkeletonHead] = boneIndex;
+        } else if (outIndices[SkeletonNeck] < 0 && matchesAnyBoneName(boneName, {"neck", "neck_01"})) {
+            outIndices[SkeletonNeck] = boneIndex;
+        } else if (outIndices[SkeletonChest] < 0 && matchesAnyBoneName(boneName, {"spine_03", "spine_02", "chest"})) {
+            outIndices[SkeletonChest] = boneIndex;
+        } else if (outIndices[SkeletonPelvis] < 0 && matchesAnyBoneName(boneName, {"pelvis", "root"})) {
+            outIndices[SkeletonPelvis] = boneIndex;
+        } else if (outIndices[SkeletonShoulderLeft] < 0 && matchesAnyBoneName(boneName, {"clavicle_l", "upperarm_l"})) {
+            outIndices[SkeletonShoulderLeft] = boneIndex;
+        } else if (outIndices[SkeletonElbowLeft] < 0 && matchesAnyBoneName(boneName, {"lowerarm_l", "forearm_l"})) {
+            outIndices[SkeletonElbowLeft] = boneIndex;
+        } else if (outIndices[SkeletonHandLeft] < 0 && matchesAnyBoneName(boneName, {"hand_l"})) {
+            outIndices[SkeletonHandLeft] = boneIndex;
+        } else if (outIndices[SkeletonShoulderRight] < 0 && matchesAnyBoneName(boneName, {"clavicle_r", "upperarm_r"})) {
+            outIndices[SkeletonShoulderRight] = boneIndex;
+        } else if (outIndices[SkeletonElbowRight] < 0 && matchesAnyBoneName(boneName, {"lowerarm_r", "forearm_r"})) {
+            outIndices[SkeletonElbowRight] = boneIndex;
+        } else if (outIndices[SkeletonHandRight] < 0 && matchesAnyBoneName(boneName, {"hand_r"})) {
+            outIndices[SkeletonHandRight] = boneIndex;
+        } else if (outIndices[SkeletonThighLeft] < 0 && matchesAnyBoneName(boneName, {"thigh_l", "calf_l"})) {
+            outIndices[SkeletonThighLeft] = boneIndex;
+        } else if (outIndices[SkeletonKneeLeft] < 0 && matchesAnyBoneName(boneName, {"calf_l", "leg_l"})) {
+            outIndices[SkeletonKneeLeft] = boneIndex;
+        } else if (outIndices[SkeletonFootLeft] < 0 && matchesAnyBoneName(boneName, {"foot_l", "ball_l"})) {
+            outIndices[SkeletonFootLeft] = boneIndex;
+        } else if (outIndices[SkeletonThighRight] < 0 && matchesAnyBoneName(boneName, {"thigh_r", "calf_r"})) {
+            outIndices[SkeletonThighRight] = boneIndex;
+        } else if (outIndices[SkeletonKneeRight] < 0 && matchesAnyBoneName(boneName, {"calf_r", "leg_r"})) {
+            outIndices[SkeletonKneeRight] = boneIndex;
+        } else if (outIndices[SkeletonFootRight] < 0 && matchesAnyBoneName(boneName, {"foot_r", "ball_r"})) {
+            outIndices[SkeletonFootRight] = boneIndex;
+        }
+    }
+
+    m_skeletonIndexCache[skeletalMeshPtr] = outIndices;
+    return true;
+}
+
+bool MatchMonitor::fillPlayerSkeleton(PlayerNode& player) {
+    player.hasSkeleton = false;
+    for (auto& skeletonPoint : player.skeletonPoints) {
+        skeletonPoint.valid = false;
+        skeletonPoint.pos = {};
+    }
+
+    if (player.characterPtr == 0
+        || m_off.Char_Mesh < 0
+        || m_off.SkelComp_CachedComponentSpaceTransforms < 0
+        || m_off.SceneComp_ComponentToWorld < 0) {
+        return false;
+    }
+
+    const uintptr_t meshComponentPtr = safeReadPtr(player.characterPtr + m_off.Char_Mesh);
+    if (meshComponentPtr == 0 || meshComponentPtr < 0x10000) {
+        return false;
+    }
+
+    const uintptr_t skeletalMeshPtr = safeReadPtr(meshComponentPtr + m_off.SkinnedMeshComp_SkeletalMesh);
+    if (skeletalMeshPtr == 0 || skeletalMeshPtr < 0x10000) {
+        return false;
+    }
+
+    std::array<int, PLAYER_SKELETON_POINT_COUNT> skeletonIndices{};
+    if (!resolveSkeletonIndices(skeletalMeshPtr, skeletonIndices)) {
+        return false;
+    }
+
+    FTransformNative componentToWorld;
+    memcpy(&componentToWorld, reinterpret_cast<const void*>(meshComponentPtr + m_off.SceneComp_ComponentToWorld), sizeof(componentToWorld));
+
+    const uintptr_t boneArrayData = safeReadPtr(meshComponentPtr + m_off.SkelComp_CachedComponentSpaceTransforms);
+    const int32_t boneArrayNum = safeReadS32(meshComponentPtr + m_off.SkelComp_CachedComponentSpaceTransforms + 8);
+    if (boneArrayData == 0 || boneArrayNum <= 0 || boneArrayNum > 512) {
+        return false;
+    }
+
+    int validPointCount = 0;
+    for (size_t slot = 0; slot < skeletonIndices.size(); ++slot) {
+        const int boneIndex = skeletonIndices[slot];
+        if (boneIndex < 0 || boneIndex >= boneArrayNum) {
+            continue;
+        }
+
+        FTransformNative boneTransform;
+        memcpy(&boneTransform, reinterpret_cast<const void*>(boneArrayData + static_cast<uintptr_t>(boneIndex) * sizeof(FTransformNative)), sizeof(boneTransform));
+        const FVector3 worldPos = transformPosition(componentToWorld, boneTransform.translation);
+        if (!isFiniteVector(worldPos)) {
+            continue;
+        }
+
+        player.skeletonPoints[slot].pos = worldPos;
+        player.skeletonPoints[slot].valid = true;
+        validPointCount++;
+    }
+
+    player.hasSkeleton = validPointCount >= 5
+        && player.skeletonPoints[SkeletonHead].valid
+        && player.skeletonPoints[SkeletonChest].valid
+        && player.skeletonPoints[SkeletonPelvis].valid;
+    return player.hasSkeleton;
+}
+
 // =====================================================================
 //  类继承链检
 // =====================================================================
@@ -606,6 +854,7 @@ int MatchMonitor::scanCharacters() {
             data.healthMax  = healthMax;
             data.kills      = 0;
             data.pos        = loc;
+            data.characterPtr = objPtr;
             m_playerList.upsert(playerKey, data);
             newCharsFound++;
         }
@@ -678,6 +927,7 @@ int MatchMonitor::updatePlayerList(uintptr_t gameStatePtr) {
         data.healthMax  = healthMax;
         data.kills      = kills;
         data.pos        = loc;
+        data.characterPtr = charOwner;
         m_playerList.upsert(playerKey, data);
         seenKeys[playerKey] = true;
         updated++;
@@ -861,6 +1111,12 @@ void MatchMonitor::pollPlayers() {
     // 填充所有玩家
     cur = m_playerList.head();
     while (cur) {
+        if (cur->liveState == 0 && cur->health > 0) {
+            fillPlayerSkeleton(*cur);
+        } else {
+            cur->hasSkeleton = false;
+        }
+
         ue4draw::DrawPlayerInfo dp;
         dp.playerKey = cur->playerKey;
         dp.teamID = cur->teamID;
@@ -874,6 +1130,15 @@ void MatchMonitor::pollPlayers() {
         dp.posY = cur->pos.y;
         dp.posZ = cur->pos.z;
         dp.isTeammate = (m_myTeamID > 0 && cur->teamID == m_myTeamID);
+        dp.hasSkeleton = cur->hasSkeleton;
+        if (cur->hasSkeleton) {
+            for (size_t skeletonIndex = 0; skeletonIndex < cur->skeletonPoints.size(); ++skeletonIndex) {
+                dp.skeletonPoints[skeletonIndex].x = cur->skeletonPoints[skeletonIndex].pos.x;
+                dp.skeletonPoints[skeletonIndex].y = cur->skeletonPoints[skeletonIndex].pos.y;
+                dp.skeletonPoints[skeletonIndex].z = cur->skeletonPoints[skeletonIndex].pos.z;
+                dp.skeletonPoints[skeletonIndex].valid = cur->skeletonPoints[skeletonIndex].valid;
+            }
+        }
         drawData.players.push_back(dp);
         cur = cur->next;
     }
@@ -916,6 +1181,7 @@ void MatchMonitor::pollMatchStateLoop() {
                     ue4draw::SharedUE4Data::getInstance().setInMatch(true);
                     m_playerList.clear();
                     m_characterClassSet.clear();
+                    m_skeletonIndexCache.clear();
                     m_myTeamID = -1;
                     m_myPlayerKey = 0;
                     m_lastReportedArrayNum = -1;
@@ -933,6 +1199,9 @@ void MatchMonitor::pollMatchStateLoop() {
                     ue4draw::SharedUE4Data::getInstance().pushData(emptyData);
                     closeLog();
                     m_playerList.clear();
+                    m_characterClassSet.clear();
+                    m_skeletonIndexCache.clear();
+                    m_myTeamID = -1;
                     m_myPlayerKey = 0;
                 }
                 m_lastMatchState = ms.state;

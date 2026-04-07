@@ -5,6 +5,7 @@
 #include <mutex>
 #include <atomic>
 #include <vector>
+#include <array>
 #include <string>
 #include <cstdint>
 
@@ -13,6 +14,15 @@
 // =====================================================================
 
 namespace ue4draw {
+
+static constexpr size_t DRAW_SKELETON_POINT_COUNT = 16;
+
+struct DrawSkeletonPoint {
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+    bool valid = false;
+};
 
 // =====================================================================
 //  共享玩家数据 (MatchMonitor -> 渲染线程)
@@ -30,6 +40,8 @@ struct DrawPlayerInfo {
     float       posY = 0.0f;
     float       posZ = 0.0f;
     bool        isTeammate = false;
+    bool        hasSkeleton = false;
+    std::array<DrawSkeletonPoint, DRAW_SKELETON_POINT_COUNT> skeletonPoints{};
 };
 
 struct DrawGameData {
@@ -98,6 +110,7 @@ private:
     bool m_enableHP        = true;     // 血条
     bool m_enableName      = true;     // 名字
     bool m_enableDistance   = true;     // 距离
+    bool m_enableSkeleton  = true;     // 骨架
     bool m_enableTeammate  = false;    // 显示队友
     bool m_enableMinimap   = true;     // 小地图
     bool m_enableFallbackESP = true;   // 投影失败时绘制屏边箭头
