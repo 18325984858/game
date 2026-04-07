@@ -95,7 +95,7 @@ namespace android
         double m_lastTime = 0.0;
 
         Options m_options;
-        size_t m_maxPacketSize = 1 * 1024 * 1024; // 1MB
+        size_t m_maxPacketSize = 8 * 1024 * 1024; // 8MB, enough for Chinese font atlas exchange
         sockaddr_in m_transportAddress{};
         int m_serverFd = -1, m_clientFd = -1;
         std::unique_ptr<std::thread> m_serverWorkerThread;

@@ -710,6 +710,7 @@ int MatchMonitor::updatePlayerList(uintptr_t gameStatePtr) {
 // =====================================================================
 void MatchMonitor::openLog() {
     std::lock_guard<std::mutex> lock(m_logMutex);
+    if (!g_runtimeLogEnabled) return;
     if (m_logFp) return;
     mkdir(m_logDir.c_str(), 0777);
     std::string path = m_logDir + m_logFile;
@@ -722,6 +723,7 @@ void MatchMonitor::openLog() {
 }
 
 void MatchMonitor::writeLog(const char* line) {
+    if (!g_runtimeLogEnabled) return;
     if (!m_logFp) return;
     fprintf(m_logFp, "%s\n", line);
     m_logLineCount++;

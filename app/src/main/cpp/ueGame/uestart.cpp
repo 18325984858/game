@@ -79,6 +79,10 @@ std::string resolveUe4GuiTracePath() {
 }
 
 void writeGuiTrace(int priority, const char* fmt, va_list args) {
+    if (!g_runtimeLogEnabled) {
+        return;
+    }
+
     char message[1024] = {};
     vsnprintf(message, sizeof(message), fmt, args);
 

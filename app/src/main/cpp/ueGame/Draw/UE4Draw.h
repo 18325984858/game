@@ -100,7 +100,7 @@ private:
     bool m_enableDistance   = true;     // 距离
     bool m_enableTeammate  = false;    // 显示队友
     bool m_enableMinimap   = true;     // 小地图
-    bool m_enableFallbackESP = true;   // 投影失败时的降级绘制
+    bool m_enableFallbackESP = true;   // 投影失败时绘制屏边箭头
     bool m_enablePlayerList = true;    // 玩家坐标/血量调试面板
     bool m_enableTouchPoint = true;    // 手指按下绘制触点
     float m_minimapSize    = 200.0f;   // 小地图大小

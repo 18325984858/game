@@ -18,6 +18,12 @@ struct ViewPoint {
     float z = 0.0f;
 };
 
+struct CameraSpacePoint {
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+};
+
 bool shouldLogEvery(Clock::time_point& lastLogTime, std::chrono::milliseconds interval) {
     const auto now = Clock::now();
     if (lastLogTime.time_since_epoch().count() != 0 && now - lastLogTime < interval) {
@@ -38,6 +44,17 @@ bool isValidNumber(float value) {
 bool hasValidWorldPoint(float x, float y, float z) {
     return isValidNumber(x) && isValidNumber(y) && isValidNumber(z)
         && (std::fabs(x) > 1.0f || std::fabs(y) > 1.0f || std::fabs(z) > 1.0f);
+}
+
+float sanitizeAngleDegrees(float value) {
+    return isValidNumber(value) ? std::remainder(value, 360.0f) : 0.0f;
+}
+
+float sanitizeFov(float value) {
+    if (!isValidNumber(value) || value < 30.0f || value > 170.0f) {
+        return 90.0f;
+    }
+    return value;
 }
 
 bool tryGetViewPoint(const DrawGameData& data, ViewPoint& outPoint) {
@@ -61,6 +78,54 @@ float distanceMeters(float x1, float y1, float z1, float x2, float y2, float z2)
 
 float playerDistanceMeters(const DrawPlayerInfo& player, const ViewPoint& viewPoint) {
     return distanceMeters(player.posX, player.posY, player.posZ, viewPoint.x, viewPoint.y, viewPoint.z);
+}
+
+bool transformWorldToCamera(const DrawGameData& data,
+                            float wx,
+                            float wy,
+                            float wz,
+                            CameraSpacePoint& outPoint) {
+    ViewPoint cameraOrigin;
+    if (!tryGetViewPoint(data, cameraOrigin)) {
+        return false;
+    }
+    if (!isValidNumber(wx) || !isValidNumber(wy) || !isValidNumber(wz)) {
+        return false;
+    }
+
+    constexpr float DEG2RAD = 3.14159265358979f / 180.0f;
+    const float pitch = sanitizeAngleDegrees(data.camPitch) * DEG2RAD;
+    const float yaw = sanitizeAngleDegrees(data.camYaw) * DEG2RAD;
+    const float roll = sanitizeAngleDegrees(data.camRoll) * DEG2RAD;
+
+    const float sp = std::sin(pitch);
+    const float cp = std::cos(pitch);
+    const float sy = std::sin(yaw);
+    const float cy = std::cos(yaw);
+    const float sr = std::sin(roll);
+    const float cr = std::cos(roll);
+
+    const float axisXx = cp * cy;
+    const float axisXy = cp * sy;
+    const float axisXz = sp;
+
+    const float axisYx = sr * sp * cy - cr * sy;
+    const float axisYy = sr * sp * sy + cr * cy;
+    const float axisYz = -sr * cp;
+
+    const float axisZx = -(cr * sp * cy + sr * sy);
+    const float axisZy = cy * sr - cr * sp * sy;
+    const float axisZz = cr * cp;
+
+    const float dx = wx - cameraOrigin.x;
+    const float dy = wy - cameraOrigin.y;
+    const float dz = wz - cameraOrigin.z;
+
+    outPoint.x = dx * axisYx + dy * axisYy + dz * axisYz;
+    outPoint.y = dx * axisZx + dy * axisZy + dz * axisZz;
+    outPoint.z = dx * axisXx + dy * axisXy + dz * axisXz;
+
+    return isValidNumber(outPoint.x) && isValidNumber(outPoint.y) && isValidNumber(outPoint.z);
 }
 
 float playerHealthRatio(const DrawPlayerInfo& player) {
@@ -95,75 +160,54 @@ void drawTouchPointOverlay(bool enabled, float screenW, float screenH) {
     drawList->AddCircle(ImVec2(touchX, touchY), 18.0f, IM_COL32(255, 255, 255, 220), 0, 2.0f);
 }
 
-bool projectFallbackMarker(const DrawGameData& data,
-                           const DrawPlayerInfo& player,
-                           float screenW,
-                           float screenH,
-                           float& centerX,
-                           float& topY,
-                           float& bottomY,
-                           float& boxW,
-                           bool& edgeClamped) {
+bool projectFallbackArrow(const DrawGameData& data,
+                          const DrawPlayerInfo& player,
+                          float screenW,
+                          float screenH,
+                          float& arrowX,
+                          float& arrowY,
+                          float& angleRad) {
+    CameraSpacePoint cameraPoint;
+    if (!transformWorldToCamera(data, player.posX, player.posY, player.posZ + 90.0f, cameraPoint)) {
+        return false;
+    }
+
     constexpr float DEG2RAD = 3.14159265358979f / 180.0f;
+    constexpr float kNearDepth = 1.0f;
+    constexpr float kMarginX = 40.0f;
+    constexpr float kMarginY = 60.0f;
 
-    ViewPoint viewPoint;
-    if (!tryGetViewPoint(data, viewPoint)) {
+    const float tanHalfFov = std::tan(sanitizeFov(data.camFOV) * 0.5f * DEG2RAD);
+    if (!isValidNumber(tanHalfFov) || tanHalfFov < 0.01f) {
         return false;
     }
 
-    const float dx = player.posX - viewPoint.x;
-    const float dy = player.posY - viewPoint.y;
-    const float dz = player.posZ - viewPoint.z;
-    const float planarDist = std::sqrt(dx * dx + dy * dy);
-    if (planarDist < 1.0f) {
+    const bool behindCamera = cameraPoint.z <= kNearDepth;
+    const float safeDepth = std::max(std::fabs(cameraPoint.z), kNearDepth);
+    const float focalLength = screenW * 0.5f / tanHalfFov;
+
+    float screenDx = cameraPoint.x * focalLength / safeDepth;
+    float screenDy = -cameraPoint.y * focalLength / safeDepth;
+    if (behindCamera) {
+        screenDx = -screenDx;
+        screenDy = -screenDy;
+    }
+
+    if (!isValidNumber(screenDx) || !isValidNumber(screenDy)) {
         return false;
     }
-
-    const float yawRad = data.camYaw * DEG2RAD;
-    const float forward = dx * std::cos(yawRad) + dy * std::sin(yawRad);
-    const float side = -dx * std::sin(yawRad) + dy * std::cos(yawRad);
-
-    float fov = data.camFOV;
-    if (!isValidNumber(fov) || fov < 30.0f || fov > 170.0f) {
-        fov = 90.0f;
+    if (std::fabs(screenDx) < 0.5f && std::fabs(screenDy) < 0.5f) {
+        screenDy = behindCamera ? 1.0f : -1.0f;
     }
 
-    float tanHalfFov = std::tan(fov * 0.5f * DEG2RAD);
-    if (!isValidNumber(tanHalfFov) || tanHalfFov < 0.2f) {
-        tanHalfFov = std::tan(45.0f * DEG2RAD);
-    }
+    const float halfW = std::max(screenW * 0.5f - kMarginX, 1.0f);
+    const float halfH = std::max(screenH * 0.5f - kMarginY, 1.0f);
+    const float scale = 1.0f / std::max(std::fabs(screenDx) / halfW, std::fabs(screenDy) / halfH);
 
-    const float safeForward = std::fabs(forward) > 120.0f ? forward : (forward >= 0.0f ? 120.0f : -120.0f);
-    const float normalizedX = std::clamp((side / safeForward) / tanHalfFov, -1.6f, 1.6f);
-    const float normalizedY = std::clamp(dz / std::max(planarDist, 120.0f), -0.65f, 0.45f);
-
-    float screenX = screenW * 0.5f + normalizedX * screenW * 0.38f;
-    float screenY = screenH * 0.58f - normalizedY * screenH * 0.32f;
-
-    constexpr float kMarginX = 32.0f;
-    constexpr float kMarginTop = 42.0f;
-    constexpr float kMarginBottom = 72.0f;
-    edgeClamped = false;
-
-    if (forward < 0.0f) {
-        screenX = side >= 0.0f ? screenW - kMarginX : kMarginX;
-        screenY = std::clamp(screenY, screenH * 0.25f, screenH * 0.75f);
-        edgeClamped = true;
-    }
-
-    const float clampedX = std::clamp(screenX, kMarginX, screenW - kMarginX);
-    const float clampedY = std::clamp(screenY, kMarginTop, screenH - kMarginBottom);
-    if (clampedX != screenX || clampedY != screenY) {
-        edgeClamped = true;
-    }
-
-    centerX = clampedX;
-    const float distMetersValue = playerDistanceMeters(player, viewPoint);
-    const float boxH = std::clamp(1050.0f / std::max(distMetersValue, 1.0f), 34.0f, 92.0f);
-    boxW = boxH * 0.62f;
-    topY = std::clamp(clampedY - boxH * 0.82f, 8.0f, screenH - boxH - 8.0f);
-    bottomY = topY + boxH;
-    return true;
+    arrowX = std::clamp(screenW * 0.5f + screenDx * scale, kMarginX, screenW - kMarginX);
+    arrowY = std::clamp(screenH * 0.5f + screenDy * scale, kMarginY, screenH - kMarginY);
+    angleRad = std::atan2(screenDy, screenDx);
+    return isValidNumber(arrowX) && isValidNumber(arrowY) && isValidNumber(angleRad);
 }
 } // namespace
 
@@ -249,53 +293,53 @@ void UE4Overlay::drawMenu(const DrawGameData& data) {
 
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoResize | ImGuiWindowFlags_AlwaysAutoResize;
 
-    if (ImGui::Begin("PUBG ESP", &m_menuExpanded, flags)) {
+    if (ImGui::Begin("PUBG 绘制", &m_menuExpanded, flags)) {
         bool settingsChanged = false;
 
         // 对局状态
         if (data.inMatch) {
             ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "★ 对局中");
             ImGui::SameLine();
-            ImGui::Text("Players: %d/%d", data.aliveCount, data.totalCount);
-            ImGui::Text("World: %s", data.worldName.c_str());
-            ImGui::Text("State: %s", data.matchState.c_str());
+            ImGui::Text("玩家: %d/%d", data.aliveCount, data.totalCount);
+            ImGui::Text("地图: %s", data.worldName.c_str());
+            ImGui::Text("状态: %s", data.matchState.c_str());
         } else {
             ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "○ 等待对局...");
         }
         ImGui::Separator();
 
         // 功能开关
-        settingsChanged |= ImGui::Checkbox("ESP Box", &m_enableESP);
-        settingsChanged |= ImGui::Checkbox("Snap Line", &m_enableSnapline);
-        settingsChanged |= ImGui::Checkbox("HP Bar", &m_enableHP);
-        settingsChanged |= ImGui::Checkbox("Name", &m_enableName);
-        settingsChanged |= ImGui::Checkbox("Distance", &m_enableDistance);
-        settingsChanged |= ImGui::Checkbox("Show Teammate", &m_enableTeammate);
+        settingsChanged |= ImGui::Checkbox("ESP 方框", &m_enableESP);
+        settingsChanged |= ImGui::Checkbox("射线", &m_enableSnapline);
+        settingsChanged |= ImGui::Checkbox("血条", &m_enableHP);
+        settingsChanged |= ImGui::Checkbox("名字", &m_enableName);
+        settingsChanged |= ImGui::Checkbox("距离", &m_enableDistance);
+        settingsChanged |= ImGui::Checkbox("显示队友", &m_enableTeammate);
         ImGui::Separator();
 
-        settingsChanged |= ImGui::Checkbox("Minimap", &m_enableMinimap);
+        settingsChanged |= ImGui::Checkbox("小地图", &m_enableMinimap);
         if (m_enableMinimap) {
-            settingsChanged |= ImGui::SliderFloat("Map Size", &m_minimapSize, 100.0f, 400.0f, "%.0f");
+            settingsChanged |= ImGui::SliderFloat("地图大小", &m_minimapSize, 100.0f, 400.0f, "%.0f");
         }
-        settingsChanged |= ImGui::Checkbox("Fallback ESP", &m_enableFallbackESP);
-        settingsChanged |= ImGui::Checkbox("Player List", &m_enablePlayerList);
-        settingsChanged |= ImGui::Checkbox("Touch Point", &m_enableTouchPoint);
+        settingsChanged |= ImGui::Checkbox("边缘箭头", &m_enableFallbackESP);
+        settingsChanged |= ImGui::Checkbox("玩家列表", &m_enablePlayerList);
+        settingsChanged |= ImGui::Checkbox("触点", &m_enableTouchPoint);
         ImGui::Separator();
-        settingsChanged |= ImGui::SliderFloat("Max Dist", &m_espMaxDist, 100.0f, 2000.0f, "%.0f m");
+        settingsChanged |= ImGui::SliderFloat("最大距离", &m_espMaxDist, 100.0f, 2000.0f, "%.0f m");
 
         if (data.inMatch) {
-            ImGui::Text("ESP Draw: precise %d  fallback %d", m_lastPreciseESP, m_lastFallbackESP);
+            ImGui::Text("ESP 绘制: 精确 %d  箭头 %d", m_lastPreciseESP, m_lastFallbackESP);
         }
         if (m_enableTouchPoint) {
             const ImGuiIO& io = ImGui::GetIO();
             if (io.MouseDown[0] && ImGui::IsMousePosValid()) {
-                ImGui::Text("Touch: %.0f, %.0f", io.MousePos.x, io.MousePos.y);
+                ImGui::Text("触点: %.0f, %.0f", io.MousePos.x, io.MousePos.y);
             } else {
-                ImGui::TextDisabled("Touch: idle");
+                ImGui::TextDisabled("触点: 空闲");
             }
         }
 
-        if (m_enablePlayerList && data.inMatch && ImGui::CollapsingHeader("Tracked Players", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (m_enablePlayerList && data.inMatch && ImGui::CollapsingHeader("追踪玩家", ImGuiTreeNodeFlags_DefaultOpen)) {
             ViewPoint viewPoint;
             const bool hasViewPoint = tryGetViewPoint(data, viewPoint);
             std::vector<const DrawPlayerInfo*> trackedPlayers;
@@ -355,7 +399,7 @@ void UE4Overlay::drawMenu(const DrawGameData& data) {
 
         if (settingsChanged) {
             DLOG(LOG_LEVEL_INFO,
-                 "settings updated: esp=%s snap=%s hp=%s name=%s dist=%s teammate=%s minimap=%s fallback=%s playerList=%s touch=%s mapSize=%.0f maxDist=%.0f",
+                 "settings updated: esp=%s snap=%s hp=%s name=%s dist=%s teammate=%s minimap=%s edgeArrow=%s playerList=%s touch=%s mapSize=%.0f maxDist=%.0f",
                  onOff(m_enableESP),
                  onOff(m_enableSnapline),
                  onOff(m_enableHP),
@@ -383,48 +427,26 @@ bool UE4Overlay::worldToScreen(const DrawGameData& cam,
                                float& sx, float& sy) {
     constexpr float DEG2RAD = 3.14159265358979f / 180.0f;
 
-    // 相机旋转角度 (UE4: Pitch=上下, Yaw=左右, Roll=翻滚)
-    float pitch = cam.camPitch * DEG2RAD;
-    float yaw   = cam.camYaw * DEG2RAD;
+    CameraSpacePoint cameraPoint;
+    if (!transformWorldToCamera(cam, wx, wy, wz, cameraPoint)) {
+        return false;
+    }
 
-    float cp = std::cos(pitch), sp = std::sin(pitch);
-    float cy = std::cos(yaw),   sy_r = std::sin(yaw);
+    constexpr float kNearDepth = 1.0f;
+    if (cameraPoint.z <= kNearDepth) {
+        return false;
+    }
 
-    // 旋转矩阵的三个轴 (UE4 左手坐标系)
-    // Forward (X轴方向)
-    float fwdX = cp * cy;
-    float fwdY = cp * sy_r;
-    float fwdZ = sp;
-    // Right (Y轴方向)
-    float rightX = -sy_r;
-    float rightY = cy;
-    float rightZ = 0.0f;
-    // Up (Z轴方向)
-    float upX = -sp * cy;
-    float upY = -sp * sy_r;
-    float upZ = cp;
+    const float tanHalfFov = std::tan(sanitizeFov(cam.camFOV) * 0.5f * DEG2RAD);
+    if (!isValidNumber(tanHalfFov) || tanHalfFov < 0.01f) {
+        return false;
+    }
 
-    // 世界坐标差 (目标 - 相机)
-    float dx = wx - cam.camLocX;
-    float dy = wy - cam.camLocY;
-    float dz = wz - cam.camLocZ;
+    const float focalLength = screenW * 0.5f / tanHalfFov;
+    sx = screenW * 0.5f + cameraPoint.x * focalLength / cameraPoint.z;
+    sy = screenH * 0.5f - cameraPoint.y * focalLength / cameraPoint.z;
 
-    // 投影到相机坐标系
-    float dot_fwd   = dx * fwdX   + dy * fwdY   + dz * fwdZ;
-    float dot_right = dx * rightX + dy * rightY + dz * rightZ;
-    float dot_up    = dx * upX    + dy * upY    + dz * upZ;
-
-    // 在相机背后则不可见
-    if (dot_fwd < 1.0f) return false;
-
-    // 透视投影
-    float fov = cam.camFOV > 0.0f ? cam.camFOV : 90.0f;
-    float tanHalfFOV = std::tan(fov * 0.5f * DEG2RAD);
-
-    sx = screenW * 0.5f + (dot_right / dot_fwd / tanHalfFOV) * screenW * 0.5f;
-    sy = screenH * 0.5f - (dot_up / dot_fwd / tanHalfFOV) * screenW * 0.5f;
-
-    return true;
+    return isValidNumber(sx) && isValidNumber(sy);
 }
 
 // =====================================================================
@@ -446,7 +468,8 @@ int UE4Overlay::drawESP(const DrawGameData& data, float screenW, float screenH) 
 
     ViewPoint viewPoint;
     const bool hasViewPoint = tryGetViewPoint(data, viewPoint);
-    const bool hasPreciseCamera = hasValidWorldPoint(data.camLocX, data.camLocY, data.camLocZ);
+    const bool hasPreciseCamera = hasValidWorldPoint(data.camLocX, data.camLocY, data.camLocZ)
+        || hasValidWorldPoint(data.myPosX, data.myPosY, data.myPosZ);
 
     for (const auto& p : data.players) {
         if (!p.isAlive) continue;
@@ -516,56 +539,26 @@ int UE4Overlay::drawESP(const DrawGameData& data, float screenW, float screenH) 
         }
 
         if (!rendered && m_enableFallbackESP) {
-            float cx = 0.0f;
-            float topY = 0.0f;
-            float botY = 0.0f;
-            float boxW = 0.0f;
-            bool edgeClamped = false;
-            if (projectFallbackMarker(data, p, screenW, screenH, cx, topY, botY, boxW, edgeClamped)) {
+            float arrowX = 0.0f;
+            float arrowY = 0.0f;
+            float angleRad = 0.0f;
+            if (projectFallbackArrow(data, p, screenW, screenH, arrowX, arrowY, angleRad)) {
                 fallbackRenderedCount++;
 
-                const float hpBarHeight = 4.0f;
-                const float hpBarTop = topY - hpBarHeight - 3.0f;
-                const ImVec2 boxMin(cx - boxW / 2, topY);
-                const ImVec2 boxMax(cx + boxW / 2, botY);
+                const ImVec2 tip(arrowX, arrowY);
+                const ImVec2 forward(std::cos(angleRad), std::sin(angleRad));
+                const ImVec2 side(-forward.y, forward.x);
+                const float arrowLength = 18.0f;
+                const float arrowWidth = 14.0f;
+                const ImVec2 baseCenter(tip.x - forward.x * arrowLength,
+                                        tip.y - forward.y * arrowLength);
+                const ImVec2 baseLeft(baseCenter.x + side.x * (arrowWidth * 0.5f),
+                                      baseCenter.y + side.y * (arrowWidth * 0.5f));
+                const ImVec2 baseRight(baseCenter.x - side.x * (arrowWidth * 0.5f),
+                                       baseCenter.y - side.y * (arrowWidth * 0.5f));
 
-                dl->AddRectFilled(boxMin, boxMax, IM_COL32(0, 0, 0, edgeClamped ? 70 : 90));
-                dl->AddRect(boxMin, boxMax, boxColor, 0.0f, 0, edgeClamped ? 1.5f : 2.0f);
-
-                if (m_enableSnapline) {
-                    dl->AddLine(ImVec2(myCx, myCy), ImVec2(cx, botY),
-                                IM_COL32(255, 255, 255, edgeClamped ? 55 : 85), 1.0f);
-                }
-
-                if (m_enableHP) {
-                    dl->AddRectFilled(ImVec2(boxMin.x, hpBarTop), ImVec2(boxMax.x, hpBarTop + hpBarHeight),
-                                      IM_COL32(0, 0, 0, 160));
-                    dl->AddRectFilled(ImVec2(boxMin.x, hpBarTop),
-                                      ImVec2(boxMin.x + boxW * hpRatio, hpBarTop + hpBarHeight),
-                                      hpColor(hpRatio));
-                }
-
-                if (edgeClamped) {
-                    const float direction = cx < screenW * 0.5f ? -1.0f : 1.0f;
-                    dl->AddTriangleFilled(
-                        ImVec2(cx, topY + 10.0f),
-                        ImVec2(cx - direction * 10.0f, topY + 2.0f),
-                        ImVec2(cx - direction * 10.0f, topY + 18.0f),
-                        boxColor);
-                }
-
-                if (m_enableName) {
-                    const char* label = playerLabel(p);
-                    ImVec2 textSize = ImGui::CalcTextSize(label);
-                    dl->AddText(ImVec2(cx - textSize.x / 2, topY - 18.0f),
-                                IM_COL32(255, 255, 255, 220), label);
-                }
-
-                char infoBuf[48];
-                snprintf(infoBuf, sizeof(infoBuf), "%.0fm %.0fHP", dist, p.health);
-                ImVec2 infoSize = ImGui::CalcTextSize(infoBuf);
-                dl->AddText(ImVec2(cx - infoSize.x / 2, botY + 2.0f),
-                            IM_COL32(220, 220, 220, 210), infoBuf);
+                dl->AddTriangleFilled(tip, baseLeft, baseRight, boxColor);
+                dl->AddTriangle(tip, baseLeft, baseRight, IM_COL32(0, 0, 0, 220), 1.5f);
             }
         }
     }
@@ -638,7 +631,7 @@ int UE4Overlay::drawMinimap(const DrawGameData& data, float screenW, float scree
 
     // 标题
     char title[64];
-    snprintf(title, sizeof(title), "Alive: %d", data.aliveCount);
+    snprintf(title, sizeof(title), "存活: %d", data.aliveCount);
     dl->AddText(ImVec2(mapX + 4, mapY + 2), IM_COL32(200, 200, 200, 220), title);
 
     ImGui::End();

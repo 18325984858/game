@@ -8,8 +8,165 @@
 #include <ImGui-SharedDrawData/modules/ImGuiSharedDrawData.h>
 #include <zstd.h>
 #include <netinet/tcp.h>
+#include <dirent.h>
+#include <fcntl.h>
+#include <strings.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 size_t android::anative_window_creator::detail::compat::SystemVersion = 13;
+
+namespace
+{
+    bool TryLoadChineseFontFromFile(ImGuiIO &imguiIO, const char *path, float fontSizePixels, int fontNo = 0)
+    {
+        struct stat st{};
+        if (nullptr == path || 0 != stat(path, &st) || !S_ISREG(st.st_mode))
+            return false;
+
+        int fd = open(path, O_RDONLY | O_CLOEXEC);
+        if (0 > fd)
+            return false;
+
+        int fileSize = static_cast<int>(st.st_size);
+        void *data = IM_ALLOC(fileSize);
+        if (nullptr == data)
+        {
+            close(fd);
+            return false;
+        }
+
+        size_t totalRead = 0;
+        while (totalRead < static_cast<size_t>(fileSize))
+        {
+            auto readSize = read(fd, reinterpret_cast<char *>(data) + totalRead, fileSize - totalRead);
+            if (0 >= readSize)
+                break;
+            totalRead += static_cast<size_t>(readSize);
+        }
+        close(fd);
+
+        if (totalRead != static_cast<size_t>(fileSize))
+        {
+            IM_FREE(data);
+            return false;
+        }
+
+        ImFontConfig fontConfig;
+        fontConfig.FontDataOwnedByAtlas = true;
+        fontConfig.OversampleH = 1;
+        fontConfig.OversampleV = 1;
+        fontConfig.PixelSnapH = true;
+        fontConfig.FontNo = fontNo;
+        fontConfig.SizePixels = fontSizePixels;
+
+        ImFont *font = imguiIO.Fonts->AddFontFromMemoryTTF(
+                data,
+                fileSize,
+                fontSizePixels,
+                &fontConfig,
+                imguiIO.Fonts->GetGlyphRangesChineseSimplifiedCommon());
+        if (nullptr == font)
+        {
+            IM_FREE(data);
+            return false;
+        }
+
+        if (!imguiIO.Fonts->Build())
+        {
+            LogDebug("[AImGui] Font build skipped: %s", path);
+            imguiIO.Fonts->Clear();
+            return false;
+        }
+
+        if (nullptr == font->FindGlyphNoFallback(static_cast<ImWchar>(0x4E2D)))
+        {
+            LogDebug("[AImGui] Font missing Chinese glyphs: %s", path);
+            imguiIO.Fonts->Clear();
+            return false;
+        }
+
+        LogInfo("[AImGui] Loaded Chinese font: %s (%d bytes, atlas %dx%d)",
+                path,
+                fileSize,
+                imguiIO.Fonts->TexWidth,
+                imguiIO.Fonts->TexHeight);
+        return true;
+    }
+
+    bool IsFontFileName(const char *name)
+    {
+        if (nullptr == name)
+            return false;
+
+        auto len = strlen(name);
+        if (len < 4)
+            return false;
+
+        const char *ext = name + len - 4;
+        return 0 == strcasecmp(ext, ".ttf")
+                || 0 == strcasecmp(ext, ".otf")
+                || 0 == strcasecmp(ext, ".ttc");
+    }
+
+    void LoadPreferredImGuiFont(ImGuiIO &imguiIO, float fontSizePixels)
+    {
+        imguiIO.Fonts->TexDesiredWidth = 4096;
+
+        static const char *fontPaths[] = {
+                "/data/local/tmp/chinese.ttf",
+                "/system/fonts/DroidSansFallback.ttf",
+                "/system/fonts/NotoSansSC-Regular.ttf",
+                "/system/fonts/NotoSansCJKsc-Regular.ttf",
+                "/system/fonts/MiLanProVF.ttf",
+                "/system/fonts/HarmonyOS_Sans_SC.ttf",
+                "/system/fonts/OPPOSans-Regular.ttf",
+                "/system/fonts/VivoSans-Regular.ttf",
+                "/system/fonts/RobotoFallback-Regular.ttf",
+                "/system/fonts/NotoSansSC-Regular.otf",
+                "/system/fonts/NotoSansHans-Regular.otf",
+                "/system/fonts/NotoSansCJKsc-Regular.otf",
+                "/system/fonts/NotoSansSC-Regular.ttc",
+                "/system/fonts/NotoSansCJKsc-Regular.ttc",
+                "/system/fonts/NotoSansCJK-Regular.ttc",
+        };
+
+        for (const char *path : fontPaths)
+        {
+            if (TryLoadChineseFontFromFile(imguiIO, path, fontSizePixels))
+                return;
+        }
+
+        DIR *dir = opendir("/system/fonts");
+        if (nullptr != dir)
+        {
+            dirent *entry = nullptr;
+            while (nullptr != (entry = readdir(dir)))
+            {
+                if (!IsFontFileName(entry->d_name))
+                    continue;
+
+                char path[512] = {};
+                snprintf(path, sizeof(path), "/system/fonts/%s", entry->d_name);
+                if (TryLoadChineseFontFromFile(imguiIO, path, fontSizePixels))
+                {
+                    closedir(dir);
+                    return;
+                }
+            }
+            closedir(dir);
+        }
+
+        imguiIO.Fonts->Clear();
+        ImFontConfig fallbackConfig;
+        fallbackConfig.SizePixels = fontSizePixels;
+        imguiIO.Fonts->AddFontDefault(&fallbackConfig);
+        imguiIO.Fonts->Build();
+        LogInfo("[AImGui] Chinese font unavailable, fallback to default atlas %dx%d",
+                imguiIO.Fonts->TexWidth,
+                imguiIO.Fonts->TexHeight);
+    }
+}
 
 static ImGuiKey KeyCodeToImGuiKey(int32_t keyCode)
 {
@@ -951,9 +1108,7 @@ namespace android
         if (m_options.styleScale > 0.0f && m_options.styleScale != 1.0f)
             ImGui::GetStyle().ScaleAllSizes(m_options.styleScale);
 
-        ImFontConfig fontConfig;
-        fontConfig.SizePixels = m_options.fontSizePixels > 0.0f ? m_options.fontSizePixels : 18.0f;
-        imguiIO.Fonts->AddFontDefault(&fontConfig);
+        LoadPreferredImGuiFont(imguiIO, m_options.fontSizePixels > 0.0f ? m_options.fontSizePixels : 18.0f);
         if (RenderType::RenderClient == m_options.renderType && m_options.exchangeFontData)
         {
             auto sharedFontData = ImGui::GetSharedFontData();
