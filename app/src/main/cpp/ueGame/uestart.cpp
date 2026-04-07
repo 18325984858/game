@@ -5,37 +5,178 @@
 #include "interface/interface.h"
 #include "pubgmhd/pubgmhd.h"
 #include "Draw/UE4Draw.h"
+#include "AImGui.h"
+#include "ANativeWindowCreator.h"
+#include <atomic>
 #include <thread>
 #include <chrono>
+#include <cstdarg>
 #include <fcntl.h>
 #include <unistd.h>
 #include <cstring>
+#include <cstdio>
+#include <string>
 #include <dlfcn.h>
 #include <jni.h>
 #include <stdexcept>
 #include <sys/stat.h>
 #include <dirent.h>
 
+namespace {
+std::string resolveUe4GuiTracePath() {
+    static std::string cachedPath;
+    const auto tryOpen = [](const std::string& path) -> int {
+        if (path.empty()) {
+            return -1;
+        }
+        return open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    };
+
+    if (!cachedPath.empty()) {
+        const int cachedFd = tryOpen(cachedPath);
+        if (cachedFd >= 0) {
+            close(cachedFd);
+            return cachedPath;
+        }
+        cachedPath.clear();
+    }
+
+    char processName[256] = {};
+    const int cmdlineFd = open("/proc/self/cmdline", O_RDONLY | O_CLOEXEC);
+    if (cmdlineFd >= 0) {
+        const ssize_t processNameSize = read(cmdlineFd, processName, sizeof(processName) - 1);
+        close(cmdlineFd);
+        if (processNameSize > 0) {
+            processName[processNameSize] = '\0';
+            std::string packageName(processName);
+            const size_t processSeparator = packageName.find(':');
+            if (processSeparator != std::string::npos) {
+                packageName.resize(processSeparator);
+            }
+
+            if (!packageName.empty()) {
+                const std::string cachePath = "/data/data/" + packageName + "/cache/ue4_gui_trace.txt";
+                const int cacheFd = tryOpen(cachePath);
+                if (cacheFd >= 0) {
+                    close(cacheFd);
+                    cachedPath = cachePath;
+                    return cachedPath;
+                }
+
+                const std::string filesPath = "/data/data/" + packageName + "/files/ue4_gui_trace.txt";
+                const int filesFd = tryOpen(filesPath);
+                if (filesFd >= 0) {
+                    close(filesFd);
+                    cachedPath = filesPath;
+                    return cachedPath;
+                }
+            }
+        }
+    }
+
+    cachedPath = "/data/local/tmp/ue4_gui_trace.txt";
+    return cachedPath;
+}
+
+void writeGuiTrace(int priority, const char* fmt, va_list args) {
+    char message[1024] = {};
+    vsnprintf(message, sizeof(message), fmt, args);
+
+    __android_log_print(priority, "UE4-GUI", "%s", message);
+
+    const std::string tracePath = resolveUe4GuiTracePath();
+    const int fd = open(tracePath.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        return;
+    }
+
+    const char* level = priority >= ANDROID_LOG_ERROR ? "E" : "I";
+    char line[1200] = {};
+    const int length = snprintf(line, sizeof(line), "[%s][pid=%d] %s\n", level, getpid(), message);
+    if (length > 0) {
+        write(fd, line, static_cast<size_t>(length));
+    }
+    close(fd);
+}
+
+void guiInfo(const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    writeGuiTrace(ANDROID_LOG_INFO, fmt, args);
+    va_end(args);
+}
+
+void guiError(const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    writeGuiTrace(ANDROID_LOG_ERROR, fmt, args);
+    va_end(args);
+}
+} // namespace
+
+// 直接日志输出 + 落盘追踪 (避免被进程过滤后完全看不到)
+#define GLOG(...) guiInfo(__VA_ARGS__)
+#define GERR(...) guiError(__VA_ARGS__)
+
 // =====================================================================
 //  JNI Toast 工具 — 在安卓主线程显示下方弹框
 // =====================================================================
 namespace toast_util {
     using JniGetCreatedJavaVMsFn = jint (*)(JavaVM**, jsize, jsize*);
+    using AndroidRuntimeGetJavaVMFn = JavaVM* (*)();
 
     static JavaVM* getJavaVM() {
         static JavaVM* s_vm = nullptr;
         static bool s_tried = false;
         if (s_tried) return s_vm;
         s_tried = true;
-        auto tryResolve = [](void* h) -> JavaVM* {
-            if (!h) return nullptr;
-            auto fn = reinterpret_cast<JniGetCreatedJavaVMsFn>(dlsym(h, "JNI_GetCreatedJavaVMs"));
+
+        auto resolveFromCreatedVMs = [](void* handle) -> JavaVM* {
+            if (!handle) return nullptr;
+            auto fn = reinterpret_cast<JniGetCreatedJavaVMsFn>(dlsym(handle, "JNI_GetCreatedJavaVMs"));
             if (!fn) return nullptr;
-            JavaVM* buf[2] = {}; jsize cnt = 0;
-            return (fn(buf, 2, &cnt) == JNI_OK && cnt > 0) ? buf[0] : nullptr;
+
+            JavaVM* vmBuf[2] = {nullptr, nullptr};
+            jsize vmCount = 0;
+            if (fn(vmBuf, 2, &vmCount) != JNI_OK || vmCount <= 0) return nullptr;
+            return vmBuf[0];
         };
-        s_vm = tryResolve(RTLD_DEFAULT);
-        if (!s_vm) { void* h = dlopen("libart.so", RTLD_NOW|RTLD_NOLOAD); s_vm = tryResolve(h); if (h) dlclose(h); }
+
+        auto resolveFromAndroidRuntime = [](void* handle) -> JavaVM* {
+            if (!handle) return nullptr;
+            constexpr const char* symbols[] = {
+                "_ZN7android14AndroidRuntime9getJavaVMEv",
+                "_ZN7android14AndroidRuntime7getJavaVMEv",
+            };
+            for (const char* symbol : symbols) {
+                auto fn = reinterpret_cast<AndroidRuntimeGetJavaVMFn>(dlsym(handle, symbol));
+                if (!fn) continue;
+                JavaVM* vm = fn();
+                if (vm) return vm;
+            }
+            return nullptr;
+        };
+
+        auto openLibrary = [](const char* name) -> void* {
+            void* handle = dlopen(name, RTLD_NOW | RTLD_NOLOAD);
+            if (!handle) handle = dlopen(name, RTLD_NOW);
+            return handle;
+        };
+
+        s_vm = resolveFromCreatedVMs(RTLD_DEFAULT);
+        if (!s_vm) {
+            void* libArt = openLibrary("libart.so");
+            s_vm = resolveFromCreatedVMs(libArt);
+            if (libArt) dlclose(libArt);
+        }
+        if (!s_vm) {
+            void* libAndroidRuntime = openLibrary("libandroid_runtime.so");
+            s_vm = resolveFromCreatedVMs(libAndroidRuntime);
+            if (!s_vm) s_vm = resolveFromAndroidRuntime(libAndroidRuntime);
+            if (libAndroidRuntime) dlclose(libAndroidRuntime);
+        }
+
+        GLOG("getJavaVM: resolved vm=%p", s_vm);
         return s_vm;
     }
 
@@ -114,254 +255,436 @@ static bool readUeHeaderEnabled() {
     return strstr(buf, "ue_header=1") != nullptr;
 }
 
+struct JavaDisplayInfo {
+    int width = 0;
+    int height = 0;
+    int rotateTheta = 0;
+};
+
+static void normalizePublicOverlayDisplayInfo(JavaDisplayInfo& displayInfo) {
+    if (displayInfo.width <= 0 || displayInfo.height <= 0) {
+        return;
+    }
+
+    const int originalWidth = displayInfo.width;
+    const int originalHeight = displayInfo.height;
+    const int originalRotate = displayInfo.rotateTheta;
+
+    if (displayInfo.width < displayInfo.height || 90 == displayInfo.rotateTheta || 270 == displayInfo.rotateTheta) {
+        displayInfo.width = originalWidth > originalHeight ? originalWidth : originalHeight;
+        displayInfo.height = originalWidth > originalHeight ? originalHeight : originalWidth;
+        displayInfo.rotateTheta = 0;
+
+        GLOG("公开 Overlay 坐标空间归一化: %dx%d r%d -> %dx%d r%d",
+             originalWidth,
+             originalHeight,
+             originalRotate,
+             displayInfo.width,
+             displayInfo.height,
+             displayInfo.rotateTheta);
+    }
+}
+
+static bool queryJavaDisplayInfo(JavaDisplayInfo& outInfo);
+
+static bool readShellCommandOutput(const char* command, std::string& output) {
+    FILE* pipe = popen(command, "r");
+    if (!pipe) {
+        return false;
+    }
+
+    char buffer[256] = {};
+    while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+        output += buffer;
+    }
+
+    const int rc = pclose(pipe);
+    return rc == 0 && !output.empty();
+}
+
+static bool parseDisplaySizeFromText(const std::string& text, int& width, int& height) {
+    for (size_t index = 0; index < text.size(); ++index) {
+        int parsedWidth = 0;
+        int parsedHeight = 0;
+        if (sscanf(text.c_str() + index, "%dx%d", &parsedWidth, &parsedHeight) == 2 &&
+            parsedWidth > 0 && parsedHeight > 0) {
+            width = parsedWidth;
+            height = parsedHeight;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool parseRotationQuarterTurnsFromText(const std::string& text, int& quarterTurns) {
+    constexpr const char* keys[] = {
+        "SurfaceOrientation:",
+        "orientation=",
+        "mCurrentOrientation=",
+    };
+
+    for (const char* key : keys) {
+        const char* found = strstr(text.c_str(), key);
+        if (!found) continue;
+
+        int value = 0;
+        if (sscanf(found + strlen(key), "%d", &value) == 1 && value >= 0 && value <= 3) {
+            quarterTurns = value;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool queryShellDisplayInfo(JavaDisplayInfo& outInfo) {
+    std::string wmSizeOutput;
+    if (!readShellCommandOutput("/system/bin/wm size 2>/dev/null", wmSizeOutput) ||
+        !parseDisplaySizeFromText(wmSizeOutput, outInfo.width, outInfo.height)) {
+        GERR("queryShellDisplayInfo: wm size 解析失败");
+        return false;
+    }
+
+    std::string dumpsysInputOutput;
+    int quarterTurns = -1;
+    if (readShellCommandOutput("/system/bin/dumpsys input 2>/dev/null", dumpsysInputOutput)) {
+        parseRotationQuarterTurnsFromText(dumpsysInputOutput, quarterTurns);
+    }
+
+    if (quarterTurns >= 0) {
+        outInfo.rotateTheta = quarterTurns * 90;
+    } else if (outInfo.width < outInfo.height) {
+        outInfo.rotateTheta = 90;
+    } else {
+        outInfo.rotateTheta = 0;
+    }
+
+    GLOG("queryShellDisplayInfo: width=%d height=%d rotate=%d", outInfo.width, outInfo.height, outInfo.rotateTheta);
+    return outInfo.width > 0 && outInfo.height > 0;
+}
+
+static bool resolveDisplayInfo(JavaDisplayInfo& outInfo) {
+    if (queryJavaDisplayInfo(outInfo)) {
+        return true;
+    }
+
+    GLOG("resolveDisplayInfo: Java 查询失败, 尝试 shell 回退");
+    if (queryShellDisplayInfo(outInfo)) {
+        return true;
+    }
+
+    outInfo.width = 2400;
+    outInfo.height = 1080;
+    outInfo.rotateTheta = 0;
+    GERR("resolveDisplayInfo: shell 查询失败, 使用兜底尺寸 width=%d height=%d rotate=%d",
+         outInfo.width,
+         outInfo.height,
+         outInfo.rotateTheta);
+    return true;
+}
+
+static void runSurfacePreflight(const JavaDisplayInfo& displayInfo) {
+    try {
+        GLOG("AImGui 预检: GetDisplayInfo begin");
+        const auto creatorDisplay = android::ANativeWindowCreator::GetDisplayInfo();
+        GLOG("AImGui 预检: GetDisplayInfo result width=%d height=%d rotate=%d",
+             creatorDisplay.width,
+             creatorDisplay.height,
+             creatorDisplay.theta);
+
+        GLOG("AImGui 预检: Create begin width=%d height=%d", displayInfo.width, displayInfo.height);
+        ANativeWindow* preflightWindow = android::ANativeWindowCreator::Create({
+            .name = "UE4-AImGui-Preflight",
+            .width = displayInfo.width,
+            .height = displayInfo.height,
+            .skipScreenshot = false,
+        });
+        if (!preflightWindow) {
+            GERR("AImGui 预检: Create 返回空窗口");
+            return;
+        }
+
+        GLOG("AImGui 预检: Create 成功 window=%p size=%dx%d",
+             preflightWindow,
+             ANativeWindow_getWidth(preflightWindow),
+             ANativeWindow_getHeight(preflightWindow));
+
+        ANativeWindow_acquire(preflightWindow);
+        ANativeWindow_release(preflightWindow);
+        android::ANativeWindowCreator::Destroy(preflightWindow);
+        GLOG("AImGui 预检: Destroy 完成");
+    } catch (const std::exception& exception) {
+        GERR("AImGui 预检异常: %s", exception.what());
+    } catch (...) {
+        GERR("AImGui 预检异常: 未知异常");
+    }
+}
+
+static bool queryJavaDisplayInfo(JavaDisplayInfo& outInfo) {
+    JavaVM* vm = toast_util::getJavaVM();
+    if (!vm) {
+        GERR("queryJavaDisplayInfo: 无法获取 JavaVM");
+        return false;
+    }
+
+    JNIEnv* env = nullptr;
+    bool attached = false;
+    const jint stat = vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
+    if (stat == JNI_EDETACHED) {
+        if (vm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
+            GERR("queryJavaDisplayInfo: AttachCurrentThread 失败");
+            return false;
+        }
+        attached = true;
+    }
+    if (!env) {
+        GERR("queryJavaDisplayInfo: JNIEnv 为空");
+        return false;
+    }
+
+    bool ok = false;
+    jclass atClass = nullptr;
+    jobject ctx = nullptr;
+    jclass ctxClass = nullptr;
+    jobject wm = nullptr;
+    jclass displayMetricsClass = nullptr;
+    jobject dm = nullptr;
+    jobject display = nullptr;
+    jclass displayClass = nullptr;
+
+    do {
+        atClass = env->FindClass("android/app/ActivityThread");
+        if (!atClass || env->ExceptionCheck()) break;
+        jmethodID curApp = env->GetStaticMethodID(atClass, "currentApplication", "()Landroid/app/Application;");
+        if (!curApp || env->ExceptionCheck()) break;
+        ctx = env->CallStaticObjectMethod(atClass, curApp);
+        if (!ctx || env->ExceptionCheck()) break;
+
+        ctxClass = env->GetObjectClass(ctx);
+        if (!ctxClass || env->ExceptionCheck()) break;
+        jmethodID getSysSvc = env->GetMethodID(ctxClass, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;");
+        if (!getSysSvc || env->ExceptionCheck()) break;
+        jstring wmName = env->NewStringUTF("window");
+        wm = env->CallObjectMethod(ctx, getSysSvc, wmName);
+        env->DeleteLocalRef(wmName);
+        if (!wm || env->ExceptionCheck()) break;
+
+        displayMetricsClass = env->FindClass("android/util/DisplayMetrics");
+        if (!displayMetricsClass || env->ExceptionCheck()) break;
+        jmethodID dmInit = env->GetMethodID(displayMetricsClass, "<init>", "()V");
+        if (!dmInit || env->ExceptionCheck()) break;
+        dm = env->NewObject(displayMetricsClass, dmInit);
+        if (!dm || env->ExceptionCheck()) break;
+
+        jclass wmClass = env->FindClass("android/view/WindowManager");
+        if (!wmClass || env->ExceptionCheck()) break;
+        jmethodID getDisplay = env->GetMethodID(wmClass, "getDefaultDisplay", "()Landroid/view/Display;");
+        if (!getDisplay || env->ExceptionCheck()) {
+            env->DeleteLocalRef(wmClass);
+            break;
+        }
+        display = env->CallObjectMethod(wm, getDisplay);
+        env->DeleteLocalRef(wmClass);
+        if (!display || env->ExceptionCheck()) break;
+
+        displayClass = env->GetObjectClass(display);
+        if (!displayClass || env->ExceptionCheck()) break;
+        jmethodID getRealMetrics = env->GetMethodID(displayClass, "getRealMetrics", "(Landroid/util/DisplayMetrics;)V");
+        if (!getRealMetrics || env->ExceptionCheck()) break;
+        env->CallVoidMethod(display, getRealMetrics, dm);
+        if (env->ExceptionCheck()) break;
+
+        jfieldID widthField = env->GetFieldID(displayMetricsClass, "widthPixels", "I");
+        jfieldID heightField = env->GetFieldID(displayMetricsClass, "heightPixels", "I");
+        if (!widthField || !heightField || env->ExceptionCheck()) break;
+        outInfo.width = env->GetIntField(dm, widthField);
+        outInfo.height = env->GetIntField(dm, heightField);
+
+        jmethodID getRotation = env->GetMethodID(displayClass, "getRotation", "()I");
+        if (getRotation && !env->ExceptionCheck()) {
+            outInfo.rotateTheta = env->CallIntMethod(display, getRotation) * 90;
+            if (env->ExceptionCheck()) {
+                env->ExceptionClear();
+                outInfo.rotateTheta = 0;
+            }
+        }
+
+        ok = outInfo.width > 0 && outInfo.height > 0;
+    } while (false);
+
+    if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+    }
+    if (displayClass) env->DeleteLocalRef(displayClass);
+    if (display) env->DeleteLocalRef(display);
+    if (dm) env->DeleteLocalRef(dm);
+    if (displayMetricsClass) env->DeleteLocalRef(displayMetricsClass);
+    if (wm) env->DeleteLocalRef(wm);
+    if (ctxClass) env->DeleteLocalRef(ctxClass);
+    if (ctx) env->DeleteLocalRef(ctx);
+    if (atClass) env->DeleteLocalRef(atClass);
+    if (attached) vm->DetachCurrentThread();
+
+    if (ok) {
+        GLOG("queryJavaDisplayInfo: width=%d height=%d rotate=%d", outInfo.width, outInfo.height, outInfo.rotateTheta);
+    } else {
+        GERR("queryJavaDisplayInfo: 获取显示信息失败");
+    }
+    return ok;
+}
+
 // =====================================================================
 //  UE4 GUI 线程 — 使用 AImGui 独立 Surface 绘制 (无 Hook)
 // =====================================================================
 
-// 直接日志输出 (绕过可能被 OBFU 覆盖的 LOG 宏)
-#define GLOG(...) __android_log_print(ANDROID_LOG_INFO, "UE4-GUI", __VA_ARGS__)
-#define GERR(...) __android_log_print(ANDROID_LOG_ERROR, "UE4-GUI", __VA_ARGS__)
+static std::atomic<bool> g_ue4GuiThreadStarted{false};
 
-#include <EGL/egl.h>
-#include <GLES3/gl3.h>
-#include <android/native_window.h>
-#include <android/native_window_jni.h>
-#include <imgui/imgui.h>
-#include <imgui/backends/imgui_impl_opengl3.h>
-#include <imgui/backends/imgui_impl_android.h>
+namespace {
+using Clock = std::chrono::steady_clock;
 
-// =====================================================================
-//  通过 JNI 创建悬浮窗覆盖层 (不依赖 libgui.so)
-//  使用 WindowManager + SurfaceView 获取 ANativeWindow
-// =====================================================================
-static ANativeWindow* createOverlayWindow(JNIEnv* env) {
-    // 获取 Application context
-    jclass atClass = env->FindClass("android/app/ActivityThread");
-    if (!atClass) return nullptr;
-    jmethodID curApp = env->GetStaticMethodID(atClass, "currentApplication", "()Landroid/app/Application;");
-    jobject ctx = curApp ? env->CallStaticObjectMethod(atClass, curApp) : nullptr;
-    env->DeleteLocalRef(atClass);
-    if (!ctx) return nullptr;
-
-    // 获取 WindowManager
-    jclass ctxClass = env->GetObjectClass(ctx);
-    jmethodID getSysSvc = env->GetMethodID(ctxClass, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;");
-    jstring wmName = env->NewStringUTF("window");
-    jobject wm = env->CallObjectMethod(ctx, getSysSvc, wmName);
-    env->DeleteLocalRef(wmName);
-    env->DeleteLocalRef(ctxClass);
-    if (!wm) { env->DeleteLocalRef(ctx); return nullptr; }
-
-    // 获取屏幕尺寸
-    jclass displayMetricsClass = env->FindClass("android/util/DisplayMetrics");
-    jobject dm = env->NewObject(displayMetricsClass, env->GetMethodID(displayMetricsClass, "<init>", "()V"));
-    jclass wmClass = env->FindClass("android/view/WindowManager");
-    jmethodID getDisplay = env->GetMethodID(wmClass, "getDefaultDisplay", "()Landroid/view/Display;");
-    jobject display = env->CallObjectMethod(wm, getDisplay);
-    jclass displayClass = env->GetObjectClass(display);
-    jmethodID getRealMetrics = env->GetMethodID(displayClass, "getRealMetrics", "(Landroid/util/DisplayMetrics;)V");
-    env->CallVoidMethod(display, getRealMetrics, dm);
-    int screenW = env->GetIntField(dm, env->GetFieldID(displayMetricsClass, "widthPixels", "I"));
-    int screenH = env->GetIntField(dm, env->GetFieldID(displayMetricsClass, "heightPixels", "I"));
-    env->DeleteLocalRef(dm); env->DeleteLocalRef(display); env->DeleteLocalRef(displayClass);
-    env->DeleteLocalRef(displayMetricsClass); env->DeleteLocalRef(wmClass);
-    GLOG("屏幕尺寸: %dx%d", screenW, screenH);
-
-    // 创建 SurfaceView
-    jclass surfaceViewClass = env->FindClass("android/view/SurfaceView");
-    jmethodID svInit = env->GetMethodID(surfaceViewClass, "<init>", "(Landroid/content/Context;)V");
-    jobject surfaceView = env->NewObject(surfaceViewClass, svInit, ctx);
-
-    // 设置透明背景
-    jmethodID setZOrderOnTop = env->GetMethodID(surfaceViewClass, "setZOrderOnTop", "(Z)V");
-    env->CallVoidMethod(surfaceView, setZOrderOnTop, JNI_TRUE);
-    jmethodID getHolder = env->GetMethodID(surfaceViewClass, "getHolder", "()Landroid/view/SurfaceHolder;");
-    jobject holder = env->CallObjectMethod(surfaceView, getHolder);
-    jclass holderClass = env->GetObjectClass(holder);
-    jmethodID setFormat = env->GetMethodID(holderClass, "setFormat", "(I)V");
-    env->CallVoidMethod(holder, setFormat, -3); // PixelFormat.TRANSLUCENT
-
-    // 创建 LayoutParams (TYPE_APPLICATION_OVERLAY)
-    jclass lpClass = env->FindClass("android/view/WindowManager$LayoutParams");
-    jmethodID lpInit = env->GetMethodID(lpClass, "<init>", "(IIIII)V");
-    // TYPE_APPLICATION_OVERLAY = 2038, FLAG_NOT_FOCUSABLE|FLAG_NOT_TOUCHABLE|FLAG_LAYOUT_IN_SCREEN = 0x8|0x10|0x100
-    jobject lp = env->NewObject(lpClass, lpInit, screenW, screenH, 2038, 0x8 | 0x10 | 0x100, -3);
-
-    // 设置 gravity = TOP | LEFT
-    jfieldID gravityField = env->GetFieldID(lpClass, "gravity", "I");
-    env->SetIntField(lp, gravityField, 0x30 | 0x03); // Gravity.TOP | Gravity.LEFT
-
-    // 添加到 WindowManager
-    jclass wmIfClass = env->FindClass("android/view/ViewManager");
-    jmethodID addView = env->GetMethodID(wmIfClass, "addView", "(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V");
-    env->CallVoidMethod(wm, addView, surfaceView, lp);
-
-    if (env->ExceptionCheck()) {
-        GERR("创建悬浮窗异常");
-        env->ExceptionDescribe();
-        env->ExceptionClear();
-        env->DeleteLocalRef(surfaceView); env->DeleteLocalRef(holder);
-        env->DeleteLocalRef(lp); env->DeleteLocalRef(lpClass);
-        env->DeleteLocalRef(wm); env->DeleteLocalRef(ctx);
-        return nullptr;
+bool shouldLogEvery(Clock::time_point& lastLogTime, std::chrono::milliseconds interval) {
+    const auto now = Clock::now();
+    if (lastLogTime.time_since_epoch().count() != 0 && now - lastLogTime < interval) {
+        return false;
     }
-
-    // 等待 Surface 就绪
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-
-    // 获取 Surface -> ANativeWindow
-    jmethodID getSurface = env->GetMethodID(holderClass, "getSurface", "()Landroid/view/Surface;");
-    jobject surface = env->CallObjectMethod(holder, getSurface);
-    if (!surface) {
-        GERR("getSurface 返回 null");
-        env->DeleteLocalRef(holder); env->DeleteLocalRef(holderClass);
-        env->DeleteLocalRef(surfaceView); env->DeleteLocalRef(lp);
-        env->DeleteLocalRef(wm); env->DeleteLocalRef(ctx);
-        return nullptr;
-    }
-
-    ANativeWindow* window = ANativeWindow_fromSurface(env, surface);
-    GLOG("ANativeWindow: %p", window);
-
-    env->DeleteLocalRef(surface); env->DeleteLocalRef(holder);
-    env->DeleteLocalRef(holderClass); env->DeleteLocalRef(surfaceView);
-    env->DeleteLocalRef(lp); env->DeleteLocalRef(lpClass);
-    env->DeleteLocalRef(wmIfClass); env->DeleteLocalRef(wm); env->DeleteLocalRef(ctx);
-    return window;
+    lastLogTime = now;
+    return true;
 }
 
+class UE4GuiThreadResetGuard {
+public:
+    UE4GuiThreadResetGuard() = default;
+    UE4GuiThreadResetGuard(const UE4GuiThreadResetGuard&) = delete;
+    UE4GuiThreadResetGuard& operator=(const UE4GuiThreadResetGuard&) = delete;
+    ~UE4GuiThreadResetGuard() {
+        g_ue4GuiThreadStarted.store(false, std::memory_order_release);
+        GLOG("GUI 线程已退出, 释放单例锁");
+    }
+};
+} // namespace
+
 static void UE4GuiThread() {
+    UE4GuiThreadResetGuard resetGuard;
+
     GLOG("GUI 线程已启动, 等待 10 秒...");
     std::this_thread::sleep_for(std::chrono::seconds(10));
 
-    // 获取 JVM (直接调用 JNI_GetCreatedJavaVMs)
-    JavaVM* vm = nullptr;
-    jsize vmCount = 0;
-    // 先用 toast_util 的缓存
-    vm = toast_util::getJavaVM();
-    if (!vm) {
-        // 直接从 libart.so 获取 (尝试多个路径)
-        const char* artPaths[] = {
-            "libart.so",
-            "/apex/com.android.art/lib64/libart.so",
-            "/system/lib64/libart.so",
-        };
-        void* art = nullptr;
-        for (auto* p : artPaths) {
-            art = dlopen(p, RTLD_NOW | RTLD_NOLOAD);
-            if (art) break;
-            art = dlopen(p, RTLD_NOW);
-            if (art) break;
-        }
-        if (art) {
-            auto fn = reinterpret_cast<jint(*)(JavaVM**, jsize, jsize*)>(dlsym(art, "JNI_GetCreatedJavaVMs"));
-            if (fn) {
-                JavaVM* vms[2] = {};
-                fn(vms, 2, &vmCount);
-                if (vmCount > 0) vm = vms[0];
-            }
-            GLOG("从 libart.so 获取 JVM: fn=%p vmCount=%d vm=%p", (void*)fn, vmCount, vm);
-        } else {
-            GLOG("dlopen libart.so 失败: %s", dlerror());
-        }
-    }
-    if (!vm) { GERR("无法获取 JavaVM"); return; }
-
-    JNIEnv* env = nullptr;
-    bool attached = false;
-    jint stat = vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
-    if (stat == JNI_EDETACHED) {
-        if (vm->AttachCurrentThread(&env, nullptr) != JNI_OK) { GERR("AttachCurrentThread 失败"); return; }
-        attached = true;
-    }
-    if (!env) { GERR("JNIEnv 为空"); return; }
-
-    GLOG("正在通过 JNI 创建悬浮窗...");
-    ANativeWindow* window = createOverlayWindow(env);
-    if (!window) {
-        GERR("创建悬浮窗失败, 绘制功能不可用");
-        if (attached) vm->DetachCurrentThread();
+    JavaDisplayInfo displayInfo;
+    if (!resolveDisplayInfo(displayInfo)) {
+        GERR("GUI 线程终止: 无法获取显示信息");
         return;
     }
-    GLOG("悬浮窗创建成功");
+    normalizePublicOverlayDisplayInfo(displayInfo);
 
-    // 初始化 EGL
-    EGLDisplay eglDisplay = eglGetDisplay(EGL_DEFAULT_DISPLAY);
-    eglInitialize(eglDisplay, nullptr, nullptr);
+    GLOG("准备初始化 AImGui RenderClient: width=%d height=%d rotate=%d", displayInfo.width, displayInfo.height, displayInfo.rotateTheta);
 
-    EGLint configAttribs[] = {
-        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
-        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
-        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
-        EGL_DEPTH_SIZE, 24, EGL_STENCIL_SIZE, 8,
-        EGL_NONE
+    android::AImGui::Options imguiOptions{
+        .renderType = android::AImGui::RenderType::RenderClient,
+        .compressionFrameData = false,
+        .autoUpdateOrientation = false,
+        .exchangeFontData = true,
+        .tcpNoDelay = true,
+        .disableVsync = true,
+        .styleScale = 1.75f,
+        .fontSizePixels = 18.0f,
+        .screenWidth = displayInfo.width,
+        .screenHeight = displayInfo.height,
+        .rotateTheta = displayInfo.rotateTheta,
+        .clientConnectAddress = "127.0.0.1",
     };
-    EGLConfig eglConfig; EGLint numConfig;
-    eglChooseConfig(eglDisplay, configAttribs, &eglConfig, 1, &numConfig);
 
-    EGLint ctxAttribs[] = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
-    EGLContext eglCtx = eglCreateContext(eglDisplay, eglConfig, EGL_NO_CONTEXT, ctxAttribs);
+    GLOG("AImGui RenderClient 选项已准备: width=%d height=%d rotate=%d", imguiOptions.screenWidth, imguiOptions.screenHeight, imguiOptions.rotateTheta);
 
-    EGLint bufFormat;
-    eglGetConfigAttrib(eglDisplay, eglConfig, EGL_NATIVE_VISUAL_ID, &bufFormat);
-    ANativeWindow_setBuffersGeometry(window, 0, 0, bufFormat);
-    EGLSurface eglSurface = eglCreateWindowSurface(eglDisplay, eglConfig, window, nullptr);
+    std::unique_ptr<android::AImGui> imgui;
+    for (int attempt = 1; attempt <= 20; ++attempt) {
+        try {
+            imgui = std::make_unique<android::AImGui>(imguiOptions);
+            GLOG("AImGui RenderClient 构造已返回: attempt=%d state=%d", attempt, *imgui ? 1 : 0);
+        } catch (const std::exception& exception) {
+            GERR("AImGui RenderClient 构造异常: attempt=%d error=%s", attempt, exception.what());
+            imgui.reset();
+        } catch (...) {
+            GERR("AImGui RenderClient 构造异常: attempt=%d error=unknown", attempt);
+            imgui.reset();
+        }
 
-    eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglCtx);
+        if (imgui && *imgui) {
+            break;
+        }
 
-    int screenW = ANativeWindow_getWidth(window);
-    int screenH = ANativeWindow_getHeight(window);
-    GLOG("EGL 初始化完成: %dx%d", screenW, screenH);
+        GLOG("等待公开 Overlay 服务就绪: attempt=%d/20", attempt);
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
 
-    // 初始化 ImGui
-    IMGUI_CHECKVERSION();
-    ImGui::CreateContext();
-    auto& io = ImGui::GetIO();
-    io.IniFilename = nullptr;
-    io.DisplaySize = ImVec2((float)screenW, (float)screenH);
-    ImGui::StyleColorsDark();
-    ImGui::GetStyle().ScaleAllSizes(3.f);
+    if (!imgui || !(*imgui)) {
+        GERR("AImGui RenderClient 初始化失败: 无法连接公开 Overlay 服务");
+        return;
+    }
 
-    // 加载字体 (默认)
-    io.Fonts->AddFontDefault();
-    io.Fonts->Build();
+    GLOG("AImGui RenderClient 初始化完成");
 
-    ImGui_ImplOpenGL3_Init("#version 300 es");
-    GLOG("ImGui 初始化完成");
+    std::thread([imguiPtr = imgui.get()]() {
+        GLOG("RenderClient 输入线程启动");
+        while (true) {
+            imguiPtr->ProcessInputEvent();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }).detach();
 
     ue4draw::DrawGameData gameData;
     ue4draw::UE4Overlay overlay;
-    double lastTime = 0.0;
+    Clock::time_point lastHeartbeatLog;
+    Clock::time_point lastDisplayRefresh;
+    JavaDisplayInfo activeDisplayInfo = displayInfo;
 
     // 渲染主循环
     while (true) {
-        // 时间
-        timespec ts{};
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        double now = (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
-        io.DeltaTime = lastTime > 0.0 ? (float)(now - lastTime) : (1.0f / 60.0f);
-        lastTime = now;
+        imgui->BeginFrame();
 
-        // 检查窗口尺寸变化
-        int curW = ANativeWindow_getWidth(window);
-        int curH = ANativeWindow_getHeight(window);
-        if (curW > 0 && curH > 0) {
-            io.DisplaySize = ImVec2((float)curW, (float)curH);
+        if (shouldLogEvery(lastDisplayRefresh, std::chrono::milliseconds(1000))) {
+            JavaDisplayInfo refreshedDisplayInfo;
+            if (resolveDisplayInfo(refreshedDisplayInfo)) {
+                normalizePublicOverlayDisplayInfo(refreshedDisplayInfo);
+                if (refreshedDisplayInfo.width != activeDisplayInfo.width
+                    || refreshedDisplayInfo.height != activeDisplayInfo.height
+                    || refreshedDisplayInfo.rotateTheta != activeDisplayInfo.rotateTheta) {
+                    GLOG("RenderClient 显示尺寸刷新: %dx%d r%d -> %dx%d r%d",
+                         activeDisplayInfo.width,
+                         activeDisplayInfo.height,
+                         activeDisplayInfo.rotateTheta,
+                         refreshedDisplayInfo.width,
+                         refreshedDisplayInfo.height,
+                         refreshedDisplayInfo.rotateTheta);
+                    activeDisplayInfo = refreshedDisplayInfo;
+                }
+            }
         }
 
-        ImGui_ImplOpenGL3_NewFrame();
-        ImGui::NewFrame();
+        {
+            ImGuiIO& io = ImGui::GetIO();
+            if (activeDisplayInfo.width > 0 && activeDisplayInfo.height > 0) {
+                io.DisplaySize = ImVec2(static_cast<float>(activeDisplayInfo.width), static_cast<float>(activeDisplayInfo.height));
+                io.DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
+            }
+        }
 
         ue4draw::SharedUE4Data::getInstance().getData(gameData);
         overlay.drawOverlay(gameData);
 
-        ImGui::Render();
-        glClearColor(0, 0, 0, 0);
-        glClear(GL_COLOR_BUFFER_BIT);
-        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-        eglSwapBuffers(eglDisplay, eglSurface);
+        if (shouldLogEvery(lastHeartbeatLog, std::chrono::milliseconds(3000))) {
+            const ImGuiIO& io = ImGui::GetIO();
+            GLOG("RenderClient 心跳: display=%.0fx%.0f fps=%.1f inMatch=%d alive=%d/%d tracked=%zu",
+                 io.DisplaySize.x,
+                 io.DisplaySize.y,
+                 io.Framerate,
+                 gameData.inMatch ? 1 : 0,
+                 gameData.aliveCount,
+                 gameData.totalCount,
+                 gameData.players.size());
+        }
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(16));
+        imgui->EndFrame();
+        std::this_thread::yield();
     }
 }
 
@@ -480,6 +803,11 @@ extern "C" __attribute__((visibility("default")))
 bool MyStartPointUE4(void* plibUE4ModeBase, void* pGNames,
                      void* pGWorld, void* pGUObjectArray, uint64_t moduleSize, void* pData) {
     if (!plibUE4ModeBase || !pGNames || !pGWorld || !pGUObjectArray) {
+        GERR("MyStartPointUE4: 参数为空 base=%p GNames=%p GWorld=%p GUObjectArray=%p",
+             plibUE4ModeBase,
+             pGNames,
+             pGWorld,
+             pGUObjectArray);
         LOG(LOG_LEVEL_ERROR, "[MyStartPointUE4] 参数为空: base=%p GNames=%p GWorld=%p GUObjectArray=%p",
             plibUE4ModeBase, pGNames, pGWorld, pGUObjectArray);
         return false;
@@ -491,13 +819,28 @@ bool MyStartPointUE4(void* plibUE4ModeBase, void* pGNames,
     uintptr_t base = reinterpret_cast<uintptr_t>(plibUE4ModeBase);
     void* pGWorldGlobal = reinterpret_cast<void*>(base + 0x14988578);
 
+        GLOG("MyStartPointUE4: base=%p GNames=%p GWorldSnapshot=%p GWorldGlobal=%p GUObjectArray=%p moduleSize=0x%llX",
+            plibUE4ModeBase,
+            pGNames,
+            pGWorld,
+            pGWorldGlobal,
+            pGUObjectArray,
+            (unsigned long long)moduleSize);
+
     LOG(LOG_LEVEL_INFO, "MatchMonitor [MyStartPointUE4] 参数: base=%p GNames=%p GWorld=%p(全局=%p) GUObjectArray=%p moduleSize=0x%llX",
             plibUE4ModeBase, pGNames, pGWorld, pGWorldGlobal, pGUObjectArray, (unsigned long long)moduleSize);
 
     LOG(LOG_LEVEL_INFO, "[MyStartPointUE4] 启动 UE4 工作线程");
 
-    // 启动 GUI 线程 (独立 Surface 绘制, 无 Hook)
-    std::thread(UE4GuiThread).detach();
+    bool expected = false;
+    if (g_ue4GuiThreadStarted.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        GLOG("MyStartPointUE4: 启动 UE4 GUI 线程");
+        LOG(LOG_LEVEL_INFO, "[MyStartPointUE4] 启动 UE4 GUI 线程");
+        std::thread(UE4GuiThread).detach();
+    } else {
+        GLOG("MyStartPointUE4: UE4 GUI 线程已存在, 跳过重复启动");
+        LOG(LOG_LEVEL_INFO, "[MyStartPointUE4] UE4 GUI 线程已存在, 跳过重复启动");
+    }
 
     // 传递 pGWorldGlobal (全局变量地址) 而非 pGWorld (快照值)
     std::thread(UE4WorkerThread, plibUE4ModeBase, pGNames,

@@ -232,6 +232,58 @@ static uint64_t getRemoteModuleSize(pid_t pid, const char* moduleName) {
     return (maxEnd > minStart) ? (maxEnd - minStart) : 0;
 }
 
+static pid_t waitForTargetProcessReady(const char* packageName, Injector::InjectMode mode) {
+    constexpr int kDefaultWaitSeconds = 15;
+    constexpr int kPubgWaitSeconds = 45;
+    constexpr int kPubgStableSamples = 3;
+
+    const int maxWaitSeconds = (mode == Injector::MODE_PUBG) ? kPubgWaitSeconds : kDefaultWaitSeconds;
+    pid_t lastPid = -1;
+    int stableSamples = 0;
+
+    for (int attempt = 1; attempt <= maxWaitSeconds; ++attempt) {
+        pid_t pid = Injector::findPidByName(packageName);
+        if (pid <= 0) {
+            lastPid = -1;
+            stableSamples = 0;
+            LOG(LOG_LEVEL_INFO, "[Injector] 等待目标进程启动... (%d/%d)", attempt, maxWaitSeconds);
+            sleep(1);
+            continue;
+        }
+
+        if (mode != Injector::MODE_PUBG) {
+            return pid;
+        }
+
+        const bool ue4Loaded = getRemoteModuleBase(pid, "libUE4.so") != 0;
+        if (pid != lastPid) {
+            lastPid = pid;
+            stableSamples = ue4Loaded ? 1 : 0;
+        } else if (ue4Loaded) {
+            ++stableSamples;
+        } else {
+            stableSamples = 0;
+        }
+
+        LOG(LOG_LEVEL_INFO,
+            "[Injector] PUBG 就绪检查 pid=%d libUE4=%s stable=%d/%d (%d/%d)",
+            pid,
+            ue4Loaded ? "yes" : "no",
+            stableSamples,
+            kPubgStableSamples,
+            attempt,
+            maxWaitSeconds);
+
+        if (ue4Loaded && stableSamples >= kPubgStableSamples) {
+            return pid;
+        }
+
+        sleep(1);
+    }
+
+    return -1;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // 获取本进程某个模块的基地址
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -500,6 +552,15 @@ int Injector::injectRemote(pid_t pid, const char* soPath, InjectMode mode) {
             LOG(LOG_LEVEL_INFO, "[Injector] GUObjectArray: %llx", (unsigned long long)pGUObjectArray);
             LOG(LOG_LEVEL_INFO, "[Injector] GWorld:        %llx", (unsigned long long)pGWorld);
 
+            if (ue4Size == 0 || pGNames == 0 || pGWorld == 0) {
+                LOG(LOG_LEVEL_ERROR,
+                    "[Injector] PUBG 全局指针未就绪 ue4Size=0x%llx GNames=%llx GWorld=%llx",
+                    (unsigned long long)ue4Size,
+                    (unsigned long long)pGNames,
+                    (unsigned long long)pGWorld);
+                goto cleanup;
+            }
+
             // 调用 MyStartPointUE4(libUE4Base, pGNames, pGWorld, pGUObjectArray, moduleSize, NULL)
             uint64_t startParams[6] = { ue4Base, pGNames, pGWorld, pGUObjectArray, ue4Size, 0 };
             LOG(LOG_LEVEL_INFO, "[Injector] 调用 MyStartPointUE4...");
@@ -509,6 +570,11 @@ int Injector::injectRemote(pid_t pid, const char* soPath, InjectMode mode) {
                 goto cleanup;
             }
             LOG(LOG_LEVEL_INFO, "[Injector] ✓ MyStartPointUE4 返回: %lld", (long long)startRet);
+            if (startRet == 0) {
+                LOG(LOG_LEVEL_ERROR, "[Injector] MyStartPointUE4 返回 0, 视为失败");
+                goto cleanup;
+            }
+            result = 0;
         } else {
         // ═══ LOL (il2cpp) 注入路径 ═══
         {
@@ -567,6 +633,11 @@ int Injector::injectRemote(pid_t pid, const char* soPath, InjectMode mode) {
                 goto cleanup;
             }
             LOG(LOG_LEVEL_INFO, "[Injector] ✓ MyStartPoint 返回: %lld", (long long)startRet);
+            if (startRet == 0) {
+                LOG(LOG_LEVEL_ERROR, "[Injector] MyStartPoint 返回 0, 视为失败");
+                goto cleanup;
+            }
+            result = 0;
         }
         } // end LOL branch
 
@@ -578,8 +649,6 @@ cleanup:
             ptrace_call(pid, remoteMunmapAddr, munmapParams, 2, nullptr);
             LOG(LOG_LEVEL_INFO, "[Injector] 远程临时内存已释放");
         }
-
-        result = 0;
     }
 
 detach:
@@ -656,17 +725,14 @@ int Injector::injectByPackageName(const char* packageName, const char* soPath, I
     LOG(LOG_LEVEL_INFO, "[Injector] 开始注入 package=%s so=%s mode=%s",
         packageName, soPath, mode == MODE_PUBG ? "PUBG" : "LOL");
 
-    // 等待目标进程启动, 每秒检查一次, 最多等待 15 秒
-    pid_t pid = -1;
-    for (int i = 0; i < 15; i++) {
-        pid = findPidByName(packageName);
-        if (pid > 0) break;
-        LOG(LOG_LEVEL_INFO, "[Injector] 等待目标进程启动... (%d/15)", i + 1);
-        sleep(1);
-    }
+    pid_t pid = waitForTargetProcessReady(packageName, mode);
 
     if (pid <= 0) {
-        LOG(LOG_LEVEL_ERROR, "[Injector] 等待 15 秒后目标进程仍未运行: %s", packageName);
+        if (mode == MODE_PUBG) {
+            LOG(LOG_LEVEL_ERROR, "[Injector] PUBG 目标进程未在就绪窗口内稳定并加载 libUE4.so: %s", packageName);
+        } else {
+            LOG(LOG_LEVEL_ERROR, "[Injector] 等待 15 秒后目标进程仍未运行: %s", packageName);
+        }
         return -1;
     }
 

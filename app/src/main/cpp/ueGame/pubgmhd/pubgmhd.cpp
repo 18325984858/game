@@ -19,6 +19,17 @@
 
 namespace pubgmhd {
 
+using Clock = std::chrono::steady_clock;
+
+bool shouldLogEvery(Clock::time_point& lastLogTime, std::chrono::milliseconds interval) {
+    const auto now = Clock::now();
+    if (lastLogTime.time_since_epoch().count() != 0 && now - lastLogTime < interval) {
+        return false;
+    }
+    lastLogTime = now;
+    return true;
+}
+
 // =====================================================================
 //  观战类型名称
 // =====================================================================
@@ -668,8 +679,13 @@ int MatchMonitor::updatePlayerList(uintptr_t gameStatePtr) {
         seenKeys[playerKey] = true;
         updated++;
 
-        // 记录自己TeamID
-        if (i == 0 && teamID > 0) m_myTeamID = teamID;
+        // 记录本地玩家 key / TeamID
+        if (i == 0) {
+            if (teamID > 0) {
+                m_myTeamID = teamID;
+            }
+            m_myPlayerKey = playerKey;
+        }
     }
 
     // 移除已退出的玩家
@@ -728,6 +744,9 @@ void MatchMonitor::closeLog() {
 //  玩家数据轮询
 // =====================================================================
 void MatchMonitor::pollPlayers() {
+    static Clock::time_point s_lastPlayerLogTime;
+    const bool shouldDumpPlayerLog = shouldLogEvery(s_lastPlayerLogTime, std::chrono::milliseconds(PLAYER_LOG_INTERVAL_MS));
+
     auto* names = reinterpret_cast<ue4::TNameEntryArray*>(m_gNames);
     m_numNames = names->NumElements;
     MatchState ms = getMatchState();
@@ -758,39 +777,42 @@ void MatchMonitor::pollPlayers() {
         cur = cur->next;
     }
 
-    MLOG(LOG_LEVEL_INFO, "[Players] %d alive (%d team + %d enemy) / %d total",
-        aliveCount, aliveTeam, aliveEnemy, m_playerList.size());
+    if (shouldDumpPlayerLog) {
+        MLOG(LOG_LEVEL_INFO, "[Players] %d alive (%d team + %d enemy) / %d total",
+            aliveCount, aliveTeam, aliveEnemy, m_playerList.size());
+    }
 
     char logBuf[512];
 
     // logcat + 文件日志: 敌人
-    int limit = (enemies.size() < 40) ? (int)enemies.size() : 40;
-    for (int i = 0; i < limit; i++) {
-        PlayerNode* p = enemies[i];
-        MLOG(LOG_LEVEL_INFO, "[Enemy] T%d %s %.0f/%.0fHP (%.0f, %.0f, %.0f) K:%d %s",
-             p->teamID, p->isAI ? "AI" : "Real",
-             p->health, p->healthMax,
-             p->pos.x, p->pos.y, p->pos.z,
-             p->kills, p->playerName.c_str());
-        snprintf(logBuf, sizeof(logBuf), " ★ T%d %.0f/%.0fHP (%.0f, %.0f, %.0f) %s",
-                 p->teamID, p->health, p->healthMax,
-                 p->pos.x, p->pos.y, p->pos.z, p->playerName.c_str());
-        writeLog(logBuf);
+    if (shouldDumpPlayerLog) {
+        int limit = (enemies.size() < 40) ? (int)enemies.size() : 40;
+        for (int i = 0; i < limit; i++) {
+            PlayerNode* p = enemies[i];
+            MLOG(LOG_LEVEL_INFO, "[Enemy] T%d %s %.0f/%.0fHP (%.0f, %.0f, %.0f) K:%d %s",
+                 p->teamID, p->isAI ? "AI" : "Real",
+                 p->health, p->healthMax,
+                 p->pos.x, p->pos.y, p->pos.z,
+                 p->kills, p->playerName.c_str());
+            snprintf(logBuf, sizeof(logBuf), " ★ T%d %.0f/%.0fHP (%.0f, %.0f, %.0f) %s",
+                     p->teamID, p->health, p->healthMax,
+                     p->pos.x, p->pos.y, p->pos.z, p->playerName.c_str());
+            writeLog(logBuf);
+        }
+        for (int i = 0; i < (int)teammates.size(); i++) {
+            PlayerNode* p = teammates[i];
+            MLOG(LOG_LEVEL_INFO, "[Team] T%d %s %.0f/%.0fHP (%.0f, %.0f, %.0f) K:%d %s",
+                 p->teamID, p->isAI ? "AI" : "Real",
+                 p->health, p->healthMax,
+                 p->pos.x, p->pos.y, p->pos.z,
+                 p->kills, p->playerName.c_str());
+            snprintf(logBuf, sizeof(logBuf), " ○ T%d %.0f/%.0fHP (%.0f, %.0f, %.0f) %s",
+                     p->teamID, p->health, p->healthMax,
+                     p->pos.x, p->pos.y, p->pos.z, p->playerName.c_str());
+            writeLog(logBuf);
+        }
+        writeLog("");
     }
-    // logcat + 文件日志: 队友
-    for (int i = 0; i < (int)teammates.size(); i++) {
-        PlayerNode* p = teammates[i];
-        MLOG(LOG_LEVEL_INFO, "[Team] T%d %s %.0f/%.0fHP (%.0f, %.0f, %.0f) K:%d %s",
-             p->teamID, p->isAI ? "AI" : "Real",
-             p->health, p->healthMax,
-             p->pos.x, p->pos.y, p->pos.z,
-             p->kills, p->playerName.c_str());
-        snprintf(logBuf, sizeof(logBuf), " ○ T%d %.0f/%.0fHP (%.0f, %.0f, %.0f) %s",
-                 p->teamID, p->health, p->healthMax,
-                 p->pos.x, p->pos.y, p->pos.z, p->playerName.c_str());
-        writeLog(logBuf);
-    }
-    writeLog("");
 
     // 推送数据到绘制层
     ue4draw::DrawGameData drawData;
@@ -801,7 +823,10 @@ void MatchMonitor::pollPlayers() {
     drawData.aliveCount = aliveCount;
     drawData.totalCount = m_playerList.size();
     // 获取自己的位置 (PlayerArray[0])
-    PlayerNode* myNode = m_playerList.head();
+    PlayerNode* myNode = m_myPlayerKey != 0 ? m_playerList.findByKey(m_myPlayerKey) : nullptr;
+    if (!myNode) {
+        myNode = m_playerList.head();
+    }
     if (myNode) {
         drawData.myPosX = myNode->pos.x;
         drawData.myPosY = myNode->pos.y;
@@ -854,62 +879,71 @@ void MatchMonitor::pollMatchStateLoop() {
     MLOG(LOG_LEVEL_INFO, "监控线程启动 (状态%dms, 玩家%dms)",
         POLL_INTERVAL_MS, PLAYER_POLL_INTERVAL_MS);
 
-    int playerPollCounter = 0;
-    const int playerPollRatio = PLAYER_POLL_INTERVAL_MS > 0
-        ? (POLL_INTERVAL_MS / PLAYER_POLL_INTERVAL_MS)
-        : 2;
+    Clock::time_point lastStatePollTime;
+    Clock::time_point lastPlayerPollTime;
+    Clock::time_point lastStateLogTime;
+    MatchState lastKnownState{};
 
     while (m_running) {
-        // 更新 numNames
-        auto* names = reinterpret_cast<ue4::TNameEntryArray*>(m_gNames);
-        m_numNames = names->NumElements;
+        const auto now = Clock::now();
+        bool stateChanged = false;
 
-        MatchState ms = getMatchState();
-        bool stateChanged = (ms.state != m_lastMatchState);
+        if (lastStatePollTime.time_since_epoch().count() == 0
+            || now - lastStatePollTime >= std::chrono::milliseconds(POLL_INTERVAL_MS)) {
+            lastStatePollTime = now;
 
-        if (stateChanged) {
+            auto* names = reinterpret_cast<ue4::TNameEntryArray*>(m_gNames);
+            m_numNames = names->NumElements;
+
+            MatchState ms = getMatchState();
+            lastKnownState = ms;
+
             bool wasInMatch = m_isInMatch;
-            m_isInMatch = ms.inMatch;
+            stateChanged = (ms.state != m_lastMatchState) || (ms.inMatch != wasInMatch);
+            if (stateChanged) {
+                m_isInMatch = ms.inMatch;
 
-            if (m_isInMatch && !wasInMatch) {
-                MLOG(LOG_LEVEL_INFO, "进入对局! State=%s World=%s", ms.state.c_str(), ms.worldName.c_str());
-                ue4draw::SharedUE4Data::getInstance().setInMatch(true);
-                m_playerList.clear();
-                m_characterClassSet.clear();
-                m_myTeamID = -1;
-                m_lastReportedArrayNum = -1;
-                m_lastReportedTotal = -1;
-                openLog();
-                char logBuf[256];
-                snprintf(logBuf, sizeof(logBuf), ">>> ★ 进入对局 State=%s World=%s", ms.state.c_str(), ms.worldName.c_str());
-                writeLog(logBuf);
-                writeLog("");
-                detectObserverType();
-            } else if (!m_isInMatch && wasInMatch) {
-                MLOG(LOG_LEVEL_INFO, "★ 离开对局! 共追踪 %d 名玩家", m_playerList.size());
-                // 推送空数据清除绘制
-                ue4draw::DrawGameData emptyData;
-                emptyData.inMatch = false;
-                ue4draw::SharedUE4Data::getInstance().pushData(emptyData);
-                closeLog();
-                m_playerList.clear();
+                if (m_isInMatch && !wasInMatch) {
+                    MLOG(LOG_LEVEL_INFO, "进入对局! State=%s World=%s", ms.state.c_str(), ms.worldName.c_str());
+                    ue4draw::SharedUE4Data::getInstance().setInMatch(true);
+                    m_playerList.clear();
+                    m_characterClassSet.clear();
+                    m_myTeamID = -1;
+                    m_myPlayerKey = 0;
+                    m_lastReportedArrayNum = -1;
+                    m_lastReportedTotal = -1;
+                    openLog();
+                    char logBuf[256];
+                    snprintf(logBuf, sizeof(logBuf), ">>> ★ 进入对局 State=%s World=%s", ms.state.c_str(), ms.worldName.c_str());
+                    writeLog(logBuf);
+                    writeLog("");
+                    detectObserverType();
+                } else if (!m_isInMatch && wasInMatch) {
+                    MLOG(LOG_LEVEL_INFO, "★ 离开对局! 共追踪 %d 名玩家", m_playerList.size());
+                    ue4draw::DrawGameData emptyData;
+                    emptyData.inMatch = false;
+                    ue4draw::SharedUE4Data::getInstance().pushData(emptyData);
+                    closeLog();
+                    m_playerList.clear();
+                    m_myPlayerKey = 0;
+                }
+                m_lastMatchState = ms.state;
             }
-            m_lastMatchState = ms.state;
         }
 
-        // 对局中时轮询玩家
-        if (m_isInMatch) {
+        if (m_isInMatch && (lastPlayerPollTime.time_since_epoch().count() == 0
+            || now - lastPlayerPollTime >= std::chrono::milliseconds(PLAYER_POLL_INTERVAL_MS))) {
+            lastPlayerPollTime = now;
             pollPlayers();
         }
 
-        std::string status = m_isInMatch ? "★ 对局中" : "○ 非对局";
-        MLOG(LOG_LEVEL_INFO, "[%s] State=%s World=%s Players=%d",
-            status.c_str(), ms.state.c_str(), ms.worldName.c_str(), m_playerList.size());
-
-        // 等待轮询间隔
-        for (int i = 0; i < POLL_INTERVAL_MS / 100 && m_running; i++) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if (stateChanged || shouldLogEvery(lastStateLogTime, std::chrono::milliseconds(STATE_LOG_INTERVAL_MS))) {
+            std::string status = m_isInMatch ? "★ 对局中" : "○ 非对局";
+            MLOG(LOG_LEVEL_INFO, "[%s] State=%s World=%s Players=%d",
+                status.c_str(), lastKnownState.state.c_str(), lastKnownState.worldName.c_str(), m_playerList.size());
         }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(MONITOR_IDLE_SLEEP_MS));
     }
 
     MLOG(LOG_LEVEL_INFO, "监控线程退出");

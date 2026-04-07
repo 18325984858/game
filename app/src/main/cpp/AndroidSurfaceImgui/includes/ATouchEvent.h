@@ -7,6 +7,7 @@
 #include <android/keycodes.h>
 
 #include <array>
+#include <algorithm>
 #include <bitset>
 #include <filesystem>
 #include <vector>
@@ -79,29 +80,44 @@ namespace android
 
             void TransformToScreen(int width, int height, int theta = 0)
             {
-                auto k = x, l = width;
+                if (transformScalerX <= 0 || transformScalerY <= 0 || width <= 0 || height <= 0)
+                    return;
+
+                const int rawX = x;
+                const int rawY = y;
+                int mappedX = rawX;
+                int mappedY = rawY;
+                int sourceWidth = transformScalerX;
+                int sourceHeight = transformScalerY;
+
+                theta %= 360;
+                if (theta < 0)
+                    theta += 360;
+
                 if (90 == theta)
                 {
-                    x = y;
-                    y = transformScalerX - k;
-                    width = height;
-                    height = l;
+                    mappedX = rawY;
+                    mappedY = transformScalerX - rawX;
+                    sourceWidth = transformScalerY;
+                    sourceHeight = transformScalerX;
                 }
                 else if (180 == theta)
                 {
-                    x = transformScalerX - x;
-                    y = transformScalerY - y;
+                    mappedX = transformScalerX - rawX;
+                    mappedY = transformScalerY - rawY;
                 }
                 else if (270 == theta)
                 {
-                    x = transformScalerY - y;
-                    y = k;
-                    width = height;
-                    height = l;
+                    mappedX = transformScalerY - rawY;
+                    mappedY = rawX;
+                    sourceWidth = transformScalerY;
+                    sourceHeight = transformScalerX;
                 }
 
-                x = x * width / transformScalerX;
-                y = y * height / transformScalerY;
+                x = mappedX * width / sourceWidth;
+                y = mappedY * height / sourceHeight;
+                x = std::clamp(x, 0, width - 1);
+                y = std::clamp(y, 0, height - 1);
             }
         };
 

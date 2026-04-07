@@ -100,13 +100,18 @@ private:
     bool m_enableDistance   = true;     // 距离
     bool m_enableTeammate  = false;    // 显示队友
     bool m_enableMinimap   = true;     // 小地图
+    bool m_enableFallbackESP = true;   // 投影失败时的降级绘制
+    bool m_enablePlayerList = true;    // 玩家坐标/血量调试面板
+    bool m_enableTouchPoint = true;    // 手指按下绘制触点
     float m_minimapSize    = 200.0f;   // 小地图大小
     float m_espMaxDist     = 500.0f;   // ESP 最大显示距离 (米)
+    int m_lastPreciseESP   = 0;
+    int m_lastFallbackESP  = 0;
 
     // ---- 子绘制 ----
     void drawMenu(const DrawGameData& data);
-    void drawESP(const DrawGameData& data, float screenW, float screenH);
-    void drawMinimap(const DrawGameData& data, float screenW, float screenH);
+    int drawESP(const DrawGameData& data, float screenW, float screenH);
+    int drawMinimap(const DrawGameData& data, float screenW, float screenH);
 
     // ---- 工具 ----
     static ImU32 hpColor(float ratio);

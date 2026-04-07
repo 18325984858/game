@@ -32,6 +32,8 @@
 #include <android/log.h>
 #include <android/native_window.h>
 
+#include <cstdio>
+#include <cstring>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -954,6 +956,7 @@ namespace android::anative_window_creator::detail::compat
                     windowFlags |= types::WindowFlags::eSkipScreenshot;
 
                 result = ApiInvoker<"SurfaceComposerClient::CreateSurface@v13">()(data, windowName, width, height, pixelFormat, windowFlags, &parentHandle, layerMetadata, nullptr);
+                break;
             }
             default:
             {
@@ -969,11 +972,31 @@ namespace android::anative_window_creator::detail::compat
 
             if (12 <= SystemVersion)
             {
-                static SurfaceComposerClientTransaction transaction;
+                if (!result)
+                {
+                    LogError("[ANativeWindowCreator] CreateSurface returned null control");
+                    return {};
+                }
 
-                transaction.SetTrustedOverlay(result, true);
+                SurfaceComposerClientTransaction transaction;
+
+                if (16 > SystemVersion)
+                {
+                    LogInfo("[ANativeWindowCreator] SetTrustedOverlay begin");
+                    transaction.SetTrustedOverlay(result, true);
+                }
+                else
+                {
+                    LogInfo("[ANativeWindowCreator] Skip SetTrustedOverlay on Android %zu", SystemVersion);
+                }
+
+                LogInfo("[ANativeWindowCreator] SetLayer begin");
                 transaction.SetLayer(result, INT_MAX);
-                transaction.Apply(false, true);
+                LogInfo("[ANativeWindowCreator] Show begin");
+                transaction.Show(result);
+                LogInfo("[ANativeWindowCreator] Apply begin");
+                int32_t applyResult = transaction.Apply(false, true);
+                LogInfo("[ANativeWindowCreator] Apply result=%d", applyResult);
             }
             else if (8 >= SystemVersion)
             {
@@ -1255,18 +1278,110 @@ namespace android::anative_window_creator::detail
 
             LogInfo("[*] Starting to resolve symbols for Android %zu", compat::SystemVersion);
 
-#ifdef __LP64__
-            auto libgui = resolver.Open("/system/lib64/libgui.so", RTLD_LAZY);
-            auto libutils = resolver.Open("/system/lib64/libutils.so", RTLD_LAZY);
-#else
-            auto libgui = resolver.Open("/system/lib/libgui.so", RTLD_LAZY);
-            auto libutils = resolver.Open("/system/lib/libutils.so", RTLD_LAZY);
-#endif
-            if (nullptr == libgui || nullptr == libutils)
+            auto findLoadedLibraryPath = [](const char *libraryName) -> std::string
             {
-                LogError("[!] Failed to open libgui.so or libutils.so");
-                throw std::runtime_error("Failed to open libgui.so or libutils.so");
-            }
+                FILE *maps = fopen("/proc/self/maps", "r");
+                if (!maps)
+                    return {};
+
+                char line[1024]{};
+                std::string path;
+                while (fgets(line, sizeof(line), maps) != nullptr)
+                {
+                    if (nullptr == strstr(line, libraryName))
+                        continue;
+
+                    char *pathBegin = strchr(line, '/');
+                    if (!pathBegin)
+                        continue;
+
+                    char *pathEnd = strpbrk(pathBegin, "\r\n");
+                    path.assign(pathBegin, pathEnd ? static_cast<size_t>(pathEnd - pathBegin) : strlen(pathBegin));
+                    break;
+                }
+
+                fclose(maps);
+                return path;
+            };
+
+            auto openLibraryWithFallbacks = [&](const char *libraryName, const auto &fallbackPaths) -> void *
+            {
+                auto tryOpen = [&](const char *candidate, int flags) -> void *
+                {
+                    if (!candidate || !*candidate)
+                        return nullptr;
+
+                    void *handle = resolver.Open(candidate, flags);
+                    if (handle)
+                    {
+                        LogInfo("[*] Opened %s via %s flags=0x%x", libraryName, candidate, flags);
+                        return handle;
+                    }
+                    return nullptr;
+                };
+
+                if (void *handle = tryOpen(libraryName, RTLD_NOW | RTLD_NOLOAD))
+                    return handle;
+                if (void *handle = tryOpen(libraryName, RTLD_NOW))
+                    return handle;
+
+                std::string loadedPath = findLoadedLibraryPath(libraryName);
+                if (!loadedPath.empty())
+                {
+                    if (void *handle = tryOpen(loadedPath.c_str(), RTLD_NOW | RTLD_NOLOAD))
+                        return handle;
+                    if (void *handle = tryOpen(loadedPath.c_str(), RTLD_NOW))
+                        return handle;
+                }
+
+                for (const char *candidate : fallbackPaths)
+                {
+                    if (void *handle = tryOpen(candidate, RTLD_NOW | RTLD_NOLOAD))
+                        return handle;
+                    if (void *handle = tryOpen(candidate, RTLD_NOW))
+                        return handle;
+                }
+
+                LogError("[!] Failed to open %s, fallback to RTLD_DEFAULT", libraryName);
+                return RTLD_DEFAULT;
+            };
+
+#ifdef __LP64__
+            constexpr std::array<const char *, 5> libguiFallbacks = {
+                "/system/lib64/libgui.so",
+                "/system_ext/lib64/libgui.so",
+                "/apex/com.android.graphics/lib64/libgui.so",
+                "/apex/com.android.vndk.current/lib64/libgui.so",
+                "/apex/com.android.media/lib64/libgui.so",
+            };
+            constexpr std::array<const char *, 6> libutilsFallbacks = {
+                "/system/lib64/libutils.so",
+                "/system_ext/lib64/libutils.so",
+                "/apex/com.android.runtime/lib64/libutils.so",
+                "/apex/com.android.art/lib64/libutils.so",
+                "/apex/com.android.vndk.current/lib64/libutils.so",
+                "/apex/com.android.i18n/lib64/libutils.so",
+            };
+#else
+            constexpr std::array<const char *, 5> libguiFallbacks = {
+                "/system/lib/libgui.so",
+                "/system_ext/lib/libgui.so",
+                "/apex/com.android.graphics/lib/libgui.so",
+                "/apex/com.android.vndk.current/lib/libgui.so",
+                "/apex/com.android.media/lib/libgui.so",
+            };
+            constexpr std::array<const char *, 6> libutilsFallbacks = {
+                "/system/lib/libutils.so",
+                "/system_ext/lib/libutils.so",
+                "/apex/com.android.runtime/lib/libutils.so",
+                "/apex/com.android.art/lib/libutils.so",
+                "/apex/com.android.vndk.current/lib/libutils.so",
+                "/apex/com.android.i18n/lib/libutils.so",
+            };
+#endif
+
+            auto libgui = openLibraryWithFallbacks("libgui.so", libguiFallbacks);
+            auto libutils = openLibraryWithFallbacks("libutils.so", libutilsFallbacks);
 
             const auto &[libutilsApis, libguiApis] = ApiTableDescriptor::GetDefaultDescriptors();
             for (const auto &descriptor : libutilsApis)
@@ -1295,8 +1410,10 @@ namespace android::anative_window_creator::detail
                 }
             }
 
-            resolver.Close(libutils);
-            resolver.Close(libgui);
+            if (libutils != RTLD_DEFAULT)
+                resolver.Close(libutils);
+            if (libgui != RTLD_DEFAULT)
+                resolver.Close(libgui);
             resolved = true;
             LogInfo("[+] Version[Android %zu] resolved all symbols", compat::SystemVersion);
         }
@@ -1482,10 +1599,20 @@ namespace android
                 break;
             }
 
-            auto surfaceControl = surfaceComposerClient.CreateSurface(options.name, width, height, {}, options.skipScreenshot);
-            auto nativeWindow = reinterpret_cast<ANativeWindow *>(surfaceControl.GetSurface());
+            LogInfo("[ANativeWindowCreator] Create begin name=%s width=%d height=%d skipScreenshot=%d android=%zu",
+                    options.name,
+                    width,
+                    height,
+                    options.skipScreenshot ? 1 : 0,
+                    anative_window_creator::detail::compat::SystemVersion);
 
-            m_cachedSurfaceControl.emplace(nativeWindow, std::move(surfaceControl));
+            auto surfaceControl = surfaceComposerClient.CreateSurface(options.name, width, height, {}, options.skipScreenshot);
+            LogInfo("[ANativeWindowCreator] CreateSurface returned control=%p", surfaceControl.data);
+            auto nativeWindow = reinterpret_cast<ANativeWindow *>(surfaceControl.GetSurface());
+            LogInfo("[ANativeWindowCreator] GetSurface returned nativeWindow=%p", nativeWindow);
+
+            if (nullptr != nativeWindow)
+                m_cachedSurfaceControl.emplace(nativeWindow, std::move(surfaceControl));
             return nativeWindow;
         }
 

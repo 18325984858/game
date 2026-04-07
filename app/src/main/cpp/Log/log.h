@@ -69,7 +69,12 @@ inline bool g_runtimeLogEnabled = true;
                 __android_log_print(priority, tag, "%s:%d: " fmt, __FILE__, __LINE__, ##__VA_ARGS__); \
             } \
         } while (0)
-#define LOG(level, fmt, ...)  // 如果禁用日志，则宏什么都不做
+#else
+
+inline bool g_runtimeLogEnabled = false;
+
+#define LOG(level, fmt, ...)
+#define LOGT(tag, level, fmt, ...)
 #endif
 
 

@@ -1,11 +1,13 @@
 #include "AImGui.h"
 
+#define TAG "UE4-GUI"
 #include "Global.h"
 #include "ANativeWindowCreator.h"
 #include "ATouchEvent.h"
 
 #include <ImGui-SharedDrawData/modules/ImGuiSharedDrawData.h>
 #include <zstd.h>
+#include <netinet/tcp.h>
 
 size_t android::anative_window_creator::detail::compat::SystemVersion = 13;
 
@@ -374,7 +376,19 @@ namespace android
     AImGui::AImGui(const Options &options)
         : m_options(options)
     {
+        LogInfo("[AImGui] ctor begin renderType=%d autoUpdateOrientation=%d screenWidth=%d screenHeight=%d rotateTheta=%d",
+                static_cast<int>(m_options.renderType),
+                m_options.autoUpdateOrientation ? 1 : 0,
+                m_options.screenWidth,
+                m_options.screenHeight,
+                m_options.rotateTheta);
         InitEnvironment();
+        LogInfo("[AImGui] ctor end state=%d nativeWindow=%p eglDisplay=%p eglSurface=%p eglContext=%p",
+                m_state ? 1 : 0,
+                m_nativeWindow,
+                m_defaultDisplay,
+                m_eglSurface,
+                m_eglContext);
     }
 
     AImGui::~AImGui()
@@ -386,6 +400,17 @@ namespace android
     {
         if (!m_state)
             return;
+
+        if (RenderType::RenderClient != m_options.renderType && nullptr != m_nativeWindow)
+        {
+            int currentWidth = ANativeWindow_getWidth(m_nativeWindow);
+            int currentHeight = ANativeWindow_getHeight(m_nativeWindow);
+            if (0 < currentWidth && 0 < currentHeight)
+            {
+                m_screenWidth = currentWidth;
+                m_screenHeight = currentHeight;
+            }
+        }
 
         if (m_options.autoUpdateOrientation)
         {
@@ -437,6 +462,9 @@ namespace android
                     uint32_t packetSize = static_cast<uint32_t>(sharedData.size());
                     WriteData(&packetSize, sizeof(packetSize));
                     WriteData(const_cast<uint8_t *>(sharedData.data()), sharedData.size());
+                    m_renderPacketCount++;
+                    m_lastRenderPacketSize = packetSize;
+                    m_lastRenderDecodedSize = sharedData.size();
                 }
                 else
                 {
@@ -467,9 +495,20 @@ namespace android
                         uint32_t sharedDataSize = sharedData.size();
                         WriteData(&sharedDataSize, sizeof(sharedDataSize));
                         WriteData(compressBuffer.data(), output.pos);
+                        m_renderPacketCount++;
+                        m_lastRenderPacketSize = packetSize;
+                        m_lastRenderDecodedSize = sharedDataSize;
                     }
                     else
                         LogDebug("[-] Client compression frame data error");
+                }
+
+                if (0 == (m_renderPacketCount % 180))
+                {
+                    LogInfo("[AImGui] Client sent render packets=%llu lastPacket=%zu decoded=%zu",
+                            static_cast<unsigned long long>(m_renderPacketCount),
+                            m_lastRenderPacketSize,
+                            m_lastRenderDecodedSize);
                 }
             }
         }
@@ -490,6 +529,9 @@ namespace android
                     ImGui_ImplOpenGL3_DestroyFontsTexture();
                     ImGui::SetSharedFontData(m_serverFontData);
                     ImGui_ImplOpenGL3_CreateFontsTexture();
+                    LogInfo("[AImGui] Server applied font packet count=%llu size=%zu",
+                            static_cast<unsigned long long>(m_fontPacketCount),
+                            m_lastFontPacketSize);
                 }
                 m_renderState = RenderState::ReadData;
 
@@ -513,6 +555,26 @@ namespace android
                     glClear(GL_COLOR_BUFFER_BIT);
                     ImGui_ImplOpenGL3_RenderDrawData(drawData);
                     eglSwapBuffers(m_defaultDisplay, m_eglSurface);
+                    m_renderFrameCount++;
+                    if (0 == (m_renderFrameCount % 180))
+                    {
+                        int totalCmdCount = 0;
+                        for (int cmdListIndex = 0; cmdListIndex < drawData->CmdListsCount; ++cmdListIndex)
+                            totalCmdCount += drawData->CmdLists[cmdListIndex]->CmdBuffer.Size;
+
+                        LogInfo("[AImGui] Server rendered frames=%llu packets=%llu drawLists=%d cmds=%d decoded=%zu",
+                                static_cast<unsigned long long>(m_renderFrameCount),
+                                static_cast<unsigned long long>(m_renderPacketCount),
+                                drawData->CmdListsCount,
+                                totalCmdCount,
+                                m_lastRenderDecodedSize);
+                    }
+                }
+                else
+                {
+                    LogError("[AImGui] Server RenderSharedDrawData returned null decoded=%zu packetCount=%llu",
+                             m_lastRenderDecodedSize,
+                             static_cast<unsigned long long>(m_renderPacketCount));
                 }
                 m_renderState = RenderState::ReadData;
 
@@ -547,7 +609,11 @@ namespace android
             event.TransformToScreen(m_screenWidth, m_screenHeight, m_rotateTheta);
 
             if (RenderType::RenderServer == m_options.renderType)
+            {
+                if (-1 == m_clientFd)
+                    return;
                 WriteData(&event, sizeof(event));
+            }
         }
         else
         {
@@ -629,6 +695,10 @@ namespace android
 
     bool AImGui::InitEnvironment()
     {
+        LogInfo("[AImGui] InitEnvironment begin renderType=%d", static_cast<int>(m_options.renderType));
+
+        m_usesExternalNativeWindow = nullptr != m_options.externalNativeWindow;
+
         // Initialize rpc
         m_transportAddress.sin_family = AF_INET;
         m_transportAddress.sin_port = htons(16888);
@@ -639,15 +709,30 @@ namespace android
             m_clientFd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
             if (0 > m_clientFd)
             {
-                LogDebug("[-] Client fd create failed, m_clientFd:%d", m_clientFd);
+                LogError("[-] Client fd create failed, m_clientFd:%d errno=%d:%s", m_clientFd, errno, strerror(errno));
                 return false;
+            }
+
+            if (m_options.tcpNoDelay)
+            {
+                int optionValue = 1;
+                setsockopt(m_clientFd, IPPROTO_TCP, TCP_NODELAY, &optionValue, sizeof(optionValue));
             }
 
             if (0 > connect(m_clientFd, reinterpret_cast<sockaddr *>(&m_transportAddress), sizeof(m_transportAddress)))
             {
-                LogDebug("[-] Client connect to server failed, %d:%s", errno, strerror(errno));
+                LogError("[-] Client connect to %s:%d failed, %d:%s",
+                         m_options.clientConnectAddress.c_str(),
+                         ntohs(m_transportAddress.sin_port),
+                         errno,
+                         strerror(errno));
                 return false;
             }
+
+            LogInfo("[AImGui] Client connected to %s:%d fd=%d",
+                    m_options.clientConnectAddress.c_str(),
+                    ntohs(m_transportAddress.sin_port),
+                    m_clientFd);
         }
         else if (RenderType::RenderServer == m_options.renderType)
         {
@@ -656,13 +741,13 @@ namespace android
             m_serverFd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
             if (0 > m_serverFd)
             {
-                LogDebug("[-] Server fd create failed, m_serverFd:%d", m_serverFd);
+                LogError("[-] Server fd create failed, m_serverFd:%d errno=%d:%s", m_serverFd, errno, strerror(errno));
                 return false;
             }
             int optionValue = 1;
             if (0 > setsockopt(m_serverFd, SOL_SOCKET, SO_REUSEADDR, &optionValue, sizeof(int)))
             {
-                LogDebug("[-] Server fd set reuseaddr failed, m_serverFd:%d", m_serverFd);
+                LogError("[-] Server fd set reuseaddr failed, m_serverFd:%d errno=%d:%s", m_serverFd, errno, strerror(errno));
                 return false;
             }
 
@@ -678,40 +763,70 @@ namespace android
                 return false;
             }
 
-            m_serverWorkerThread = std::make_unique<std::thread>(&AImGui::ServerWorker, this);
+            LogInfo("[AImGui] Server listening on %s:%d fd=%d",
+                    m_options.serverListenAddress.c_str(),
+                    ntohs(m_transportAddress.sin_port),
+                    m_serverFd);
         }
 
-        // Initialize display orientation
-        auto displayInfo = ANativeWindowCreator::GetDisplayInfo();
-        LogInfo("[=] Display angle:%d width:%d height:%d", displayInfo.theta, displayInfo.width, displayInfo.height);
+        int displayTheta = m_options.rotateTheta;
+        int displayWidth = m_options.screenWidth;
+        int displayHeight = m_options.screenHeight;
+        if (m_usesExternalNativeWindow)
+        {
+            if (0 >= displayWidth)
+                displayWidth = ANativeWindow_getWidth(m_options.externalNativeWindow);
+            if (0 >= displayHeight)
+                displayHeight = ANativeWindow_getHeight(m_options.externalNativeWindow);
+        }
+        if (0 >= displayWidth || 0 >= displayHeight)
+        {
+            LogInfo("[AImGui] display size missing, query GetDisplayInfo");
+            auto displayInfo = ANativeWindowCreator::GetDisplayInfo();
+            displayTheta = displayInfo.theta;
+            displayWidth = displayInfo.width;
+            displayHeight = displayInfo.height;
+        }
+        LogInfo("[AImGui] display angle:%d width:%d height:%d", displayTheta, displayWidth, displayHeight);
 
         if (RenderType::RenderClient != m_options.renderType)
         {
-            // Create native window
-            m_nativeWindow = ANativeWindowCreator::Create({.name = "AImGui", .skipScreenshot = false});
-            if (nullptr == m_nativeWindow)
+            if (m_usesExternalNativeWindow)
             {
-                LogDebug("[-] ANativeWindow create failed");
-                return false;
+                m_nativeWindow = m_options.externalNativeWindow;
+                LogInfo("[AImGui] using external native window=%p size=%dx%d", m_nativeWindow, displayWidth, displayHeight);
             }
+            else
+            {
+                // Create native window
+                LogInfo("[AImGui] creating native window");
+                m_nativeWindow = ANativeWindowCreator::Create({.name = "AImGui", .width = displayWidth, .height = displayHeight, .skipScreenshot = false});
+                if (nullptr == m_nativeWindow)
+                {
+                    LogError("[AImGui] ANativeWindow create failed");
+                    return false;
+                }
 
-            // Acquire native window
-            LogInfo("[=] Acquiring native window");
-            ANativeWindow_acquire(m_nativeWindow);
-            LogInfo("[+] Native window acquired");
+                // Acquire native window created by the private compositor path.
+                LogInfo("[AImGui] acquiring native window=%p", m_nativeWindow);
+                ANativeWindow_acquire(m_nativeWindow);
+            }
+            LogInfo("[AImGui] native window acquired size=%dx%d", ANativeWindow_getWidth(m_nativeWindow), ANativeWindow_getHeight(m_nativeWindow));
         }
 
         // EGL initialization
+        LogInfo("[AImGui] eglGetDisplay begin");
         m_defaultDisplay = eglGetDisplay(EGL_DEFAULT_DISPLAY);
         if (EGL_NO_DISPLAY == m_defaultDisplay)
         {
-            LogDebug("[-] EGL get default display failed: %d", eglGetError());
+            LogError("[AImGui] EGL get default display failed: %d", eglGetError());
             return false;
         }
 
+        LogInfo("[AImGui] eglInitialize begin");
         if (EGL_TRUE != eglInitialize(m_defaultDisplay, 0, 0))
         {
-            LogDebug("[-] EGL initialize failed: %d", eglGetError());
+            LogError("[AImGui] EGL initialize failed: %d", eglGetError());
             return false;
         }
 
@@ -732,76 +847,112 @@ namespace android
             {EGL_SAMPLE_BUFFERS, 0},                   // 多重采样抗锯齿缓冲禁用
             {EGL_NONE, EGL_NONE},
         };
+        LogInfo("[AImGui] eglChooseConfig begin");
         if (EGL_TRUE != eglChooseConfig(m_defaultDisplay, reinterpret_cast<const EGLint *>(eglConfigAttributeList), &eglConfig, 1, &numEglConfig))
         {
-            LogDebug("[-] EGL choose config failed: %d", eglGetError());
+            LogError("[AImGui] EGL choose config failed: %d", eglGetError());
             return false;
         }
         if (0 == numEglConfig)
         {
-            LogDebug("[-] EGL choose config failed: Unsupported config attribute list.");
+            LogError("[AImGui] EGL choose config failed: unsupported config attribute list");
             return false;
         }
 
         if (RenderType::RenderClient != m_options.renderType)
         {
             EGLint eglBufferFormat;
+            LogInfo("[AImGui] eglGetConfigAttrib begin");
             if (EGL_TRUE != eglGetConfigAttrib(m_defaultDisplay, eglConfig, EGL_NATIVE_VISUAL_ID, &eglBufferFormat))
             {
-                LogDebug("[-] EGL get config attribute failed: %d", eglGetError());
+                LogError("[AImGui] EGL get config attribute failed: %d", eglGetError());
                 return false;
             }
+            LogInfo("[AImGui] ANativeWindow_setBuffersGeometry begin format=%d", eglBufferFormat);
             ANativeWindow_setBuffersGeometry(m_nativeWindow, 0, 0, eglBufferFormat);
+            LogInfo("[AImGui] eglCreateWindowSurface begin nativeWindow=%p", m_nativeWindow);
             m_eglSurface = eglCreateWindowSurface(m_defaultDisplay, eglConfig, m_nativeWindow, nullptr);
         }
         else
         {
             std::pair<EGLint, EGLint> bufferAttribute[] = {
-                {EGL_WIDTH, displayInfo.width},
-                {EGL_HEIGHT, displayInfo.height},
+                {EGL_WIDTH, displayWidth},
+                {EGL_HEIGHT, displayHeight},
                 {EGL_NONE, EGL_NONE},
             };
-
+            LogInfo("[AImGui] eglCreatePbufferSurface begin");
             m_eglSurface = eglCreatePbufferSurface(m_defaultDisplay, eglConfig, reinterpret_cast<const EGLint *>(bufferAttribute));
         }
         if (EGL_NO_SURFACE == m_eglSurface)
         {
-            LogDebug("[-] EGL create window surface failed: %d", eglGetError());
+            LogError("[AImGui] EGL create surface failed: %d", eglGetError());
             return false;
         }
 
-        EGLint eglContextAttribList[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
-        m_eglContext = eglCreateContext(m_defaultDisplay, eglConfig, EGL_NO_CONTEXT, eglContextAttribList);
+        const char* glslVersion = "#version 300 es";
+        int eglContextClientVersion = 3;
+
+        const EGLint eglContextAttribListGles3[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
+        const EGLint eglContextAttribListGles2[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
+
+        LogInfo("[AImGui] eglCreateContext begin prefer=GLES3");
+        m_eglContext = eglCreateContext(m_defaultDisplay, eglConfig, EGL_NO_CONTEXT, eglContextAttribListGles3);
         if (EGL_NO_CONTEXT == m_eglContext)
         {
-            LogDebug("[-] EGL create context failed: %d", eglGetError());
-            return false;
+            auto eglError = eglGetError();
+            LogInfo("[AImGui] EGL create GLES3 context failed: %d, fallback to GLES2", eglError);
+            m_eglContext = eglCreateContext(m_defaultDisplay, eglConfig, EGL_NO_CONTEXT, eglContextAttribListGles2);
+            if (EGL_NO_CONTEXT == m_eglContext)
+            {
+                LogError("[AImGui] EGL create context failed after GLES2 fallback: %d", eglGetError());
+                return false;
+            }
+
+            eglContextClientVersion = 2;
+            glslVersion = "#version 100";
         }
 
+        LogInfo("[AImGui] eglMakeCurrent begin");
         if (EGL_TRUE != eglMakeCurrent(m_defaultDisplay, m_eglSurface, m_eglSurface, m_eglContext))
         {
-            LogDebug("[-] EGL make current failed: %d", eglGetError());
+            LogError("[AImGui] EGL make current failed: %d", eglGetError());
             return false;
         }
 
+        if (RenderType::RenderClient != m_options.renderType && m_options.disableVsync)
+        {
+            eglSwapInterval(m_defaultDisplay, 0);
+            LogInfo("[AImGui] eglSwapInterval set to 0 for low latency");
+        }
+
+        const char* glVersion = reinterpret_cast<const char*>(glGetString(GL_VERSION));
+        const char* glslVersionRuntime = reinterpret_cast<const char*>(glGetString(GL_SHADING_LANGUAGE_VERSION));
+        LogInfo("[AImGui] GL runtime context=GLES%d version=%s glsl=%s",
+                eglContextClientVersion,
+                glVersion ? glVersion : "(null)",
+                glslVersionRuntime ? glslVersionRuntime : "(null)");
+
         // ImGui initialization
+        LogInfo("[AImGui] ImGui init begin");
         IMGUI_CHECKVERSION();
 
         m_imguiContext = ImGui::CreateContext();
         if (nullptr == m_imguiContext)
         {
-            LogDebug("[-] ImGui create context failed");
+            LogError("[AImGui] ImGui create context failed");
             return false;
         }
 
         auto &imguiIO = ImGui::GetIO();
 
         imguiIO.IniFilename = nullptr;
+        imguiIO.ConfigInputTrickleEventQueue = false;
         ImGui::StyleColorsDark();
-        ImGui::GetStyle().ScaleAllSizes(3.f);
+        if (m_options.styleScale > 0.0f && m_options.styleScale != 1.0f)
+            ImGui::GetStyle().ScaleAllSizes(m_options.styleScale);
 
         ImFontConfig fontConfig;
-        fontConfig.SizePixels = 22.f;
+        fontConfig.SizePixels = m_options.fontSizePixels > 0.0f ? m_options.fontSizePixels : 18.0f;
         imguiIO.Fonts->AddFontDefault(&fontConfig);
         if (RenderType::RenderClient == m_options.renderType && m_options.exchangeFontData)
         {
@@ -810,13 +961,16 @@ namespace android
             // First packet
             WriteData(&packetSize, sizeof(packetSize));
             WriteData(sharedFontData.data(), sharedFontData.size());
+            m_fontPacketCount = 1;
+            m_lastFontPacketSize = sharedFontData.size();
+            LogInfo("[AImGui] Client sent initial font packet size=%u", packetSize);
         }
 
         if (RenderType::RenderClient != m_options.renderType)
         {
             if (!ImGui_ImplAndroid_Init(m_nativeWindow))
             {
-                LogDebug("[-] ImGui init android implement failed");
+                LogError("[AImGui] ImGui init android implement failed");
                 return false;
             }
         }
@@ -824,24 +978,50 @@ namespace android
         {
             imguiIO.BackendPlatformName = "imgui_impl_aimgui";
         }
-        if (!ImGui_ImplOpenGL3_Init("#version 300 es"))
+        LogInfo("[AImGui] ImGui OpenGL backend init glsl=%s", glslVersion);
+        if (!ImGui_ImplOpenGL3_Init(glslVersion))
         {
-            LogDebug("[-] ImGui init OpenGL3 failed");
+            LogError("[AImGui] ImGui init OpenGL3 failed");
             return false;
         }
 
-        glViewport(0, 0, displayInfo.width, displayInfo.height);
+        glViewport(0, 0, displayWidth, displayHeight);
         glClearColor(0.f, 0.f, 0.f, 0.f);
 
-        m_rotateTheta = displayInfo.theta;
-        m_screenWidth = displayInfo.width;
-        m_screenHeight = displayInfo.height;
+        m_rotateTheta = displayTheta;
+        m_screenWidth = displayWidth;
+        m_screenHeight = displayHeight;
 
-        return (m_state = true);
+        LogInfo("[AImGui] InitEnvironment success screen=%dx%d rotate=%d", m_screenWidth, m_screenHeight, m_rotateTheta);
+
+        m_state = true;
+        if (RenderType::RenderServer == m_options.renderType)
+        {
+            m_serverWorkerThread = std::make_unique<std::thread>(&AImGui::ServerWorker, this);
+            LogInfo("[AImGui] Server worker thread started");
+        }
+
+        return true;
     }
     void AImGui::UnInitEnvironment()
     {
         m_state = false;
+
+        int clientFd = m_clientFd;
+        int serverFd = m_serverFd;
+        m_clientFd = -1;
+        m_serverFd = -1;
+
+        if (-1 != clientFd)
+        {
+            shutdown(clientFd, SHUT_RDWR);
+            close(clientFd);
+        }
+        if (-1 != serverFd)
+        {
+            shutdown(serverFd, SHUT_RDWR);
+            close(serverFd);
+        }
 
         if (nullptr != m_imguiContext)
         {
@@ -871,7 +1051,8 @@ namespace android
             if (nullptr != m_nativeWindow)
             {
                 ANativeWindow_release(m_nativeWindow);
-                android::ANativeWindowCreator::Destroy(m_nativeWindow);
+                if (!m_usesExternalNativeWindow)
+                    android::ANativeWindowCreator::Destroy(m_nativeWindow);
             }
         }
 
@@ -879,92 +1060,139 @@ namespace android
             m_serverWorkerThread->join();
         m_serverWorkerThread.reset();
 
-        if (-1 != m_clientFd)
-            close(m_clientFd);
-        if (-1 != m_serverFd)
-            close(m_serverFd);
-        m_clientFd = -1;
-        m_serverFd = -1;
-
         m_imguiContext = nullptr;
         m_eglContext = EGL_NO_CONTEXT;
         m_eglSurface = EGL_NO_SURFACE;
         m_defaultDisplay = EGL_NO_DISPLAY;
         m_nativeWindow = nullptr;
+        m_usesExternalNativeWindow = false;
     }
 
     void AImGui::ServerWorker()
     {
-        m_clientFd = accept(m_serverFd, nullptr, nullptr);
-        if (0 > m_clientFd)
-        {
-            LogDebug("[-] Server accept client connect failed, %d:%s", errno, strerror(errno));
-            m_state = false;
-            return;
-        }
-
-        uint32_t packetSize = 0;
         while (m_state)
         {
-            if (static_cast<int>(sizeof(packetSize)) > ReadData(&packetSize, sizeof(packetSize)))
+            m_clientFd = accept(m_serverFd, nullptr, nullptr);
+            if (0 > m_clientFd)
             {
-                LogDebug("[-] Server can not read packet size, %d:%s", errno, strerror(errno));
-                break;
-            }
-            if (packetSize > m_maxPacketSize)
-            {
-                LogDebug("[-] Packet is too large: %2.f", packetSize / 1024.f / 1024.f);
-                break;
-            }
-
-            if (m_serverRenderDataBack.size() < packetSize)
-                m_serverRenderDataBack.resize(packetSize);
-            auto readResult = ReadData(m_serverRenderDataBack.data(), packetSize);
-            if (0 >= readResult)
-            {
-                LogDebug("[-] Client disconnect or read failed, readResult:%d  %d:%s", readResult, errno, strerror(errno));
-                break;
+                if (m_state)
+                {
+                    LogDebug("[-] Server accept client connect failed, %d:%s", errno, strerror(errno));
+                    m_state = false;
+                }
+                return;
             }
 
-            if (RenderState::ReadData != m_renderState)
-                continue;
-            if (m_options.exchangeFontData && m_serverFontData.empty()) // NOTE: First packet is font data
+            if (m_options.tcpNoDelay)
             {
-                std::lock_guard<std::mutex> lock(m_renderDataMutex);
-                m_serverFontData.swap(m_serverRenderDataBack);
-                m_renderState = RenderState::SetFont;
+                int optionValue = 1;
+                setsockopt(m_clientFd, IPPROTO_TCP, TCP_NODELAY, &optionValue, sizeof(optionValue));
             }
-            else
+
             {
                 std::lock_guard<std::mutex> lock(m_renderDataMutex);
-                if (!m_options.compressionFrameData)
-                    m_serverRenderData.swap(m_serverRenderDataBack);
+                m_serverFontData.clear();
+                m_serverRenderData.clear();
+                m_serverRenderDataBack.clear();
+                m_renderState = RenderState::ReadData;
+                m_fontPacketCount = 0;
+                m_renderPacketCount = 0;
+                m_renderFrameCount = 0;
+                m_lastFontPacketSize = 0;
+                m_lastRenderPacketSize = 0;
+                m_lastRenderDecodedSize = 0;
+                m_serverFontPacketReceived = false;
+            }
+            LogInfo("[AImGui] Server accepted client fd=%d", m_clientFd);
+
+            uint32_t packetSize = 0;
+            while (m_state)
+            {
+                if (static_cast<int>(sizeof(packetSize)) > ReadData(&packetSize, sizeof(packetSize)))
+                {
+                    if (m_state)
+                        LogDebug("[-] Server can not read packet size, %d:%s", errno, strerror(errno));
+                    break;
+                }
+                if (packetSize > m_maxPacketSize)
+                {
+                    LogDebug("[-] Packet is too large: %2.f", packetSize / 1024.f / 1024.f);
+                    break;
+                }
+
+                if (m_serverRenderDataBack.size() < packetSize)
+                    m_serverRenderDataBack.resize(packetSize);
+                auto readResult = ReadData(m_serverRenderDataBack.data(), packetSize);
+                if (0 >= readResult)
+                {
+                    if (m_state)
+                        LogDebug("[-] Client disconnect or read failed, readResult:%d  %d:%s", readResult, errno, strerror(errno));
+                    break;
+                }
+
+                if (RenderState::ReadData != m_renderState)
+                    continue;
+                if (m_options.exchangeFontData && !m_serverFontPacketReceived) // NOTE: First packet is font data
+                {
+                    std::lock_guard<std::mutex> lock(m_renderDataMutex);
+                    m_serverFontData.swap(m_serverRenderDataBack);
+                    m_serverFontPacketReceived = true;
+                    m_fontPacketCount++;
+                    m_lastFontPacketSize = packetSize;
+                    LogInfo("[AImGui] Server received font packet size=%u", packetSize);
+                    m_renderState = RenderState::SetFont;
+                }
                 else
                 {
-                    static std::unique_ptr<ZSTD_DCtx, decltype(&ZSTD_freeDCtx)> decompressContext(ZSTD_createDCtx(), &ZSTD_freeDCtx);
-
-                    if (nullptr == decompressContext)
+                    std::lock_guard<std::mutex> lock(m_renderDataMutex);
+                    if (!m_options.compressionFrameData)
+                        m_serverRenderData.swap(m_serverRenderDataBack);
+                    else
                     {
-                        LogDebug("[-] Server can not create decompress context");
-                        m_state = false;
-                        break;
+                        static std::unique_ptr<ZSTD_DCtx, decltype(&ZSTD_freeDCtx)> decompressContext(ZSTD_createDCtx(), &ZSTD_freeDCtx);
+
+                        if (nullptr == decompressContext)
+                        {
+                            LogDebug("[-] Server can not create decompress context");
+                            m_state = false;
+                            break;
+                        }
+
+                        uint32_t sharedDataSize = 0;
+                        memcpy(&sharedDataSize, m_serverRenderDataBack.data(), sizeof(sharedDataSize));
+                        if (m_serverRenderData.size() < sharedDataSize)
+                            m_serverRenderData.resize(sharedDataSize);
+
+                        ZSTD_inBuffer input{m_serverRenderDataBack.data() + sizeof(sharedDataSize), packetSize - sizeof(sharedDataSize), 0};
+                        ZSTD_outBuffer output{m_serverRenderData.data(), m_serverRenderData.size(), 0};
+                        if (0 != ZSTD_decompressStream(decompressContext.get(), &output, &input))
+                            LogDebug("[-] Server decompression frame data error");
+
+                        m_lastRenderDecodedSize = output.pos;
                     }
-
-                    uint32_t sharedDataSize = 0;
-                    memcpy(&sharedDataSize, m_serverRenderDataBack.data(), sizeof(sharedDataSize));
-                    if (m_serverRenderData.size() < sharedDataSize)
-                        m_serverRenderData.resize(sharedDataSize);
-
-                    ZSTD_inBuffer input{m_serverRenderDataBack.data() + sizeof(sharedDataSize), packetSize - sizeof(sharedDataSize), 0};
-                    ZSTD_outBuffer output{m_serverRenderData.data(), m_serverRenderData.size(), 0};
-                    if (0 != ZSTD_decompressStream(decompressContext.get(), &output, &input))
-                        LogDebug("[-] Server decompression frame data error");
+                    m_renderPacketCount++;
+                    m_lastRenderPacketSize = packetSize;
+                    if (0 == (m_renderPacketCount % 180) || 1 == m_renderPacketCount)
+                    {
+                        LogInfo("[AImGui] Server received render packet count=%llu packet=%zu decoded=%zu",
+                                static_cast<unsigned long long>(m_renderPacketCount),
+                                m_lastRenderPacketSize,
+                                m_lastRenderDecodedSize);
+                    }
+                    m_renderState = RenderState::Rendering;
                 }
-                m_renderState = RenderState::Rendering;
             }
-        }
 
-        m_state = false;
+            int clientFd = m_clientFd;
+            m_clientFd = -1;
+            if (-1 != clientFd)
+            {
+                shutdown(clientFd, SHUT_RDWR);
+                close(clientFd);
+            }
+            if (m_state)
+                LogInfo("[AImGui] Server client disconnected, waiting next client");
+        }
     }
 
     int AImGui::ReadData(void *buffer, size_t readSize)
@@ -991,6 +1219,9 @@ namespace android
     }
     void AImGui::WriteData(void *data, size_t size)
     {
+        if (RenderType::RenderServer == m_options.renderType && -1 == m_clientFd)
+            return;
+
         size_t totalWritten = 0;
         while (totalWritten < size)
         {
@@ -998,6 +1229,17 @@ namespace android
             if (0 >= result)
             {
                 LogDebug("[-] WriteData failed, result:%zd  %d:%s", result, errno, strerror(errno));
+                if (RenderType::RenderServer == m_options.renderType)
+                {
+                    int clientFd = m_clientFd;
+                    m_clientFd = -1;
+                    if (-1 != clientFd)
+                    {
+                        shutdown(clientFd, SHUT_RDWR);
+                        close(clientFd);
+                    }
+                    return;
+                }
                 m_state = false;
                 return;
             }

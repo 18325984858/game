@@ -104,6 +104,7 @@ find_library(
 # used in the AndroidManifest.xml file.
 add_library(${CMAKE_PROJECT_NAME} SHARED
         # List C/C++ source files with relative paths to this CMakeLists.txt.
+        publicOverlay/PublicOverlayRenderer.cpp
         unityGame/native-lib.cpp
         unityGame/unitystart.cpp
         "unityGame/Draw/Draw.cpp"
@@ -145,6 +146,10 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
         AndroidSurfaceImgui/modules
         AndroidSurfaceImgui/third_party
         AndroidSurfaceImgui/third_party/imgui
+)
+
+target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE
+        "-include" "${CMAKE_CURRENT_SOURCE_DIR}/unityGame/obfu_attrs.h"
 )
 
 if(USE_WINDOWS_LLVM_FRONTEND AND ENABLE_WINDOWS_LLVM_OBFUSCATION)

@@ -47,6 +47,10 @@ import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
 import android.view.View;
+import android.content.Intent;
+import android.net.Uri;
+import android.os.Build;
+import android.provider.Settings;
 
 import java.io.BufferedReader;
 import java.io.DataOutputStream;
@@ -99,6 +103,8 @@ public class MainActivity extends AppCompatActivity {
     private TextView tvStatus;
     private CheckBox cbPubgDumper;
     private CheckBox cbPubgHeader;
+
+    private static final String UE4_OVERLAY_STATUS = "UE4 公开 Overlay 已启动";
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -155,6 +161,13 @@ public class MainActivity extends AppCompatActivity {
                 Toast.makeText(this, "请先设置宽容模式", Toast.LENGTH_SHORT).show();
                 return;
             }
+
+            if (!ensureOverlayPermission()) {
+                updateStatus("请授予悬浮窗权限后重试");
+                return;
+            }
+
+            startUe4OverlayService();
             btnPubgLaunch.setEnabled(false);
 
             boolean enableUeDumper = cbPubgDumper.isChecked();
@@ -169,7 +182,7 @@ public class MainActivity extends AppCompatActivity {
             if (enableUeDumper) options += " [UE4 Dumper]";
             if (enableUeHeader) options += " [UE4 Header]";
             btnPubgLaunch.setText("✅ 游戏已启动" + options);
-            updateStatus("和平精英启动中..." + options);
+            updateStatus(UE4_OVERLAY_STATUS + " | 和平精英启动中..." + options);
             Toast.makeText(this, "正在启动和平精英并注入..." + options, Toast.LENGTH_SHORT).show();
         });
 
@@ -295,6 +308,35 @@ public class MainActivity extends AppCompatActivity {
 
     private void updateStatus(String msg) {
         if (tvStatus != null) tvStatus.setText(msg);
+    }
+
+    private boolean ensureOverlayPermission() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M || Settings.canDrawOverlays(this)) {
+            return true;
+        }
+
+        Intent intent = new Intent(
+                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                Uri.parse("package:" + getPackageName())
+        );
+        startActivity(intent);
+        Toast.makeText(this, "请先授予悬浮窗权限", Toast.LENGTH_LONG).show();
+        return false;
+    }
+
+    private void startUe4OverlayService() {
+        Intent intent = new Intent(this, Ue4OverlayService.class);
+        intent.setAction(Ue4OverlayService.ACTION_START);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent);
+        } else {
+            startService(intent);
+        }
+    }
+
+    private void stopUe4OverlayService() {
+        Intent intent = new Intent(this, Ue4OverlayService.class);
+        stopService(intent);
     }
 
     /**
@@ -949,6 +991,8 @@ public class MainActivity extends AppCompatActivity {
     // ═══════════════════════════════════════════════════════════════════
 
     private static final String PUBG_PACKAGE = "com.tencent.tmgp.pubgmhd";
+    private static final String PUBG_INJECTOR_TRACE = "/data/local/tmp/injector_trace.txt";
+    private static final String PUBG_UE4_GUI_TRACE = "/data/data/" + PUBG_PACKAGE + "/cache/ue4_gui_trace.txt";
 
     /**
      * 拷贝 SO 到和平精英目标目录
@@ -1025,6 +1069,7 @@ public class MainActivity extends AppCompatActivity {
                                   + "log=" + (enableLog ? "1" : "0") + "\n";
                 cfgOs.writeBytes("echo '" + cfgContent + "' > /data/local/tmp/dobby_config.txt\n");
                 cfgOs.writeBytes("chmod 644 /data/local/tmp/dobby_config.txt\n");
+                cfgOs.writeBytes("rm -f " + PUBG_INJECTOR_TRACE + " " + PUBG_UE4_GUI_TRACE + "\n");
                 cfgOs.writeBytes("exit\n");
                 cfgOs.flush();
                 cfgP.waitFor();
@@ -1033,7 +1078,33 @@ public class MainActivity extends AppCompatActivity {
                 LogUtil.i("[PUBG] 执行注入: " + injectorDst + " " + PUBG_PACKAGE + " " + soPath + " pubg");
                 Process p = Runtime.getRuntime().exec("su");
                 DataOutputStream os = new DataOutputStream(p.getOutputStream());
-                os.writeBytes(injectorDst + " " + PUBG_PACKAGE + " " + soPath + " pubg\n");
+                os.writeBytes("success=0\n");
+                os.writeBytes("last_ret=2\n");
+                os.writeBytes("for attempt in 1 2 3 4; do\n");
+                os.writeBytes("  pid_before=$(pidof " + PUBG_PACKAGE + " 2>/dev/null)\n");
+                os.writeBytes("  echo [PUBG_TRACE] attempt=${attempt} pid_before=${pid_before}\n");
+                os.writeBytes("  " + injectorDst + " " + PUBG_PACKAGE + " " + soPath + " pubg > " + PUBG_INJECTOR_TRACE + " 2>&1\n");
+                os.writeBytes("  last_ret=$?\n");
+                os.writeBytes("  echo [PUBG_TRACE] injector_ret=${last_ret}\n");
+                os.writeBytes("  echo [PUBG_TRACE] injector_output_begin\n");
+                os.writeBytes("  cat " + PUBG_INJECTOR_TRACE + " 2>/dev/null\n");
+                os.writeBytes("  echo [PUBG_TRACE] injector_output_end\n");
+                os.writeBytes("  sleep 8\n");
+                os.writeBytes("  if [ -s " + PUBG_UE4_GUI_TRACE + " ]; then\n");
+                os.writeBytes("    success=1\n");
+                os.writeBytes("    echo [PUBG_TRACE] ue4_gui_trace_detected attempt=${attempt}\n");
+                os.writeBytes("    break\n");
+                os.writeBytes("  fi\n");
+                os.writeBytes("  pid_after=$(pidof " + PUBG_PACKAGE + " 2>/dev/null)\n");
+                os.writeBytes("  echo [PUBG_TRACE] no_ue4_trace attempt=${attempt} pid_after=${pid_after}\n");
+                os.writeBytes("  sleep 5\n");
+                os.writeBytes("done\n");
+                if (enableLog) {
+                    os.writeBytes("echo [PUBG_TRACE] ue4_gui_output_begin\n");
+                    os.writeBytes("cat " + PUBG_UE4_GUI_TRACE + " 2>/dev/null\n");
+                    os.writeBytes("echo [PUBG_TRACE] ue4_gui_output_end\n");
+                }
+                os.writeBytes("if [ \"$success\" = \"1\" ]; then exit 0; else exit 2; fi\n");
                 os.writeBytes("exit\n");
                 os.flush();
 
@@ -1049,13 +1120,17 @@ public class MainActivity extends AppCompatActivity {
                     if (exitCode == 0) {
                         updateStatus("和平精英注入成功");
                     } else {
+                        stopUe4OverlayService();
                         updateStatus("和平精英注入失败 (code=" + exitCode + ")");
                     }
                 });
 
             } catch (Exception e) {
                 LogUtil.e("[PUBG] 注入异常: " + e.getMessage(), e);
-                runOnUiThread(() -> updateStatus("和平精英注入异常"));
+                runOnUiThread(() -> {
+                    stopUe4OverlayService();
+                    updateStatus("和平精英注入异常");
+                });
             }
         }).start();
     }

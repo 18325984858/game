@@ -47,6 +47,14 @@ namespace android
             bool compressionFrameData = true;
             bool autoUpdateOrientation = false;
             bool exchangeFontData = false;
+            bool tcpNoDelay = true;
+            bool disableVsync = true;
+            float styleScale = 1.75f;
+            float fontSizePixels = 18.0f;
+            int screenWidth = 0;
+            int screenHeight = 0;
+            int rotateTheta = 0;
+            ANativeWindow *externalNativeWindow = nullptr;
             std::string serverListenAddress = "127.0.0.1";
             std::string clientConnectAddress = "127.0.0.1";
         };
@@ -95,8 +103,16 @@ namespace android
         std::vector<uint8_t> m_serverRenderData, m_serverRenderDataBack;
         std::mutex m_renderDataMutex;
         std::atomic<RenderState> m_renderState = RenderState::ReadData;
+        uint64_t m_fontPacketCount = 0;
+        uint64_t m_renderPacketCount = 0;
+        uint64_t m_renderFrameCount = 0;
+        size_t m_lastFontPacketSize = 0;
+        size_t m_lastRenderPacketSize = 0;
+        size_t m_lastRenderDecodedSize = 0;
+        bool m_serverFontPacketReceived = false;
 
         ANativeWindow *m_nativeWindow = nullptr;
+        bool m_usesExternalNativeWindow = false;
         EGLDisplay m_defaultDisplay = EGL_NO_DISPLAY;
         EGLSurface m_eglSurface = EGL_NO_SURFACE;
         EGLContext m_eglContext = EGL_NO_CONTEXT;

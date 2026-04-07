@@ -22,8 +22,11 @@ namespace pubgmhd {
 // =====================================================================
 //  引擎常量
 // =====================================================================
-static constexpr int POLL_INTERVAL_MS         = 2000;
-static constexpr int PLAYER_POLL_INTERVAL_MS  = 1000;
+static constexpr int POLL_INTERVAL_MS         = 250;
+static constexpr int PLAYER_POLL_INTERVAL_MS  = 16;
+static constexpr int MONITOR_IDLE_SLEEP_MS    = 1;
+static constexpr int STATE_LOG_INTERVAL_MS    = 1000;
+static constexpr int PLAYER_LOG_INTERVAL_MS   = 1000;
 static constexpr float MAX_CULL_DIST_SQ       = 1.0e18f;
 
 // =====================================================================
@@ -250,6 +253,7 @@ private:
     std::string   m_lastMatchState;
     bool          m_isInMatch = false;
     int32_t       m_myTeamID = -1;
+    uint32_t      m_myPlayerKey = 0;
     int           m_lastReportedArrayNum = -1;
     int           m_lastReportedTotal = -1;
 
