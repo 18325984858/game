@@ -92,6 +92,10 @@ struct ResolvedOffsets {
     int32_t SkelComp_CachedComponentSpaceTransforms = -1;
     int32_t SkinnedMeshComp_SkeletalMesh = -1;
 
+    // SkeletalMesh / Skeleton
+    int32_t SkeletalMesh_Skeleton       = -1;
+    int32_t Skeleton_RefBoneNames       = -1;
+
     /// 所有关键偏移是否已成功解析
     bool isValid() const;
 };

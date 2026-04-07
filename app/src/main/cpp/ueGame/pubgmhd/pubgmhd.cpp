@@ -26,9 +26,6 @@ using Clock = std::chrono::steady_clock;
 
 namespace {
 
-constexpr int32_t kFallbackSkinnedMeshSkeletalMeshOffset = 0x7F0;
-constexpr int32_t kSkeletalMeshRefBoneInfoOffset = 0x238;
-
 struct FQuatNative {
     float x = 0.0f;
     float y = 0.0f;
@@ -48,6 +45,30 @@ static_assert(sizeof(FTransformNative) == 0x30, "FTransformNative size mismatch"
 
 bool isFiniteVector(const FVector3& value) {
     return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
+}
+
+bool hasUsablePlayerPosition(const FVector3& value) {
+    return isFiniteVector(value)
+        && (std::fabs(value.x) > 1.0f || std::fabs(value.y) > 1.0f || std::fabs(value.z) > 1.0f)
+        && std::fabs(value.x) < 1.0e8f
+        && std::fabs(value.y) < 1.0e8f
+        && std::fabs(value.z) < 1.0e8f;
+}
+
+bool isPlayerInNormalState(const PlayerNode& player) {
+    if (player.playerKey == 0) {
+        return false;
+    }
+    if (player.liveState != 0) {
+        return false;
+    }
+    if (!std::isfinite(player.health)) {
+        return false;
+    }
+    if (player.health <= 0.0f) {
+        return false;
+    }
+    return true;
 }
 
 FVector3 rotateVectorByQuat(const FQuatNative& quat, const FVector3& vector) {
@@ -342,10 +363,10 @@ bool MatchMonitor::initOffsets() {
     if (m_off.SkinnedMeshComp_SkeletalMesh < 0) {
         RESOLVE_OFFSET_MULTI(m_off.SkinnedMeshComp_SkeletalMesh, "SkeletalMeshAsset", "SkinnedMeshComponent", "SkeletalMeshComponent");
     }
-    if (m_off.SkinnedMeshComp_SkeletalMesh < 0) {
-        m_off.SkinnedMeshComp_SkeletalMesh = kFallbackSkinnedMeshSkeletalMeshOffset;
-        MLOG(LOG_LEVEL_WARN, "[InitOffsets] SkinnedMeshComponent.SkeletalMesh 未找到, 回退 0x%X", m_off.SkinnedMeshComp_SkeletalMesh);
-    }
+
+    // SkeletalMesh / Skeleton
+    RESOLVE_OFFSET_MULTI(m_off.SkeletalMesh_Skeleton, "Skeleton", "SkeletalMesh");
+    RESOLVE_OFFSET_MULTI(m_off.Skeleton_RefBoneNames, "RefBoneNames", "Skeleton");
 
     MLOG(LOG_LEVEL_INFO, "[InitOffsets] 解析完成, isValid=%d", m_off.isValid());
     MLOG(LOG_LEVEL_INFO, "[InitOffsets] World.GameState=0x%X GS.PlayerArray=0x%X PS.PlayerKey=0x%X",
@@ -552,19 +573,26 @@ bool MatchMonitor::resolveSkeletonIndices(uintptr_t skeletalMeshPtr, std::array<
     }
 
     outIndices.fill(-1);
-    if (skeletalMeshPtr == 0) {
+    if (skeletalMeshPtr == 0
+        || m_off.SkeletalMesh_Skeleton < 0
+        || m_off.Skeleton_RefBoneNames < 0) {
         return false;
     }
 
-    const uintptr_t boneInfoData = safeReadPtr(skeletalMeshPtr + kSkeletalMeshRefBoneInfoOffset);
-    const int32_t boneInfoNum = safeReadS32(skeletalMeshPtr + kSkeletalMeshRefBoneInfoOffset + 8);
-    if (boneInfoData == 0 || boneInfoNum <= 0 || boneInfoNum > 512) {
+    const uintptr_t skeletonPtr = safeReadPtr(skeletalMeshPtr + m_off.SkeletalMesh_Skeleton);
+    if (skeletonPtr == 0 || skeletonPtr < 0x10000) {
         return false;
     }
 
-    for (int32_t boneIndex = 0; boneIndex < boneInfoNum; ++boneIndex) {
-        const uintptr_t boneInfoPtr = boneInfoData + static_cast<uintptr_t>(boneIndex) * 16ULL;
-        const std::string boneName = readFName(boneInfoPtr);
+    const uintptr_t boneNameData = safeReadPtr(skeletonPtr + m_off.Skeleton_RefBoneNames);
+    const int32_t boneNameNum = safeReadS32(skeletonPtr + m_off.Skeleton_RefBoneNames + 8);
+    if (boneNameData == 0 || boneNameNum <= 0 || boneNameNum > 512) {
+        return false;
+    }
+
+    for (int32_t boneIndex = 0; boneIndex < boneNameNum; ++boneIndex) {
+        const uintptr_t boneNamePtr = boneNameData + static_cast<uintptr_t>(boneIndex) * sizeof(ue4::FName);
+        const std::string boneName = readFName(boneNamePtr);
         if (boneName.empty() || boneName == "<invalid>") {
             continue;
         }
@@ -617,6 +645,9 @@ bool MatchMonitor::fillPlayerSkeleton(PlayerNode& player) {
 
     if (player.characterPtr == 0
         || m_off.Char_Mesh < 0
+        || m_off.SkinnedMeshComp_SkeletalMesh < 0
+        || m_off.SkeletalMesh_Skeleton < 0
+        || m_off.Skeleton_RefBoneNames < 0
         || m_off.SkelComp_CachedComponentSpaceTransforms < 0
         || m_off.SceneComp_ComponentToWorld < 0) {
         return false;
@@ -910,6 +941,27 @@ int MatchMonitor::updatePlayerList(uintptr_t gameStatePtr) {
         if (charOwner != 0) {
             getActorLocation(charOwner, loc);
             patchActorNetCull(charOwner);
+
+            const bool hasCharHealth = m_off.Char_Health >= 0;
+            const bool hasCharHealthMax = m_off.Char_HealthMax >= 0;
+            const bool hasCharDead = m_off.Char_bDead >= 0;
+
+            if (hasCharHealth) {
+                const float charHealth = safeReadFloat(charOwner + m_off.Char_Health);
+                if (std::isfinite(charHealth) && charHealth >= 0.0f) {
+                    health = charHealth;
+                }
+            }
+            if (hasCharHealthMax) {
+                const float charHealthMax = safeReadFloat(charOwner + m_off.Char_HealthMax);
+                if (std::isfinite(charHealthMax) && charHealthMax > 0.0f) {
+                    healthMax = charHealthMax;
+                }
+            }
+            if (hasCharDead) {
+                const bool bDead = (safeReadU8(charOwner + m_off.Char_bDead) & 1) != 0;
+                liveState = bDead ? 1 : 0;
+            }
         }
         // 回退SelfLocAndRot
         if (loc.x == 0 && loc.y == 0 && loc.z == 0) {
@@ -1017,7 +1069,7 @@ void MatchMonitor::pollPlayers() {
 
     PlayerNode* cur = m_playerList.head();
     while (cur) {
-        if (cur->liveState == 0 && cur->health > 0) {
+        if (isPlayerInNormalState(*cur)) {
             aliveCount++;
             if (m_myTeamID > 0 && cur->teamID == m_myTeamID) {
                 aliveTeam++;
@@ -1088,33 +1140,84 @@ void MatchMonitor::pollPlayers() {
         drawData.myPosZ = myNode->pos.z;
     }
     // 读取相机数据: PlayerController(+0x658) -> PlayerCameraManager -> CameraCache.POV
+    // 若 CameraCache 当前帧异常, 回退到 CachedViewPOV。
     uintptr_t pc = getLocalPlayerController();
     if (pc != 0) {
         uintptr_t pcm = safeReadPtr(pc + 0x658);  // PlayerController.PlayerCameraManager
         if (pcm != 0) {
-            // CameraCache.POV.Location @ PCM+0x650 (3 floats)
-            drawData.camLocX = safeReadFloat(pcm + 0x650);
-            drawData.camLocY = safeReadFloat(pcm + 0x654);
-            drawData.camLocZ = safeReadFloat(pcm + 0x658);
-            // CameraCache.POV.Rotation @ PCM+0x668 (Pitch, Yaw, Roll)
-            drawData.camPitch = safeReadFloat(pcm + 0x668);
-            drawData.camYaw   = safeReadFloat(pcm + 0x66C);
-            drawData.camRoll  = safeReadFloat(pcm + 0x670);
-            // CameraCache.POV.FOV @ PCM+0x674, fallback to DefaultFOV @ PCM+0x5E0
-            drawData.camFOV = safeReadFloat(pcm + 0x674);
-            if (drawData.camFOV <= 0.0f || drawData.camFOV > 170.0f) {
-                drawData.camFOV = safeReadFloat(pcm + 0x5E0);
+            auto readMinimalViewInfo = [&](uintptr_t viewInfoPtr,
+                                           float& locX,
+                                           float& locY,
+                                           float& locZ,
+                                           float& pitch,
+                                           float& yaw,
+                                           float& roll,
+                                           float& fov) {
+                locX = safeReadFloat(viewInfoPtr + 0x0);
+                locY = safeReadFloat(viewInfoPtr + 0x4);
+                locZ = safeReadFloat(viewInfoPtr + 0x8);
+                pitch = safeReadFloat(viewInfoPtr + 0x18);
+                yaw = safeReadFloat(viewInfoPtr + 0x1C);
+                roll = safeReadFloat(viewInfoPtr + 0x20);
+                fov = safeReadFloat(viewInfoPtr + 0x30);
+            };
+            auto hasFiniteCameraPose = [](float locX,
+                                          float locY,
+                                          float locZ,
+                                          float pitch,
+                                          float yaw,
+                                          float roll) {
+                return std::isfinite(locX) && std::isfinite(locY) && std::isfinite(locZ)
+                    && (std::fabs(locX) > 1.0f || std::fabs(locY) > 1.0f || std::fabs(locZ) > 1.0f)
+                    && std::isfinite(pitch) && std::isfinite(yaw) && std::isfinite(roll);
+            };
+            auto hasValidFov = [](float fov) {
+                return std::isfinite(fov) && fov >= 30.0f && fov <= 170.0f;
+            };
+
+            float camLocX = 0.0f;
+            float camLocY = 0.0f;
+            float camLocZ = 0.0f;
+            float camPitch = 0.0f;
+            float camYaw = 0.0f;
+            float camRoll = 0.0f;
+            float camFov = 0.0f;
+
+            // CameraCacheEntry.POV @ PCM+0x650, MinimalViewInfo.FOV @ +0x30 => PCM+0x680
+            readMinimalViewInfo(pcm + 0x650, camLocX, camLocY, camLocZ, camPitch, camYaw, camRoll, camFov);
+            if (!hasFiniteCameraPose(camLocX, camLocY, camLocZ, camPitch, camYaw, camRoll)) {
+                // CachedViewPOV is a direct MinimalViewInfo at PCM+0x2120.
+                readMinimalViewInfo(pcm + 0x2120, camLocX, camLocY, camLocZ, camPitch, camYaw, camRoll, camFov);
             }
-            if (drawData.camFOV <= 0.0f || drawData.camFOV > 170.0f) drawData.camFOV = 90.0f;
+
+            if (!hasValidFov(camFov)) {
+                camFov = safeReadFloat(pcm + 0x5E0);
+            }
+
+            if (hasFiniteCameraPose(camLocX, camLocY, camLocZ, camPitch, camYaw, camRoll)) {
+                drawData.camLocX = camLocX;
+                drawData.camLocY = camLocY;
+                drawData.camLocZ = camLocZ;
+                drawData.camPitch = camPitch;
+                drawData.camYaw = camYaw;
+                drawData.camRoll = camRoll;
+                drawData.camFOV = hasValidFov(camFov) ? camFov : 90.0f;
+            }
         }
     }
     // 填充所有玩家
     cur = m_playerList.head();
     while (cur) {
-        if (cur->liveState == 0 && cur->health > 0) {
+        const bool isNormalState = isPlayerInNormalState(*cur);
+        if (isNormalState) {
             fillPlayerSkeleton(*cur);
         } else {
             cur->hasSkeleton = false;
+        }
+
+        if (!isNormalState) {
+            cur = cur->next;
+            continue;
         }
 
         ue4draw::DrawPlayerInfo dp;
@@ -1122,7 +1225,7 @@ void MatchMonitor::pollPlayers() {
         dp.teamID = cur->teamID;
         dp.playerName = cur->playerName;
         dp.isAI = cur->isAI;
-        dp.isAlive = (cur->liveState == 0 && cur->health > 0);
+        dp.isAlive = true;
         dp.health = cur->health;
         dp.healthMax = cur->healthMax;
         dp.kills = cur->kills;

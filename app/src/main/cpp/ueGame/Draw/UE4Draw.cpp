@@ -90,42 +90,12 @@ bool hasValidCameraPose(const DrawGameData& data) {
         && isValidNumber(data.camPitch)
         && isValidNumber(data.camYaw)
         && isValidNumber(data.camRoll)
-        && isValidNumber(data.camFOV);
+        && data.camFOV >= 30.0f
+        && data.camFOV <= 170.0f;
 }
 
 DrawGameData stabilizeRenderData(const DrawGameData& data) {
-    static bool s_hasLastCamera = false;
-    static DrawGameData s_lastCameraData;
-
-    DrawGameData resolved = data;
-    if (!data.inMatch) {
-        s_hasLastCamera = false;
-        return resolved;
-    }
-
-    if (hasValidCameraPose(data)) {
-        s_lastCameraData.camLocX = data.camLocX;
-        s_lastCameraData.camLocY = data.camLocY;
-        s_lastCameraData.camLocZ = data.camLocZ;
-        s_lastCameraData.camPitch = data.camPitch;
-        s_lastCameraData.camYaw = data.camYaw;
-        s_lastCameraData.camRoll = data.camRoll;
-        s_lastCameraData.camFOV = data.camFOV;
-        s_hasLastCamera = true;
-        return resolved;
-    }
-
-    if (s_hasLastCamera) {
-        resolved.camLocX = s_lastCameraData.camLocX;
-        resolved.camLocY = s_lastCameraData.camLocY;
-        resolved.camLocZ = s_lastCameraData.camLocZ;
-        resolved.camPitch = s_lastCameraData.camPitch;
-        resolved.camYaw = s_lastCameraData.camYaw;
-        resolved.camRoll = s_lastCameraData.camRoll;
-        resolved.camFOV = s_lastCameraData.camFOV;
-    }
-
-    return resolved;
+    return data;
 }
 
 float sanitizeAngleDegrees(float value) {
@@ -149,6 +119,15 @@ bool tryGetViewPoint(const DrawGameData& data, ViewPoint& outPoint) {
         return true;
     }
     return false;
+}
+
+bool tryGetCameraOrigin(const DrawGameData& data, ViewPoint& outPoint) {
+    if (!hasValidCameraPose(data)) {
+        return false;
+    }
+
+    outPoint = {data.camLocX, data.camLocY, data.camLocZ};
+    return true;
 }
 
 float distanceMeters(float x1, float y1, float z1, float x2, float y2, float z2) {
@@ -229,7 +208,7 @@ bool transformWorldToCamera(const DrawGameData& data,
                             float wz,
                             CameraSpacePoint& outPoint) {
     ViewPoint cameraOrigin;
-    if (!tryGetViewPoint(data, cameraOrigin)) {
+    if (!tryGetCameraOrigin(data, cameraOrigin)) {
         return false;
     }
     if (!isValidNumber(wx) || !isValidNumber(wy) || !isValidNumber(wz)) {
@@ -691,7 +670,7 @@ int UE4Overlay::drawESP(const DrawGameData& data, float screenW, float screenH) 
             }
         }
 
-        if (!rendered && m_enableFallbackESP) {
+        if (!rendered && m_enableFallbackESP && hasPreciseCamera) {
             float arrowX = 0.0f;
             float arrowY = 0.0f;
             float angleRad = 0.0f;
