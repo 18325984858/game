@@ -140,6 +140,9 @@ enum SkeletonPointSlot : size_t {
     SkeletonFootRight,
 };
 
+constexpr auto kSlowPlayerRefreshInterval = std::chrono::milliseconds(120);
+constexpr auto kSkeletonRefreshInterval = std::chrono::milliseconds(40);
+
 } // namespace
 
 bool shouldLogEvery(Clock::time_point& lastLogTime, std::chrono::milliseconds interval) {
@@ -1010,6 +1013,112 @@ int MatchMonitor::updatePlayerList(uintptr_t gameStatePtr) {
     return updated;
 }
 
+void MatchMonitor::refreshTrackedPlayersFast() {
+    PlayerNode* cur = m_playerList.head();
+    while (cur) {
+        if (cur->characterPtr != 0 && cur->characterPtr >= 0x10000) {
+            FVector3 loc{};
+            if (getActorLocation(cur->characterPtr, loc) && hasUsablePlayerPosition(loc)) {
+                cur->pos = loc;
+            }
+
+            if (m_off.Char_Health >= 0) {
+                const float charHealth = safeReadFloat(cur->characterPtr + m_off.Char_Health);
+                if (std::isfinite(charHealth) && charHealth >= 0.0f) {
+                    cur->health = charHealth;
+                }
+            }
+            if (m_off.Char_HealthMax >= 0) {
+                const float charHealthMax = safeReadFloat(cur->characterPtr + m_off.Char_HealthMax);
+                if (std::isfinite(charHealthMax) && charHealthMax > 0.0f) {
+                    cur->healthMax = charHealthMax;
+                }
+            }
+            if (m_off.Char_bDead >= 0) {
+                const bool bDead = (safeReadU8(cur->characterPtr + m_off.Char_bDead) & 1) != 0;
+                cur->liveState = bDead ? 1 : 0;
+            } else if (std::isfinite(cur->health) && cur->health <= 0.0f) {
+                cur->liveState = 1;
+            }
+        } else if (std::isfinite(cur->health) && cur->health <= 0.0f) {
+            cur->liveState = 1;
+        }
+
+        cur = cur->next;
+    }
+}
+
+void MatchMonitor::fillCameraSnapshot(ue4draw::DrawGameData& drawData) {
+    const uintptr_t pc = getLocalPlayerController();
+    if (pc == 0) {
+        return;
+    }
+
+    const uintptr_t pcm = safeReadPtr(pc + 0x658);  // PlayerController.PlayerCameraManager
+    if (pcm == 0) {
+        return;
+    }
+
+    auto readMinimalViewInfo = [&](uintptr_t viewInfoPtr,
+                                   float& locX,
+                                   float& locY,
+                                   float& locZ,
+                                   float& pitch,
+                                   float& yaw,
+                                   float& roll,
+                                   float& fov) {
+        locX = safeReadFloat(viewInfoPtr + 0x0);
+        locY = safeReadFloat(viewInfoPtr + 0x4);
+        locZ = safeReadFloat(viewInfoPtr + 0x8);
+        pitch = safeReadFloat(viewInfoPtr + 0x18);
+        yaw = safeReadFloat(viewInfoPtr + 0x1C);
+        roll = safeReadFloat(viewInfoPtr + 0x20);
+        fov = safeReadFloat(viewInfoPtr + 0x30);
+    };
+    auto hasFiniteCameraPose = [](float locX,
+                                  float locY,
+                                  float locZ,
+                                  float pitch,
+                                  float yaw,
+                                  float roll) {
+        return std::isfinite(locX) && std::isfinite(locY) && std::isfinite(locZ)
+            && (std::fabs(locX) > 1.0f || std::fabs(locY) > 1.0f || std::fabs(locZ) > 1.0f)
+            && std::isfinite(pitch) && std::isfinite(yaw) && std::isfinite(roll);
+    };
+    auto hasValidFov = [](float fov) {
+        return std::isfinite(fov) && fov >= 30.0f && fov <= 170.0f;
+    };
+
+    float camLocX = 0.0f;
+    float camLocY = 0.0f;
+    float camLocZ = 0.0f;
+    float camPitch = 0.0f;
+    float camYaw = 0.0f;
+    float camRoll = 0.0f;
+    float camFov = 0.0f;
+
+    // CameraCacheEntry.POV @ PCM+0x650, MinimalViewInfo.FOV @ +0x30 => PCM+0x680
+    readMinimalViewInfo(pcm + 0x650, camLocX, camLocY, camLocZ, camPitch, camYaw, camRoll, camFov);
+    if (!hasFiniteCameraPose(camLocX, camLocY, camLocZ, camPitch, camYaw, camRoll)) {
+        // CachedViewPOV is a direct MinimalViewInfo at PCM+0x2120.
+        readMinimalViewInfo(pcm + 0x2120, camLocX, camLocY, camLocZ, camPitch, camYaw, camRoll, camFov);
+    }
+
+    if (!hasValidFov(camFov)) {
+        camFov = safeReadFloat(pcm + 0x5E0);
+    }
+
+    if (hasFiniteCameraPose(camLocX, camLocY, camLocZ, camPitch, camYaw, camRoll)) {
+        drawData.camLocX = camLocX;
+        drawData.camLocY = camLocY;
+        drawData.camLocZ = camLocZ;
+        drawData.camPitch = camPitch;
+        drawData.camYaw = camYaw;
+        drawData.camRoll = camRoll;
+        drawData.camFOV = hasValidFov(camFov) ? camFov : 90.0f;
+    }
+}
+
 // =====================================================================
 //  日志工具
 // =====================================================================
@@ -1052,6 +1161,9 @@ void MatchMonitor::closeLog() {
 // =====================================================================
 void MatchMonitor::pollPlayers() {
     static Clock::time_point s_lastPlayerLogTime;
+    static Clock::time_point s_lastSlowRefreshTime;
+    static Clock::time_point s_lastSkeletonRefreshTime;
+
     const bool shouldDumpPlayerLog = shouldLogEvery(s_lastPlayerLogTime, std::chrono::milliseconds(PLAYER_LOG_INTERVAL_MS));
 
     auto* names = reinterpret_cast<ue4::TNameEntryArray*>(m_gNames);
@@ -1059,67 +1171,25 @@ void MatchMonitor::pollPlayers() {
     MatchState ms = getMatchState();
     if (!ms.inMatch) return;
 
-    int count = updatePlayerList(ms.gameStatePtr);
-    if (count <= 0) return;
+    const bool shouldRunSlowPath = m_playerList.size() <= 0
+        || m_myPlayerKey == 0
+        || shouldLogEvery(s_lastSlowRefreshTime, kSlowPlayerRefreshInterval);
 
-    int aliveCount = 0, deadCount = 0;
-    int aliveTeam = 0, aliveEnemy = 0;
-    std::vector<PlayerNode*> enemies;
-    std::vector<PlayerNode*> teammates;
-
-    PlayerNode* cur = m_playerList.head();
-    while (cur) {
-        if (isPlayerInNormalState(*cur)) {
-            aliveCount++;
-            if (m_myTeamID > 0 && cur->teamID == m_myTeamID) {
-                aliveTeam++;
-                teammates.push_back(cur);
-            } else {
-                aliveEnemy++;
-                enemies.push_back(cur);
-            }
-        } else {
-            deadCount++;
+    if (shouldRunSlowPath) {
+        const int count = updatePlayerList(ms.gameStatePtr);
+        if (count <= 0 && m_playerList.size() <= 0) {
+            return;
         }
-        cur = cur->next;
+    } else {
+        refreshTrackedPlayersFast();
     }
 
-    if (shouldDumpPlayerLog) {
-        MLOG(LOG_LEVEL_INFO, "[Players] %d alive (%d team + %d enemy) / %d total",
-            aliveCount, aliveTeam, aliveEnemy, m_playerList.size());
+    if (m_playerList.size() <= 0) {
+        return;
     }
 
-    char logBuf[512];
-
-    // logcat + 文件日志: 敌人
-    if (shouldDumpPlayerLog) {
-        int limit = (enemies.size() < 40) ? (int)enemies.size() : 40;
-        for (int i = 0; i < limit; i++) {
-            PlayerNode* p = enemies[i];
-            MLOG(LOG_LEVEL_INFO, "[Enemy] T%d %s %.0f/%.0fHP (%.0f, %.0f, %.0f) K:%d %s",
-                 p->teamID, p->isAI ? "AI" : "Real",
-                 p->health, p->healthMax,
-                 p->pos.x, p->pos.y, p->pos.z,
-                 p->kills, p->playerName.c_str());
-            snprintf(logBuf, sizeof(logBuf), " ★ T%d %.0f/%.0fHP (%.0f, %.0f, %.0f) %s",
-                     p->teamID, p->health, p->healthMax,
-                     p->pos.x, p->pos.y, p->pos.z, p->playerName.c_str());
-            writeLog(logBuf);
-        }
-        for (int i = 0; i < (int)teammates.size(); i++) {
-            PlayerNode* p = teammates[i];
-            MLOG(LOG_LEVEL_INFO, "[Team] T%d %s %.0f/%.0fHP (%.0f, %.0f, %.0f) K:%d %s",
-                 p->teamID, p->isAI ? "AI" : "Real",
-                 p->health, p->healthMax,
-                 p->pos.x, p->pos.y, p->pos.z,
-                 p->kills, p->playerName.c_str());
-            snprintf(logBuf, sizeof(logBuf), " ○ T%d %.0f/%.0fHP (%.0f, %.0f, %.0f) %s",
-                     p->teamID, p->health, p->healthMax,
-                     p->pos.x, p->pos.y, p->pos.z, p->playerName.c_str());
-            writeLog(logBuf);
-        }
-        writeLog("");
-    }
+    const bool shouldRefreshSkeleton = shouldRunSlowPath
+        || shouldLogEvery(s_lastSkeletonRefreshTime, kSkeletonRefreshInterval);
 
     // 推送数据到绘制层
     ue4draw::DrawGameData drawData;
@@ -1127,8 +1197,9 @@ void MatchMonitor::pollPlayers() {
     drawData.worldName = ms.worldName;
     drawData.matchState = ms.state;
     drawData.myTeamID = m_myTeamID;
-    drawData.aliveCount = aliveCount;
     drawData.totalCount = m_playerList.size();
+    drawData.players.reserve(static_cast<size_t>(m_playerList.size()));
+
     // 获取自己的位置 (PlayerArray[0])
     PlayerNode* myNode = m_myPlayerKey != 0 ? m_playerList.findByKey(m_myPlayerKey) : nullptr;
     if (!myNode) {
@@ -1139,85 +1210,43 @@ void MatchMonitor::pollPlayers() {
         drawData.myPosY = myNode->pos.y;
         drawData.myPosZ = myNode->pos.z;
     }
-    // 读取相机数据: PlayerController(+0x658) -> PlayerCameraManager -> CameraCache.POV
-    // 若 CameraCache 当前帧异常, 回退到 CachedViewPOV。
-    uintptr_t pc = getLocalPlayerController();
-    if (pc != 0) {
-        uintptr_t pcm = safeReadPtr(pc + 0x658);  // PlayerController.PlayerCameraManager
-        if (pcm != 0) {
-            auto readMinimalViewInfo = [&](uintptr_t viewInfoPtr,
-                                           float& locX,
-                                           float& locY,
-                                           float& locZ,
-                                           float& pitch,
-                                           float& yaw,
-                                           float& roll,
-                                           float& fov) {
-                locX = safeReadFloat(viewInfoPtr + 0x0);
-                locY = safeReadFloat(viewInfoPtr + 0x4);
-                locZ = safeReadFloat(viewInfoPtr + 0x8);
-                pitch = safeReadFloat(viewInfoPtr + 0x18);
-                yaw = safeReadFloat(viewInfoPtr + 0x1C);
-                roll = safeReadFloat(viewInfoPtr + 0x20);
-                fov = safeReadFloat(viewInfoPtr + 0x30);
-            };
-            auto hasFiniteCameraPose = [](float locX,
-                                          float locY,
-                                          float locZ,
-                                          float pitch,
-                                          float yaw,
-                                          float roll) {
-                return std::isfinite(locX) && std::isfinite(locY) && std::isfinite(locZ)
-                    && (std::fabs(locX) > 1.0f || std::fabs(locY) > 1.0f || std::fabs(locZ) > 1.0f)
-                    && std::isfinite(pitch) && std::isfinite(yaw) && std::isfinite(roll);
-            };
-            auto hasValidFov = [](float fov) {
-                return std::isfinite(fov) && fov >= 30.0f && fov <= 170.0f;
-            };
+    fillCameraSnapshot(drawData);
 
-            float camLocX = 0.0f;
-            float camLocY = 0.0f;
-            float camLocZ = 0.0f;
-            float camPitch = 0.0f;
-            float camYaw = 0.0f;
-            float camRoll = 0.0f;
-            float camFov = 0.0f;
-
-            // CameraCacheEntry.POV @ PCM+0x650, MinimalViewInfo.FOV @ +0x30 => PCM+0x680
-            readMinimalViewInfo(pcm + 0x650, camLocX, camLocY, camLocZ, camPitch, camYaw, camRoll, camFov);
-            if (!hasFiniteCameraPose(camLocX, camLocY, camLocZ, camPitch, camYaw, camRoll)) {
-                // CachedViewPOV is a direct MinimalViewInfo at PCM+0x2120.
-                readMinimalViewInfo(pcm + 0x2120, camLocX, camLocY, camLocZ, camPitch, camYaw, camRoll, camFov);
-            }
-
-            if (!hasValidFov(camFov)) {
-                camFov = safeReadFloat(pcm + 0x5E0);
-            }
-
-            if (hasFiniteCameraPose(camLocX, camLocY, camLocZ, camPitch, camYaw, camRoll)) {
-                drawData.camLocX = camLocX;
-                drawData.camLocY = camLocY;
-                drawData.camLocZ = camLocZ;
-                drawData.camPitch = camPitch;
-                drawData.camYaw = camYaw;
-                drawData.camRoll = camRoll;
-                drawData.camFOV = hasValidFov(camFov) ? camFov : 90.0f;
-            }
-        }
+    int aliveCount = 0;
+    int aliveTeam = 0;
+    int aliveEnemy = 0;
+    std::vector<PlayerNode*> enemies;
+    std::vector<PlayerNode*> teammates;
+    if (shouldDumpPlayerLog) {
+        enemies.reserve(static_cast<size_t>(m_playerList.size()));
+        teammates.reserve(static_cast<size_t>(m_playerList.size()));
     }
-    // 填充所有玩家
-    cur = m_playerList.head();
+
+    PlayerNode* cur = m_playerList.head();
     while (cur) {
         const bool isNormalState = isPlayerInNormalState(*cur);
-        if (isNormalState) {
-            fillPlayerSkeleton(*cur);
-        } else {
-            cur->hasSkeleton = false;
-        }
-
         if (!isNormalState) {
+            cur->hasSkeleton = false;
             cur = cur->next;
             continue;
+        }
+
+        const bool isTeammate = (m_myTeamID > 0 && cur->teamID == m_myTeamID);
+        aliveCount++;
+        if (isTeammate) {
+            aliveTeam++;
+            if (shouldDumpPlayerLog) {
+                teammates.push_back(cur);
+            }
+        } else {
+            aliveEnemy++;
+            if (shouldDumpPlayerLog) {
+                enemies.push_back(cur);
+            }
+        }
+
+        if (shouldRefreshSkeleton) {
+            fillPlayerSkeleton(*cur);
         }
 
         ue4draw::DrawPlayerInfo dp;
@@ -1232,7 +1261,7 @@ void MatchMonitor::pollPlayers() {
         dp.posX = cur->pos.x;
         dp.posY = cur->pos.y;
         dp.posZ = cur->pos.z;
-        dp.isTeammate = (m_myTeamID > 0 && cur->teamID == m_myTeamID);
+        dp.isTeammate = isTeammate;
         dp.hasSkeleton = cur->hasSkeleton;
         if (cur->hasSkeleton) {
             for (size_t skeletonIndex = 0; skeletonIndex < cur->skeletonPoints.size(); ++skeletonIndex) {
@@ -1245,6 +1274,42 @@ void MatchMonitor::pollPlayers() {
         drawData.players.push_back(dp);
         cur = cur->next;
     }
+
+    drawData.aliveCount = aliveCount;
+
+    if (shouldDumpPlayerLog) {
+        MLOG(LOG_LEVEL_INFO, "[Players] %d alive (%d team + %d enemy) / %d total",
+            aliveCount, aliveTeam, aliveEnemy, m_playerList.size());
+
+        char logBuf[512];
+        const int limit = (enemies.size() < 40) ? static_cast<int>(enemies.size()) : 40;
+        for (int i = 0; i < limit; i++) {
+            PlayerNode* p = enemies[i];
+            MLOG(LOG_LEVEL_INFO, "[Enemy] T%d %s %.0f/%.0fHP (%.0f, %.0f, %.0f) K:%d %s",
+                 p->teamID, p->isAI ? "AI" : "Real",
+                 p->health, p->healthMax,
+                 p->pos.x, p->pos.y, p->pos.z,
+                 p->kills, p->playerName.c_str());
+            snprintf(logBuf, sizeof(logBuf), " ★ T%d %.0f/%.0fHP (%.0f, %.0f, %.0f) %s",
+                     p->teamID, p->health, p->healthMax,
+                     p->pos.x, p->pos.y, p->pos.z, p->playerName.c_str());
+            writeLog(logBuf);
+        }
+        for (int i = 0; i < static_cast<int>(teammates.size()); i++) {
+            PlayerNode* p = teammates[i];
+            MLOG(LOG_LEVEL_INFO, "[Team] T%d %s %.0f/%.0fHP (%.0f, %.0f, %.0f) K:%d %s",
+                 p->teamID, p->isAI ? "AI" : "Real",
+                 p->health, p->healthMax,
+                 p->pos.x, p->pos.y, p->pos.z,
+                 p->kills, p->playerName.c_str());
+            snprintf(logBuf, sizeof(logBuf), " ○ T%d %.0f/%.0fHP (%.0f, %.0f, %.0f) %s",
+                     p->teamID, p->health, p->healthMax,
+                     p->pos.x, p->pos.y, p->pos.z, p->playerName.c_str());
+            writeLog(logBuf);
+        }
+        writeLog("");
+    }
+
     ue4draw::SharedUE4Data::getInstance().pushData(drawData);
 }
 

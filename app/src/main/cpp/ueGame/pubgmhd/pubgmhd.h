@@ -11,6 +11,7 @@
 
 // 前向声明
 namespace ue4inf { class UE4Interface; }
+namespace ue4draw { struct DrawGameData; }
 
 // =====================================================================
 //  PUBG Mobile 和平精英 — 对局状态监控 + 玩家坐标采集 (C++ 原生实现)
@@ -248,6 +249,10 @@ private:
 
     // ---- PlayerArray 遍历更新 ----
     int updatePlayerList(uintptr_t gameStatePtr);
+
+    // ---- 高频轻量刷新 ----
+    void refreshTrackedPlayersFast();
+    void fillCameraSnapshot(ue4draw::DrawGameData& drawData);
 
     // ---- 轮询线程 ----
     void pollMatchStateLoop();
