@@ -1,10 +1,21 @@
 #include "UE4Draw.h"
 #include "../../Log/log.h"
+#include <imgui/imgui_internal.h>
 #include <cmath>
 #include <algorithm>
 #include <chrono>
 
 #define DLOG(level, fmt, ...) LOG(level, fmt, ##__VA_ARGS__)
+
+// =====================================================================
+//  历史错误总结:
+//  [BUG-3] ImGui::Begin assert "g.WithinFrameScope" failed
+//    原因: 游戏引擎线程 (MainThread-UE4) 触发了注入的 ImGui context
+//          的 assert, 但崩溃线程并非我们的 GUI 线程
+//    修复: 在 drawOverlay 入口检查 WithinFrameScope, 但会导致不绘制
+//          最终方案: 确保 AImGui BeginFrame 成功后才调用 drawOverlay
+//          保留 WithinFrameScope 检查作为安全网
+// =====================================================================
 
 namespace ue4draw {
 
@@ -360,6 +371,12 @@ float UE4Overlay::distance3D(float x1, float y1, float z1, float x2, float y2, f
 //  主绘制入口
 // =====================================================================
 void UE4Overlay::drawOverlay(const DrawGameData& data) {
+    // 确认 ImGui frame 处于活跃状态, 防止从错误线程或 frame 外调用时 assert 崩溃
+    ImGuiContext* ctx = ImGui::GetCurrentContext();
+    if (!ctx || !ctx->WithinFrameScope) {
+        return;
+    }
+
     const DrawGameData renderData = stabilizeRenderData(data);
     ImGuiIO& io = ImGui::GetIO();
     float screenW = io.DisplaySize.x;

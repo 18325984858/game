@@ -2,6 +2,7 @@
 #define UE4_DRAW_H
 
 #include <imgui/imgui.h>
+#include <mutex>
 #include <atomic>
 #include <vector>
 #include <array>
@@ -10,6 +11,15 @@
 
 // =====================================================================
 //  UE4 ESP 绘制系统 — PUBG Mobile 玩家坐标绘制 + 控制菜单
+//
+//  历史错误总结:
+//  [BUG-1] 无锁三缓冲导致堆损坏 (Scudo misaligned pointer)
+//    原因: DrawGameData 含 std::vector/std::string, Writer 通过 exchange
+//          拿回 buffer 后赋值会析构 Reader 正在引用的容器
+//    修复: 回退为 mutex 双缓冲, Reader 在锁内拷贝到本地变量
+//  [BUG-2] 三缓冲闪烁 (Writer 无新数据时 Reader ping-pong)
+//    原因: acquireRead() 每帧无条件 exchange, 好坏数据交替
+//    修复: 已随三缓冲移除而解决
 // =====================================================================
 
 namespace ue4draw {
@@ -50,13 +60,12 @@ struct DrawGameData {
 };
 
 // =====================================================================
-//  SharedUE4Data — 无锁三缓冲数据桥接 (单例, SPSC lock-free)
+//  SharedUE4Data — 线程安全数据桥接 (单例, mutex 保护)
 //
-//  设计模式: Triple Buffer (三缓冲)
-//  - Writer(MatchMonitor) 写入 writeSlot, 完成后与 readySlot 原子交换
-//  - Reader(GUI线程) 将 readSlot 与 readySlot 原子交换, 然后直接引用 readSlot
-//  - 三个 slot 互不重叠, Writer 永远不会写到 Reader 正在读的 buffer
-//  - 完全消除 mutex 竞争, Reader 不会阻塞 Writer, 反之亦然
+//  使用 mutex + 双缓冲: Writer 写后台 buffer 后交换前后台索引
+//  Reader 拷贝前台 buffer 到本地后立即释放锁
+//  DrawGameData 含 std::vector/std::string, 无锁三缓冲会因
+//  赋值时析构正在被 Reader 引用的容器导致堆损坏 (Scudo misaligned ptr)
 // =====================================================================
 class SharedUE4Data {
 public:
@@ -69,25 +78,17 @@ public:
 
     /// Writer 端: 写入最新数据 (仅 MatchMonitor 线程调用)
     void pushData(const DrawGameData& data) {
-        m_buffers[m_writeSlot] = data;
-        // 将写完的 buffer 提交为 ready, 拿回空闲 buffer 作为下次写入目标
-        m_writeSlot = m_readySlot.exchange(m_writeSlot, std::memory_order_acq_rel);
-        m_newDataAvailable.store(true, std::memory_order_release);
+        std::lock_guard<std::mutex> lock(m_mutex);
+        const int writeIdx = 1 - m_frontIndex;
+        m_buffers[writeIdx] = data;
+        m_frontIndex = writeIdx;
         m_inMatch.store(data.inMatch, std::memory_order_release);
     }
 
-    /// Reader 端: 获取最新数据的只读引用 (仅 GUI 线程调用)
-    /// 仅在 Writer 有新数据时才交换, 避免无新数据时交替闪烁
-    const DrawGameData& acquireRead() {
-        if (m_newDataAvailable.exchange(false, std::memory_order_acq_rel)) {
-            m_readSlot = m_readySlot.exchange(m_readSlot, std::memory_order_acq_rel);
-        }
-        return m_buffers[m_readSlot];
-    }
-
-    /// 兼容旧接口: 拷贝到 outData
+    /// Reader 端: 拷贝最新数据到 outData (仅 GUI 线程调用)
     void getData(DrawGameData& outData) {
-        outData = acquireRead();
+        std::lock_guard<std::mutex> lock(m_mutex);
+        outData = m_buffers[m_frontIndex];
     }
 
     bool isInMatch() const { return m_inMatch.load(std::memory_order_acquire); }
@@ -95,11 +96,9 @@ public:
 
 private:
     SharedUE4Data() = default;
-    std::array<DrawGameData, 3> m_buffers{};
-    int m_writeSlot = 0;                     // Writer 私有, 无需原子
-    int m_readSlot  = 1;                     // Reader 私有, 无需原子
-    std::atomic<int> m_readySlot{2};         // Writer/Reader 共享交换点
-    std::atomic<bool> m_newDataAvailable{false}; // Writer 有新数据时置 true
+    std::mutex m_mutex;
+    std::array<DrawGameData, 2> m_buffers{};
+    int m_frontIndex = 0;
     std::atomic<bool> m_inMatch{false};
 };
 

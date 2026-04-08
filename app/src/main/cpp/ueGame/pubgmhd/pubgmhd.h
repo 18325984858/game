@@ -18,6 +18,33 @@ namespace ue4draw { struct DrawGameData; }
 //  PUBG Mobile 和平精英 — 对局状态监控 + 玩家坐标采集 (C++ 原生实现)
 //  从 frida_match_monitor.js 转写
 //  Target: com.tencent.tmgp.pubgmhd (ARM64 Android, UE4.18 腾讯定制版)
+//
+//  历史错误总结:
+//  [BUG-4] BatchMemReader “全有或全无”导致遍历不到数据
+//    原因: read() 失败时 continue 跳过整个玩家; 字段超出缓冲返回 0
+//    修复: get() 自动回退到 safeReadMemory 单独读取
+//  [BUG-5] 指针数组批量读取无回退
+//    原因: TArray 内存跨页边界时整块 memcpy 失败, psPtrs 全零
+//    修复: 改为逐个 safeReadPtr 读取指针数组
+//  [BUG-6] writeMemFloat/writeMemU8 裸写入崩溃
+//    原因: 写入已释放的 Actor 内存 → SIGSEGV, s_safeReadActive=0 无法恢复
+//    修复: 新增 safeWriteMemory() 与 safeReadMemory 相同的 sigsetjmp 保护
+//  [BUG-7] GNames/GUObjectArray 裸指针解引用 (13 处)
+//    原因: getNameByIndex/scanCharacters/pollPlayers 中直接 ptr->field
+//    修复: 全部改为 safeReadPtr/safeReadS32 + 结构体偏移计算
+//  [BUG-8] readFString() 裸解引用 wstr[i]
+//    原因: UTF-16 字符串指针被游戏释放后访问 → SIGSEGV
+//    修复: safeReadMemory 一次性读取到栈缓冲区
+//  [BUG-9] installSafeReadGuard 非线程安全
+//    原因: bool 检查+设置无原子性, 多线程可能重复安装信号处理器
+//    修复: 改为 std::call_once
+//  [BUG-10] 信号处理器链冲突
+//    原因: uestart.cpp 调用 pubgmhd 的 safeReadMemory 安装处理器 A,
+//          UE4Dumper 又安装处理器 B 覆盖 A → siglongjmp 跳错 jmpbuf
+//    修复: uestart 改用 /proc/self/mem pread() 探测, 不涉及信号处理器
+//  [BUG-11] 开局网络异常断开 (“网络波动异常”)
+//    原因: patchActorNetCull 在 加载/飞机/跳伞 阶段写入 NetCullDistSq
+//    修复: 仅在 matchState=="InProgress" 时才允许写入
 // =====================================================================
 
 namespace pubgmhd {
@@ -167,10 +194,8 @@ public:
         return v;
     }
 
-    /// 安全内存读取 (公开, 供外部在安装信号保护后使用)
-    static bool safeReadMemoryStatic(uintptr_t addr, void* out, size_t size);
-
 private:
+    static bool safeReadMemoryStatic(uintptr_t addr, void* out, size_t size);
     uint8_t   m_buf[kMaxBatchSize]{};
     uintptr_t m_base = 0;
     size_t    m_size = 0;

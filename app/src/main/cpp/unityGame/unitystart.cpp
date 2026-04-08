@@ -26,15 +26,13 @@
 // 线程安全游戏数据桥接
 #include "SharedGameData.h"
 
-// Dobby — inline hook
+// Dobby — inline hook (仅用于数据采集 hook, 不再用于绘制)
 #include "../Dobby/include/dobby.h"
 
-// ImGui (eglSwapBuffers hook 使用)
+// ImGui (AImGui RenderClient 使用)
 #include <imgui/imgui.h>
-#include <imgui/backends/imgui_impl_opengl3.h>
-#include <EGL/egl.h>
 
-// 触摸输入 (读取 /dev/input/event*)
+// 触摸输入 (读取 /dev/input/event* — 保留用于数据采集中的按键模拟)
 #include <linux/input.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -908,290 +906,138 @@ namespace touch_input {
 
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// eglSwapBuffers Hook — 直接绘制方案
+// AImGui RenderClient 绘制方案 (无 Hook)
 //
-// hook 游戏的 eglSwapBuffers，在每帧提交前绘制 ImGui 覆盖层。
-// eglSwapBuffers 是 EGL 公开 API，dlsym 直接获取，无需 DobbySymbolResolver。
-// ImGui OpenGL3 后端自动保存/恢复 GL 状态，不影响游戏渲染。
+// 独立 GUI 线程通过 AImGui RenderClient 连接到 PublicOverlayRenderer (RenderServer),
+// 通过 TCP 传输 ImGui 绘制数据, 在独立 Surface 上渲染覆盖层。
+// 完全不 hook 游戏线程, 零性能影响。
 // ═══════════════════════════════════════════════════════════════════════════════
 
-namespace egl_hook {
-    static EGLBoolean (*g_origSwapBuffers)(EGLDisplay, EGLSurface) = nullptr;
-    static std::atomic<bool> g_ready{false};
-    static ImGuiContext*      g_ctx       = nullptr;
-    static int                g_width     = 0;
-    static int                g_height    = 0;
-    static double             g_lastTime  = 0.0;
+#include "../AndroidSurfaceImgui/includes/AImGui.h"
 
-    static bool initImGui(EGLDisplay display, EGLSurface surface) {
-        EGLint w = 0, h = 0;
-        eglQuerySurface(display, surface, EGL_WIDTH, &w);
-        eglQuerySurface(display, surface, EGL_HEIGHT, &h);
-        if (w <= 0 || h <= 0) {
-            LOG(LOG_LEVEL_ERROR, "[EglHook] surface 尺寸无效: %dx%d", w, h);
-            return false;
+namespace {
+
+struct ShellDisplayInfo {
+    int width = 0;
+    int height = 0;
+    int rotateTheta = 0;
+};
+
+static bool queryShellDisplay(ShellDisplayInfo& outInfo) {
+    FILE* fp = popen("wm size 2>/dev/null", "r");
+    if (!fp) return false;
+    char buf[128] = {};
+    while (fgets(buf, sizeof(buf), fp)) {
+        int w = 0, h = 0;
+        if (sscanf(buf, "Physical size: %dx%d", &w, &h) == 2 ||
+            sscanf(buf, "Override size: %dx%d", &w, &h) == 2) {
+            if (w > 0 && h > 0) { outInfo.width = w; outInfo.height = h; }
         }
-        g_width  = w;
-        g_height = h;
+    }
+    pclose(fp);
 
-        IMGUI_CHECKVERSION();
-        g_ctx = ImGui::CreateContext();
-        if (!g_ctx) {
-            LOG(LOG_LEVEL_ERROR, "[EglHook] ImGui::CreateContext 失败");
-            return false;
+    // 横屏归一化
+    if (outInfo.width > 0 && outInfo.height > 0) {
+        if (outInfo.width < outInfo.height) {
+            std::swap(outInfo.width, outInfo.height);
+            outInfo.rotateTheta = 0;
         }
-
-        auto& io       = ImGui::GetIO();
-        io.IniFilename = nullptr;
-        io.DisplaySize = ImVec2((float)w, (float)h);
-        io.DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
-
-        ImGui::StyleColorsDark();
-        ImGui::GetStyle().ScaleAllSizes(3.f);
-
-        // ── 加载中文字体 (stb_truetype 内置光栅化器, 支持 TrueType) ──
-        const float fontSize = 22.0f;
-        io.Fonts->TexDesiredWidth = 4096;
-
-        // 辅助: 用 open()/read() 读文件到 IM_ALLOC 内存 (绕过 fopen SELinux)
-        auto tryLoadFont = [&](const char* path, int fontNo = 0) -> bool {
-            struct stat st{};
-            if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) return false;
-
-            int fd = open(path, O_RDONLY);
-            if (fd < 0) return false;
-            int fileSize = (int)st.st_size;
-            void* data = IM_ALLOC(fileSize);
-            if (!data) { close(fd); return false; }
-            size_t total = 0;
-            while (total < (size_t)fileSize) {
-                ssize_t n = read(fd, (char*)data + total, fileSize - total);
-                if (n <= 0) break;
-                total += n;
-            }
-            close(fd);
-            if ((int)total != fileSize) { IM_FREE(data); return false; }
-
-            ImFontConfig cfg;
-            cfg.FontDataOwnedByAtlas = true;
-            cfg.OversampleH = 1;
-            cfg.OversampleV = 1;
-            cfg.PixelSnapH  = true;
-            cfg.FontNo      = fontNo;
-
-            ImFont* font = io.Fonts->AddFontFromMemoryTTF(
-                    data, fileSize, fontSize, &cfg,
-                    io.Fonts->GetGlyphRangesChineseFull());
-            if (!font) { IM_FREE(data); return false; }
-
-            if (!io.Fonts->Build()) {
-                LOG(LOG_LEVEL_INFO, "[Font] 跳过 (stb_truetype 不支持此格式): %s", path);
-                io.Fonts->Clear();
-                return false;
-            }
-
-            // 验证中文字形
-            const ImFontGlyph* g = font->FindGlyphNoFallback((ImWchar)0x4E2D);
-            if (!g) {
-                LOG(LOG_LEVEL_WARN, "[Font] 无中文字形: %s [FontNo=%d]", path, fontNo);
-                io.Fonts->Clear();
-                return false;
-            }
-
-            LOG(LOG_LEVEL_INFO, "[Font] ✓ %s [FontNo=%d] (%d bytes, atlas %dx%d)",
-                path, fontNo, fileSize, io.Fonts->TexWidth, io.Fonts->TexHeight);
-            return true;
-        };
-
-        // 候选列表 (按优先级)
-        // stb_truetype 仅支持 TrueType 轮廓 (.ttf)
-        // CFF/CFF2 轮廓 (.otf, 部分 .ttc) 需要 FreeType, 放到最后作为兜底
-        const char* fontPaths[] = {
-            // ── 用户自定义 (最高优先级) ──
-            "/data/local/tmp/chinese.ttf",
-            // ── TrueType .ttf (stb_truetype 原生支持) ──
-            "/system/fonts/DroidSansFallback.ttf",         // Android 4.x-6.x, 广泛兼容
-            "/system/fonts/NotoSansSC-Regular.ttf",        // 部分 Android 用 .ttf 版本
-            "/system/fonts/NotoSansCJKsc-Regular.ttf",
-            "/system/fonts/MiLanProVF.ttf",                // 小米
-            "/system/fonts/HarmonyOS_Sans_SC.ttf",         // 华为
-            "/system/fonts/OPPOSans-Regular.ttf",          // OPPO
-            "/system/fonts/VivoSans-Regular.ttf",          // vivo
-            "/system/fonts/RobotoFallback-Regular.ttf",    // 部分原生 ROM
-            // ── CFF/CFF2 格式 (stb_truetype 可能不支持, 放最后) ──
-            "/system/fonts/NotoSansSC-Regular.otf",
-            "/system/fonts/NotoSansHans-Regular.otf",
-            "/system/fonts/NotoSansCJKsc-Regular.otf",
-            "/system/fonts/NotoSansSC-Regular.ttc",
-            "/system/fonts/NotoSansCJKsc-Regular.ttc",
-            "/system/fonts/NotoSansCJK-Regular.ttc",       // CFF2, 需要 FreeType
-            "/data/local/tmp/chinese.ttc",
-        };
-
-        bool fontOK = false;
-        for (const char* path : fontPaths) {
-            if (tryLoadFont(path)) { fontOK = true; break; }
-        }
-
-        // 扫描 /system/fonts/ 兜底
-        if (!fontOK) {
-            DIR* dir = opendir("/system/fonts");
-            if (dir) {
-                struct dirent* entry;
-                while (!fontOK && (entry = readdir(dir)) != nullptr) {
-                    const char* name = entry->d_name;
-                    size_t len = strlen(name);
-                    if (len < 5) continue;
-                    const char* ext = name + len - 4;
-                    if (strcasecmp(ext, ".ttf") != 0 && strcasecmp(ext, ".otf") != 0 &&
-                        strcasecmp(ext, ".ttc") != 0) continue;
-                    char full[256];
-                    snprintf(full, sizeof(full), "/system/fonts/%s", name);
-                    if (tryLoadFont(full)) fontOK = true;
-                }
-                closedir(dir);
-            }
-        }
-
-        // 全部失败 → 默认 ASCII 字体
-        if (!fontOK) {
-            LOG(LOG_LEVEL_WARN, "[EglHook] ⚠ 未找到中文字体, 回退默认字体");
-            ImFontConfig fallbackCfg;
-            fallbackCfg.SizePixels = fontSize;
-            io.Fonts->AddFontDefault(&fallbackCfg);
-            io.Fonts->Build();
-        }
-
-        LOG(LOG_LEVEL_INFO, "[EglHook] 字体图集: %dx%d", io.Fonts->TexWidth, io.Fonts->TexHeight);
-
-        if (!ImGui_ImplOpenGL3_Init("#version 300 es")) {
-            LOG(LOG_LEVEL_ERROR, "[EglHook] ImGui_ImplOpenGL3_Init 失败");
-            ImGui::DestroyContext(g_ctx);
-            g_ctx = nullptr;
-            return false;
-        }
-
-        LOG(LOG_LEVEL_INFO, "[EglHook] ✓ ImGui 初始化完成 (%dx%d)", w, h);
         return true;
     }
+    return false;
+}
 
-    static EGLBoolean hooked_eglSwapBuffers(EGLDisplay display, EGLSurface surface) {
-        if (!g_ready.load(std::memory_order_relaxed)) {
-            if (initImGui(display, surface))
-                g_ready.store(true, std::memory_order_release);
-        }
+} // namespace
 
-        if (g_ready.load(std::memory_order_acquire) && g_ctx) {
-            ImGui::SetCurrentContext(g_ctx);
+static std::atomic<bool> g_unityGuiThreadStarted{false};
 
-            // ── 触摸输入: 自动重试初始化 + 每帧处理事件 ──
-            touch_input::init();       // 内部有频率限制, 每 5s 重试一次
-            touch_input::processEvents((float)g_width, (float)g_height);
+static void UnityGuiThread() {
+    struct GuiResetGuard {
+        ~GuiResetGuard() { g_unityGuiThreadStarted.store(false, std::memory_order_release); }
+    } resetGuard;
 
-            EGLint curW = 0, curH = 0;
-            eglQuerySurface(display, surface, EGL_WIDTH,  &curW);
-            eglQuerySurface(display, surface, EGL_HEIGHT, &curH);
-            if (curW > 0 && curH > 0 && (curW != g_width || curH != g_height)) {
-                g_width  = curW;
-                g_height = curH;
-            }
+    LOG(LOG_LEVEL_INFO, "[UnityGui] GUI 线程启动, 等待 10 秒...");
+    std::this_thread::sleep_for(std::chrono::seconds(10));
 
-            auto& io     = ImGui::GetIO();
-            io.DisplaySize = ImVec2((float)g_width, (float)g_height);
-
-            timespec ts{};
-            clock_gettime(CLOCK_MONOTONIC, &ts);
-            double now   = (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
-            io.DeltaTime = g_lastTime > 0.0 ? (float)(now - g_lastTime) : (1.0f / 60.0f);
-            g_lastTime   = now;
-
-            ImGui_ImplOpenGL3_NewFrame();
-            ImGui::NewFrame();
-
-            static lol::MiniMapData gameData;
-            static draw::GameOverlay overlay;
-            SharedGameData::getInstance().pullData(gameData);
-            bool inBattle = SharedGameData::getInstance().isBattleActive();
-            overlay.drawOverlay(gameData, inBattle);
-
-            // 触摸调试: 红色圆点跟随手指 (确认触摸是否生效)
-            touch_input::drawDebugIndicator();
-
-            // 触摸诊断日志 (每 3 秒打印一次)
-            {
-                static double s_lastDiag = 0.0;
-                double nowD = (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
-                if (nowD - s_lastDiag > 3.0) {
-                    s_lastDiag = nowD;
-                    LOG(LOG_LEVEL_INFO, "[TouchDiag] MousePos=(%.0f,%.0f) MouseDown=%d WantCaptureMouse=%d DisplaySize=(%.0f,%.0f) fd=%d dev=%s name=%s raw=(%.4f,%.4f) cur=(%.0f,%.0f) touching=%d rot=%s",
-                        io.MousePos.x, io.MousePos.y,
-                        io.MouseDown[0] ? 1 : 0,
-                        io.WantCaptureMouse ? 1 : 0,
-                        io.DisplaySize.x, io.DisplaySize.y,
-                        touch_input::getFd(),
-                        touch_input::getDevicePath(),
-                        touch_input::getDeviceName(),
-                        touch_input::getRawX(), touch_input::getRawY(),
-                        touch_input::getCurX(), touch_input::getCurY(),
-                        touch_input::isTouching() ? 1 : 0,
-                        touch_input::getRotationLabel());
-                }
-            }
-
-            ImGui::Render();
-            ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-        }
-
-        return g_origSwapBuffers(display, surface);
+    // 获取显示尺寸
+    ShellDisplayInfo displayInfo;
+    if (!queryShellDisplay(displayInfo)) {
+        displayInfo.width = 2400;
+        displayInfo.height = 1080;
+        displayInfo.rotateTheta = 0;
+        LOG(LOG_LEVEL_WARN, "[UnityGui] 显示信息获取失败, 使用兜底尺寸 %dx%d", displayInfo.width, displayInfo.height);
     }
-} // namespace egl_hook
+    LOG(LOG_LEVEL_INFO, "[UnityGui] 显示尺寸: %dx%d rotate=%d", displayInfo.width, displayInfo.height, displayInfo.rotateTheta);
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// GuiNativeThread — 安装 eglSwapBuffers hook
-// ═══════════════════════════════════════════════════════════════════════════════
+    // 创建 AImGui RenderClient
+    android::AImGui::Options imguiOptions{
+        .renderType = android::AImGui::RenderType::RenderClient,
+        .exchangeFontData = true,
+        .tcpNoDelay = true,
+        .disableVsync = true,
+        .styleScale = 1.75f,
+        .fontSizePixels = 18.0f,
+        .screenWidth = displayInfo.width,
+        .screenHeight = displayInfo.height,
+        .rotateTheta = displayInfo.rotateTheta,
+        .clientConnectAddress = "127.0.0.1",
+    };
 
-static void GuiNativeThread() {
-    LOG(LOG_LEVEL_INFO, "[GuiNative] ══════ 启动直接绘制模式 (eglSwapBuffers Hook) ══════");
-    installCrashGuard();
-
-
-    void* swapAddr = dlsym(RTLD_DEFAULT, "eglSwapBuffers");
-    if (!swapAddr) {
-        void* eglLib = dlopen("libEGL.so", RTLD_LAZY);
-        if (eglLib) {
-            swapAddr = dlsym(eglLib, "eglSwapBuffers");
-            dlclose(eglLib);
+    LOG(LOG_LEVEL_INFO, "[UnityGui] AImGui RenderClient 连接中...");
+    std::unique_ptr<android::AImGui> imgui;
+    for (int attempt = 1; attempt <= 20; ++attempt) {
+        try {
+            imgui = std::make_unique<android::AImGui>(imguiOptions);
+        } catch (const std::exception& e) {
+            LOG(LOG_LEVEL_ERROR, "[UnityGui] AImGui 初始化异常: attempt=%d error=%s", attempt, e.what());
+            imgui.reset();
+        } catch (...) {
+            LOG(LOG_LEVEL_ERROR, "[UnityGui] AImGui 初始化异常: attempt=%d", attempt);
+            imgui.reset();
         }
+        if (imgui && *imgui) break;
+        LOG(LOG_LEVEL_INFO, "[UnityGui] 等待 Overlay 服务就绪: %d/20", attempt);
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
-    if (!swapAddr) {
-        LOG(LOG_LEVEL_ERROR, "[GuiNative] ✘ 无法找到 eglSwapBuffers");
+
+    if (!imgui || !(*imgui)) {
+        LOG(LOG_LEVEL_ERROR, "[UnityGui] AImGui RenderClient 连接失败");
         return;
     }
-    LOG(LOG_LEVEL_INFO, "[GuiNative] ✓ eglSwapBuffers → %p", swapAddr);
+    LOG(LOG_LEVEL_INFO, "[UnityGui] AImGui RenderClient 连接成功");
 
-    {
-        int crashSig = sigsetjmp(t_jumpBuf, 1);
-        if (crashSig != 0) {
-            LOG(LOG_LEVEL_ERROR, "[GuiNative] ✘ DobbyHook 触发信号 %d", crashSig);
-            t_guardActive = 0;
-            return;
+    // 输入处理线程
+    std::thread([imguiPtr = imgui.get()]() {
+        LOG(LOG_LEVEL_INFO, "[UnityGui] 输入线程启动");
+        while (true) {
+            imguiPtr->ProcessInputEvent();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
-        t_guardActive = 1;
+    }).detach();
 
-        int ret = DobbyHook(
-            swapAddr,
-            (dobby_dummy_func_t)egl_hook::hooked_eglSwapBuffers,
-            (dobby_dummy_func_t*)&egl_hook::g_origSwapBuffers
-        );
-        t_guardActive = 0;
+    // 主渲染循环
+    lol::MiniMapData gameData;
+    draw::GameOverlay overlay;
 
-        if (ret != 0) {
-            LOG(LOG_LEVEL_ERROR, "[GuiNative] ✘ DobbyHook 安装失败 (ret=%d)", ret);
-            return;
+    while (true) {
+        imgui->BeginFrame();
+
+        {
+            ImGuiIO& io = ImGui::GetIO();
+            if (displayInfo.width > 0 && displayInfo.height > 0) {
+                io.DisplaySize = ImVec2(static_cast<float>(displayInfo.width),
+                                        static_cast<float>(displayInfo.height));
+                io.DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
+            }
         }
+
+        SharedGameData::getInstance().pullData(gameData);
+        bool inBattle = SharedGameData::getInstance().isBattleActive();
+        overlay.drawOverlay(gameData, inBattle);
+
+        imgui->EndFrame();
+        std::this_thread::yield();
     }
-
-    LOG(LOG_LEVEL_INFO, "[GuiNative] ✓ eglSwapBuffers hook 已安装");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1553,7 +1399,10 @@ bool MyStartPoint(void *pli2cppModeBase, void *pCodeRegistration, void *pMetadat
             }).detach();
         }
 
-        std::thread(GuiNativeThread).detach();
+        bool guiExpected = false;
+        if (g_unityGuiThreadStarted.compare_exchange_strong(guiExpected, true, std::memory_order_acq_rel)) {
+            std::thread(UnityGuiThread).detach();
+        }
 
         std::thread([=]() {
             std::this_thread::sleep_for(std::chrono::seconds(2));

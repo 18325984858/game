@@ -646,6 +646,7 @@ static void UE4GuiThread() {
         }
     }).detach();
 
+    ue4draw::DrawGameData gameData;
     ue4draw::UE4Overlay overlay;
     Clock::time_point lastHeartbeatLog;
     Clock::time_point lastDisplayRefresh;
@@ -682,7 +683,7 @@ static void UE4GuiThread() {
             }
         }
 
-        const ue4draw::DrawGameData& gameData = ue4draw::SharedUE4Data::getInstance().acquireRead();
+        ue4draw::SharedUE4Data::getInstance().getData(gameData);
         overlay.drawOverlay(gameData);
 
         if (shouldLogEvery(lastHeartbeatLog, std::chrono::milliseconds(3000))) {
@@ -772,30 +773,26 @@ static void UE4WorkerThread(void* plibUE4ModeBase, void* pGNames,
         LOG(LOG_LEVEL_INFO, "[UE4Worker] 初始化 UE4Interface 并启动对局监控");
 
         // 等待游戏引擎完成初始化, GNames/GWorld/GUObjectArray 尚未稳定时直接访问会崩溃
-        // 通过轮询检测 GNames.NumElements > 0 且 GWorld 有效来判断就绪
+        // 通过 /proc/self/mem 安全探测 (不安装信号处理器, 不与 UE4Dumper 冲突)
         LOG(LOG_LEVEL_INFO, "[UE4Worker] 等待游戏引擎就绪...");
         {
             uintptr_t gNamesAddr = reinterpret_cast<uintptr_t>(pGNames);
             uintptr_t gWorldAddr = reinterpret_cast<uintptr_t>(pGWorld);
             constexpr int kMaxWaitSeconds = 120;
+            int memFd = open("/proc/self/mem", O_RDONLY);
             bool ready = false;
             for (int i = 0; i < kMaxWaitSeconds * 2; i++) {
-                // 安全读取: 使用 pubgmhd 的 safeReadMemory (信号保护)
                 int32_t numNames = 0;
                 uintptr_t worldPtr = 0;
                 bool namesOk = false, worldOk = false;
-                if (gNamesAddr >= 0x10000) {
-                    int32_t tmp = 0;
+                if (memFd >= 0 && gNamesAddr >= 0x10000) {
                     // TNameEntryArray.NumElements @ +0x1400
-                    if (pubgmhd::BatchMemReader::safeReadMemoryStatic(gNamesAddr + 0x1400, &tmp, sizeof(tmp))) {
-                        numNames = tmp;
+                    if (pread(memFd, &numNames, sizeof(numNames), static_cast<off_t>(gNamesAddr + 0x1400)) == sizeof(numNames)) {
                         namesOk = (numNames > 100);
                     }
                 }
-                if (gWorldAddr >= 0x10000) {
-                    uintptr_t tmp = 0;
-                    if (pubgmhd::BatchMemReader::safeReadMemoryStatic(gWorldAddr, &tmp, sizeof(tmp))) {
-                        worldPtr = tmp;
+                if (memFd >= 0 && gWorldAddr >= 0x10000) {
+                    if (pread(memFd, &worldPtr, sizeof(worldPtr), static_cast<off_t>(gWorldAddr)) == sizeof(worldPtr)) {
                         worldOk = (worldPtr >= 0x10000);
                     }
                 }
@@ -807,6 +804,7 @@ static void UE4WorkerThread(void* plibUE4ModeBase, void* pGNames,
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(500));
             }
+            if (memFd >= 0) close(memFd);
             if (!ready) {
                 LOG(LOG_LEVEL_ERROR, "[UE4Worker] 引擎等待超时 (%ds), 放弃启动监控", kMaxWaitSeconds);
                 return;
