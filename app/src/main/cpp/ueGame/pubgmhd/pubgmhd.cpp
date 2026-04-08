@@ -7,8 +7,9 @@
 #include <thread>
 #include <chrono>
 #include <algorithm>
-#include <array>
-#include <cctype>
+#include <csetjmp>
+#include <cstddef>
+#include <csignal>
 #include <cstring>
 #include <cstdio>
 #include <cmath>
@@ -26,22 +27,65 @@ using Clock = std::chrono::steady_clock;
 
 namespace {
 
-struct FQuatNative {
-    float x = 0.0f;
-    float y = 0.0f;
-    float z = 0.0f;
-    float w = 1.0f;
-};
+constexpr uintptr_t kUObjectClassPrivateOffset = 0x10;
+constexpr uintptr_t kUObjectNamePrivateOffset = 0x18;
+constexpr uintptr_t kUStructSuperStructOffset = 0x30;
+constexpr uintptr_t kFNameComparisonIndexOffset = 0x0;
+constexpr uintptr_t kFNameNumberOffset = 0x4;
 
-struct FTransformNative {
-    FQuatNative rotation;
-    FVector3 translation;
-    float translationPad = 0.0f;
-    FVector3 scale3D{1.0f, 1.0f, 1.0f};
-    float scalePad = 0.0f;
-};
+static thread_local sigjmp_buf s_safeReadJmpBuf;
+static thread_local volatile sig_atomic_t s_safeReadActive = 0;
+static struct sigaction s_oldSigsegvAction{};
+static struct sigaction s_oldSigbusAction{};
+static bool s_safeReadGuardInstalled = false;
 
-static_assert(sizeof(FTransformNative) == 0x30, "FTransformNative size mismatch");
+void safeReadSignalHandler(int sig, siginfo_t* info, void* ctx) {
+    if (s_safeReadActive) {
+        s_safeReadActive = 0;
+        siglongjmp(s_safeReadJmpBuf, sig);
+    }
+
+    struct sigaction* old = (sig == SIGSEGV) ? &s_oldSigsegvAction : &s_oldSigbusAction;
+    if ((old->sa_flags & SA_SIGINFO) != 0) {
+        old->sa_sigaction(sig, info, ctx);
+    } else if (old->sa_handler != SIG_DFL && old->sa_handler != SIG_IGN) {
+        old->sa_handler(sig);
+    } else {
+        signal(sig, SIG_DFL);
+        raise(sig);
+    }
+}
+
+void installSafeReadGuard() {
+    if (s_safeReadGuardInstalled) {
+        return;
+    }
+
+    struct sigaction sa{};
+    sa.sa_sigaction = safeReadSignalHandler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, &s_oldSigsegvAction);
+    sigaction(SIGBUS, &sa, &s_oldSigbusAction);
+    s_safeReadGuardInstalled = true;
+}
+
+bool safeReadMemory(uintptr_t addr, void* out, size_t size) {
+    if (out == nullptr || size == 0 || addr < 0x10000) {
+        return false;
+    }
+
+    installSafeReadGuard();
+    if (sigsetjmp(s_safeReadJmpBuf, 1) != 0) {
+        s_safeReadActive = 0;
+        return false;
+    }
+
+    s_safeReadActive = 1;
+    memcpy(out, reinterpret_cast<const void*>(addr), size);
+    s_safeReadActive = 0;
+    return true;
+}
 
 bool isFiniteVector(const FVector3& value) {
     return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
@@ -71,75 +115,6 @@ bool isPlayerInNormalState(const PlayerNode& player) {
     return true;
 }
 
-FVector3 rotateVectorByQuat(const FQuatNative& quat, const FVector3& vector) {
-    const FVector3 quatVector{quat.x, quat.y, quat.z};
-    const FVector3 uv{
-        quatVector.y * vector.z - quatVector.z * vector.y,
-        quatVector.z * vector.x - quatVector.x * vector.z,
-        quatVector.x * vector.y - quatVector.y * vector.x,
-    };
-    const FVector3 uuv{
-        quatVector.y * uv.z - quatVector.z * uv.y,
-        quatVector.z * uv.x - quatVector.x * uv.z,
-        quatVector.x * uv.y - quatVector.y * uv.x,
-    };
-    return {
-        vector.x + ((uv.x * quat.w) + uuv.x) * 2.0f,
-        vector.y + ((uv.y * quat.w) + uuv.y) * 2.0f,
-        vector.z + ((uv.z * quat.w) + uuv.z) * 2.0f,
-    };
-}
-
-FVector3 transformPosition(const FTransformNative& transform, const FVector3& point) {
-    const FVector3 scaled{
-        point.x * transform.scale3D.x,
-        point.y * transform.scale3D.y,
-        point.z * transform.scale3D.z,
-    };
-    const FVector3 rotated = rotateVectorByQuat(transform.rotation, scaled);
-    return {
-        rotated.x + transform.translation.x,
-        rotated.y + transform.translation.y,
-        rotated.z + transform.translation.z,
-    };
-}
-
-std::string toLowerAscii(std::string value) {
-    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
-        return static_cast<char>(std::tolower(ch));
-    });
-    return value;
-}
-
-bool matchesAnyBoneName(const std::string& name, std::initializer_list<const char*> candidates) {
-    const std::string loweredName = toLowerAscii(name);
-    for (const char* candidate : candidates) {
-        if (loweredName == candidate) {
-            return true;
-        }
-    }
-    return false;
-}
-
-enum SkeletonPointSlot : size_t {
-    SkeletonHead = 0,
-    SkeletonNeck,
-    SkeletonChest,
-    SkeletonPelvis,
-    SkeletonShoulderLeft,
-    SkeletonElbowLeft,
-    SkeletonHandLeft,
-    SkeletonShoulderRight,
-    SkeletonElbowRight,
-    SkeletonHandRight,
-    SkeletonThighLeft,
-    SkeletonKneeLeft,
-    SkeletonFootLeft,
-    SkeletonThighRight,
-    SkeletonKneeRight,
-    SkeletonFootRight,
-};
-
 constexpr auto kSlowPlayerRefreshInterval = std::chrono::milliseconds(120);
 enum class LoadThrottlePhase : int {
     Early = 0,
@@ -149,12 +124,8 @@ enum class LoadThrottlePhase : int {
 
 constexpr int32_t kEarlyLoadPhaseSeconds = 120;
 constexpr int32_t kTransitionLoadPhaseSeconds = 180;
-constexpr auto kSkeletonRefreshInterval = std::chrono::milliseconds(40);
 constexpr auto kTransitionSlowPlayerRefreshInterval = std::chrono::milliseconds(160);
 constexpr auto kEarlySlowPlayerRefreshInterval = std::chrono::milliseconds(220);
-
-constexpr auto kTransitionSkeletonRefreshInterval = std::chrono::milliseconds(80);
-constexpr auto kEarlySkeletonRefreshInterval = std::chrono::milliseconds(120);
 
 uint64_t nowMonotonicMs() {
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -193,18 +164,6 @@ std::chrono::milliseconds getSlowRefreshInterval(int32_t matchElapsedSeconds) {
         case LoadThrottlePhase::Normal:
         default:
             return kSlowPlayerRefreshInterval;
-    }
-}
-
-std::chrono::milliseconds getSkeletonRefreshInterval(int32_t matchElapsedSeconds) {
-    switch (getLoadThrottlePhase(matchElapsedSeconds)) {
-        case LoadThrottlePhase::Early:
-            return kEarlySkeletonRefreshInterval;
-        case LoadThrottlePhase::Transition:
-            return kTransitionSkeletonRefreshInterval;
-        case LoadThrottlePhase::Normal:
-        default:
-            return kSkeletonRefreshInterval;
     }
 }
 
@@ -304,8 +263,6 @@ PlayerNode* PlayerList::upsert(uint32_t playerKey, const PlayerNode& data) {
         node->kills      = data.kills;
         node->pos        = data.pos;
         node->characterPtr = data.characterPtr;
-        node->hasSkeleton = data.hasSkeleton;
-        node->skeletonPoints = data.skeletonPoints;
         return node;
     }
     node = new PlayerNode();
@@ -319,8 +276,6 @@ PlayerNode* PlayerList::upsert(uint32_t playerKey, const PlayerNode& data) {
     node->kills      = data.kills;
     node->pos        = data.pos;
     node->characterPtr = data.characterPtr;
-    node->hasSkeleton = data.hasSkeleton;
-    node->skeletonPoints = data.skeletonPoints;
 
     if (!m_head) {
         m_head = node;
@@ -451,7 +406,6 @@ bool MatchMonitor::initOffsets() {
     RESOLVE_OFFSET_MULTI(m_off.Char_TeamID,        "TeamID",             "UAECharacter", "STExtraCharacter", "STExtraBaseCharacter");
     RESOLVE_OFFSET_MULTI(m_off.Char_PlayerKey,     "PlayerKey",          "UAECharacter", "STExtraCharacter", "STExtraBaseCharacter");
     RESOLVE_OFFSET_MULTI(m_off.Char_PlayerName,    "PlayerName",         "UAECharacter", "STExtraCharacter", "STExtraBaseCharacter");
-    RESOLVE_OFFSET_MULTI(m_off.Char_Mesh,          "Mesh",               "Character", "UAECharacter", "STExtraCharacter", "STExtraBaseCharacter");
 
     // STExtraCharacter
     RESOLVE_OFFSET_MULTI(m_off.Char_Health,        "Health",             "STExtraCharacter", "UAECharacter", "STExtraBaseCharacter");
@@ -460,17 +414,6 @@ bool MatchMonitor::initOffsets() {
 
     // STExtraBaseCharacter
     RESOLVE_OFFSET_MULTI(m_off.Char_CurrentNetCullDistSq, "CurrentNetCullDistanceSquared", "STExtraBaseCharacter", "STExtraCharacter", "UAECharacter");
-
-    // SkeletalMeshComponent / SkinnedMeshComponent
-    RESOLVE_OFFSET_MULTI(m_off.SkelComp_CachedComponentSpaceTransforms, "CachedComponentSpaceTransforms", "SkeletalMeshComponent", "SkinnedMeshComponent");
-    RESOLVE_OFFSET_MULTI(m_off.SkinnedMeshComp_SkeletalMesh, "SkeletalMesh", "SkinnedMeshComponent", "SkeletalMeshComponent");
-    if (m_off.SkinnedMeshComp_SkeletalMesh < 0) {
-        RESOLVE_OFFSET_MULTI(m_off.SkinnedMeshComp_SkeletalMesh, "SkeletalMeshAsset", "SkinnedMeshComponent", "SkeletalMeshComponent");
-    }
-
-    // SkeletalMesh / Skeleton
-    RESOLVE_OFFSET_MULTI(m_off.SkeletalMesh_Skeleton, "Skeleton", "SkeletalMesh");
-    RESOLVE_OFFSET_MULTI(m_off.Skeleton_RefBoneNames, "RefBoneNames", "Skeleton");
 
     MLOG(LOG_LEVEL_INFO, "[InitOffsets] 解析完成, isValid=%d", m_off.isValid());
     MLOG(LOG_LEVEL_INFO, "[InitOffsets] World.GameState=0x%X GS.PlayerArray=0x%X PS.PlayerKey=0x%X",
@@ -488,35 +431,32 @@ bool MatchMonitor::initOffsets() {
 //  安全内存读取
 // =====================================================================
 uintptr_t MatchMonitor::safeReadPtr(uintptr_t addr) {
-    if (addr == 0) return 0;
     uintptr_t val = 0;
-    if (memcpy(&val, reinterpret_cast<void*>(addr), sizeof(val))) return val;
-    return 0;
+    safeReadMemory(addr, &val, sizeof(val));
+    return val;
 }
 
 int32_t MatchMonitor::safeReadS32(uintptr_t addr) {
-    if (addr == 0) return 0;
     int32_t val = 0;
-    memcpy(&val, reinterpret_cast<void*>(addr), sizeof(val));
+    safeReadMemory(addr, &val, sizeof(val));
     return val;
 }
 
 uint32_t MatchMonitor::safeReadU32(uintptr_t addr) {
-    if (addr == 0) return 0;
     uint32_t val = 0;
-    memcpy(&val, reinterpret_cast<void*>(addr), sizeof(val));
+    safeReadMemory(addr, &val, sizeof(val));
     return val;
 }
 
 uint8_t MatchMonitor::safeReadU8(uintptr_t addr) {
-    if (addr == 0) return 0;
-    return *reinterpret_cast<uint8_t*>(addr);
+    uint8_t val = 0;
+    safeReadMemory(addr, &val, sizeof(val));
+    return val;
 }
 
 float MatchMonitor::safeReadFloat(uintptr_t addr) {
-    if (addr == 0) return 0.0f;
     float val = 0.0f;
-    memcpy(&val, reinterpret_cast<void*>(addr), sizeof(val));
+    safeReadMemory(addr, &val, sizeof(val));
     return val;
 }
 
@@ -570,9 +510,8 @@ std::string MatchMonitor::getNameByIndex(int index) {
 
 std::string MatchMonitor::readFName(uintptr_t addr) {
     if (addr == 0 || addr < 0x10000) return "<invalid>";
-    auto* fn = reinterpret_cast<ue4::FName*>(addr);
-    int32_t idx = fn->ComparisonIndex;
-    int32_t num = fn->Number;
+    int32_t idx = safeReadS32(addr + kFNameComparisonIndexOffset);
+    int32_t num = safeReadS32(addr + kFNameNumberOffset);
     if (idx < 0 || idx >= m_numNames) return "<invalid>";
     std::string base = getNameByIndex(idx);
     if (base.empty()) return "<invalid>";
@@ -582,14 +521,12 @@ std::string MatchMonitor::readFName(uintptr_t addr) {
 
 std::string MatchMonitor::readObjName(uintptr_t objPtr) {
     if (objPtr == 0 || objPtr < 0x10000) return "<invalid>";
-    auto* obj = reinterpret_cast<ue4::UObjectBase*>(objPtr);
-    return readFName(reinterpret_cast<uintptr_t>(&obj->NamePrivate));
+    return readFName(objPtr + kUObjectNamePrivateOffset);
 }
 
 std::string MatchMonitor::readClassName(uintptr_t objPtr) {
     if (objPtr == 0 || objPtr < 0x10000) return "<no_class>";
-    auto* obj = reinterpret_cast<ue4::UObjectBase*>(objPtr);
-    uintptr_t clsPtr = reinterpret_cast<uintptr_t>(obj->ClassPrivate);
+    uintptr_t clsPtr = safeReadPtr(objPtr + kUObjectClassPrivateOffset);
     if (clsPtr == 0 || clsPtr < 0x10000) return "<no_class>";
     return readObjName(clsPtr);
 }
@@ -676,154 +613,16 @@ bool MatchMonitor::getActorLocation(uintptr_t actorPtr, FVector3& outLoc) {
     return true;
 }
 
-bool MatchMonitor::resolveSkeletonIndices(uintptr_t skeletalMeshPtr, std::array<int, PLAYER_SKELETON_POINT_COUNT>& outIndices) {
-    auto cacheIt = m_skeletonIndexCache.find(skeletalMeshPtr);
-    if (cacheIt != m_skeletonIndexCache.end()) {
-        outIndices = cacheIt->second;
-        return true;
-    }
-
-    outIndices.fill(-1);
-    if (skeletalMeshPtr == 0
-        || m_off.SkeletalMesh_Skeleton < 0
-        || m_off.Skeleton_RefBoneNames < 0) {
-        return false;
-    }
-
-    const uintptr_t skeletonPtr = safeReadPtr(skeletalMeshPtr + m_off.SkeletalMesh_Skeleton);
-    if (skeletonPtr == 0 || skeletonPtr < 0x10000) {
-        return false;
-    }
-
-    const uintptr_t boneNameData = safeReadPtr(skeletonPtr + m_off.Skeleton_RefBoneNames);
-    const int32_t boneNameNum = safeReadS32(skeletonPtr + m_off.Skeleton_RefBoneNames + 8);
-    if (boneNameData == 0 || boneNameNum <= 0 || boneNameNum > 512) {
-        return false;
-    }
-
-    for (int32_t boneIndex = 0; boneIndex < boneNameNum; ++boneIndex) {
-        const uintptr_t boneNamePtr = boneNameData + static_cast<uintptr_t>(boneIndex) * sizeof(ue4::FName);
-        const std::string boneName = readFName(boneNamePtr);
-        if (boneName.empty() || boneName == "<invalid>") {
-            continue;
-        }
-
-        if (outIndices[SkeletonHead] < 0 && matchesAnyBoneName(boneName, {"head", "head_01"})) {
-            outIndices[SkeletonHead] = boneIndex;
-        } else if (outIndices[SkeletonNeck] < 0 && matchesAnyBoneName(boneName, {"neck", "neck_01"})) {
-            outIndices[SkeletonNeck] = boneIndex;
-        } else if (outIndices[SkeletonChest] < 0 && matchesAnyBoneName(boneName, {"spine_03", "spine_02", "chest"})) {
-            outIndices[SkeletonChest] = boneIndex;
-        } else if (outIndices[SkeletonPelvis] < 0 && matchesAnyBoneName(boneName, {"pelvis", "root"})) {
-            outIndices[SkeletonPelvis] = boneIndex;
-        } else if (outIndices[SkeletonShoulderLeft] < 0 && matchesAnyBoneName(boneName, {"clavicle_l", "upperarm_l"})) {
-            outIndices[SkeletonShoulderLeft] = boneIndex;
-        } else if (outIndices[SkeletonElbowLeft] < 0 && matchesAnyBoneName(boneName, {"lowerarm_l", "forearm_l"})) {
-            outIndices[SkeletonElbowLeft] = boneIndex;
-        } else if (outIndices[SkeletonHandLeft] < 0 && matchesAnyBoneName(boneName, {"hand_l"})) {
-            outIndices[SkeletonHandLeft] = boneIndex;
-        } else if (outIndices[SkeletonShoulderRight] < 0 && matchesAnyBoneName(boneName, {"clavicle_r", "upperarm_r"})) {
-            outIndices[SkeletonShoulderRight] = boneIndex;
-        } else if (outIndices[SkeletonElbowRight] < 0 && matchesAnyBoneName(boneName, {"lowerarm_r", "forearm_r"})) {
-            outIndices[SkeletonElbowRight] = boneIndex;
-        } else if (outIndices[SkeletonHandRight] < 0 && matchesAnyBoneName(boneName, {"hand_r"})) {
-            outIndices[SkeletonHandRight] = boneIndex;
-        } else if (outIndices[SkeletonThighLeft] < 0 && matchesAnyBoneName(boneName, {"thigh_l", "calf_l"})) {
-            outIndices[SkeletonThighLeft] = boneIndex;
-        } else if (outIndices[SkeletonKneeLeft] < 0 && matchesAnyBoneName(boneName, {"calf_l", "leg_l"})) {
-            outIndices[SkeletonKneeLeft] = boneIndex;
-        } else if (outIndices[SkeletonFootLeft] < 0 && matchesAnyBoneName(boneName, {"foot_l", "ball_l"})) {
-            outIndices[SkeletonFootLeft] = boneIndex;
-        } else if (outIndices[SkeletonThighRight] < 0 && matchesAnyBoneName(boneName, {"thigh_r", "calf_r"})) {
-            outIndices[SkeletonThighRight] = boneIndex;
-        } else if (outIndices[SkeletonKneeRight] < 0 && matchesAnyBoneName(boneName, {"calf_r", "leg_r"})) {
-            outIndices[SkeletonKneeRight] = boneIndex;
-        } else if (outIndices[SkeletonFootRight] < 0 && matchesAnyBoneName(boneName, {"foot_r", "ball_r"})) {
-            outIndices[SkeletonFootRight] = boneIndex;
-        }
-    }
-
-    m_skeletonIndexCache[skeletalMeshPtr] = outIndices;
-    return true;
-}
-
-bool MatchMonitor::fillPlayerSkeleton(PlayerNode& player) {
-    player.hasSkeleton = false;
-    for (auto& skeletonPoint : player.skeletonPoints) {
-        skeletonPoint.valid = false;
-        skeletonPoint.pos = {};
-    }
-
-    if (player.characterPtr == 0
-        || m_off.Char_Mesh < 0
-        || m_off.SkinnedMeshComp_SkeletalMesh < 0
-        || m_off.SkeletalMesh_Skeleton < 0
-        || m_off.Skeleton_RefBoneNames < 0
-        || m_off.SkelComp_CachedComponentSpaceTransforms < 0
-        || m_off.SceneComp_ComponentToWorld < 0) {
-        return false;
-    }
-
-    const uintptr_t meshComponentPtr = safeReadPtr(player.characterPtr + m_off.Char_Mesh);
-    if (meshComponentPtr == 0 || meshComponentPtr < 0x10000) {
-        return false;
-    }
-
-    const uintptr_t skeletalMeshPtr = safeReadPtr(meshComponentPtr + m_off.SkinnedMeshComp_SkeletalMesh);
-    if (skeletalMeshPtr == 0 || skeletalMeshPtr < 0x10000) {
-        return false;
-    }
-
-    std::array<int, PLAYER_SKELETON_POINT_COUNT> skeletonIndices{};
-    if (!resolveSkeletonIndices(skeletalMeshPtr, skeletonIndices)) {
-        return false;
-    }
-
-    FTransformNative componentToWorld;
-    memcpy(&componentToWorld, reinterpret_cast<const void*>(meshComponentPtr + m_off.SceneComp_ComponentToWorld), sizeof(componentToWorld));
-
-    const uintptr_t boneArrayData = safeReadPtr(meshComponentPtr + m_off.SkelComp_CachedComponentSpaceTransforms);
-    const int32_t boneArrayNum = safeReadS32(meshComponentPtr + m_off.SkelComp_CachedComponentSpaceTransforms + 8);
-    if (boneArrayData == 0 || boneArrayNum <= 0 || boneArrayNum > 512) {
-        return false;
-    }
-
-    int validPointCount = 0;
-    for (size_t slot = 0; slot < skeletonIndices.size(); ++slot) {
-        const int boneIndex = skeletonIndices[slot];
-        if (boneIndex < 0 || boneIndex >= boneArrayNum) {
-            continue;
-        }
-
-        FTransformNative boneTransform;
-        memcpy(&boneTransform, reinterpret_cast<const void*>(boneArrayData + static_cast<uintptr_t>(boneIndex) * sizeof(FTransformNative)), sizeof(boneTransform));
-        const FVector3 worldPos = transformPosition(componentToWorld, boneTransform.translation);
-        if (!isFiniteVector(worldPos)) {
-            continue;
-        }
-
-        player.skeletonPoints[slot].pos = worldPos;
-        player.skeletonPoints[slot].valid = true;
-        validPointCount++;
-    }
-
-    player.hasSkeleton = validPointCount >= 5
-        && player.skeletonPoints[SkeletonHead].valid
-        && player.skeletonPoints[SkeletonChest].valid
-        && player.skeletonPoints[SkeletonPelvis].valid;
-    return player.hasSkeleton;
-}
-
 // =====================================================================
 //  类继承链检
 // =====================================================================
 bool MatchMonitor::isSubclassOf(uintptr_t classPtr, const char* targetName) {
-    auto* cur = reinterpret_cast<ue4::UStruct*>(classPtr);
+    uintptr_t currentPtr = classPtr;
     int depth = 0;
-    while (cur != nullptr && depth < 20) {
-        std::string name = readObjName(reinterpret_cast<uintptr_t>(cur));
+    while (currentPtr != 0 && currentPtr >= 0x10000 && depth < 20) {
+        std::string name = readObjName(currentPtr);
         if (name == targetName) return true;
-        cur = cur->SuperStruct;
+        currentPtr = safeReadPtr(currentPtr + kUStructSuperStructOffset);
         depth++;
     }
     return false;
@@ -998,7 +797,7 @@ int MatchMonitor::scanCharacters() {
             if (!obj) continue;
 
             uintptr_t objPtr = reinterpret_cast<uintptr_t>(obj);
-            uintptr_t classPtr = reinterpret_cast<uintptr_t>(obj->ClassPrivate);
+            uintptr_t classPtr = safeReadPtr(objPtr + kUObjectClassPrivateOffset);
             if (classPtr == 0) continue;
 
             auto it = m_characterClassSet.find(classPtr);
@@ -1339,7 +1138,6 @@ void MatchMonitor::closeLog() {
 void MatchMonitor::pollPlayers() {
     static Clock::time_point s_lastPlayerLogTime;
     static Clock::time_point s_lastSlowRefreshTime;
-    static Clock::time_point s_lastSkeletonRefreshTime;
 
     const bool shouldDumpPlayerLog = shouldLogEvery(s_lastPlayerLogTime, std::chrono::milliseconds(PLAYER_LOG_INTERVAL_MS));
 
@@ -1364,7 +1162,6 @@ void MatchMonitor::pollPlayers() {
     }
 
     const auto slowRefreshInterval = getSlowRefreshInterval(m_currentMatchElapsedSeconds);
-    const auto skeletonRefreshInterval = getSkeletonRefreshInterval(m_currentMatchElapsedSeconds);
 
     const bool shouldRunSlowPath = m_playerList.size() <= 0
         || m_myPlayerKey == 0
@@ -1382,9 +1179,6 @@ void MatchMonitor::pollPlayers() {
     if (m_playerList.size() <= 0) {
         return;
     }
-
-    const bool shouldRefreshSkeleton = shouldRunSlowPath
-        || shouldLogEvery(s_lastSkeletonRefreshTime, skeletonRefreshInterval);
 
     // 推送数据到绘制层
     ue4draw::DrawGameData drawData;
@@ -1421,7 +1215,6 @@ void MatchMonitor::pollPlayers() {
     while (cur) {
         const bool isNormalState = isPlayerInNormalState(*cur);
         if (!isNormalState) {
-            cur->hasSkeleton = false;
             cur = cur->next;
             continue;
         }
@@ -1440,10 +1233,6 @@ void MatchMonitor::pollPlayers() {
             }
         }
 
-        if (shouldRefreshSkeleton) {
-            fillPlayerSkeleton(*cur);
-        }
-
         ue4draw::DrawPlayerInfo dp;
         dp.playerKey = cur->playerKey;
         dp.teamID = cur->teamID;
@@ -1457,15 +1246,6 @@ void MatchMonitor::pollPlayers() {
         dp.posY = cur->pos.y;
         dp.posZ = cur->pos.z;
         dp.isTeammate = isTeammate;
-        dp.hasSkeleton = cur->hasSkeleton;
-        if (cur->hasSkeleton) {
-            for (size_t skeletonIndex = 0; skeletonIndex < cur->skeletonPoints.size(); ++skeletonIndex) {
-                dp.skeletonPoints[skeletonIndex].x = cur->skeletonPoints[skeletonIndex].pos.x;
-                dp.skeletonPoints[skeletonIndex].y = cur->skeletonPoints[skeletonIndex].pos.y;
-                dp.skeletonPoints[skeletonIndex].z = cur->skeletonPoints[skeletonIndex].pos.z;
-                dp.skeletonPoints[skeletonIndex].valid = cur->skeletonPoints[skeletonIndex].valid;
-            }
-        }
         drawData.players.push_back(dp);
         cur = cur->next;
     }
@@ -1545,7 +1325,6 @@ void MatchMonitor::pollMatchStateLoop() {
                     m_playerList.clear();
                     m_lastNetCullPatchMs.clear();
                     m_characterClassSet.clear();
-                    m_skeletonIndexCache.clear();
                     m_myTeamID = -1;
                     m_myPlayerKey = 0;
                     m_lastReportedArrayNum = -1;
@@ -1573,7 +1352,6 @@ void MatchMonitor::pollMatchStateLoop() {
                     m_playerList.clear();
                     m_lastNetCullPatchMs.clear();
                     m_characterClassSet.clear();
-                    m_skeletonIndexCache.clear();
                     m_myTeamID = -1;
                     m_myPlayerKey = 0;
                     m_currentMatchElapsedSeconds = -1;

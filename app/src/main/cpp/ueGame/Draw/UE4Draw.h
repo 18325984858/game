@@ -15,15 +15,6 @@
 
 namespace ue4draw {
 
-static constexpr size_t DRAW_SKELETON_POINT_COUNT = 16;
-
-struct DrawSkeletonPoint {
-    float x = 0.0f;
-    float y = 0.0f;
-    float z = 0.0f;
-    bool valid = false;
-};
-
 // =====================================================================
 //  共享玩家数据 (MatchMonitor -> 渲染线程)
 // =====================================================================
@@ -40,8 +31,6 @@ struct DrawPlayerInfo {
     float       posY = 0.0f;
     float       posZ = 0.0f;
     bool        isTeammate = false;
-    bool        hasSkeleton = false;
-    std::array<DrawSkeletonPoint, DRAW_SKELETON_POINT_COUNT> skeletonPoints{};
 };
 
 struct DrawGameData {
@@ -75,14 +64,16 @@ public:
 
     void pushData(const DrawGameData& data) {
         std::lock_guard<std::mutex> lock(m_mutex);
-        m_data = data;
+        const int writeIndex = 1 - m_frontBufferIndex;
+        m_buffers[writeIndex] = data;
+        m_frontBufferIndex = writeIndex;
         m_inMatch.store(data.inMatch, std::memory_order_release);
     }
 
     /// 获取最新数据快照 (非消费型, 每帧都返回当前数据)
     void getData(DrawGameData& outData) {
         std::lock_guard<std::mutex> lock(m_mutex);
-        outData = m_data;
+        outData = m_buffers[m_frontBufferIndex];
     }
 
     bool isInMatch() const { return m_inMatch.load(std::memory_order_acquire); }
@@ -91,7 +82,8 @@ public:
 private:
     SharedUE4Data() = default;
     std::mutex m_mutex;
-    DrawGameData m_data;
+    std::array<DrawGameData, 2> m_buffers{};
+    int m_frontBufferIndex = 0;
     std::atomic<bool> m_inMatch{false};
 };
 
@@ -110,7 +102,6 @@ private:
     bool m_enableHP        = true;     // 血条
     bool m_enableName      = true;     // 名字
     bool m_enableDistance   = true;     // 距离
-    bool m_enableSkeleton  = true;     // 骨架
     bool m_enableTeammate  = false;    // 显示队友
     bool m_enableMinimap   = true;     // 小地图
     bool m_enableFallbackESP = true;   // 投影失败时绘制屏边箭头

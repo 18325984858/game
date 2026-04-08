@@ -3,8 +3,6 @@
 #include <cmath>
 #include <algorithm>
 #include <chrono>
-#include <array>
-#include <utility>
 
 #define DTAG "UE4Draw"
 #define DLOG(level, fmt, ...) LOGT(DTAG, level, fmt, ##__VA_ARGS__)
@@ -25,43 +23,6 @@ struct CameraSpacePoint {
     float y = 0.0f;
     float z = 0.0f;
 };
-
-enum SkeletonPointSlot : size_t {
-    SkeletonHead = 0,
-    SkeletonNeck,
-    SkeletonChest,
-    SkeletonPelvis,
-    SkeletonShoulderLeft,
-    SkeletonElbowLeft,
-    SkeletonHandLeft,
-    SkeletonShoulderRight,
-    SkeletonElbowRight,
-    SkeletonHandRight,
-    SkeletonThighLeft,
-    SkeletonKneeLeft,
-    SkeletonFootLeft,
-    SkeletonThighRight,
-    SkeletonKneeRight,
-    SkeletonFootRight,
-};
-
-constexpr std::array<std::pair<size_t, size_t>, 15> kSkeletonSegments{{
-    {SkeletonHead, SkeletonNeck},
-    {SkeletonNeck, SkeletonChest},
-    {SkeletonChest, SkeletonPelvis},
-    {SkeletonChest, SkeletonShoulderLeft},
-    {SkeletonShoulderLeft, SkeletonElbowLeft},
-    {SkeletonElbowLeft, SkeletonHandLeft},
-    {SkeletonChest, SkeletonShoulderRight},
-    {SkeletonShoulderRight, SkeletonElbowRight},
-    {SkeletonElbowRight, SkeletonHandRight},
-    {SkeletonPelvis, SkeletonThighLeft},
-    {SkeletonThighLeft, SkeletonKneeLeft},
-    {SkeletonKneeLeft, SkeletonFootLeft},
-    {SkeletonPelvis, SkeletonThighRight},
-    {SkeletonThighRight, SkeletonKneeRight},
-    {SkeletonKneeRight, SkeletonFootRight},
-}};
 
 bool shouldLogEvery(Clock::time_point& lastLogTime, std::chrono::milliseconds interval) {
     const auto now = Clock::now();
@@ -94,8 +55,108 @@ bool hasValidCameraPose(const DrawGameData& data) {
         && data.camFOV <= 170.0f;
 }
 
+const DrawPlayerInfo* findPlayerByKey(const DrawGameData& data, uint32_t playerKey) {
+    for (const auto& player : data.players) {
+        if (player.playerKey == playerKey) {
+            return &player;
+        }
+    }
+    return nullptr;
+}
+
+void copyCameraState(const DrawGameData& src, DrawGameData& dst) {
+    dst.camLocX = src.camLocX;
+    dst.camLocY = src.camLocY;
+    dst.camLocZ = src.camLocZ;
+    dst.camPitch = src.camPitch;
+    dst.camYaw = src.camYaw;
+    dst.camRoll = src.camRoll;
+    dst.camFOV = src.camFOV;
+}
+
+void backfillTransientPlayerState(DrawGameData& current, const DrawGameData& previous) {
+    for (auto& player : current.players) {
+        const DrawPlayerInfo* previousPlayer = findPlayerByKey(previous, player.playerKey);
+        if (nullptr == previousPlayer) {
+            continue;
+        }
+
+        if (!hasValidWorldPoint(player.posX, player.posY, player.posZ)
+            && hasValidWorldPoint(previousPlayer->posX, previousPlayer->posY, previousPlayer->posZ)) {
+            player.posX = previousPlayer->posX;
+            player.posY = previousPlayer->posY;
+            player.posZ = previousPlayer->posZ;
+        }
+    }
+}
+
 DrawGameData stabilizeRenderData(const DrawGameData& data) {
-    return data;
+    static DrawGameData s_lastStableData;
+    static Clock::time_point s_lastStableTime;
+    static Clock::time_point s_lastReuseLogTime;
+    static bool s_hasLastStableData = false;
+
+    const auto now = Clock::now();
+    constexpr auto kTransientHoldWindow = std::chrono::milliseconds(120);
+
+    if (!data.inMatch) {
+        s_lastStableData = data;
+        s_lastStableTime = now;
+        s_hasLastStableData = true;
+        return data;
+    }
+
+    DrawGameData stabilized = data;
+    bool reusedPreviousFrame = false;
+    const bool canReusePrevious = s_hasLastStableData
+        && s_lastStableData.inMatch
+        && now - s_lastStableTime <= kTransientHoldWindow;
+
+    if (canReusePrevious) {
+        if (!hasValidCameraPose(stabilized) && hasValidCameraPose(s_lastStableData)) {
+            copyCameraState(s_lastStableData, stabilized);
+            reusedPreviousFrame = true;
+        }
+
+        if (!hasValidWorldPoint(stabilized.myPosX, stabilized.myPosY, stabilized.myPosZ)
+            && hasValidWorldPoint(s_lastStableData.myPosX, s_lastStableData.myPosY, s_lastStableData.myPosZ)) {
+            stabilized.myPosX = s_lastStableData.myPosX;
+            stabilized.myPosY = s_lastStableData.myPosY;
+            stabilized.myPosZ = s_lastStableData.myPosZ;
+            reusedPreviousFrame = true;
+        }
+
+        if (stabilized.players.empty() && !s_lastStableData.players.empty()) {
+            stabilized.players = s_lastStableData.players;
+            stabilized.aliveCount = s_lastStableData.aliveCount;
+            stabilized.totalCount = s_lastStableData.totalCount;
+            if (stabilized.myTeamID < 0) {
+                stabilized.myTeamID = s_lastStableData.myTeamID;
+            }
+            reusedPreviousFrame = true;
+        } else if (!stabilized.players.empty()) {
+            backfillTransientPlayerState(stabilized, s_lastStableData);
+        }
+    }
+
+    const bool shouldRefreshStableData = hasValidCameraPose(stabilized)
+        || hasValidWorldPoint(stabilized.myPosX, stabilized.myPosY, stabilized.myPosZ)
+        || !stabilized.players.empty();
+    if (shouldRefreshStableData) {
+        s_lastStableData = stabilized;
+        s_lastStableTime = now;
+        s_hasLastStableData = true;
+    }
+
+    if (reusedPreviousFrame && shouldLogEvery(s_lastReuseLogTime, std::chrono::milliseconds(1000))) {
+        DLOG(LOG_LEVEL_INFO,
+             "render stabilization reused previous snapshot: players=%zu alive=%d total=%d",
+             stabilized.players.size(),
+             stabilized.aliveCount,
+             stabilized.totalCount);
+    }
+
+    return stabilized;
 }
 
 float sanitizeAngleDegrees(float value) {
@@ -150,57 +211,6 @@ bool transformWorldToCamera(const DrawGameData& data,
                             float wy,
                             float wz,
                             CameraSpacePoint& outPoint);
-
-void drawPlayerSkeleton(ImDrawList* drawList,
-                        const DrawGameData& data,
-                        const DrawPlayerInfo& player,
-                        float screenW,
-                        float screenH,
-                        ImU32 color) {
-    if (!player.hasSkeleton) {
-        return;
-    }
-
-    std::array<ImVec2, DRAW_SKELETON_POINT_COUNT> projectedPoints{};
-    std::array<bool, DRAW_SKELETON_POINT_COUNT> projectedValid{};
-    for (size_t pointIndex = 0; pointIndex < player.skeletonPoints.size(); ++pointIndex) {
-        const DrawSkeletonPoint& point = player.skeletonPoints[pointIndex];
-        if (!point.valid) {
-            continue;
-        }
-
-        CameraSpacePoint cameraPoint;
-        if (!transformWorldToCamera(data, point.x, point.y, point.z, cameraPoint)) {
-            continue;
-        }
-        if (cameraPoint.z <= 1.0f) {
-            continue;
-        }
-
-        constexpr float DEG2RAD = 3.14159265358979f / 180.0f;
-        const float tanHalfFov = std::tan(sanitizeFov(data.camFOV) * 0.5f * DEG2RAD);
-        if (!isValidNumber(tanHalfFov) || tanHalfFov < 0.01f) {
-            continue;
-        }
-
-        const float focalLength = screenW * 0.5f / tanHalfFov;
-        const float sx = screenW * 0.5f + cameraPoint.x * focalLength / cameraPoint.z;
-        const float sy = screenH * 0.5f - cameraPoint.y * focalLength / cameraPoint.z;
-        if (!isValidNumber(sx) || !isValidNumber(sy)) {
-            continue;
-        }
-
-        projectedPoints[pointIndex] = ImVec2(sx, sy);
-        projectedValid[pointIndex] = true;
-    }
-
-    for (const auto& segment : kSkeletonSegments) {
-        if (!projectedValid[segment.first] || !projectedValid[segment.second]) {
-            continue;
-        }
-        drawList->AddLine(projectedPoints[segment.first], projectedPoints[segment.second], color, 1.8f);
-    }
-}
 
 bool transformWorldToCamera(const DrawGameData& data,
                             float wx,
@@ -437,7 +447,6 @@ void UE4Overlay::drawMenu(const DrawGameData& data) {
         settingsChanged |= ImGui::Checkbox("血条", &m_enableHP);
         settingsChanged |= ImGui::Checkbox("名字", &m_enableName);
         settingsChanged |= ImGui::Checkbox("距离", &m_enableDistance);
-        settingsChanged |= ImGui::Checkbox("骨架", &m_enableSkeleton);
         settingsChanged |= ImGui::Checkbox("显示队友", &m_enableTeammate);
         ImGui::Separator();
 
@@ -524,13 +533,12 @@ void UE4Overlay::drawMenu(const DrawGameData& data) {
 
         if (settingsChanged) {
             DLOG(LOG_LEVEL_INFO,
-                 "settings updated: esp=%s snap=%s hp=%s name=%s dist=%s skeleton=%s teammate=%s minimap=%s edgeArrow=%s playerList=%s touch=%s mapSize=%.0f mapRange=%.0f maxDist=%.0f",
+                 "settings updated: esp=%s snap=%s hp=%s name=%s dist=%s teammate=%s minimap=%s edgeArrow=%s playerList=%s touch=%s mapSize=%.0f mapRange=%.0f maxDist=%.0f",
                  onOff(m_enableESP),
                  onOff(m_enableSnapline),
                  onOff(m_enableHP),
                  onOff(m_enableName),
                  onOff(m_enableDistance),
-                 onOff(m_enableSkeleton),
                  onOff(m_enableTeammate),
                  onOff(m_enableMinimap),
                  onOff(m_enableFallbackESP),
@@ -612,10 +620,6 @@ int UE4Overlay::drawESP(const DrawGameData& data, float screenW, float screenH) 
         bool rendered = false;
 
         if (hasPreciseCamera) {
-            if (m_enableSkeleton) {
-                drawPlayerSkeleton(dl, data, p, screenW, screenH, boxColor);
-            }
-
             constexpr float kCharacterHalfHeight = 88.0f;
             float footSX = 0.0f;
             float footSY = 0.0f;

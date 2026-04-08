@@ -5,7 +5,6 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
-#include <array>
 #include <mutex>
 #include "../libUE4Struct/ilbUE4Struct.h"
 
@@ -30,7 +29,6 @@ static constexpr int MONITOR_IDLE_SLEEP_MS    = 1;
 static constexpr int STATE_LOG_INTERVAL_MS    = 1000;
 static constexpr int PLAYER_LOG_INTERVAL_MS   = 1000;
 static constexpr float MAX_CULL_DIST_SQ       = 1.0e18f;
-static constexpr size_t PLAYER_SKELETON_POINT_COUNT = 16;
 
 // =====================================================================
 //  ResolvedOffsets — 通过 UE4Interface 动态查找的游戏特定偏移
@@ -87,15 +85,6 @@ struct ResolvedOffsets {
     int32_t Char_PlayerName             = -1;
     int32_t Char_bDead                  = -1;
     int32_t Char_CurrentNetCullDistSq   = -1;
-    int32_t Char_Mesh                   = -1;
-
-    // SkeletalMeshComponent / SkinnedMeshComponent
-    int32_t SkelComp_CachedComponentSpaceTransforms = -1;
-    int32_t SkinnedMeshComp_SkeletalMesh = -1;
-
-    // SkeletalMesh / Skeleton
-    int32_t SkeletalMesh_Skeleton       = -1;
-    int32_t Skeleton_RefBoneNames       = -1;
 
     /// 所有关键偏移是否已成功解析
     bool isValid() const;
@@ -108,11 +97,6 @@ struct FVector3 {
     float x = 0.0f;
     float y = 0.0f;
     float z = 0.0f;
-};
-
-struct SkeletonWorldPoint {
-    FVector3 pos;
-    bool valid = false;
 };
 
 enum class PlayerSource : uint8_t {
@@ -134,8 +118,6 @@ struct PlayerNode {
     int32_t     kills = 0;
     FVector3    pos;
     uintptr_t   characterPtr = 0;
-    bool        hasSkeleton = false;
-    std::array<SkeletonWorldPoint, PLAYER_SKELETON_POINT_COUNT> skeletonPoints{};
     PlayerSource source = PlayerSource::PlayerArray;
     uint32_t    lastSeenCharacterScanEpoch = 0;
 
@@ -237,10 +219,6 @@ private:
     // ---- Actor 位置 ----
     bool getActorLocation(uintptr_t actorPtr, FVector3& outLoc);
 
-    // ---- 骨架读取 ----
-    bool fillPlayerSkeleton(PlayerNode& player);
-    bool resolveSkeletonIndices(uintptr_t skeletalMeshPtr, std::array<int, PLAYER_SKELETON_POINT_COUNT>& outIndices);
-
     // ---- 类继承链检查 ----
     bool isSubclassOf(uintptr_t classPtr, const char* targetName);
 
@@ -305,7 +283,6 @@ private:
     PlayerList m_playerList;
     std::unordered_map<uintptr_t, uint64_t> m_lastNetCullPatchMs;
     std::unordered_map<uintptr_t, bool> m_characterClassSet;
-    std::unordered_map<uintptr_t, std::array<int, PLAYER_SKELETON_POINT_COUNT>> m_skeletonIndexCache;
     std::unordered_map<int, std::string> m_nameCache;
 
     FILE* m_logFp = nullptr;
