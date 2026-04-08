@@ -6,6 +6,8 @@
 #include <unordered_map>
 #include <vector>
 #include <mutex>
+#include <algorithm>
+#include <cstring>
 #include "../libUE4Struct/ilbUE4Struct.h"
 
 // 前向声明
@@ -97,6 +99,80 @@ struct FVector3 {
     float x = 0.0f;
     float y = 0.0f;
     float z = 0.0f;
+};
+
+// =====================================================================
+//  BatchMemReader — 批量内存读取器 (Flyweight 模式, 自动回退)
+//
+//  设计模式: Flyweight + Facade
+//  - 一次 safeReadMemory 调用读取目标结构体到本地缓冲
+//  - 缓冲内字段: 零系统调用, 直接 memcpy 提取
+//  - 缓冲外字段或批量读取失败: 自动回退到 safeReadMemory 单独读取
+//  - 调用者无需关心是否命中缓冲, get() 始终返回正确值
+// =====================================================================
+class BatchMemReader {
+public:
+    static constexpr size_t kMaxBatchSize = 2048;
+
+    BatchMemReader() = default;
+
+    /// 从 baseAddr 开始批量读取 size 字节到本地缓冲
+    /// 即使返回 false (缓冲失败或超限), get() 仍可通过回退路径正常工作
+    bool read(uintptr_t baseAddr, size_t size) {
+        m_base = baseAddr;  // 始终记录基址, 用于回退
+        m_size = 0;
+        m_valid = false;
+        if (baseAddr < 0x10000 || size == 0) {
+            return false;
+        }
+        const size_t readSize = (size <= kMaxBatchSize) ? size : kMaxBatchSize;
+        m_valid = safeReadMemoryStatic(baseAddr, m_buf, readSize);
+        if (m_valid) {
+            m_size = readSize;
+        }
+        return m_valid;
+    }
+
+    bool isValid() const { return m_valid; }
+    uintptr_t base() const { return m_base; }
+
+    /// 从缓冲中提取指定偏移处的 T 值
+    /// 如果偏移超出缓冲范围, 自动回退到单独 safeReadMemory
+    template<typename T>
+    T get(int32_t offset) const {
+        T val{};
+        if (offset < 0) return val;
+        if (m_valid && static_cast<size_t>(offset) + sizeof(T) <= m_size) {
+            // 快速路径: 从本地缓冲提取
+            std::memcpy(&val, m_buf + offset, sizeof(T));
+        } else if (m_base >= 0x10000) {
+            // 回退路径: 单独读取 (缓冲未覆盖或批量读取失败)
+            safeReadMemoryStatic(m_base + static_cast<uintptr_t>(offset), &val, sizeof(T));
+        }
+        return val;
+    }
+
+    uintptr_t getPtr(int32_t offset) const { return get<uintptr_t>(offset); }
+    int32_t   getS32(int32_t offset) const { return get<int32_t>(offset); }
+    uint32_t  getU32(int32_t offset) const { return get<uint32_t>(offset); }
+    uint8_t   getU8(int32_t offset)  const { return get<uint8_t>(offset); }
+    float     getFloat(int32_t offset) const { return get<float>(offset); }
+
+    /// 提取 FVector3 (三个连续 float)
+    FVector3 getVec3(int32_t offset) const {
+        FVector3 v;
+        v.x = getFloat(offset);
+        v.y = getFloat(offset + 4);
+        v.z = getFloat(offset + 8);
+        return v;
+    }
+
+private:
+    static bool safeReadMemoryStatic(uintptr_t addr, void* out, size_t size);
+    uint8_t   m_buf[kMaxBatchSize]{};
+    uintptr_t m_base = 0;
+    size_t    m_size = 0;
+    bool      m_valid = false;
 };
 
 enum class PlayerSource : uint8_t {
@@ -252,6 +328,11 @@ private:
     // ---- 偏移解析 ----
     bool initOffsets();
 
+    // ---- 批量读取偏移范围 (initOffsets 后计算) ----
+    void computeBatchReadBounds();
+    size_t m_psReadSize = 0;     // PlayerState 需要批量读取的字节数
+    size_t m_charReadSize = 0;   // Character 需要批量读取的字节数
+
     // ---- 成员变量 ----
     ue4inf::UE4Interface& m_interface;  // UE4 反射查询接口
     ResolvedOffsets m_off;              // 动态解析的游戏偏移
@@ -266,6 +347,7 @@ private:
 
     volatile bool m_running = false;
     std::string   m_lastMatchState;
+    std::string   m_currentMatchState;   // 当前对局状态 (InProgress/WaitingToStart/Aircraft 等)
     bool          m_isInMatch = false;
     int32_t       m_myTeamID = -1;
     uint32_t      m_myPlayerKey = 0;

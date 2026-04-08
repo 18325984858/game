@@ -259,6 +259,17 @@ static bool readUeHeaderEnabled() {
     return strstr(buf, "ue_header=1") != nullptr;
 }
 
+static bool readLogEnabled() {
+    int fd = open("/data/local/tmp/dobby_config.txt", O_RDONLY);
+    if (fd < 0) return false;
+    char buf[256] = {};
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return false;
+    buf[n] = '\0';
+    return strstr(buf, "log=1") != nullptr;
+}
+
 struct JavaDisplayInfo {
     int width = 0;
     int height = 0;
@@ -635,7 +646,6 @@ static void UE4GuiThread() {
         }
     }).detach();
 
-    ue4draw::DrawGameData gameData;
     ue4draw::UE4Overlay overlay;
     Clock::time_point lastHeartbeatLog;
     Clock::time_point lastDisplayRefresh;
@@ -672,7 +682,7 @@ static void UE4GuiThread() {
             }
         }
 
-        ue4draw::SharedUE4Data::getInstance().getData(gameData);
+        const ue4draw::DrawGameData& gameData = ue4draw::SharedUE4Data::getInstance().acquireRead();
         overlay.drawOverlay(gameData);
 
         if (shouldLogEvery(lastHeartbeatLog, std::chrono::milliseconds(3000))) {
@@ -697,6 +707,9 @@ static void UE4WorkerThread(void* plibUE4ModeBase, void* pGNames,
     LOG(LOG_LEVEL_INFO, "[UE4Worker] 工作线程启动");
     LOG(LOG_LEVEL_INFO, "[UE4Worker] libUE4Base=%p GNames=%p GWorld=%p GUObjectArray=%p moduleSize=0x%llX",
         plibUE4ModeBase, pGNames, pGWorld, pGUObjectArray, (unsigned long long)moduleSize);
+
+    // 读取配置文件中的日志开关
+    g_runtimeLogEnabled = readLogEnabled();
 
     // 检查界面上的 "启用 ueDumper (导出 dump)" 按钮状态
     if (readUeDumperEnabled()) {

@@ -11,8 +11,7 @@
 #include "../Log/log.h"
 #include "../AndroidSurfaceImgui/includes/AImGui.h"
 
-#define OTAG "UE4-PublicOverlay"
-#define OLOG(level, fmt, ...) LOGT(OTAG, level, fmt, ##__VA_ARGS__)
+#define OLOG(level, fmt, ...) LOG(level, fmt, ##__VA_ARGS__)
 
 namespace {
 

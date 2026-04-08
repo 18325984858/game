@@ -2,7 +2,6 @@
 #define UE4_DRAW_H
 
 #include <imgui/imgui.h>
-#include <mutex>
 #include <atomic>
 #include <vector>
 #include <array>
@@ -51,7 +50,13 @@ struct DrawGameData {
 };
 
 // =====================================================================
-//  SharedUE4Data — 线程安全数据桥接 (单例)
+//  SharedUE4Data — 无锁三缓冲数据桥接 (单例, SPSC lock-free)
+//
+//  设计模式: Triple Buffer (三缓冲)
+//  - Writer(MatchMonitor) 写入 writeSlot, 完成后与 readySlot 原子交换
+//  - Reader(GUI线程) 将 readSlot 与 readySlot 原子交换, 然后直接引用 readSlot
+//  - 三个 slot 互不重叠, Writer 永远不会写到 Reader 正在读的 buffer
+//  - 完全消除 mutex 竞争, Reader 不会阻塞 Writer, 反之亦然
 // =====================================================================
 class SharedUE4Data {
 public:
@@ -62,18 +67,24 @@ public:
     SharedUE4Data(const SharedUE4Data&) = delete;
     SharedUE4Data& operator=(const SharedUE4Data&) = delete;
 
+    /// Writer 端: 写入最新数据 (仅 MatchMonitor 线程调用)
     void pushData(const DrawGameData& data) {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        const int writeIndex = 1 - m_frontBufferIndex;
-        m_buffers[writeIndex] = data;
-        m_frontBufferIndex = writeIndex;
+        m_buffers[m_writeSlot] = data;
+        // 将写完的 buffer 提交为 ready, 拿回空闲 buffer 作为下次写入目标
+        m_writeSlot = m_readySlot.exchange(m_writeSlot, std::memory_order_acq_rel);
         m_inMatch.store(data.inMatch, std::memory_order_release);
     }
 
-    /// 获取最新数据快照 (非消费型, 每帧都返回当前数据)
+    /// Reader 端: 获取最新数据的只读引用 (仅 GUI 线程调用)
+    /// 返回的引用在下一次 acquireRead() 之前保持有效
+    const DrawGameData& acquireRead() {
+        m_readSlot = m_readySlot.exchange(m_readSlot, std::memory_order_acq_rel);
+        return m_buffers[m_readSlot];
+    }
+
+    /// 兼容旧接口: 拷贝到 outData
     void getData(DrawGameData& outData) {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        outData = m_buffers[m_frontBufferIndex];
+        outData = acquireRead();
     }
 
     bool isInMatch() const { return m_inMatch.load(std::memory_order_acquire); }
@@ -81,9 +92,10 @@ public:
 
 private:
     SharedUE4Data() = default;
-    std::mutex m_mutex;
-    std::array<DrawGameData, 2> m_buffers{};
-    int m_frontBufferIndex = 0;
+    std::array<DrawGameData, 3> m_buffers{};
+    int m_writeSlot = 0;                     // Writer 私有, 无需原子
+    int m_readSlot  = 1;                     // Reader 私有, 无需原子
+    std::atomic<int> m_readySlot{2};         // Writer/Reader 共享交换点
     std::atomic<bool> m_inMatch{false};
 };
 

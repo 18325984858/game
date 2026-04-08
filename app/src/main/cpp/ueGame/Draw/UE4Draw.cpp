@@ -4,8 +4,7 @@
 #include <algorithm>
 #include <chrono>
 
-#define DTAG "UE4Draw"
-#define DLOG(level, fmt, ...) LOGT(DTAG, level, fmt, ##__VA_ARGS__)
+#define DLOG(level, fmt, ...) LOG(level, fmt, ##__VA_ARGS__)
 
 namespace ue4draw {
 
