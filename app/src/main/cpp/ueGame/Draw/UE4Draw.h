@@ -72,13 +72,16 @@ public:
         m_buffers[m_writeSlot] = data;
         // 将写完的 buffer 提交为 ready, 拿回空闲 buffer 作为下次写入目标
         m_writeSlot = m_readySlot.exchange(m_writeSlot, std::memory_order_acq_rel);
+        m_newDataAvailable.store(true, std::memory_order_release);
         m_inMatch.store(data.inMatch, std::memory_order_release);
     }
 
     /// Reader 端: 获取最新数据的只读引用 (仅 GUI 线程调用)
-    /// 返回的引用在下一次 acquireRead() 之前保持有效
+    /// 仅在 Writer 有新数据时才交换, 避免无新数据时交替闪烁
     const DrawGameData& acquireRead() {
-        m_readSlot = m_readySlot.exchange(m_readSlot, std::memory_order_acq_rel);
+        if (m_newDataAvailable.exchange(false, std::memory_order_acq_rel)) {
+            m_readSlot = m_readySlot.exchange(m_readSlot, std::memory_order_acq_rel);
+        }
         return m_buffers[m_readSlot];
     }
 
@@ -96,6 +99,7 @@ private:
     int m_writeSlot = 0;                     // Writer 私有, 无需原子
     int m_readSlot  = 1;                     // Reader 私有, 无需原子
     std::atomic<int> m_readySlot{2};         // Writer/Reader 共享交换点
+    std::atomic<bool> m_newDataAvailable{false}; // Writer 有新数据时置 true
     std::atomic<bool> m_inMatch{false};
 };
 

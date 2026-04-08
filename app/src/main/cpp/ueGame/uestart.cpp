@@ -771,6 +771,51 @@ static void UE4WorkerThread(void* plibUE4ModeBase, void* pGNames,
     std::thread([=]() {
         LOG(LOG_LEVEL_INFO, "[UE4Worker] 初始化 UE4Interface 并启动对局监控");
 
+        // 等待游戏引擎完成初始化, GNames/GWorld/GUObjectArray 尚未稳定时直接访问会崩溃
+        // 通过轮询检测 GNames.NumElements > 0 且 GWorld 有效来判断就绪
+        LOG(LOG_LEVEL_INFO, "[UE4Worker] 等待游戏引擎就绪...");
+        {
+            uintptr_t gNamesAddr = reinterpret_cast<uintptr_t>(pGNames);
+            uintptr_t gWorldAddr = reinterpret_cast<uintptr_t>(pGWorld);
+            constexpr int kMaxWaitSeconds = 120;
+            bool ready = false;
+            for (int i = 0; i < kMaxWaitSeconds * 2; i++) {
+                // 安全读取: 使用 pubgmhd 的 safeReadMemory (信号保护)
+                int32_t numNames = 0;
+                uintptr_t worldPtr = 0;
+                bool namesOk = false, worldOk = false;
+                if (gNamesAddr >= 0x10000) {
+                    int32_t tmp = 0;
+                    // TNameEntryArray.NumElements @ +0x1400
+                    if (pubgmhd::BatchMemReader::safeReadMemoryStatic(gNamesAddr + 0x1400, &tmp, sizeof(tmp))) {
+                        numNames = tmp;
+                        namesOk = (numNames > 100);
+                    }
+                }
+                if (gWorldAddr >= 0x10000) {
+                    uintptr_t tmp = 0;
+                    if (pubgmhd::BatchMemReader::safeReadMemoryStatic(gWorldAddr, &tmp, sizeof(tmp))) {
+                        worldPtr = tmp;
+                        worldOk = (worldPtr >= 0x10000);
+                    }
+                }
+                if (namesOk && worldOk) {
+                    LOG(LOG_LEVEL_INFO, "[UE4Worker] 引擎就绪! numNames=%d worldPtr=%p (等待了 %.1fs)",
+                        numNames, (void*)worldPtr, i * 0.5f);
+                    ready = true;
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            }
+            if (!ready) {
+                LOG(LOG_LEVEL_ERROR, "[UE4Worker] 引擎等待超时 (%ds), 放弃启动监控", kMaxWaitSeconds);
+                return;
+            }
+        }
+
+        // 额外等待 5 秒让引擎完全稳定 (避免 GUObjectArray 正在扩容)
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+
         // 1. 创建 UE4Dumper 并初始化
         auto* dumper = new ue4::UE4Dumper(
             reinterpret_cast<uintptr_t>(plibUE4ModeBase),

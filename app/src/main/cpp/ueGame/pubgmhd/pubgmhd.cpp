@@ -34,7 +34,7 @@ static thread_local sigjmp_buf s_safeReadJmpBuf;
 static thread_local volatile sig_atomic_t s_safeReadActive = 0;
 static struct sigaction s_oldSigsegvAction{};
 static struct sigaction s_oldSigbusAction{};
-static bool s_safeReadGuardInstalled = false;
+static std::once_flag s_safeReadGuardOnce;
 
 void safeReadSignalHandler(int sig, siginfo_t* info, void* ctx) {
     if (s_safeReadActive) {
@@ -54,17 +54,14 @@ void safeReadSignalHandler(int sig, siginfo_t* info, void* ctx) {
 }
 
 void installSafeReadGuard() {
-    if (s_safeReadGuardInstalled) {
-        return;
-    }
-
-    struct sigaction sa{};
-    sa.sa_sigaction = safeReadSignalHandler;
-    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGSEGV, &sa, &s_oldSigsegvAction);
-    sigaction(SIGBUS, &sa, &s_oldSigbusAction);
-    s_safeReadGuardInstalled = true;
+    std::call_once(s_safeReadGuardOnce, []() {
+        struct sigaction sa{};
+        sa.sa_sigaction = safeReadSignalHandler;
+        sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGSEGV, &sa, &s_oldSigsegvAction);
+        sigaction(SIGBUS, &sa, &s_oldSigbusAction);
+    });
 }
 
 bool safeReadMemory(uintptr_t addr, void* out, size_t size) {
@@ -607,10 +604,14 @@ std::string MatchMonitor::readFString(uintptr_t addr) {
     int32_t num = safeReadS32(addr + 8);
     if (dataPtr == 0 || num <= 0 || num > 256) return "";
 
+    // 一次性安全读取整个 UTF-16 缓冲区, 避免裸解引用崩溃
+    const size_t byteLen = static_cast<size_t>(num) * 2;
+    uint16_t buf[256] = {};
+    if (!safeReadMemory(dataPtr, buf, byteLen)) return "";
+
     std::string result;
-    const uint16_t* wstr = reinterpret_cast<const uint16_t*>(dataPtr);
     for (int i = 0; i < num - 1; i++) {
-        uint16_t c = wstr[i];
+        uint16_t c = buf[i];
         if (c == 0) break;
         if (c < 128) {
             result += static_cast<char>(c);

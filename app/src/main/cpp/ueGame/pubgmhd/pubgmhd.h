@@ -167,8 +167,10 @@ public:
         return v;
     }
 
-private:
+    /// 安全内存读取 (公开, 供外部在安装信号保护后使用)
     static bool safeReadMemoryStatic(uintptr_t addr, void* out, size_t size);
+
+private:
     uint8_t   m_buf[kMaxBatchSize]{};
     uintptr_t m_base = 0;
     size_t    m_size = 0;
