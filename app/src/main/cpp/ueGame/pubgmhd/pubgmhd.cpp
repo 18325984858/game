@@ -141,7 +141,108 @@ enum SkeletonPointSlot : size_t {
 };
 
 constexpr auto kSlowPlayerRefreshInterval = std::chrono::milliseconds(120);
+enum class LoadThrottlePhase : int {
+    Early = 0,
+    Transition = 1,
+    Normal = 2,
+};
+
+constexpr int32_t kEarlyLoadPhaseSeconds = 120;
+constexpr int32_t kTransitionLoadPhaseSeconds = 180;
 constexpr auto kSkeletonRefreshInterval = std::chrono::milliseconds(40);
+constexpr auto kTransitionSlowPlayerRefreshInterval = std::chrono::milliseconds(160);
+constexpr auto kEarlySlowPlayerRefreshInterval = std::chrono::milliseconds(220);
+
+constexpr auto kTransitionSkeletonRefreshInterval = std::chrono::milliseconds(80);
+constexpr auto kEarlySkeletonRefreshInterval = std::chrono::milliseconds(120);
+
+uint64_t nowMonotonicMs() {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        Clock::now().time_since_epoch()).count());
+}
+
+LoadThrottlePhase getLoadThrottlePhase(int32_t matchElapsedSeconds) {
+    if (matchElapsedSeconds < 0 || matchElapsedSeconds < kEarlyLoadPhaseSeconds) {
+        return LoadThrottlePhase::Early;
+    }
+    if (matchElapsedSeconds < kTransitionLoadPhaseSeconds) {
+        return LoadThrottlePhase::Transition;
+    }
+    return LoadThrottlePhase::Normal;
+}
+
+const char* loadThrottlePhaseName(LoadThrottlePhase phase) {
+    switch (phase) {
+        case LoadThrottlePhase::Early:
+            return "EARLY";
+        case LoadThrottlePhase::Transition:
+            return "TRANSITION";
+        case LoadThrottlePhase::Normal:
+            return "NORMAL";
+        default:
+            return "UNKNOWN";
+    }
+}
+
+std::chrono::milliseconds getSlowRefreshInterval(int32_t matchElapsedSeconds) {
+    switch (getLoadThrottlePhase(matchElapsedSeconds)) {
+        case LoadThrottlePhase::Early:
+            return kEarlySlowPlayerRefreshInterval;
+        case LoadThrottlePhase::Transition:
+            return kTransitionSlowPlayerRefreshInterval;
+        case LoadThrottlePhase::Normal:
+        default:
+            return kSlowPlayerRefreshInterval;
+    }
+}
+
+std::chrono::milliseconds getSkeletonRefreshInterval(int32_t matchElapsedSeconds) {
+    switch (getLoadThrottlePhase(matchElapsedSeconds)) {
+        case LoadThrottlePhase::Early:
+            return kEarlySkeletonRefreshInterval;
+        case LoadThrottlePhase::Transition:
+            return kTransitionSkeletonRefreshInterval;
+        case LoadThrottlePhase::Normal:
+        default:
+            return kSkeletonRefreshInterval;
+    }
+}
+
+int getCharacterScanBudget(int32_t matchElapsedSeconds) {
+    switch (getLoadThrottlePhase(matchElapsedSeconds)) {
+        case LoadThrottlePhase::Early:
+            return 0;
+        case LoadThrottlePhase::Transition:
+            return 32768;
+        case LoadThrottlePhase::Normal:
+        default:
+            return 65536;
+    }
+}
+
+int getCharacterScanIntervalMs(int32_t matchElapsedSeconds) {
+    switch (getLoadThrottlePhase(matchElapsedSeconds)) {
+        case LoadThrottlePhase::Early:
+            return -1;
+        case LoadThrottlePhase::Transition:
+            return 800;
+        case LoadThrottlePhase::Normal:
+        default:
+            return 0;
+    }
+}
+
+uint64_t getNetCullPatchIntervalMs(int32_t matchElapsedSeconds) {
+    switch (getLoadThrottlePhase(matchElapsedSeconds)) {
+        case LoadThrottlePhase::Early:
+            return 5000;
+        case LoadThrottlePhase::Transition:
+            return 2000;
+        case LoadThrottlePhase::Normal:
+        default:
+            return 1000;
+    }
+}
 
 } // namespace
 
@@ -541,6 +642,13 @@ MatchState MatchMonitor::getMatchState() {
         ms.state = "Unknown";
     }
 
+    if (gsPtr != 0 && gsPtr > 0x10000 && m_off.GS_ElapsedTime >= 0) {
+        const int32_t elapsedTime = safeReadS32(gsPtr + m_off.GS_ElapsedTime);
+        if (elapsedTime >= 0 && elapsedTime < 7200) {
+            ms.elapsedTimeSeconds = elapsedTime;
+        }
+    }
+
     // 判断是否在对局: 排除大厅/UI 地图
     ms.inMatch = ms.worldName.find("Editor_login") == std::string::npos
               && ms.worldName.find("UImap") == std::string::npos
@@ -811,6 +919,14 @@ bool MatchMonitor::setObserverType(EObserverType type) {
 // =====================================================================
 void MatchMonitor::patchActorNetCull(uintptr_t actorPtr) {
     if (actorPtr == 0) return;
+    const uint64_t nowMs = nowMonotonicMs();
+    const uint64_t patchIntervalMs = getNetCullPatchIntervalMs(m_currentMatchElapsedSeconds);
+    auto it = m_lastNetCullPatchMs.find(actorPtr);
+    if (it != m_lastNetCullPatchMs.end() && nowMs >= it->second && nowMs - it->second < patchIntervalMs) {
+        return;
+    }
+    m_lastNetCullPatchMs[actorPtr] = nowMs;
+
     if (m_off.Actor_NetCullDistSq >= 0)
         writeMemFloat(actorPtr + m_off.Actor_NetCullDistSq, MAX_CULL_DIST_SQ);
     if (m_off.Char_CurrentNetCullDistSq >= 0)
@@ -821,35 +937,70 @@ void MatchMonitor::patchActorNetCull(uintptr_t actorPtr) {
 //  GUObjectArray 扫描所Character
 // =====================================================================
 int MatchMonitor::scanCharacters() {
+    const int scanBudget = getCharacterScanBudget(m_currentMatchElapsedSeconds);
+    const int scanIntervalMs = getCharacterScanIntervalMs(m_currentMatchElapsedSeconds);
+    if (scanBudget <= 0 || scanIntervalMs < 0) {
+        return 0;
+    }
+
+    if (scanIntervalMs > 0) {
+        const uint64_t nowMs = nowMonotonicMs();
+        if (m_lastCharacterScanMs != 0 && nowMs >= m_lastCharacterScanMs
+            && nowMs - m_lastCharacterScanMs < static_cast<uint64_t>(scanIntervalMs)) {
+            return 0;
+        }
+        m_lastCharacterScanMs = nowMs;
+    }
+
     auto* objArray = reinterpret_cast<ue4::FUObjectArray*>(m_gUObjectArray);
     int numChunks = objArray->getNumChunks();
     int totalNum = objArray->getTotalNum();
     if (numChunks <= 0 || numChunks > 1000 || totalNum <= 0 || totalNum > 5000000) return 0;
 
-    int globalIdx = 0;
     int newCharsFound = 0;
 
-    for (int ci = 0; ci < numChunks; ci++) {
+    if (m_characterScanChunkIndex < 0 || m_characterScanChunkIndex >= numChunks) {
+        m_characterScanChunkIndex = 0;
+        m_characterScanItemIndex = 0;
+    }
+
+    if (m_characterScanChunkIndex == 0 && m_characterScanItemIndex == 0) {
+        ++m_characterScanEpoch;
+        if (m_characterScanEpoch == 0) {
+            m_characterScanEpoch = 1;
+        }
+    }
+
+    int processedItems = 0;
+    int visitedChunks = 0;
+
+    while (processedItems < scanBudget && visitedChunks < numChunks) {
+        const int ci = m_characterScanChunkIndex;
         auto* chunkBase = reinterpret_cast<ue4::FUObjectItem*>(objArray->getChunkPtr(ci));
-        int chunkCount = objArray->getChunkCount(ci);
+        const int chunkCount = objArray->getChunkCount(ci);
+
         if (!chunkBase || chunkCount <= 0) {
-            globalIdx += (chunkCount > 0) ? chunkCount : 0;
+            m_characterScanChunkIndex = (ci + 1) % numChunks;
+            m_characterScanItemIndex = 0;
+            visitedChunks++;
             continue;
         }
 
-        int remaining = totalNum - globalIdx;
-        int readCount = (chunkCount < remaining) ? chunkCount : remaining;
-        if (readCount <= 0) break;
+        int wi = m_characterScanItemIndex;
+        if (wi < 0 || wi >= chunkCount) {
+            wi = 0;
+        }
 
-        for (int wi = 0; wi < readCount; wi++) {
+        while (wi < chunkCount && processedItems < scanBudget) {
             ue4::UObjectBase* obj = chunkBase[wi].Object;
+            processedItems++;
+            wi++;
             if (!obj) continue;
 
             uintptr_t objPtr = reinterpret_cast<uintptr_t>(obj);
             uintptr_t classPtr = reinterpret_cast<uintptr_t>(obj->ClassPrivate);
             if (classPtr == 0) continue;
 
-            // 缓存 class 是否Character 子类
             auto it = m_characterClassSet.find(classPtr);
             if (it != m_characterClassSet.end()) {
                 if (!it->second) continue;
@@ -862,8 +1013,10 @@ int MatchMonitor::scanCharacters() {
             uint32_t playerKey = safeReadU32(objPtr + m_off.Char_PlayerKey);
             if (playerKey == 0) continue;
 
-            // PlayerArray 已经更新过的玩家以其数据为准，避免位置在两个来源间来回跳变。
-            if (m_playerList.findByKey(playerKey) != nullptr) continue;
+            PlayerNode* existing = m_playerList.findByKey(playerKey);
+            if (existing != nullptr && existing->source == PlayerSource::PlayerArray) {
+                continue;
+            }
 
             int32_t teamID = safeReadS32(objPtr + m_off.Char_TeamID);
             float health = safeReadFloat(objPtr + m_off.Char_Health);
@@ -874,27 +1027,43 @@ int MatchMonitor::scanCharacters() {
             FVector3 loc;
             getActorLocation(objPtr, loc);
 
-            if (healthMax <= 0) continue; // 无效对象
+            if (healthMax <= 0) continue;
 
-            // 修改每个 Character 的网络可见范围为全地
             patchActorNetCull(objPtr);
 
             PlayerNode data;
-            data.teamID     = teamID;
+            data.teamID = teamID;
             data.playerName = playerName;
-            data.isAI       = false;
-            data.liveState  = bDead ? 1 : 0;
-            data.health     = health;
-            data.healthMax  = healthMax;
-            data.kills      = 0;
-            data.pos        = loc;
+            data.isAI = false;
+            data.liveState = bDead ? 1 : 0;
+            data.health = health;
+            data.healthMax = healthMax;
+            data.kills = 0;
+            data.pos = loc;
             data.characterPtr = objPtr;
-            m_playerList.upsert(playerKey, data);
+            data.source = PlayerSource::CharacterScan;
+            PlayerNode* node = m_playerList.upsert(playerKey, data);
+            if (node) {
+                node->source = PlayerSource::CharacterScan;
+                node->lastSeenCharacterScanEpoch = m_characterScanEpoch;
+            }
             newCharsFound++;
         }
-        globalIdx += chunkCount;
-        if (globalIdx >= totalNum) break;
+
+        if (wi >= chunkCount) {
+            m_characterScanChunkIndex = (ci + 1) % numChunks;
+            m_characterScanItemIndex = 0;
+            visitedChunks++;
+            if (m_characterScanChunkIndex == 0) {
+                m_lastCompletedCharacterScanEpoch = m_characterScanEpoch;
+            }
+        } else {
+            m_characterScanChunkIndex = ci;
+            m_characterScanItemIndex = wi;
+            break;
+        }
     }
+
     return newCharsFound;
 }
 
@@ -983,7 +1152,10 @@ int MatchMonitor::updatePlayerList(uintptr_t gameStatePtr) {
         data.kills      = kills;
         data.pos        = loc;
         data.characterPtr = charOwner;
-        m_playerList.upsert(playerKey, data);
+        PlayerNode* node = m_playerList.upsert(playerKey, data);
+        if (node) {
+            node->source = PlayerSource::PlayerArray;
+        }
         seenKeys[playerKey] = true;
         updated++;
 
@@ -1001,13 +1173,18 @@ int MatchMonitor::updatePlayerList(uintptr_t gameStatePtr) {
     PlayerNode* cur = m_playerList.head();
     while (cur) {
         if (seenKeys.find(cur->playerKey) == seenKeys.end()) {
-            toRemove.push_back(cur->playerKey);
+            if (cur->source == PlayerSource::PlayerArray) {
+                toRemove.push_back(cur->playerKey);
+            } else if (m_lastCompletedCharacterScanEpoch > 0
+                && cur->lastSeenCharacterScanEpoch < m_lastCompletedCharacterScanEpoch) {
+                toRemove.push_back(cur->playerKey);
+            }
         }
         cur = cur->next;
     }
     for (uint32_t key : toRemove) m_playerList.remove(key);
 
-    // 扫描 GUObjectArray 获取附近的所Character (包括敌人)
+    // 扫描 GUObjectArray 获取附近的 Character (包括敌人)，改为跨多次轮询的分片扫描。
     scanCharacters();
 
     return updated;
@@ -1171,9 +1348,27 @@ void MatchMonitor::pollPlayers() {
     MatchState ms = getMatchState();
     if (!ms.inMatch) return;
 
+    if (ms.elapsedTimeSeconds >= 0) {
+        m_currentMatchElapsedSeconds = ms.elapsedTimeSeconds;
+    } else if (m_matchEnterTickMs != 0) {
+        m_currentMatchElapsedSeconds = static_cast<int32_t>((nowMonotonicMs() - m_matchEnterTickMs) / 1000ULL);
+    } else {
+        m_currentMatchElapsedSeconds = -1;
+    }
+
+    const LoadThrottlePhase loadPhase = getLoadThrottlePhase(m_currentMatchElapsedSeconds);
+    const int loadPhaseValue = static_cast<int>(loadPhase);
+    if (loadPhaseValue != m_lastLoadThrottlePhase) {
+        MLOG(LOG_LEVEL_INFO, "[Throttle] Phase=%s Elapsed=%d", loadThrottlePhaseName(loadPhase), m_currentMatchElapsedSeconds);
+        m_lastLoadThrottlePhase = loadPhaseValue;
+    }
+
+    const auto slowRefreshInterval = getSlowRefreshInterval(m_currentMatchElapsedSeconds);
+    const auto skeletonRefreshInterval = getSkeletonRefreshInterval(m_currentMatchElapsedSeconds);
+
     const bool shouldRunSlowPath = m_playerList.size() <= 0
         || m_myPlayerKey == 0
-        || shouldLogEvery(s_lastSlowRefreshTime, kSlowPlayerRefreshInterval);
+        || shouldLogEvery(s_lastSlowRefreshTime, slowRefreshInterval);
 
     if (shouldRunSlowPath) {
         const int count = updatePlayerList(ms.gameStatePtr);
@@ -1189,7 +1384,7 @@ void MatchMonitor::pollPlayers() {
     }
 
     const bool shouldRefreshSkeleton = shouldRunSlowPath
-        || shouldLogEvery(s_lastSkeletonRefreshTime, kSkeletonRefreshInterval);
+        || shouldLogEvery(s_lastSkeletonRefreshTime, skeletonRefreshInterval);
 
     // 推送数据到绘制层
     ue4draw::DrawGameData drawData;
@@ -1348,12 +1543,21 @@ void MatchMonitor::pollMatchStateLoop() {
                     MLOG(LOG_LEVEL_INFO, "进入对局! State=%s World=%s", ms.state.c_str(), ms.worldName.c_str());
                     ue4draw::SharedUE4Data::getInstance().setInMatch(true);
                     m_playerList.clear();
+                    m_lastNetCullPatchMs.clear();
                     m_characterClassSet.clear();
                     m_skeletonIndexCache.clear();
                     m_myTeamID = -1;
                     m_myPlayerKey = 0;
                     m_lastReportedArrayNum = -1;
                     m_lastReportedTotal = -1;
+                    m_currentMatchElapsedSeconds = -1;
+                    m_lastLoadThrottlePhase = -1;
+                    m_matchEnterTickMs = nowMonotonicMs();
+                    m_lastCharacterScanMs = 0;
+                    m_characterScanChunkIndex = 0;
+                    m_characterScanItemIndex = 0;
+                    m_characterScanEpoch = 0;
+                    m_lastCompletedCharacterScanEpoch = 0;
                     openLog();
                     char logBuf[256];
                     snprintf(logBuf, sizeof(logBuf), ">>> ★ 进入对局 State=%s World=%s", ms.state.c_str(), ms.worldName.c_str());
@@ -1367,10 +1571,19 @@ void MatchMonitor::pollMatchStateLoop() {
                     ue4draw::SharedUE4Data::getInstance().pushData(emptyData);
                     closeLog();
                     m_playerList.clear();
+                    m_lastNetCullPatchMs.clear();
                     m_characterClassSet.clear();
                     m_skeletonIndexCache.clear();
                     m_myTeamID = -1;
                     m_myPlayerKey = 0;
+                    m_currentMatchElapsedSeconds = -1;
+                    m_lastLoadThrottlePhase = -1;
+                    m_matchEnterTickMs = 0;
+                    m_lastCharacterScanMs = 0;
+                    m_characterScanChunkIndex = 0;
+                    m_characterScanItemIndex = 0;
+                    m_characterScanEpoch = 0;
+                    m_lastCompletedCharacterScanEpoch = 0;
                 }
                 m_lastMatchState = ms.state;
             }
@@ -1446,6 +1659,15 @@ bool MatchMonitor::start() {
     m_lastMatchState = "";
     m_isInMatch = false;
     m_playerList.clear();
+    m_lastNetCullPatchMs.clear();
+    m_currentMatchElapsedSeconds = -1;
+    m_lastLoadThrottlePhase = -1;
+    m_matchEnterTickMs = 0;
+    m_lastCharacterScanMs = 0;
+    m_characterScanChunkIndex = 0;
+    m_characterScanItemIndex = 0;
+    m_characterScanEpoch = 0;
+    m_lastCompletedCharacterScanEpoch = 0;
 
     std::thread(&MatchMonitor::pollMatchStateLoop, this).detach();
     MLOG(LOG_LEVEL_INFO, "=== 对局监控+玩家采集已启动 ===");

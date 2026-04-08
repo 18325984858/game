@@ -115,6 +115,11 @@ struct SkeletonWorldPoint {
     bool valid = false;
 };
 
+enum class PlayerSource : uint8_t {
+    PlayerArray = 0,
+    CharacterScan = 1,
+};
+
 // =====================================================================
 //  PlayerNode — 玩家信息节点 (双向链表 + HashMap)
 // =====================================================================
@@ -131,6 +136,8 @@ struct PlayerNode {
     uintptr_t   characterPtr = 0;
     bool        hasSkeleton = false;
     std::array<SkeletonWorldPoint, PLAYER_SKELETON_POINT_COUNT> skeletonPoints{};
+    PlayerSource source = PlayerSource::PlayerArray;
+    uint32_t    lastSeenCharacterScanEpoch = 0;
 
     PlayerNode* prev = nullptr;
     PlayerNode* next = nullptr;
@@ -179,6 +186,7 @@ struct MatchState {
     bool inMatch = false;
     uintptr_t gameStatePtr = 0;
     std::string worldName;
+    int32_t elapsedTimeSeconds = -1;
 };
 
 // =====================================================================
@@ -285,8 +293,17 @@ private:
     uint32_t      m_myPlayerKey = 0;
     int           m_lastReportedArrayNum = -1;
     int           m_lastReportedTotal = -1;
+    int32_t       m_currentMatchElapsedSeconds = -1;
+    int           m_lastLoadThrottlePhase = -1;
+    uint64_t      m_matchEnterTickMs = 0;
+    uint64_t      m_lastCharacterScanMs = 0;
+    int           m_characterScanChunkIndex = 0;
+    int           m_characterScanItemIndex = 0;
+    uint32_t      m_characterScanEpoch = 0;
+    uint32_t      m_lastCompletedCharacterScanEpoch = 0;
 
     PlayerList m_playerList;
+    std::unordered_map<uintptr_t, uint64_t> m_lastNetCullPatchMs;
     std::unordered_map<uintptr_t, bool> m_characterClassSet;
     std::unordered_map<uintptr_t, std::array<int, PLAYER_SKELETON_POINT_COUNT>> m_skeletonIndexCache;
     std::unordered_map<int, std::string> m_nameCache;
