@@ -712,62 +712,6 @@ static void UE4WorkerThread(void* plibUE4ModeBase, void* pGNames,
     // 读取配置文件中的日志开关
     g_runtimeLogEnabled = readLogEnabled();
 
-    // 检查界面上的 "启用 ueDumper (导出 dump)" 按钮状态
-    if (readUeDumperEnabled()) {
-        LOG(LOG_LEVEL_INFO, "[UE4Worker] ue_dumper 已启用, 创建 dump 线程");
-        std::thread([=]() {
-            ue4::UE4Dumper dumper(
-                reinterpret_cast<uintptr_t>(plibUE4ModeBase),
-                reinterpret_cast<uint64_t>(pGNames),
-                reinterpret_cast<uint64_t>(pGUObjectArray),
-                reinterpret_cast<uint64_t>(pGWorld),
-                static_cast<uintptr_t>(moduleSize),
-                "/data/data/com.tencent.tmgp.pubgmhd/cache/ue4_dump/"
-            );
-
-            if (!dumper.init()) {
-                LOG(LOG_LEVEL_ERROR, "[UE4Worker] UE4Dumper 初始化失败");
-                toast_util::showToast("UE4Dumper 初始化失败");
-            } else {
-                LOG(LOG_LEVEL_INFO, "[UE4Worker] UE4Dumper 初始化成功, NumNames=%d", dumper.getNumNames());
-                if (dumper.dumpAll()) {
-                    LOG(LOG_LEVEL_INFO, "[UE4Worker] dump 全部完成");
-                    toast_util::showToast("UE4 Dump 完成");
-                } else {
-                    LOG(LOG_LEVEL_ERROR, "[UE4Worker] dump 部分失败");
-                    toast_util::showToast("UE4 Dump 部分失败");
-                }
-            }
-        }).detach();
-    } else {
-        LOG(LOG_LEVEL_INFO, "[UE4Worker] ue_dumper 未启用, 跳过 dump");
-    }
-
-    // 检查 ue_header 开关: 生成 IDA 头文件和脚本
-    if (readUeHeaderEnabled()) {
-        LOG(LOG_LEVEL_INFO, "[UE4Worker] ue_header 已启用, 创建 header 生成线程");
-        std::thread([=]() {
-            ue4::UE4Dumper dumper(
-                reinterpret_cast<uintptr_t>(plibUE4ModeBase),
-                reinterpret_cast<uint64_t>(pGNames),
-                reinterpret_cast<uint64_t>(pGUObjectArray),
-                reinterpret_cast<uint64_t>(pGWorld),
-                static_cast<uintptr_t>(moduleSize),
-                "/data/data/com.tencent.tmgp.pubgmhd/cache/ue4_dump/"
-            );
-            if (!dumper.init()) {
-                LOG(LOG_LEVEL_ERROR, "[UE4Worker] UE4Header 初始化失败");
-                toast_util::showToast("UE4Header 初始化失败");
-            } else {
-                ue4::UE4Header header(dumper, "/data/data/com.tencent.tmgp.pubgmhd/cache/ue4_dump/");
-                header.start();
-                toast_util::showToast("UE4 Header 生成完成");
-            }
-        }).detach();
-    } else {
-        LOG(LOG_LEVEL_INFO, "[UE4Worker] ue_header 未启用, 跳过");
-    }
-
     // 对局状态监控 + 玩家坐标采集 (额外线程自动启动)
     std::thread([=]() {
         LOG(LOG_LEVEL_INFO, "[UE4Worker] 初始化 UE4Interface 并启动对局监控");
@@ -814,7 +758,52 @@ static void UE4WorkerThread(void* plibUE4ModeBase, void* pGNames,
         // 额外等待 5 秒让引擎完全稳定 (避免 GUObjectArray 正在扩容)
         std::this_thread::sleep_for(std::chrono::seconds(5));
 
-        // 1. 创建 UE4Dumper 并初始化
+        // ---- UE4Dumper 导出 / UE4Header 生成 (复用引擎等待, 不另起线程) ----
+        if (readUeDumperEnabled()) {
+            LOG(LOG_LEVEL_INFO, "[UE4Worker] ue_dumper 已启用, 开始 dump");
+            ue4::UE4Dumper dumpOnly(
+                reinterpret_cast<uintptr_t>(plibUE4ModeBase),
+                reinterpret_cast<uint64_t>(pGNames),
+                reinterpret_cast<uint64_t>(pGUObjectArray),
+                reinterpret_cast<uint64_t>(pGWorld),
+                static_cast<uintptr_t>(moduleSize),
+                "/data/data/com.tencent.tmgp.pubgmhd/cache/ue4_dump/"
+            );
+            if (!dumpOnly.init()) {
+                LOG(LOG_LEVEL_ERROR, "[UE4Worker] UE4Dumper 初始化失败");
+                toast_util::showToast("UE4Dumper 初始化失败");
+            } else {
+                LOG(LOG_LEVEL_INFO, "[UE4Worker] UE4Dumper 初始化成功, NumNames=%d", dumpOnly.getNumNames());
+                if (dumpOnly.dumpAll()) {
+                    LOG(LOG_LEVEL_INFO, "[UE4Worker] dump 全部完成");
+                    toast_util::showToast("UE4 Dump 完成");
+                } else {
+                    LOG(LOG_LEVEL_ERROR, "[UE4Worker] dump 部分失败");
+                    toast_util::showToast("UE4 Dump 部分失败");
+                }
+            }
+        }
+        if (readUeHeaderEnabled()) {
+            LOG(LOG_LEVEL_INFO, "[UE4Worker] ue_header 已启用, 开始生成");
+            ue4::UE4Dumper headerDumper(
+                reinterpret_cast<uintptr_t>(plibUE4ModeBase),
+                reinterpret_cast<uint64_t>(pGNames),
+                reinterpret_cast<uint64_t>(pGUObjectArray),
+                reinterpret_cast<uint64_t>(pGWorld),
+                static_cast<uintptr_t>(moduleSize),
+                "/data/data/com.tencent.tmgp.pubgmhd/cache/ue4_dump/"
+            );
+            if (!headerDumper.init()) {
+                LOG(LOG_LEVEL_ERROR, "[UE4Worker] UE4Header 初始化失败");
+                toast_util::showToast("UE4Header 初始化失败");
+            } else {
+                ue4::UE4Header header(headerDumper, "/data/data/com.tencent.tmgp.pubgmhd/cache/ue4_dump/");
+                header.start();
+                toast_util::showToast("UE4 Header 生成完成");
+            }
+        }
+
+        // 1. 创建 UE4Dumper 并初始化 (用于对局监控的反射解析)
         auto* dumper = new ue4::UE4Dumper(
             reinterpret_cast<uintptr_t>(plibUE4ModeBase),
             reinterpret_cast<uint64_t>(pGNames),
@@ -874,21 +863,11 @@ bool MyStartPointUE4(void* plibUE4ModeBase, void* pGNames,
     }
 
     // 在入口处计算 GWorld 全局变量地址 (偏移只在这里使用)
-    // pGWorld 是注入时的 UWorld* 快照, 会随地图切换失效
-    // GWorld 全局变量地址 = base + 0x14988578, 每次读取都能获徖当前 UWorld*
     uintptr_t base = reinterpret_cast<uintptr_t>(plibUE4ModeBase);
     void* pGWorldGlobal = reinterpret_cast<void*>(base + 0x14988578);
 
-        GLOG("MyStartPointUE4: base=%p GNames=%p GWorldSnapshot=%p GWorldGlobal=%p GUObjectArray=%p moduleSize=0x%llX",
-            plibUE4ModeBase,
-            pGNames,
-            pGWorld,
-            pGWorldGlobal,
-            pGUObjectArray,
-            (unsigned long long)moduleSize);
-
-    LOG(LOG_LEVEL_INFO, "MatchMonitor [MyStartPointUE4] 参数: base=%p GNames=%p GWorld=%p(全局=%p) GUObjectArray=%p moduleSize=0x%llX",
-            plibUE4ModeBase, pGNames, pGWorld, pGWorldGlobal, pGUObjectArray, (unsigned long long)moduleSize);
+    GLOG("MyStartPointUE4: base=%p GNames=%p GWorldSnapshot=%p GWorldGlobal=%p GUObjectArray=%p moduleSize=0x%llX",
+        plibUE4ModeBase, pGNames, pGWorld, pGWorldGlobal, pGUObjectArray, (unsigned long long)moduleSize);
 
     LOG(LOG_LEVEL_INFO, "[MyStartPointUE4] 启动 UE4 工作线程");
 

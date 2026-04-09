@@ -38,43 +38,45 @@ void UE4Interface::collectClassData(uintptr_t classPtr) {
     cls.className = m_dumper.readObjectFName(classPtr);
     cls.fullPath = m_dumper.readFullPath(classPtr);
 
-    // 父类
-    auto* ustruct = reinterpret_cast<UStruct*>(classPtr);
-    cls.superName = ustruct->SuperStruct ? m_dumper.readObjectFName(reinterpret_cast<uintptr_t>(ustruct->SuperStruct)) : "";
-    cls.propertiesSize = ustruct->PropertiesSize;
+    // 父类 — UStruct::SuperStruct @ +0x30, PropertiesSize @ +0x40
+    uintptr_t superPtr = m_dumper.safeReadPtr(classPtr + 0x30);
+    cls.superName = (superPtr != 0 && superPtr >= 0x10000) ? m_dumper.readObjectFName(superPtr) : "";
+    cls.propertiesSize = m_dumper.safeReadS32(classPtr + 0x40);
 
-    // ---- 遍历 Children 链表, 收集字段和函数 ----
-    auto* childField = ustruct->Children;
+    // ---- 遍历 Children 链表 (UStruct::Children @ +0x38) ----
+    uintptr_t childPtr = m_dumper.safeReadPtr(classPtr + 0x38);
     int depth = 0;
-    while (childField != nullptr && depth < 4096) {
-        uintptr_t child = reinterpret_cast<uintptr_t>(childField);
-        std::string childClassName = m_dumper.readClassName(child);
-        std::string childName = m_dumper.readObjectFName(child);
+    while (childPtr != 0 && childPtr >= 0x10000 && depth < 4096) {
+        std::string childClassName = m_dumper.readClassName(childPtr);
+        std::string childName = m_dumper.readObjectFName(childPtr);
 
         if (childClassName.find("Property") != std::string::npos) {
-            auto* prop = reinterpret_cast<UProperty*>(childField);
             UEFieldInfo field;
             field.name = childName;
             field.typeName = childClassName;
-            field.offset = prop->Offset_Internal;
-            field.elementSize = prop->ElementSize;
-            field.arrayDim = prop->ArrayDim;
-            field.propertyFlags = prop->PropertyFlags;
+            field.offset = m_dumper.safeReadS32(childPtr + 0x44);       // Offset_Internal
+            field.elementSize = m_dumper.safeReadS32(childPtr + 0x38);  // ElementSize
+            field.arrayDim = m_dumper.safeReadS32(childPtr + 0x30);     // ArrayDim
+            // PropertyFlags (uint64 @ +0x48)
+            uint64_t flags = 0;
+            int32_t lo = m_dumper.safeReadS32(childPtr + 0x48);
+            int32_t hi = m_dumper.safeReadS32(childPtr + 0x4C);
+            flags = (static_cast<uint64_t>(static_cast<uint32_t>(hi)) << 32) | static_cast<uint32_t>(lo);
+            field.propertyFlags = flags;
             cls.fields.push_back(field);
         } else if (childClassName == "Function") {
-            auto* func = reinterpret_cast<UFunction*>(childField);
             UEFuncInfo fi;
             fi.name = childName;
-            fi.funcPtr = reinterpret_cast<uintptr_t>(func->Func);
-            fi.funcFlags = func->FunctionFlags;
-            fi.numParms = func->NumParms;
+            fi.funcPtr = m_dumper.safeReadPtr(childPtr + 0xB0);       // Func
+            fi.funcFlags = static_cast<uint32_t>(m_dumper.safeReadS32(childPtr + 0x88));  // FunctionFlags
+            fi.numParms = static_cast<uint8_t>(m_dumper.safeReadS32(childPtr + 0x8E) & 0xFF);  // NumParms
             if (fi.funcPtr != 0) {
                 fi.location = m_dumper.getModuleOffsetText(fi.funcPtr);
             }
             cls.functions.push_back(fi);
         }
 
-        childField = childField->Next;
+        childPtr = m_dumper.safeReadPtr(childPtr + 0x28);  // UField::Next
         depth++;
     }
 

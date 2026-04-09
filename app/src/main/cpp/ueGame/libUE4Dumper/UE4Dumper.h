@@ -81,6 +81,7 @@ public:
     // ---- VTable 工具 (公开给 UE4Header 使用) ----
     uintptr_t findClassDefaultObject(uintptr_t classPtr);
     static uintptr_t safeReadPtr(uintptr_t addr);
+    static int32_t safeReadS32(uintptr_t addr);
     bool isModulePtr(uintptr_t ptr);
     std::string lookupVTableFuncName(uintptr_t funcAddr) const;
     std::string getModuleOffsetText(uintptr_t ptr);
@@ -98,7 +99,6 @@ private:
     std::string m_outputPath;  // 输出目录路径, 默认为""
 
     // ---- 安全内存读取 ----
-    static int32_t safeReadS32(uintptr_t addr);
     static uint32_t safeReadU32(uintptr_t addr);
 
     // ---- 输出路径 ----

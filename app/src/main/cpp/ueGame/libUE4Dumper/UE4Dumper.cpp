@@ -145,11 +145,24 @@ uint32_t UE4Dumper::safeReadU32(uintptr_t addr) {
 const char* UE4Dumper::getNameByIndex(int index) {
     if (index < 0 || index >= m_numNames) return nullptr;
 
-    auto* namesArray = reinterpret_cast<TNameEntryArray*>(m_GNames);
-    FNameEntry* entry = namesArray->getEntry(index);
-    if (entry == nullptr) return nullptr;
+    int ci = index / ue4::NAMES_ELEMENTS_PER_CHUNK;
+    int wi = index % ue4::NAMES_ELEMENTS_PER_CHUNK;
+    uintptr_t chkPtr = safeReadPtr(m_GNames + static_cast<uintptr_t>(ci) * 8);
+    if (chkPtr == 0) return nullptr;
+    uintptr_t entryPtr = safeReadPtr(chkPtr + static_cast<uintptr_t>(wi) * 8);
+    if (entryPtr == 0) return nullptr;
 
-    return entry->getName();
+    static thread_local char s_nameBuf[256];
+    installSafeReadGuard();
+    if (sigsetjmp(s_safeReadJmpBuf, 1) != 0) {
+        s_safeReadActive = 0;
+        return nullptr;
+    }
+    s_safeReadActive = 1;
+    memcpy(s_nameBuf, reinterpret_cast<const void*>(entryPtr + 0x0C), sizeof(s_nameBuf) - 1);
+    s_safeReadActive = 0;
+    s_nameBuf[sizeof(s_nameBuf) - 1] = '\0';
+    return s_nameBuf;
 }
 
 std::string UE4Dumper::fnameToString(int nameIdx, int number) {
@@ -165,24 +178,29 @@ std::string UE4Dumper::fnameToString(int nameIdx, int number) {
 }
 
 std::string UE4Dumper::readObjectFName(uintptr_t objPtr) {
-    auto* obj = reinterpret_cast<UObjectBase*>(objPtr);
-    return fnameToString(obj->NamePrivate.ComparisonIndex, obj->NamePrivate.Number);
+    if (objPtr == 0 || objPtr < 0x10000) return "<invalid>";
+    int32_t nameIdx = safeReadS32(objPtr + 0x18);
+    int32_t nameNum = safeReadS32(objPtr + 0x1C);
+    return fnameToString(nameIdx, nameNum);
 }
 
 std::string UE4Dumper::readClassName(uintptr_t objPtr) {
-    auto* obj = reinterpret_cast<UObjectBase*>(objPtr);
-    if (obj->ClassPrivate == nullptr) return "<no_class>";
-    return readObjectFName(reinterpret_cast<uintptr_t>(obj->ClassPrivate));
+    if (objPtr == 0 || objPtr < 0x10000) return "<no_class>";
+    uintptr_t classPtr = safeReadPtr(objPtr + 0x10);
+    if (classPtr == 0 || classPtr < 0x10000) return "<no_class>";
+    return readObjectFName(classPtr);
 }
 
 std::string UE4Dumper::readFullPath(uintptr_t objPtr) {
     std::string parts[64];
     int count = 0;
-    auto* cur = reinterpret_cast<UObjectBase*>(objPtr);
+    uintptr_t cur = objPtr;
 
-    while (cur != nullptr && count < 64) {
-        parts[count++] = fnameToString(cur->NamePrivate.ComparisonIndex, cur->NamePrivate.Number);
-        cur = reinterpret_cast<UObjectBase*>(cur->OuterPrivate);
+    while (cur != 0 && cur >= 0x10000 && count < 64) {
+        int32_t nameIdx = safeReadS32(cur + 0x18);
+        int32_t nameNum = safeReadS32(cur + 0x1C);
+        parts[count++] = fnameToString(nameIdx, nameNum);
+        cur = safeReadPtr(cur + 0x20);
     }
 
     std::string result;
@@ -196,28 +214,29 @@ std::string UE4Dumper::readFullPath(uintptr_t objPtr) {
 // ===================== GUObjectArray 分块遍历 ========================
 
 int UE4Dumper::forEachUObject(uintptr_t arrayBase, ForEachCallback cb, void* userData) {
-    auto* arr = reinterpret_cast<FUObjectArray*>(arrayBase);
-    int numChunks = arr->getNumChunks();
-    int totalNum  = arr->getTotalNum();
+    if (arrayBase == 0 || arrayBase < 0x10000) return 0;
+    int numChunks = safeReadS32(arrayBase + 0xF8);
+    int totalNum  = safeReadS32(arrayBase + 0x100);
 
-    if (numChunks <= 0 || totalNum <= 0) return 0;
+    if (numChunks <= 0 || numChunks > 1000 || totalNum <= 0 || totalNum > 5000000) return 0;
 
     int globalIdx = 0;
     int total = 0;
+    static constexpr size_t kItemSize = 24;
 
     for (int ci = 0; ci < numChunks; ci++) {
-        auto* chunkBase = reinterpret_cast<FUObjectItem*>(arr->getChunkPtr(ci));
-        int chunkCount = arr->getChunkCount(ci);
+        uintptr_t chunkBase = safeReadPtr(arrayBase + 0xC8 + static_cast<uintptr_t>(ci) * 8);
+        int chunkCount = safeReadS32(arrayBase + 0xE8 + static_cast<uintptr_t>(ci) * 4);
 
-        if (chunkBase == nullptr || chunkCount <= 0) {
+        if (chunkBase == 0 || chunkBase < 0x10000 || chunkCount <= 0) {
             globalIdx += (chunkCount > 0 ? chunkCount : 0);
             continue;
         }
 
         for (int wi = 0; wi < chunkCount; wi++) {
-            FUObjectItem& item = chunkBase[wi];
-            if (item.Object != nullptr) {
-                cb(reinterpret_cast<uintptr_t>(item.Object), globalIdx, userData);
+            uintptr_t objPtr = safeReadPtr(chunkBase + static_cast<uintptr_t>(wi) * kItemSize);
+            if (objPtr != 0 && objPtr >= 0x10000) {
+                cb(objPtr, globalIdx, userData);
                 total++;
             }
             globalIdx++;
@@ -233,8 +252,7 @@ int UE4Dumper::forEachUObject(uintptr_t arrayBase, ForEachCallback cb, void* use
 bool UE4Dumper::init() {
     if (m_GNames == 0 || m_GUObjectArray == 0) return false;
 
-    auto* namesArray = reinterpret_cast<TNameEntryArray*>(m_GNames);
-    m_numNames = namesArray->NumElements;
+    m_numNames = safeReadS32(m_GNames + 0x1400);
     if (m_numNames <= 0) return false;
 
     const char* name0 = getNameByIndex(0);
@@ -402,23 +420,24 @@ std::string UE4Dumper::getModuleOffsetText(uintptr_t p) {
 }
 
 std::string UE4Dumper::getPackageName(uintptr_t objPtr) {
-    auto* cur = reinterpret_cast<UObjectBase*>(objPtr);
-    auto* last = cur;
-    while (cur != nullptr) {
+    uintptr_t cur = objPtr;
+    uintptr_t last = cur;
+    int depth = 0;
+    while (cur != 0 && cur >= 0x10000 && depth < 64) {
         last = cur;
-        cur = reinterpret_cast<UObjectBase*>(cur->OuterPrivate);
+        cur = safeReadPtr(cur + 0x20);
+        depth++;
     }
-    return readObjectFName(reinterpret_cast<uintptr_t>(last));
+    return readObjectFName(last);
 }
 
 std::string UE4Dumper::outerChain(uintptr_t objPtr) {
     std::string parts[32];
     int count = 0;
-    auto* cur = reinterpret_cast<UObjectBase*>(
-        reinterpret_cast<UObjectBase*>(objPtr)->OuterPrivate);
-    while (cur != nullptr && count < 32) {
-        parts[count++] = readObjectFName(reinterpret_cast<uintptr_t>(cur));
-        cur = reinterpret_cast<UObjectBase*>(cur->OuterPrivate);
+    uintptr_t cur = safeReadPtr(objPtr + 0x20);
+    while (cur != 0 && cur >= 0x10000 && count < 32) {
+        parts[count++] = readObjectFName(cur);
+        cur = safeReadPtr(cur + 0x20);
     }
     std::string result;
     for (int i = count - 1; i >= 0; i--) {
@@ -465,14 +484,14 @@ const char* UE4Dumper::getPropTypeName(const std::string& className) {
 // ---- 继承链构建 ----
 std::vector<UE4Dumper::HierarchyEntry> UE4Dumper::buildTypeHierarchy(uintptr_t typePtr) {
     std::vector<HierarchyEntry> chain;
-    auto* cur = reinterpret_cast<UStruct*>(typePtr);
+    uintptr_t cur = typePtr;
     int depth = 0;
-    while (cur != nullptr && depth < 256) {
+    while (cur != 0 && cur >= 0x10000 && depth < 256) {
         HierarchyEntry e;
-        e.ptr = reinterpret_cast<uintptr_t>(cur);
-        e.name = readObjectFName(e.ptr);
+        e.ptr = cur;
+        e.name = readObjectFName(cur);
         chain.push_back(e);
-        cur = cur->SuperStruct;
+        cur = safeReadPtr(cur + 0x30);  // UStruct::SuperStruct
         depth++;
     }
     std::reverse(chain.begin(), chain.end());
@@ -501,38 +520,35 @@ std::vector<UE4Dumper::FieldInfo> UE4Dumper::collectDeclaredFields(uintptr_t typ
     std::vector<FieldInfo> fields;
     std::string ownerName = readObjectFName(typePtr);
 
-    auto* structPtr = reinterpret_cast<UStruct*>(typePtr);
-    auto* child = reinterpret_cast<UField*>(structPtr->Children);
+    uintptr_t childPtr = safeReadPtr(typePtr + 0x38);  // UStruct::Children
     int depth = 0;
-    while (child != nullptr && depth < 5000) {
-        std::string cc = readClassName(reinterpret_cast<uintptr_t>(child));
+    while (childPtr != 0 && childPtr >= 0x10000 && depth < 5000) {
+        std::string cc = readClassName(childPtr);
         if (cc.size() > 8 && cc.substr(cc.size() - 8) == "Property") {
-            auto* prop = reinterpret_cast<UProperty*>(child);
             FieldInfo fi;
             fi.ownerName = ownerName;
-            fi.propName = readObjectFName(reinterpret_cast<uintptr_t>(child));
+            fi.propName = readObjectFName(childPtr);
 
             const char* mapped = getPropTypeName(cc);
             fi.typeName = mapped ? mapped : cc;
 
-            fi.enumPath = getBoundEnumPath(reinterpret_cast<uintptr_t>(child));
+            fi.enumPath = getBoundEnumPath(childPtr);
             if (!fi.enumPath.empty()) {
-                // 使用实际枚举类型名 (取路径最后一段)
                 auto dot = fi.enumPath.rfind('.');
                 fi.typeName = (dot != std::string::npos) ? fi.enumPath.substr(dot + 1) : fi.enumPath;
             }
 
-            fi.offset   = prop->Offset_Internal;
-            fi.elemSize = prop->ElementSize;
-            fi.arrayDim = prop->ArrayDim;
-            fi.repIndex = prop->RepIndex;
-            fi.repNotifyFunc = fnameToString(
-                prop->RepNotifyFunc.ComparisonIndex,
-                prop->RepNotifyFunc.Number);
+            fi.offset   = safeReadS32(childPtr + 0x44);  // UProperty::Offset_Internal
+            fi.elemSize = safeReadS32(childPtr + 0x38);  // UProperty::ElementSize
+            fi.arrayDim = safeReadS32(childPtr + 0x30);  // UProperty::ArrayDim
+            fi.repIndex = static_cast<uint16_t>(safeReadS32(childPtr + 0x4C) & 0xFFFF);
+            int32_t rnIdx = safeReadS32(childPtr + 0x50);
+            int32_t rnNum = safeReadS32(childPtr + 0x54);
+            fi.repNotifyFunc = fnameToString(rnIdx, rnNum);
 
             fields.push_back(fi);
         }
-        child = child->Next;
+        childPtr = safeReadPtr(childPtr + 0x28);  // UField::Next
         depth++;
     }
     return fields;
@@ -554,38 +570,37 @@ std::vector<UE4Dumper::FuncInfo> UE4Dumper::collectDeclaredFunctions(uintptr_t t
     std::vector<FuncInfo> functions;
     std::string ownerName = readObjectFName(typePtr);
 
-    auto* structPtr = reinterpret_cast<UStruct*>(typePtr);
-    auto* child = reinterpret_cast<UField*>(structPtr->Children);
+    uintptr_t childPtr = safeReadPtr(typePtr + 0x38);  // UStruct::Children
     int depth = 0;
-    while (child != nullptr && depth < 5000) {
-        if (readClassName(reinterpret_cast<uintptr_t>(child)) == "Function") {
-            auto* func = reinterpret_cast<ue4::UFunction*>(child);
+    while (childPtr != 0 && childPtr >= 0x10000 && depth < 5000) {
+        if (readClassName(childPtr) == "Function") {
             FuncInfo fi;
             fi.ownerName = ownerName;
-            fi.funcName  = readObjectFName(reinterpret_cast<uintptr_t>(child));
-            fi.funcFlags = func->FunctionFlags;
-            fi.numParms  = func->NumParms;
+            fi.funcName  = readObjectFName(childPtr);
+            fi.funcFlags = static_cast<uint32_t>(safeReadS32(childPtr + 0x88));  // UFunction::FunctionFlags
+            fi.numParms  = static_cast<uint8_t>(safeReadS32(childPtr + 0x8E) & 0xFF);  // UFunction::NumParms
             fi.retType   = "void";
 
             // 遍历函数参数
-            auto* fparam = reinterpret_cast<UField*>(func->Children);
+            uintptr_t fparamPtr = safeReadPtr(childPtr + 0x38);  // UFunction inherits Children
             int pd = 0;
-            while (fparam != nullptr && pd < 100) {
-                std::string pc = readClassName(reinterpret_cast<uintptr_t>(fparam));
+            while (fparamPtr != 0 && fparamPtr >= 0x10000 && pd < 100) {
+                std::string pc = readClassName(fparamPtr);
                 if (pc.size() > 8 && pc.substr(pc.size() - 8) == "Property") {
-                    auto* paramProp = reinterpret_cast<UProperty*>(fparam);
-                    std::string pn = readObjectFName(reinterpret_cast<uintptr_t>(fparam));
+                    std::string pn = readObjectFName(fparamPtr);
                     const char* mapped = getPropTypeName(pc);
                     std::string pt = mapped ? mapped : pc;
 
-                    // 如果是枚举属性, 替换为实际枚举类型名
-                    std::string enumPath = getBoundEnumPath(reinterpret_cast<uintptr_t>(fparam));
+                    std::string enumPath = getBoundEnumPath(fparamPtr);
                     if (!enumPath.empty()) {
                         auto dot = enumPath.rfind('.');
                         pt = (dot != std::string::npos) ? enumPath.substr(dot + 1) : enumPath;
                     }
 
-                    uint32_t pfLo = static_cast<uint32_t>(paramProp->PropertyFlags & 0xFFFFFFFF);
+                    uint64_t pf = 0;
+                    // Read PropertyFlags (uint64 @ +0x48) via two S32 reads
+                    int32_t pfLo32 = safeReadS32(fparamPtr + 0x48);
+                    uint32_t pfLo = static_cast<uint32_t>(pfLo32);
                     if (pfLo & 0x400) {
                         fi.retType = pt;
                     } else if (pfLo & 0x80) {
@@ -595,11 +610,11 @@ std::vector<UE4Dumper::FuncInfo> UE4Dumper::collectDeclaredFunctions(uintptr_t t
                         fi.params.push_back(param);
                     }
                 }
-                fparam = fparam->Next;
+                fparamPtr = safeReadPtr(fparamPtr + 0x28);  // UField::Next
                 pd++;
             }
 
-            fi.funcPtr = reinterpret_cast<uintptr_t>(func->Func);
+            fi.funcPtr = safeReadPtr(childPtr + 0xB0);  // UFunction::Func
             if (fi.funcPtr != 0 && isModulePtr(fi.funcPtr)) {
                 fi.locationSuffix = " // [Offset: " + getModuleOffsetText(fi.funcPtr) + "]";
             } else if (fi.funcPtr != 0) {
@@ -610,7 +625,7 @@ std::vector<UE4Dumper::FuncInfo> UE4Dumper::collectDeclaredFunctions(uintptr_t t
 
             functions.push_back(fi);
         }
-        child = child->Next;
+        childPtr = safeReadPtr(childPtr + 0x28);  // UField::Next
         depth++;
     }
     return functions;
@@ -821,9 +836,9 @@ void UE4Dumper::dumpType(uintptr_t objPtr, FILE* fp) {
         return;
     }
 
-    auto* structObj = reinterpret_cast<UStruct*>(objPtr);
-    std::string superName = (structObj->SuperStruct == nullptr) ? "" : readObjectFName(reinterpret_cast<uintptr_t>(structObj->SuperStruct));
-    int propSize = structObj->PropertiesSize;
+    uintptr_t superPtr = safeReadPtr(objPtr + 0x30);  // UStruct::SuperStruct
+    std::string superName = (superPtr == 0 || superPtr < 0x10000) ? "" : readObjectFName(superPtr);
+    int propSize = safeReadS32(objPtr + 0x40);  // UStruct::PropertiesSize
 
     fprintf(fp, "// %s %s.%s\n", isClass ? "Class" : "ScriptStruct",
             pkg.c_str(), objName.c_str());
@@ -854,7 +869,7 @@ void UE4Dumper::dumpType(uintptr_t objPtr, FILE* fp) {
 
     // 虚函数表 (仅 class)
     if (isClass) {
-        dumpClassVTable(objPtr, reinterpret_cast<uintptr_t>(structObj->SuperStruct), fp);
+        dumpClassVTable(objPtr, superPtr, fp);
     }
 
     // 函数
