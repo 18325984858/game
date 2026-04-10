@@ -107,12 +107,13 @@ DrawGameData stabilizeRenderData(const DrawGameData& data) {
     static bool s_hasLastStableData = false;
 
     const auto now = Clock::now();
-    constexpr auto kTransientHoldWindow = std::chrono::milliseconds(120);
+    constexpr auto kTransientHoldWindow = std::chrono::milliseconds(500);
 
     if (!data.inMatch) {
-        s_lastStableData = data;
+        // 退出对局时清空缓存的玩家数据, 防止 ESP 残留
+        s_lastStableData = DrawGameData{};
         s_lastStableTime = now;
-        s_hasLastStableData = true;
+        s_hasLastStableData = false;
         return data;
     }
 
@@ -156,6 +157,13 @@ DrawGameData stabilizeRenderData(const DrawGameData& data) {
         s_lastStableData = stabilized;
         s_lastStableTime = now;
         s_hasLastStableData = true;
+    }
+
+    // 超过稳定窗口仍无新数据时, 清空缓存避免绘制过时数据
+    if (s_hasLastStableData && now - s_lastStableTime > std::chrono::milliseconds(2000)) {
+        s_lastStableData.players.clear();
+        s_lastStableData.aliveCount = 0;
+        s_hasLastStableData = false;
     }
 
     if (reusedPreviousFrame && shouldLogEvery(s_lastReuseLogTime, std::chrono::milliseconds(1000))) {

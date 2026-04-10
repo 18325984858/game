@@ -108,6 +108,9 @@ struct ResolvedOffsets {
     int32_t PC_bIsObserverInBattle      = -1;
     int32_t PC_bIsObserverHost          = -1;
 
+    // Controller
+    int32_t Ctrl_ControlRotation        = -1;  // FRotator (Pitch, Yaw, Roll)
+
     // Character (UAECharacter / STExtraCharacter / STExtraBaseCharacter)
     int32_t Char_Health                 = -1;
     int32_t Char_HealthMax              = -1;
@@ -373,6 +376,9 @@ private:
     void refreshTrackedPlayersFast();
     void fillCameraSnapshot(ue4draw::DrawGameData& drawData);
 
+    // ---- 自瞄 ----
+    void aimAtNearestEnemy();
+
     // ---- 轮询线程 ----
     void pollMatchStateLoop();
     void pollPlayers();
@@ -436,6 +442,10 @@ private:
     std::unordered_map<int, std::string> m_nameCache;
     std::unordered_map<uintptr_t, BoneAssetCacheEntry> m_boneAssetCache;
     uint64_t m_lastBoneCacheClearMs = 0;  // 上次清理骨骼缓存的时间
+
+    // Aimbot
+    bool          m_aimbotEnabled = true;
+    int           m_aimbotTargetBone = 4;  // 默认瞄头 (TRACKED_BONE_COUNT 索引: 4=head)
 
     FILE* m_logFp = nullptr;
     int   m_logLineCount = 0;

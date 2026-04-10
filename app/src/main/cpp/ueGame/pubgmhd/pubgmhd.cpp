@@ -611,6 +611,9 @@ bool MatchMonitor::initOffsets() {
     RESOLVE_OFFSET_MULTI(m_off.PC_bIsObserverInBattle, "bIsObserverInBattle", "UAEPlayerController", "STExtraPlayerController");
     RESOLVE_OFFSET_MULTI(m_off.PC_bIsObserverHost,     "bIsObserverHost",     "UAEPlayerController", "STExtraPlayerController");
 
+    // Controller — ControlRotation (FRotator: Pitch, Yaw, Roll)
+    RESOLVE_OFFSET_MULTI(m_off.Ctrl_ControlRotation,   "ControlRotation",     "Controller", "PlayerController", "UAEPlayerController", "STExtraPlayerController");
+
     // UAECharacter
     RESOLVE_OFFSET_MULTI(m_off.Char_TeamID,        "TeamID",             "UAECharacter", "STExtraCharacter", "STExtraBaseCharacter");
     RESOLVE_OFFSET_MULTI(m_off.Char_PlayerKey,     "PlayerKey",          "UAECharacter", "STExtraCharacter", "STExtraBaseCharacter");
@@ -1757,6 +1760,119 @@ void MatchMonitor::fillCameraSnapshot(ue4draw::DrawGameData& drawData) {
 }
 
 // =====================================================================
+//  自瞄 — 计算最近敌人方向并写入 ControlRotation
+// =====================================================================
+void MatchMonitor::aimAtNearestEnemy() {
+    if (!m_aimbotEnabled) return;
+    if (m_off.Ctrl_ControlRotation < 0) return;
+
+    const uintptr_t pc = getLocalPlayerController();
+    if (pc == 0) return;
+
+    // 读取当前相机位置作为射线起点
+    const uintptr_t pcm = safeReadPtr(pc + 0x658);  // PlayerCameraManager
+    if (pcm == 0) return;
+
+    const float camX = safeReadFloat(pcm + 0x650 + 0x0);
+    const float camY = safeReadFloat(pcm + 0x650 + 0x4);
+    const float camZ = safeReadFloat(pcm + 0x650 + 0x8);
+    if (!std::isfinite(camX) || !std::isfinite(camY) || !std::isfinite(camZ)) return;
+    if (std::fabs(camX) < 1.0f && std::fabs(camY) < 1.0f && std::fabs(camZ) < 1.0f) return;
+
+    // 找最近的存活敌人 (有有效骨骼数据)
+    const int boneIdx = m_aimbotTargetBone;  // 4=head
+    float bestDistSq = 1e18f;
+    FVector3 bestTarget{};
+    bool found = false;
+
+    PlayerNode* cur = m_playerList.head();
+    while (cur) {
+        // 跳过自己
+        if (m_myPlayerKey != 0 && cur->playerKey == m_myPlayerKey) {
+            cur = cur->next;
+            continue;
+        }
+        // 跳过队友
+        if (m_myTeamID > 0 && cur->teamID == m_myTeamID) {
+            cur = cur->next;
+            continue;
+        }
+        // 跳过死亡
+        if (cur->liveState != 0 || cur->health <= 0.0f) {
+            cur = cur->next;
+            continue;
+        }
+        // 需要有目标骨骼数据
+        if (boneIdx >= 0 && boneIdx < static_cast<int>(TRACKED_BONE_COUNT)
+            && (cur->cachedBoneMask & (1u << boneIdx)) != 0) {
+            const float tx = cur->cachedBones[boneIdx].x;
+            const float ty = cur->cachedBones[boneIdx].y;
+            const float tz = cur->cachedBones[boneIdx].z;
+            if (std::isfinite(tx) && std::isfinite(ty) && std::isfinite(tz)
+                && (std::fabs(tx) > 1.0f || std::fabs(ty) > 1.0f)) {
+                const float dx = tx - camX;
+                const float dy = ty - camY;
+                const float dz = tz - camZ;
+                const float distSq = dx * dx + dy * dy + dz * dz;
+                if (distSq < bestDistSq && distSq > 100.0f) {  // >10cm 避免自瞄
+                    bestDistSq = distSq;
+                    bestTarget = {tx, ty, tz};
+                    found = true;
+                }
+            }
+        } else {
+            // 没有骨骼数据，用角色位置 + 高度偏移瞄准上半身
+            if (std::isfinite(cur->pos.x) && std::isfinite(cur->pos.y) && std::isfinite(cur->pos.z)
+                && (std::fabs(cur->pos.x) > 1.0f || std::fabs(cur->pos.y) > 1.0f)) {
+                const float tx = cur->pos.x;
+                const float ty = cur->pos.y;
+                const float tz = cur->pos.z + 60.0f;  // 大约头部高度偏移
+                const float dx = tx - camX;
+                const float dy = ty - camY;
+                const float dz = tz - camZ;
+                const float distSq = dx * dx + dy * dy + dz * dz;
+                if (distSq < bestDistSq && distSq > 100.0f) {
+                    bestDistSq = distSq;
+                    bestTarget = {tx, ty, tz};
+                    found = true;
+                }
+            }
+        }
+        cur = cur->next;
+    }
+
+    if (!found) return;
+
+    // 计算方向角
+    const float dx = bestTarget.x - camX;
+    const float dy = bestTarget.y - camY;
+    const float dz = bestTarget.z - camZ;
+    const float dist2D = std::sqrt(dx * dx + dy * dy);
+    if (dist2D < 0.01f) return;
+
+    // UE4 FRotator: Pitch=绕Y轴(仰角), Yaw=绕Z轴(水平), Roll=绕X轴
+    // UE4 坐标系: X=前, Y=右, Z=上
+    // atan2(Y, X) 给出 Yaw; atan2(Z, 水平距离) 给出 Pitch
+    float aimYaw   = std::atan2(dy, dx) * (180.0f / 3.14159265f);
+    float aimPitch = std::atan2(dz, dist2D) * (180.0f / 3.14159265f);
+
+    if (!std::isfinite(aimYaw) || !std::isfinite(aimPitch)) return;
+
+    // 写入 ControlRotation (FRotator: Pitch@+0, Yaw@+4, Roll@+8)
+    const uintptr_t ctrlRotAddr = pc + static_cast<uintptr_t>(m_off.Ctrl_ControlRotation);
+    writeMemFloat(ctrlRotAddr + 0, aimPitch);
+    writeMemFloat(ctrlRotAddr + 4, aimYaw);
+    // Roll 保持不变
+
+    static Clock::time_point s_lastAimLog;
+    if (shouldLogEvery(s_lastAimLog, std::chrono::milliseconds(2000))) {
+        LOG(LOG_LEVEL_INFO, "[Aimbot] -> (%.1f, %.1f, %.1f) dist=%.0f pitch=%.2f yaw=%.2f",
+            bestTarget.x, bestTarget.y, bestTarget.z,
+            std::sqrt(bestDistSq), aimPitch, aimYaw);
+    }
+}
+
+// =====================================================================
 //  æ—¥å¿—å·¥å…·
 // =====================================================================
 void MatchMonitor::openLog() {
@@ -1911,6 +2027,9 @@ void MatchMonitor::pollPlayers() {
     }
     fillCameraSnapshot(drawData);
 
+    // 自瞄: 在刷新位置和相机数据后执行
+    aimAtNearestEnemy();
+
     int aliveCount = 0;
     int aliveTeam = 0;
     int aliveEnemy = 0;
@@ -2061,7 +2180,7 @@ void MatchMonitor::pollPlayers() {
 //  å¯¹å±€çŠ¶æ€è½®è¯¢å¾ª(åŽå°çº¿ç¨‹)
 // =====================================================================
 void MatchMonitor::pollMatchStateLoop() {
-    LOG(LOG_LEVEL_INFO, "ç›‘æŽ§çº¿ç¨‹å¯åŠ¨ (çŠ¶æ€%dms, çŽ©å®¶%dms)",
+    LOG(LOG_LEVEL_INFO, "Monitor thread started (state %dms, player %dms)",
         POLL_INTERVAL_MS, PLAYER_POLL_INTERVAL_MS);
 
     Clock::time_point lastStatePollTime;
@@ -2089,7 +2208,7 @@ void MatchMonitor::pollMatchStateLoop() {
                 m_isInMatch = ms.inMatch;
 
                 if (m_isInMatch && !wasInMatch) {
-                    LOG(LOG_LEVEL_INFO, "è¿›å…¥å¯¹å±€! State=%s World=%s", ms.state.c_str(), ms.worldName.c_str());
+                    LOG(LOG_LEVEL_INFO, "Entered match! State=%s World=%s", ms.state.c_str(), ms.worldName.c_str());
                     ue4draw::SharedUE4Data::getInstance().setInMatch(true);
                     m_playerList.clear();
                     m_lastNetCullPatchMs.clear();
@@ -2113,7 +2232,7 @@ void MatchMonitor::pollMatchStateLoop() {
                                       ms.state.c_str(),
                                       ms.worldName.c_str());
                     char logBuf[256];
-                    snprintf(logBuf, sizeof(logBuf), ">>> â˜… è¿›å…¥å¯¹å±€ State=%s World=%s", ms.state.c_str(), ms.worldName.c_str());
+                    snprintf(logBuf, sizeof(logBuf), ">>> * Entered match State=%s World=%s", ms.state.c_str(), ms.worldName.c_str());
                     writeLog(logBuf);
                     writeLog("");
                     detectObserverType();
