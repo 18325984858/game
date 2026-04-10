@@ -301,36 +301,35 @@ int drawPlayerSkeleton(ImDrawList* drawList,
                        ImU32 color,
                        float screenW,
                        float screenH) {
+    // 至少需要 5 个骨骼点才值得绘制 (避免零星点闪烁)
+    if (countTrackedBones(player) < 5) return 0;
+
     int segmentCount = 0;
-    int pointCount = 0;
     for (const BoneSegment& segment : kSkeletonSegments) {
-        float fromX = 0.0f;
-        float fromY = 0.0f;
-        float toX = 0.0f;
-        float toY = 0.0f;
+        float fromX, fromY, toX, toY;
         if (!projectBonePoint(data, player, segment.from, screenW, screenH, fromX, fromY)
-            || !projectBonePoint(data, player, segment.to, screenW, screenH, toX, toY)) {
+            || !projectBonePoint(data, player, segment.to, screenW, screenH, toX, toY))
             continue;
-        }
+
+        // 跳过投影后距离过大的线段 (异常数据保护)
+        float dx = toX - fromX, dy = toY - fromY;
+        if (dx * dx + dy * dy > screenH * screenH) continue;
 
         drawList->AddLine(ImVec2(fromX, fromY), ImVec2(toX, toY), color, 1.5f);
         segmentCount++;
     }
 
-    for (size_t boneIndex = 0; boneIndex < kTrackedBoneCount; ++boneIndex) {
-        const DrawBoneId bone = static_cast<DrawBoneId>(boneIndex);
-        float pointX = 0.0f;
-        float pointY = 0.0f;
-        if (!projectBonePoint(data, player, bone, screenW, screenH, pointX, pointY)) {
-            continue;
-        }
+    // 只在有线段时才绘制关节点 (避免孤立点)
+    if (segmentCount < 3) return segmentCount;
 
-        drawList->AddCircleFilled(ImVec2(pointX, pointY), 4.0f, IM_COL32(80, 255, 255, 230));
-        drawList->AddCircle(ImVec2(pointX, pointY), 5.5f, IM_COL32(0, 0, 0, 180), 0, 1.0f);
-        pointCount++;
+    for (size_t boneIndex = 0; boneIndex < kTrackedBoneCount; ++boneIndex) {
+        float px, py;
+        if (!projectBonePoint(data, player, static_cast<DrawBoneId>(boneIndex), screenW, screenH, px, py))
+            continue;
+        drawList->AddCircleFilled(ImVec2(px, py), 3.0f, IM_COL32(80, 255, 255, 200));
     }
 
-    return segmentCount + pointCount;
+    return segmentCount;
 }
 
 bool transformWorldToCamera(const DrawGameData& data,

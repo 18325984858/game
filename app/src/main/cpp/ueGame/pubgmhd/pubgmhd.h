@@ -247,6 +247,12 @@ struct PlayerNode {
     PlayerSource source = PlayerSource::PlayerArray;
     uint32_t    lastSeenCharacterScanEpoch = 0;
 
+    // 骨骼缓存: 保留最后一次有效的骨骼数据, 防止闪烁
+    struct CachedBone { float x, y, z; };
+    std::array<CachedBone, 17> cachedBones{};
+    uint32_t    cachedBoneMask = 0;
+    uint64_t    cachedBoneTimestampMs = 0;  // 最后有效骨骼的时间戳
+
     PlayerNode* prev = nullptr;
     PlayerNode* next = nullptr;
 };
@@ -429,6 +435,7 @@ private:
     std::unordered_map<uintptr_t, bool> m_characterClassSet;
     std::unordered_map<int, std::string> m_nameCache;
     std::unordered_map<uintptr_t, BoneAssetCacheEntry> m_boneAssetCache;
+    uint64_t m_lastBoneCacheClearMs = 0;  // 上次清理骨骼缓存的时间
 
     FILE* m_logFp = nullptr;
     int   m_logLineCount = 0;

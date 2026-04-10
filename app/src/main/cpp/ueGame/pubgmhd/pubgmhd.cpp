@@ -964,8 +964,15 @@ bool MatchMonitor::resolveTrackedBoneIndices(uintptr_t skeletalMeshAssetPtr, Bon
 
     const auto cached = m_boneAssetCache.find(skeletalMeshAssetPtr);
     if (cached != m_boneAssetCache.end()) {
-        outEntry = cached->second;
-        return outEntry.matchedCount > 0;
+        // 验证缓存: 检查 FReferenceSkeleton 数据指针是否仍然有效
+        constexpr uintptr_t kRefBoneInfoOffset = 0x238;
+        const uintptr_t curData = safeReadPtr(skeletalMeshAssetPtr + kRefBoneInfoOffset);
+        if (curData >= 0x10000) {
+            outEntry = cached->second;
+            return outEntry.matchedCount > 0;
+        }
+        // 指针已失效 (GC移动了对象), 移除缓存条目
+        m_boneAssetCache.erase(cached);
     }
 
     BoneAssetCacheEntry entry;
@@ -1034,6 +1041,15 @@ bool MatchMonitor::fillPlayerSkeleton(uintptr_t characterPtr, ue4draw::DrawPlaye
 
     outPlayer.boneMask = 0;
     if (characterPtr < 0x10000) return false;
+
+    // 限制骨骼资产缓存大小 (防止 GC 后旧指针堆积), 超过上限懒清理
+    if (m_boneAssetCache.size() > 128) {
+        m_boneAssetCache.clear();
+    }
+    // 限制名称缓存大小防止长时间运行后内存膨胀
+    if (m_nameCache.size() > 50000) {
+        m_nameCache.clear();
+    }
 
     auto off = [](int32_t reflected, int32_t fallback) -> int32_t {
         return (reflected >= 0) ? reflected : fallback;
@@ -1194,6 +1210,7 @@ bool MatchMonitor::fillPlayerSkeleton(uintptr_t characterPtr, ue4draw::DrawPlaye
 
     // ---- è¯»å–éª¨éª¼å˜æ¢ â†’ ä¸–ç•Œåæ ‡ ----
     int resolved = 0;
+    const float rootX = outPlayer.posX, rootY = outPlayer.posY, rootZ = outPlayer.posZ;
     for (size_t slot = 0; slot < TRACKED_BONE_COUNT; ++slot) {
         int32_t bi = bestMap.trackedBoneIndices[slot];
         if (bi < 0 || bi >= bestCount) continue;
@@ -1202,6 +1219,9 @@ bool MatchMonitor::fillPlayerSkeleton(uintptr_t characterPtr, ue4draw::DrawPlaye
             continue;
         FVector3 wp = transformPosition(bestCtw, bt.translation);
         if (!hasUsablePlayerPosition(wp)) continue;
+        // 骨骼一致性: 距离玩家根位置过远说明数据已失效
+        float dx = wp.x - rootX, dy = wp.y - rootY, dz = wp.z - rootZ;
+        if (dx*dx + dy*dy + dz*dz > 500.0f * 500.0f) continue;
         outPlayer.bones[slot] = {wp.x, wp.y, wp.z};
         outPlayer.boneMask |= (1u << static_cast<uint32_t>(slot));
         resolved++;
@@ -1941,7 +1961,27 @@ void MatchMonitor::pollPlayers() {
         dp.posY = cur->pos.y;
         dp.posZ = cur->pos.z;
         dp.isTeammate = isTeammate;
-        fillPlayerSkeleton(cur->characterPtr, dp);
+
+        // 骨骼: 尝试从活数据填充, 失败则用缓存 (防闪烁, 支持骑马)
+        bool freshBones = fillPlayerSkeleton(cur->characterPtr, dp);
+        if (freshBones) {
+            // 更新缓存
+            for (size_t i = 0; i < 17; ++i)
+                cur->cachedBones[i] = {dp.bones[i].x, dp.bones[i].y, dp.bones[i].z};
+            cur->cachedBoneMask = dp.boneMask;
+            cur->cachedBoneTimestampMs = nowMonotonicMs();
+        } else if (cur->cachedBoneMask != 0) {
+            // 使用缓存的骨骼 (最多保留 2000ms, 平滑过渡)
+            const uint64_t age = nowMonotonicMs() - cur->cachedBoneTimestampMs;
+            if (age < 2000) {
+                for (size_t i = 0; i < 17; ++i)
+                    dp.bones[i] = {cur->cachedBones[i].x, cur->cachedBones[i].y, cur->cachedBones[i].z};
+                dp.boneMask = cur->cachedBoneMask;
+            } else {
+                cur->cachedBoneMask = 0;  // 缓存过期
+            }
+        }
+
         drawData.players.push_back(dp);
         cur = cur->next;
     }
