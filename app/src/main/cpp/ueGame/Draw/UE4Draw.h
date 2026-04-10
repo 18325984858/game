@@ -24,6 +24,35 @@
 
 namespace ue4draw {
 
+enum class DrawBoneId : uint8_t {
+    Pelvis = 0,
+    SpineLower,
+    SpineUpper,
+    Neck,
+    Head,
+    LeftUpperArm,
+    LeftLowerArm,
+    LeftHand,
+    RightUpperArm,
+    RightLowerArm,
+    RightHand,
+    LeftThigh,
+    LeftCalf,
+    LeftFoot,
+    RightThigh,
+    RightCalf,
+    RightFoot,
+    Count,
+};
+
+static constexpr size_t kTrackedBoneCount = static_cast<size_t>(DrawBoneId::Count);
+
+struct DrawBonePoint {
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+};
+
 // =====================================================================
 //  共享玩家数据 (MatchMonitor -> 渲染线程)
 // =====================================================================
@@ -40,6 +69,8 @@ struct DrawPlayerInfo {
     float       posY = 0.0f;
     float       posZ = 0.0f;
     bool        isTeammate = false;
+    std::array<DrawBonePoint, kTrackedBoneCount> bones{};
+    uint32_t    boneMask = 0;
 };
 
 struct DrawGameData {
@@ -113,6 +144,7 @@ private:
     // ---- 菜单状态 ----
     bool m_menuExpanded    = true;
     bool m_enableESP       = true;     // ESP 方框
+    bool m_enableSkeleton  = true;     // 骨架线
     bool m_enableSnapline  = true;     // 射线
     bool m_enableHP        = true;     // 血条
     bool m_enableName      = true;     // 名字

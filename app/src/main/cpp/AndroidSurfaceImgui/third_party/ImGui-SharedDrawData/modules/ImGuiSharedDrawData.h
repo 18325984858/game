@@ -177,16 +177,6 @@ namespace ImGui
         // Prepare draw data
         static bool showWindow = true;
         auto drawData = ImGui::GetDrawData();
-        // Clean slice data
-        if (nullptr != drawData && 0 < drawData->CmdListsCount)
-        {
-            for (auto &cmdList : drawData->CmdLists)
-            {
-                cmdList->VtxBuffer.Data = nullptr;
-                cmdList->IdxBuffer.Data = nullptr;
-                cmdList->CmdBuffer.Data = nullptr;
-            }
-        }
         // Make cmd lists
         static std::vector<std::string> windowNames;
         if (cmdListsCount > static_cast<int>(windowNames.size()))
@@ -224,38 +214,47 @@ namespace ImGui
             if (cmdListIndex >= cmdListsCount)
                 break;
 
-            // Slice vertex buffer
-            cmdList->VtxBuffer.clear();
-            if (!CanRead(sizeof(cmdList->VtxBuffer.Size)))
-                return drawData;
-            memcpy(&cmdList->VtxBuffer.Size, data.data() + readIndex, sizeof(cmdList->VtxBuffer.Size));
-            readIndex += sizeof(cmdList->VtxBuffer.Size);
-            if (!CanRead(cmdList->VtxBuffer.Size * sizeof(ImDrawVert)))
-                return drawData;
-            cmdList->VtxBuffer.Data = reinterpret_cast<decltype(cmdList->VtxBuffer.Data)>(data.data() + readIndex);
-            readIndex += cmdList->VtxBuffer.Size * sizeof(ImDrawVert);
+            // ---- Vertex buffer: copy into ImGui-owned memory ----
+            {
+                if (!CanRead(sizeof(int)))
+                    return drawData;
+                int vtxCount = 0;
+                memcpy(&vtxCount, data.data() + readIndex, sizeof(vtxCount));
+                readIndex += sizeof(vtxCount);
+                if (vtxCount < 0 || !CanRead(static_cast<size_t>(vtxCount) * sizeof(ImDrawVert)))
+                    return drawData;
+                cmdList->VtxBuffer.resize(vtxCount);
+                memcpy(cmdList->VtxBuffer.Data, data.data() + readIndex, static_cast<size_t>(vtxCount) * sizeof(ImDrawVert));
+                readIndex += static_cast<size_t>(vtxCount) * sizeof(ImDrawVert);
+            }
 
-            // Slice index buffer
-            cmdList->IdxBuffer.clear();
-            if (!CanRead(sizeof(cmdList->IdxBuffer.Size)))
-                return drawData;
-            memcpy(&cmdList->IdxBuffer.Size, data.data() + readIndex, sizeof(cmdList->IdxBuffer.Size));
-            readIndex += sizeof(cmdList->IdxBuffer.Size);
-            if (!CanRead(cmdList->IdxBuffer.Size * sizeof(ImDrawIdx)))
-                return drawData;
-            cmdList->IdxBuffer.Data = reinterpret_cast<decltype(cmdList->IdxBuffer.Data)>(data.data() + readIndex);
-            readIndex += cmdList->IdxBuffer.Size * sizeof(ImDrawIdx);
+            // ---- Index buffer: copy into ImGui-owned memory ----
+            {
+                if (!CanRead(sizeof(int)))
+                    return drawData;
+                int idxCount = 0;
+                memcpy(&idxCount, data.data() + readIndex, sizeof(idxCount));
+                readIndex += sizeof(idxCount);
+                if (idxCount < 0 || !CanRead(static_cast<size_t>(idxCount) * sizeof(ImDrawIdx)))
+                    return drawData;
+                cmdList->IdxBuffer.resize(idxCount);
+                memcpy(cmdList->IdxBuffer.Data, data.data() + readIndex, static_cast<size_t>(idxCount) * sizeof(ImDrawIdx));
+                readIndex += static_cast<size_t>(idxCount) * sizeof(ImDrawIdx);
+            }
 
-            // Slice cmd buffer
-            cmdList->CmdBuffer.clear();
-            if (!CanRead(sizeof(cmdList->CmdBuffer.Size)))
-                return drawData;
-            memcpy(&cmdList->CmdBuffer.Size, data.data() + readIndex, sizeof(cmdList->CmdBuffer.Size));
-            readIndex += sizeof(cmdList->CmdBuffer.Size);
-            if (!CanRead(cmdList->CmdBuffer.Size * sizeof(ImDrawCmd)))
-                return drawData;
-            cmdList->CmdBuffer.Data = reinterpret_cast<decltype(cmdList->CmdBuffer.Data)>(data.data() + readIndex);
-            readIndex += cmdList->CmdBuffer.Size * sizeof(ImDrawCmd);
+            // ---- Cmd buffer: copy into ImGui-owned memory ----
+            {
+                if (!CanRead(sizeof(int)))
+                    return drawData;
+                int cmdCount = 0;
+                memcpy(&cmdCount, data.data() + readIndex, sizeof(cmdCount));
+                readIndex += sizeof(cmdCount);
+                if (cmdCount < 0 || !CanRead(static_cast<size_t>(cmdCount) * sizeof(ImDrawCmd)))
+                    return drawData;
+                cmdList->CmdBuffer.resize(cmdCount);
+                memcpy(cmdList->CmdBuffer.Data, data.data() + readIndex, static_cast<size_t>(cmdCount) * sizeof(ImDrawCmd));
+                readIndex += static_cast<size_t>(cmdCount) * sizeof(ImDrawCmd);
+            }
 
             ++cmdListIndex;
         }

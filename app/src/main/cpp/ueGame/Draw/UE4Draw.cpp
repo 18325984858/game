@@ -222,6 +222,117 @@ bool transformWorldToCamera(const DrawGameData& data,
                             float wz,
                             CameraSpacePoint& outPoint);
 
+constexpr size_t toBoneIndex(DrawBoneId bone) {
+    return static_cast<size_t>(bone);
+}
+
+struct BoneSegment {
+    DrawBoneId from;
+    DrawBoneId to;
+};
+
+constexpr BoneSegment kSkeletonSegments[] = {
+    {DrawBoneId::Pelvis, DrawBoneId::SpineLower},
+    {DrawBoneId::SpineLower, DrawBoneId::SpineUpper},
+    {DrawBoneId::SpineUpper, DrawBoneId::Neck},
+    {DrawBoneId::Neck, DrawBoneId::Head},
+    {DrawBoneId::SpineUpper, DrawBoneId::LeftUpperArm},
+    {DrawBoneId::LeftUpperArm, DrawBoneId::LeftLowerArm},
+    {DrawBoneId::LeftLowerArm, DrawBoneId::LeftHand},
+    {DrawBoneId::SpineUpper, DrawBoneId::RightUpperArm},
+    {DrawBoneId::RightUpperArm, DrawBoneId::RightLowerArm},
+    {DrawBoneId::RightLowerArm, DrawBoneId::RightHand},
+    {DrawBoneId::Pelvis, DrawBoneId::LeftThigh},
+    {DrawBoneId::LeftThigh, DrawBoneId::LeftCalf},
+    {DrawBoneId::LeftCalf, DrawBoneId::LeftFoot},
+    {DrawBoneId::Pelvis, DrawBoneId::RightThigh},
+    {DrawBoneId::RightThigh, DrawBoneId::RightCalf},
+    {DrawBoneId::RightCalf, DrawBoneId::RightFoot},
+};
+
+bool hasBonePoint(const DrawPlayerInfo& player, DrawBoneId bone) {
+    return (player.boneMask & (1u << static_cast<uint32_t>(bone))) != 0;
+}
+
+int countTrackedBones(const DrawPlayerInfo& player) {
+    uint32_t mask = player.boneMask;
+    int count = 0;
+    while (mask != 0) {
+        count += static_cast<int>(mask & 1u);
+        mask >>= 1u;
+    }
+    return count;
+}
+
+bool projectBonePoint(const DrawGameData& data,
+                      const DrawPlayerInfo& player,
+                      DrawBoneId bone,
+                      float screenW,
+                      float screenH,
+                      float& sx,
+                      float& sy) {
+    if (!hasBonePoint(player, bone)) {
+        return false;
+    }
+
+    const DrawBonePoint& point = player.bones[toBoneIndex(bone)];
+    constexpr float DEG2RAD = 3.14159265358979f / 180.0f;
+    constexpr float kNearDepth = 1.0f;
+
+    CameraSpacePoint cameraPoint;
+    if (!transformWorldToCamera(data, point.x, point.y, point.z, cameraPoint) || cameraPoint.z <= kNearDepth) {
+        return false;
+    }
+
+    const float tanHalfFov = std::tan(sanitizeFov(data.camFOV) * 0.5f * DEG2RAD);
+    if (!isValidNumber(tanHalfFov) || tanHalfFov < 0.01f) {
+        return false;
+    }
+
+    const float focalLength = screenW * 0.5f / tanHalfFov;
+    sx = screenW * 0.5f + cameraPoint.x * focalLength / cameraPoint.z;
+    sy = screenH * 0.5f - cameraPoint.y * focalLength / cameraPoint.z;
+    return isValidNumber(sx) && isValidNumber(sy);
+}
+
+int drawPlayerSkeleton(ImDrawList* drawList,
+                       const DrawGameData& data,
+                       const DrawPlayerInfo& player,
+                       ImU32 color,
+                       float screenW,
+                       float screenH) {
+    int segmentCount = 0;
+    int pointCount = 0;
+    for (const BoneSegment& segment : kSkeletonSegments) {
+        float fromX = 0.0f;
+        float fromY = 0.0f;
+        float toX = 0.0f;
+        float toY = 0.0f;
+        if (!projectBonePoint(data, player, segment.from, screenW, screenH, fromX, fromY)
+            || !projectBonePoint(data, player, segment.to, screenW, screenH, toX, toY)) {
+            continue;
+        }
+
+        drawList->AddLine(ImVec2(fromX, fromY), ImVec2(toX, toY), color, 1.5f);
+        segmentCount++;
+    }
+
+    for (size_t boneIndex = 0; boneIndex < kTrackedBoneCount; ++boneIndex) {
+        const DrawBoneId bone = static_cast<DrawBoneId>(boneIndex);
+        float pointX = 0.0f;
+        float pointY = 0.0f;
+        if (!projectBonePoint(data, player, bone, screenW, screenH, pointX, pointY)) {
+            continue;
+        }
+
+        drawList->AddCircleFilled(ImVec2(pointX, pointY), 4.0f, IM_COL32(80, 255, 255, 230));
+        drawList->AddCircle(ImVec2(pointX, pointY), 5.5f, IM_COL32(0, 0, 0, 180), 0, 1.0f);
+        pointCount++;
+    }
+
+    return segmentCount + pointCount;
+}
+
 bool transformWorldToCamera(const DrawGameData& data,
                             float wx,
                             float wy,
@@ -459,6 +570,7 @@ void UE4Overlay::drawMenu(const DrawGameData& data) {
 
         // 功能开关
         settingsChanged |= ImGui::Checkbox("ESP 方框", &m_enableESP);
+        settingsChanged |= ImGui::Checkbox("骨架线", &m_enableSkeleton);
         settingsChanged |= ImGui::Checkbox("射线", &m_enableSnapline);
         settingsChanged |= ImGui::Checkbox("血条", &m_enableHP);
         settingsChanged |= ImGui::Checkbox("名字", &m_enableName);
@@ -478,7 +590,18 @@ void UE4Overlay::drawMenu(const DrawGameData& data) {
         settingsChanged |= ImGui::SliderFloat("最大距离", &m_espMaxDist, 100.0f, 2000.0f, "%.0f m");
 
         if (data.inMatch) {
+            int playersWithBones = 0;
+            int totalBonePoints = 0;
+            for (const auto& player : data.players) {
+                const int boneCount = countTrackedBones(player);
+                if (boneCount > 0) {
+                    playersWithBones++;
+                    totalBonePoints += boneCount;
+                }
+            }
+
             ImGui::Text("ESP 绘制: 精确 %d  箭头 %d", m_lastPreciseESP, m_lastFallbackESP);
+            ImGui::Text("骨骼数据: %d/%zu 玩家  点位 %d", playersWithBones, data.players.size(), totalBonePoints);
         }
         if (m_enableTouchPoint) {
             const ImGuiIO& io = ImGui::GetIO();
@@ -534,11 +657,13 @@ void UE4Overlay::drawMenu(const DrawGameData& data) {
                 ImGui::PopStyleColor();
 
                 char coordLine[128];
-                snprintf(coordLine, sizeof(coordLine), "Pos: %.0f, %.0f, %.0f%s",
+                snprintf(coordLine, sizeof(coordLine), "Pos: %.0f, %.0f, %.0f%s  Bones:%d/%d",
                          player.posX,
                          player.posY,
                          player.posZ,
-                         player.isAI ? "  AI" : "");
+                         player.isAI ? "  AI" : "",
+                         countTrackedBones(player),
+                         static_cast<int>(kTrackedBoneCount));
                 ImGui::TextDisabled("%s", coordLine);
 
                 if (index + 1 < visibleCount) {
@@ -549,8 +674,9 @@ void UE4Overlay::drawMenu(const DrawGameData& data) {
 
         if (settingsChanged) {
             DLOG(LOG_LEVEL_INFO,
-                 "settings updated: esp=%s snap=%s hp=%s name=%s dist=%s teammate=%s minimap=%s edgeArrow=%s playerList=%s touch=%s mapSize=%.0f mapRange=%.0f maxDist=%.0f",
+                 "settings updated: esp=%s skeleton=%s snap=%s hp=%s name=%s dist=%s teammate=%s minimap=%s edgeArrow=%s playerList=%s touch=%s mapSize=%.0f mapRange=%.0f maxDist=%.0f",
                  onOff(m_enableESP),
+                 onOff(m_enableSkeleton),
                  onOff(m_enableSnapline),
                  onOff(m_enableHP),
                  onOff(m_enableName),
@@ -633,7 +759,16 @@ int UE4Overlay::drawESP(const DrawGameData& data, float screenW, float screenH) 
 
         const ImU32 boxColor = p.isTeammate ? IM_COL32(0, 200, 0, 200) : IM_COL32(255, 50, 50, 200);
         const float hpRatio = playerHealthRatio(p);
+        const int boneCount = countTrackedBones(p);
         bool rendered = false;
+        bool preciseRendered = false;
+
+        if (hasPreciseCamera && m_enableSkeleton && p.boneMask != 0) {
+            if (drawPlayerSkeleton(dl, data, p, boxColor, screenW, screenH) > 0) {
+                rendered = true;
+                preciseRendered = true;
+            }
+        }
 
         if (hasPreciseCamera) {
             constexpr float kCharacterHalfHeight = 88.0f;
@@ -652,8 +787,8 @@ int UE4Overlay::drawESP(const DrawGameData& data, float screenW, float screenH) 
                 if (boxH >= 10.0f && boxH <= screenH * 0.9f
                     && cx >= -boxW && cx <= screenW + boxW
                     && topY >= -boxH && botY <= screenH + boxH) {
-                    preciseRenderedCount++;
                     rendered = true;
+                    preciseRendered = true;
 
                     dl->AddRect(ImVec2(cx - boxW / 2, topY), ImVec2(cx + boxW / 2, botY),
                                 boxColor, 0, 0, 2.0f);
@@ -679,6 +814,13 @@ int UE4Overlay::drawESP(const DrawGameData& data, float screenW, float screenH) 
                                     IM_COL32(255, 255, 255, 230), label);
                     }
 
+                    if (m_enableSkeleton) {
+                        char boneBuf[32];
+                        snprintf(boneBuf, sizeof(boneBuf), "B:%d", boneCount);
+                        const ImU32 boneColor = boneCount > 0 ? IM_COL32(80, 255, 255, 230) : IM_COL32(255, 210, 80, 230);
+                        dl->AddText(ImVec2(cx + boxW * 0.5f + 6.0f, topY), boneColor, boneBuf);
+                    }
+
                     if (m_enableDistance) {
                         char distBuf[32];
                         snprintf(distBuf, sizeof(distBuf), "%.0fm", dist);
@@ -688,6 +830,10 @@ int UE4Overlay::drawESP(const DrawGameData& data, float screenW, float screenH) 
                     }
                 }
             }
+        }
+
+        if (preciseRendered) {
+            preciseRenderedCount++;
         }
 
         if (!rendered && m_enableFallbackESP && hasPreciseCamera) {

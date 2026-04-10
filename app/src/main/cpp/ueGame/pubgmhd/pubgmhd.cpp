@@ -7,6 +7,9 @@
 #include <thread>
 #include <chrono>
 #include <algorithm>
+#include <array>
+#include <cctype>
+#include <cstdarg>
 #include <csetjmp>
 #include <cstddef>
 #include <csignal>
@@ -29,6 +32,65 @@ constexpr uintptr_t kUObjectNamePrivateOffset = 0x18;
 constexpr uintptr_t kUStructSuperStructOffset = 0x30;
 constexpr uintptr_t kFNameComparisonIndexOffset = 0x0;
 constexpr uintptr_t kFNameNumberOffset = 0x4;
+constexpr int kMaxBoneNameCount = 2048;
+constexpr int kMinRenderableBoneMatches = 6;
+
+struct RemoteQuat {
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+    float w = 1.0f;
+};
+
+struct RemoteTransform {
+    RemoteQuat rotation;
+    FVector3 translation;
+    float translationPad = 0.0f;
+    FVector3 scale3D{1.0f, 1.0f, 1.0f};
+    float scalePad = 0.0f;
+};
+static_assert(sizeof(RemoteTransform) == 0x30, "RemoteTransform size mismatch");
+
+struct RemoteWeakObjectPtr {
+    int32_t objectIndex = -1;
+    int32_t objectSerialNumber = 0;
+};
+static_assert(sizeof(RemoteWeakObjectPtr) == 0x8, "RemoteWeakObjectPtr size mismatch");
+
+struct RemoteContainerArray {
+    uintptr_t data = 0;
+    int32_t num = 0;
+    int32_t max = 0;
+};
+static_assert(sizeof(RemoteContainerArray) == 0x10, "RemoteContainerArray size mismatch");
+
+template<typename T>
+bool isUsableRemoteArray(const ue4::TArray<T>& array, int maxNum) {
+    const uintptr_t dataPtr = reinterpret_cast<uintptr_t>(array.Data);
+    return dataPtr >= 0x10000 && array.Num > 0 && array.Num <= maxNum && array.Max >= array.Num;
+}
+
+using BoneAliasList = std::array<const char*, 8>;
+
+const std::array<BoneAliasList, TRACKED_BONE_COUNT> kTrackedBoneAliases = {{
+    BoneAliasList{"pelvis", "root", "hips", "bip001pelvis", "bip01pelvis", nullptr, nullptr, nullptr},
+    BoneAliasList{"spine01", "spine1", "spine", "bip001spine", "bip01spine", nullptr, nullptr, nullptr},
+    BoneAliasList{"spine03", "spine3", "spine02", "spine2", "spine03jnt", "bip001spine1", "bip001spine2", "bip01spine2"},
+    BoneAliasList{"neck01", "neck", "neck02", "bip001neck", "bip01neck", nullptr, nullptr, nullptr},
+    BoneAliasList{"head", "head01", "head02", "bip001head", "bip01head", nullptr, nullptr, nullptr},
+    BoneAliasList{"upperarml", "lupperarm", "leftarm", "leftupperarm", "claviclel", "bip001lupperarm", "bip01lupperarm", nullptr},
+    BoneAliasList{"lowerarml", "llowerarm", "leftforearm", "leftlowerarm", "forearml", "bip001lforearm", "bip01lforearm", nullptr},
+    BoneAliasList{"handl", "lhand", "lefthand", "bip001lhand", "bip01lhand", nullptr, nullptr, nullptr},
+    BoneAliasList{"upperarmr", "rupperarm", "rightarm", "rightupperarm", "clavicler", "bip001rupperarm", "bip01rupperarm", nullptr},
+    BoneAliasList{"lowerarmr", "rlowerarm", "rightforearm", "rightlowerarm", "forearmr", "bip001rforearm", "bip01rforearm", nullptr},
+    BoneAliasList{"handr", "rhand", "righthand", "bip001rhand", "bip01rhand", nullptr, nullptr, nullptr},
+    BoneAliasList{"thighl", "lthigh", "leftupleg", "leftthigh", "bip001lthigh", "bip01lthigh", nullptr, nullptr},
+    BoneAliasList{"calfl", "lcalf", "leftleg", "leftlowerleg", "bip001lcalf", "bip01lcalf", nullptr, nullptr},
+    BoneAliasList{"footl", "lfoot", "leftfoot", "bip001lfoot", "bip01lfoot", nullptr, nullptr, nullptr},
+    BoneAliasList{"thighr", "rthigh", "rightupleg", "rightthigh", "bip001rthigh", "bip01rthigh", nullptr, nullptr},
+    BoneAliasList{"calfr", "rcalf", "rightleg", "rightlowerleg", "bip001rcalf", "bip01rcalf", nullptr, nullptr},
+    BoneAliasList{"footr", "rfoot", "rightfoot", "bip001rfoot", "bip01rfoot", nullptr, nullptr, nullptr},
+}};
 
 static thread_local sigjmp_buf s_safeReadJmpBuf;
 static thread_local volatile sig_atomic_t s_safeReadActive = 0;
@@ -102,6 +164,79 @@ bool safeWriteMemory(uintptr_t addr, const void* src, size_t size) {
 
 bool isFiniteVector(const FVector3& value) {
     return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
+}
+
+FVector3 crossProduct(const FVector3& lhs, const FVector3& rhs) {
+    return {
+        lhs.y * rhs.z - lhs.z * rhs.y,
+        lhs.z * rhs.x - lhs.x * rhs.z,
+        lhs.x * rhs.y - lhs.y * rhs.x,
+    };
+}
+
+FVector3 scaleVector(const FVector3& value, const FVector3& scale) {
+    return {value.x * scale.x, value.y * scale.y, value.z * scale.z};
+}
+
+FVector3 rotateVector(const RemoteQuat& rotation, const FVector3& value) {
+    const FVector3 quatVector{rotation.x, rotation.y, rotation.z};
+    const FVector3 uv = crossProduct(quatVector, value);
+    const FVector3 uuv = crossProduct(quatVector, uv);
+    return {
+        value.x + ((uv.x * rotation.w) + uuv.x) * 2.0f,
+        value.y + ((uv.y * rotation.w) + uuv.y) * 2.0f,
+        value.z + ((uv.z * rotation.w) + uuv.z) * 2.0f,
+    };
+}
+
+FVector3 transformPosition(const RemoteTransform& transform, const FVector3& localPosition) {
+    FVector3 safeScale = transform.scale3D;
+    if (!std::isfinite(safeScale.x) || std::fabs(safeScale.x) < 0.0001f) safeScale.x = 1.0f;
+    if (!std::isfinite(safeScale.y) || std::fabs(safeScale.y) < 0.0001f) safeScale.y = 1.0f;
+    if (!std::isfinite(safeScale.z) || std::fabs(safeScale.z) < 0.0001f) safeScale.z = 1.0f;
+
+    const FVector3 scaled = scaleVector(localPosition, safeScale);
+    const FVector3 rotated = rotateVector(transform.rotation, scaled);
+    return {
+        rotated.x + transform.translation.x,
+        rotated.y + transform.translation.y,
+        rotated.z + transform.translation.z,
+    };
+}
+
+std::string normalizeBoneName(const std::string& value) {
+    std::string normalized;
+    normalized.reserve(value.size());
+    for (unsigned char ch : value) {
+        if (!std::isalnum(ch)) {
+            continue;
+        }
+        normalized.push_back(static_cast<char>(std::tolower(ch)));
+    }
+    return normalized;
+}
+
+bool endsWithText(const std::string& value, const char* suffix) {
+    if (nullptr == suffix) {
+        return false;
+    }
+    const size_t suffixLength = std::strlen(suffix);
+    return value.size() >= suffixLength
+        && value.compare(value.size() - suffixLength, suffixLength, suffix) == 0;
+}
+
+bool matchesTrackedBoneName(size_t slot, const std::string& normalizedName) {
+    for (const char* alias : kTrackedBoneAliases[slot]) {
+        if (nullptr == alias) {
+            break;
+        }
+        if (normalizedName == alias
+            || endsWithText(normalizedName, alias)
+            || (std::strlen(alias) >= 6 && normalizedName.find(alias) != std::string::npos)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool hasUsablePlayerPosition(const FVector3& value) {
@@ -355,6 +490,67 @@ bool ResolvedOffsets::isValid() const {
     if (target < 0) { LOG(LOG_LEVEL_WARN, "[InitOffsets] 未找到 %s (尝试了 %zu 个类+继承链)", fieldName, sizeof(_classes)/sizeof(_classes[0])); } \
 } while(0)
 
+uintptr_t resolveWeakObjectPtr(uintptr_t guObjectArrayPtr, uintptr_t weakPtrAddr) {
+    if (guObjectArrayPtr < 0x10000 || weakPtrAddr < 0x10000) {
+        return 0;
+    }
+
+    RemoteWeakObjectPtr weakPtr{};
+    if (!safeReadMemory(weakPtrAddr, &weakPtr, sizeof(weakPtr))
+        || weakPtr.objectIndex < 0
+        || weakPtr.objectSerialNumber <= 0) {
+        return 0;
+    }
+
+    int32_t numChunks = 0;
+    int32_t totalNum = 0;
+    if (!safeReadMemory(guObjectArrayPtr + 0xF8, &numChunks, sizeof(numChunks))
+        || !safeReadMemory(guObjectArrayPtr + 0x100, &totalNum, sizeof(totalNum))
+        || numChunks <= 0
+        || numChunks > 1000
+        || weakPtr.objectIndex >= totalNum) {
+        return 0;
+    }
+
+    int32_t remainingIndex = weakPtr.objectIndex;
+    for (int32_t chunkIndex = 0; chunkIndex < numChunks; ++chunkIndex) {
+        int32_t chunkCount = 0;
+        if (!safeReadMemory(guObjectArrayPtr + 0xE8 + static_cast<uintptr_t>(chunkIndex) * sizeof(int32_t),
+                            &chunkCount,
+                            sizeof(chunkCount))
+            || chunkCount <= 0) {
+            continue;
+        }
+
+        if (remainingIndex >= chunkCount) {
+            remainingIndex -= chunkCount;
+            continue;
+        }
+
+        uintptr_t chunkBase = 0;
+        if (!safeReadMemory(guObjectArrayPtr + 0xC8 + static_cast<uintptr_t>(chunkIndex) * sizeof(uintptr_t),
+                            &chunkBase,
+                            sizeof(chunkBase))
+            || chunkBase < 0x10000) {
+            return 0;
+        }
+
+        ue4::FUObjectItem item{};
+        const uintptr_t itemAddr = chunkBase + static_cast<uintptr_t>(remainingIndex) * sizeof(ue4::FUObjectItem);
+        if (!safeReadMemory(itemAddr, &item, sizeof(item))) {
+            return 0;
+        }
+
+        if (item.SerialNumber != weakPtr.objectSerialNumber) {
+            return 0;
+        }
+
+        return reinterpret_cast<uintptr_t>(item.Object);
+    }
+
+    return 0;
+}
+
 bool MatchMonitor::initOffsets() {
     LOG(LOG_LEVEL_INFO, "[InitOffsets] 开始通过反射解析偏移...");
 
@@ -419,6 +615,7 @@ bool MatchMonitor::initOffsets() {
     RESOLVE_OFFSET_MULTI(m_off.Char_TeamID,        "TeamID",             "UAECharacter", "STExtraCharacter", "STExtraBaseCharacter");
     RESOLVE_OFFSET_MULTI(m_off.Char_PlayerKey,     "PlayerKey",          "UAECharacter", "STExtraCharacter", "STExtraBaseCharacter");
     RESOLVE_OFFSET_MULTI(m_off.Char_PlayerName,    "PlayerName",         "UAECharacter", "STExtraCharacter", "STExtraBaseCharacter");
+    RESOLVE_OFFSET_MULTI(m_off.Char_Mesh,          "Mesh",               "Character", "UAECharacter", "STExtraCharacter", "STExtraBaseCharacter");
 
     // STExtraCharacter
     RESOLVE_OFFSET_MULTI(m_off.Char_Health,        "Health",             "STExtraCharacter", "UAECharacter", "STExtraBaseCharacter");
@@ -427,6 +624,24 @@ bool MatchMonitor::initOffsets() {
 
     // STExtraBaseCharacter
     RESOLVE_OFFSET_MULTI(m_off.Char_CurrentNetCullDistSq, "CurrentNetCullDistanceSquared", "STExtraBaseCharacter", "STExtraCharacter", "UAECharacter");
+    RESOLVE_OFFSET_MULTI(m_off.STBase_AvatarComponent, "AvatarComponent", "STExtraBaseCharacter", "STExtraCharacter");
+    RESOLVE_OFFSET_MULTI(m_off.STBase_FPPComp,      "FPPComp",           "STExtraBaseCharacter", "STExtraCharacter");
+    RESOLVE_OFFSET_MULTI(m_off.STBase_DefaultCharacterMesh, "DefaultCharacterMesh", "STExtraBaseCharacter");
+    RESOLVE_OFFSET_MULTI(m_off.STBase_LastSkeletalMesh, "LastSkeletalMesh", "STExtraBaseCharacter");
+
+    // AvatarComponent
+    RESOLVE_OFFSET_MULTI(m_off.Avatar_MasterBoneComponent, "MasterBoneComponent", "AvatarComponent");
+    RESOLVE_OFFSET_MULTI(m_off.Avatar_SkeletalMeshCompPool, "SkeletalMeshCompPool", "AvatarComponent");
+    RESOLVE_OFFSET_MULTI(m_off.Avatar_MeshComponentList, "meshComponentList", "AvatarComponent");
+    RESOLVE_OFFSET_MULTI(m_off.Avatar_EntityTickList, "EntityTickList", "AvatarComponent");
+    RESOLVE_OFFSET_MULTI(m_off.Avatar_AvatarEntityList, "AvatarEntityList", "AvatarComponent");
+
+    // Skeletal / bone chain
+    RESOLVE_OFFSET_MULTI(m_off.SkinnedMesh_MasterPoseComponent, "MasterPoseComponent", "SkinnedMeshComponent", "SkeletalMeshComponent");
+    RESOLVE_OFFSET_MULTI(m_off.SkinnedMesh_SkeletalMesh, "SkeletalMesh", "SkinnedMeshComponent", "SkeletalMeshComponent");
+    RESOLVE_OFFSET_MULTI(m_off.SkeletalMeshComp_CachedComponentSpaceTransforms, "CachedComponentSpaceTransforms", "SkeletalMeshComponent");
+    RESOLVE_OFFSET_MULTI(m_off.SkeletalMeshAsset_Skeleton, "Skeleton", "SkeletalMesh");
+    RESOLVE_OFFSET_MULTI(m_off.Skeleton_RefBoneNames, "RefBoneNames", "Skeleton");
 
     LOG(LOG_LEVEL_INFO, "[InitOffsets] 解析完成, isValid=%d", m_off.isValid());
     LOG(LOG_LEVEL_INFO, "[InitOffsets] World.GameState=0x%X GS.PlayerArray=0x%X PS.PlayerKey=0x%X",
@@ -679,6 +894,631 @@ bool MatchMonitor::getActorLocation(uintptr_t actorPtr, FVector3& outLoc) {
     outLoc.z = safeReadFloat(rootComp + off + 8);
     if (outLoc.x == 0 && outLoc.y == 0 && outLoc.z == 0) return false;
     if (std::fabs(outLoc.x) > 1e8f || std::fabs(outLoc.y) > 1e8f) return false;
+    return true;
+}
+
+// 从 FName 数组匹配骨骼索引
+int MatchMonitor::matchBoneNamesFromFNameArray(uintptr_t dataPtr, int count, BoneAssetCacheEntry& entry) {
+    entry.trackedBoneIndices.fill(-1);
+    entry.matchedCount = 0;
+    if (dataPtr < 0x10000 || count <= 0 || count > kMaxBoneNameCount) return 0;
+
+    for (int index = 0; index < count; ++index) {
+        ue4::FName boneName{};
+        if (!safeReadMemory(dataPtr + static_cast<uintptr_t>(index) * sizeof(ue4::FName),
+                            &boneName, sizeof(boneName)))
+            continue;
+        if (boneName.ComparisonIndex < 0 || boneName.ComparisonIndex >= m_numNames) continue;
+
+        const std::string rawName = getNameByIndex(boneName.ComparisonIndex);
+        const std::string normalizedName = normalizeBoneName(rawName);
+        if (normalizedName.empty()) continue;
+
+        for (size_t slot = 0; slot < TRACKED_BONE_COUNT; ++slot) {
+            if (entry.trackedBoneIndices[slot] >= 0) continue;
+            if (matchesTrackedBoneName(slot, normalizedName)) {
+                entry.trackedBoneIndices[slot] = index;
+                entry.matchedCount++;
+                break;
+            }
+        }
+        if (entry.matchedCount == static_cast<int>(TRACKED_BONE_COUNT)) break;
+    }
+    return entry.matchedCount;
+}
+
+// 从 FMeshBoneInfo 数组 (stride字节, FName在偏移0) 匹配骨骼索引
+int MatchMonitor::matchBoneNamesFromBoneInfoArray(uintptr_t dataPtr, int count, int stride, BoneAssetCacheEntry& entry) {
+    entry.trackedBoneIndices.fill(-1);
+    entry.matchedCount = 0;
+    if (dataPtr < 0x10000 || count <= 0 || count > kMaxBoneNameCount || stride < 12) return 0;
+
+    for (int index = 0; index < count; ++index) {
+        ue4::FName boneName{};
+        if (!safeReadMemory(dataPtr + static_cast<uintptr_t>(index) * stride,
+                            &boneName, sizeof(boneName)))
+            continue;
+        if (boneName.ComparisonIndex < 0 || boneName.ComparisonIndex >= m_numNames) continue;
+
+        const std::string rawName = getNameByIndex(boneName.ComparisonIndex);
+        const std::string normalizedName = normalizeBoneName(rawName);
+        if (normalizedName.empty()) continue;
+
+        for (size_t slot = 0; slot < TRACKED_BONE_COUNT; ++slot) {
+            if (entry.trackedBoneIndices[slot] >= 0) continue;
+            if (matchesTrackedBoneName(slot, normalizedName)) {
+                entry.trackedBoneIndices[slot] = index;
+                entry.matchedCount++;
+                break;
+            }
+        }
+        if (entry.matchedCount == static_cast<int>(TRACKED_BONE_COUNT)) break;
+    }
+    return entry.matchedCount;
+}
+
+bool MatchMonitor::resolveTrackedBoneIndices(uintptr_t skeletalMeshAssetPtr, BoneAssetCacheEntry& outEntry) {
+    outEntry.trackedBoneIndices.fill(-1);
+    outEntry.matchedCount = 0;
+
+    if (skeletalMeshAssetPtr < 0x10000) return false;
+
+    const auto cached = m_boneAssetCache.find(skeletalMeshAssetPtr);
+    if (cached != m_boneAssetCache.end()) {
+        outEntry = cached->second;
+        return outEntry.matchedCount > 0;
+    }
+
+    BoneAssetCacheEntry entry;
+    entry.trackedBoneIndices.fill(-1);
+
+    // ---- 方法1 (原始工作版本): SkeletalMesh 内嵌 FReferenceSkeleton ----
+    // SkeletalMesh+0x238 = FReferenceSkeleton.RawRefBoneInfo (TArray<FMeshBoneInfo>)
+    // FMeshBoneInfo = { FName Name(8), int32 ParentIndex(4), pad(4) } = 16 bytes
+    // 这是之前能绘制骨骼的关键路径 — 它包含全身骨骼而不只是手部
+    constexpr uintptr_t kRefBoneInfoOffset = 0x238;
+    {
+        const uintptr_t boneInfoData = safeReadPtr(skeletalMeshAssetPtr + kRefBoneInfoOffset);
+        const int32_t boneInfoNum = safeReadS32(skeletalMeshAssetPtr + kRefBoneInfoOffset + 8);
+        if (boneInfoData >= 0x10000 && boneInfoNum > 0 && boneInfoNum <= kMaxBoneNameCount) {
+            // 尝试 stride=16 (原始工作版本)
+            matchBoneNamesFromBoneInfoArray(boneInfoData, boneInfoNum, 16, entry);
+            if (entry.matchedCount < kMinRenderableBoneMatches) {
+                // 也试 stride=8 (纯 FName 数组)
+                BoneAssetCacheEntry trial;
+                int matched = matchBoneNamesFromFNameArray(boneInfoData, boneInfoNum, trial);
+                if (matched > entry.matchedCount) entry = trial;
+            }
+            if (entry.matchedCount >= kMinRenderableBoneMatches) {
+                m_boneAssetCache[skeletalMeshAssetPtr] = entry;
+                outEntry = entry;
+                return true;
+            }
+        }
+    }
+
+    // ---- 方法2: Skeleton.RefBoneNames (反射路径) ----
+    const int32_t skelOff = (m_off.SkeletalMeshAsset_Skeleton >= 0) ? m_off.SkeletalMeshAsset_Skeleton : 0x48;
+    const int32_t refOff = (m_off.Skeleton_RefBoneNames >= 0) ? m_off.Skeleton_RefBoneNames : 0x280;
+
+    const uintptr_t skeletonPtr = safeReadPtr(skeletalMeshAssetPtr + skelOff);
+    if (skeletonPtr >= 0x10000) {
+        ue4::TArray<ue4::FName> refBoneNames{};
+        if (safeReadMemory(skeletonPtr + refOff, &refBoneNames, sizeof(refBoneNames))
+            && isUsableRemoteArray(refBoneNames, kMaxBoneNameCount)) {
+            matchBoneNamesFromFNameArray(reinterpret_cast<uintptr_t>(refBoneNames.Data),
+                                         refBoneNames.Num, entry);
+            if (entry.matchedCount >= kMinRenderableBoneMatches) {
+                m_boneAssetCache[skeletalMeshAssetPtr] = entry;
+                outEntry = entry;
+                return true;
+            }
+        }
+    }
+
+    // ---- 方法2: 扫描 SkeletalMesh 内嵌的 FReferenceSkeleton ----
+    // UE4 中 FReferenceSkeleton 存于 SkeletalMesh 的非反射成员;
+    // dump.cs 最后一个反射字段 SkinWeightProfiles 在 0x3E0 (TArray=16B),
+    // 所以 FReferenceSkeleton 应在 0x3F0 之后的某处.
+    // FReferenceSkeleton 布局 (UE4.18):
+    //   +0x00: TArray<FMeshBoneInfo> RawRefBoneInfo   (FMeshBoneInfo = {FName ExchangeName, FName Name, int32 ParentIndex, pad} ≈ 24B)
+    //   +0x10: TArray<FTransform> RawRefBonePose
+    //   +0x20: TMap<FName,int32> RawNameToIndexMap
+    //   +0x70: TArray<FMeshBoneInfo> FinalRefBoneInfo
+    //   +0x80: TArray<FTransform> FinalRefBonePose
+    //   +0x90: TMap<FName,int32> FinalNameToIndexMap
+    //   +0xE0: TArray<uint16> SkeletonToMeshBoneIndexTable (与 Skeleton 的索引映射)
+    //   +0xF0: TArray<uint16> MeshToSkeletonBoneIndexTable
+    //
+    // 我们扫描 0x3F0 ~ 0x800 范围, 查找 TArray 满足:
+    //   Data >= 0x10000, 20 < Num < 300, Max >= Num
+    // 然后尝试将条目解释为 FMeshBoneInfo (stride=24, FName at +0) 或纯 FName 数组
+
+    BoneAssetCacheEntry bestRefSkelEntry;
+    bestRefSkelEntry.trackedBoneIndices.fill(-1);
+    int bestRefSkelMatched = entry.matchedCount; // 保留方法1的结果作为基准
+
+    for (uintptr_t scanOff = 0x3F0; scanOff <= 0x800; scanOff += 0x8) {
+        struct { uintptr_t data; int32_t num; int32_t max; } arr{};
+        if (!safeReadMemory(skeletalMeshAssetPtr + scanOff, &arr, sizeof(arr))) continue;
+        if (arr.data < 0x10000 || arr.num < 20 || arr.num > 300 || arr.max < arr.num || arr.max > 2000) continue;
+
+        // 试 FMeshBoneInfo stride=24 (FName ExchangeName(8) + FName Name(8) + int32 ParentIndex(4) + pad(4))
+        // 尝试不同stride: 24, 20, 16 (取决于版本是否有ExchangeName)
+        for (int stride : {24, 20, 16, 12}) {
+            BoneAssetCacheEntry trial;
+            int matched = matchBoneNamesFromBoneInfoArray(arr.data, arr.num, stride, trial);
+            if (matched > bestRefSkelMatched) {
+                bestRefSkelMatched = matched;
+                bestRefSkelEntry = trial;
+            }
+            if (matched >= kMinRenderableBoneMatches) break;
+        }
+
+        // 也尝试纯 FName 数组 (stride=8)
+        {
+            BoneAssetCacheEntry trial;
+            int matched = matchBoneNamesFromFNameArray(arr.data, arr.num, trial);
+            if (matched > bestRefSkelMatched) {
+                bestRefSkelMatched = matched;
+                bestRefSkelEntry = trial;
+            }
+        }
+
+        if (bestRefSkelMatched >= kMinRenderableBoneMatches) break;
+    }
+
+    if (bestRefSkelMatched > entry.matchedCount) {
+        entry = bestRefSkelEntry;
+    }
+
+    m_boneAssetCache[skeletalMeshAssetPtr] = entry;
+    outEntry = entry;
+    return entry.matchedCount > 0;
+}
+
+// =====================================================================
+//  fillPlayerSkeleton — 重构版
+//
+//  从 dump.cs 验证的核心偏移链:
+//    Character.Mesh                                   = 0x650
+//    SceneComponent.ComponentToWorld                   = 0x1F0  (FTransform 0x30)
+//    SkinnedMeshComponent.SkeletalMesh                 = 0x7F0
+//    SkinnedMeshComponent.MasterPoseComponent          = 0x7F8  (TWeakObjectPtr)
+//    SkeletalMeshComponent.CachedComponentSpaceTransforms = 0xBB8  (TArray<FTransform>)
+//    SkeletalMesh.Skeleton                             = 0x48
+//    Skeleton.RefBoneNames                             = 0x280  (TArray<FName>)
+//    STExtraBaseCharacter.AvatarComponent               = 0x3B98
+//    STExtraBaseCharacter.FPPComp                       = 0x4168
+//    STExtraBaseCharacter.DefaultCharacterMesh          = 0x4630
+//    STExtraBaseCharacter.LastSkeletalMesh              = 0x4790
+//    AvatarComponent.MasterBoneComponent                = 0x300
+//    AvatarComponent.meshComponentList                  = 0x528  (TSparseMap)
+//    AvatarComponent.SkeletalMeshCompPool               = 0xF10  (TArray)
+//    BaseFPPComponent._AvatarComp                       = 0x380
+//
+//  策略: 优先使用有最多 CachedComponentSpaceTransforms 的组件
+//        (通常是 MasterBoneComponent); 骨骼名称映射从所有关联
+//        SkeletalMesh 资产中选最优匹配 (>= kMinRenderableBoneMatches)
+// =====================================================================
+bool MatchMonitor::fillPlayerSkeleton(uintptr_t characterPtr, ue4draw::DrawPlayerInfo& outPlayer) {
+    static Clock::time_point s_lastSkeletonDebugLogTime;
+
+    // dump.cs 验证的静态偏移 (反射失败时的可靠后备)
+    constexpr int32_t kFB_Char_Mesh                  = 0x650;
+    constexpr int32_t kFB_ComponentToWorld            = 0x1F0;
+    constexpr int32_t kFB_SkinnedMesh_SkeletalMesh   = 0x7F0;
+    constexpr int32_t kFB_MasterPoseComponent        = 0x7F8;
+    constexpr int32_t kFB_CachedCompSpaceTransforms  = 0xBB8;
+    constexpr int32_t kFB_STBase_AvatarComponent     = 0x3B98;
+    constexpr int32_t kFB_STBase_FPPComp             = 0x4168;
+    constexpr int32_t kFB_STBase_DefaultCharMesh     = 0x4630;
+    constexpr int32_t kFB_STBase_LastSkelMesh        = 0x4790;
+    constexpr int32_t kFB_Avatar_MasterBoneComp      = 0x300;
+    constexpr int32_t kFB_Avatar_MeshCompList        = 0x528;
+    constexpr int32_t kFB_Avatar_SkelMeshPool        = 0xF10;
+    constexpr int32_t kFB_FPP_AvatarComp             = 0x380;
+
+    outPlayer.boneMask = 0;
+    if (characterPtr < 0x10000) return false;
+
+    // 使用反射偏移, 反射失败回退 dump 偏移
+    auto off = [](int32_t reflected, int32_t fallback) -> int32_t {
+        return (reflected >= 0) ? reflected : fallback;
+    };
+
+    const int32_t oCharMesh          = off(m_off.Char_Mesh, kFB_Char_Mesh);
+    const int32_t oCompToWorld       = off(m_off.SceneComp_ComponentToWorld, kFB_ComponentToWorld);
+    const int32_t oSkelMesh          = off(m_off.SkinnedMesh_SkeletalMesh, kFB_SkinnedMesh_SkeletalMesh);
+    const int32_t oMasterPose        = off(m_off.SkinnedMesh_MasterPoseComponent, kFB_MasterPoseComponent);
+    const int32_t oCachedTransforms  = off(m_off.SkeletalMeshComp_CachedComponentSpaceTransforms, kFB_CachedCompSpaceTransforms);
+    const int32_t oAvatar            = off(m_off.STBase_AvatarComponent, kFB_STBase_AvatarComponent);
+    const int32_t oFPPComp           = off(m_off.STBase_FPPComp, kFB_STBase_FPPComp);
+    const int32_t oDefaultMesh       = off(m_off.STBase_DefaultCharacterMesh, kFB_STBase_DefaultCharMesh);
+    const int32_t oLastSkelMesh      = off(m_off.STBase_LastSkeletalMesh, kFB_STBase_LastSkelMesh);
+    const int32_t oMasterBone        = off(m_off.Avatar_MasterBoneComponent, kFB_Avatar_MasterBoneComp);
+
+    // ---- 辅助 lambda ----
+    auto addUniquePtr = [](std::vector<uintptr_t>& vec, uintptr_t ptr) {
+        if (ptr >= 0x10000 && std::find(vec.begin(), vec.end(), ptr) == vec.end())
+            vec.push_back(ptr);
+    };
+
+    auto followMasterPose = [&](uintptr_t comp) -> uintptr_t {
+        if (comp < 0x10000 || oMasterPose < 0) return 0;
+        for (int depth = 0; depth < 4; ++depth) {
+            uintptr_t master = resolveWeakObjectPtr(m_gUObjectArray, comp + static_cast<uintptr_t>(oMasterPose));
+            if (master < 0x10000) break;
+            comp = master;
+        }
+        return comp;
+    };
+
+    auto readCachedTransforms = [&](uintptr_t comp, ue4::TArray<RemoteTransform>& outArr) -> bool {
+        if (comp < 0x10000) return false;
+        // 先尝试 CachedComponentSpaceTransforms (0xBB8)
+        if (safeReadMemory(comp + oCachedTransforms, &outArr, sizeof(outArr))
+            && isUsableRemoteArray(outArr, kMaxBoneNameCount)) {
+            return true;
+        }
+        // 回退尝试 CachedBoneSpaceTransforms (0xBA8) — 某些版本可能只填充这个
+        constexpr int32_t kFB_CachedBoneSpaceTransforms = 0xBA8;
+        if (safeReadMemory(comp + kFB_CachedBoneSpaceTransforms, &outArr, sizeof(outArr))
+            && isUsableRemoteArray(outArr, kMaxBoneNameCount)) {
+            return true;
+        }
+        return false;
+    };
+
+    auto readComponentToWorld = [&](uintptr_t comp, RemoteTransform& outCtw) -> bool {
+        if (comp < 0x10000) return false;
+        return safeReadMemory(comp + oCompToWorld, &outCtw, sizeof(outCtw));
+    };
+
+    // ---- Step 1: 收集所有候选 mesh component ----
+    struct MeshCandidate {
+        uintptr_t comp = 0;
+        int transformCount = 0;
+        const char* source = "";
+    };
+    std::vector<MeshCandidate> meshCandidates;
+
+    auto tryAddCandidate = [&](uintptr_t comp, const char* src) {
+        if (comp < 0x10000) return;
+        // 去重
+        for (const auto& mc : meshCandidates) { if (mc.comp == comp) return; }
+        ue4::TArray<RemoteTransform> arr{};
+        int tCount = 0;
+        if (readCachedTransforms(comp, arr)) tCount = arr.Num;
+        meshCandidates.push_back({comp, tCount, src});
+    };
+
+    // 1a. Character.Mesh
+    const uintptr_t charMesh = safeReadPtr(characterPtr + oCharMesh);
+    tryAddCandidate(charMesh, "Char.Mesh");
+
+    // 1b. Character.Mesh -> MasterPoseComponent 链
+    const uintptr_t masterRoot = followMasterPose(charMesh);
+    if (masterRoot != charMesh) tryAddCandidate(masterRoot, "Char.Mesh->MasterPose");
+
+    // 1c. AvatarComponent.MasterBoneComponent
+    const uintptr_t avatarComp = safeReadPtr(characterPtr + oAvatar);
+    if (avatarComp >= 0x10000) {
+        const uintptr_t masterBone = safeReadPtr(avatarComp + oMasterBone);
+        tryAddCandidate(masterBone, "Avatar.MasterBone");
+
+        // MasterBoneComponent -> MasterPoseComponent 进一步链
+        const uintptr_t masterBoneRoot = followMasterPose(masterBone);
+        if (masterBoneRoot != masterBone) tryAddCandidate(masterBoneRoot, "Avatar.MasterBone->MasterPose");
+
+        // meshComponentList TSparseMap (TMap<int32,UObject*>) 遍历
+        // TSparseArray 布局 (IDA / dump 验证):
+        //   +0x00: Data* (entries)         +0x08: ArrayNum   +0x0C: ArrayMax
+        //   +0x10: InlineFlags[4]  (4×uint32 = 128 bits inline bitarray)
+        //   +0x20: SecondaryData*  (heap flags when > 128 entries)
+        //   +0x28: NumBits         +0x2C: MaxBits
+        //   Entry = { int32 key, int32 pad, UObject* value, int32 hashNext, int32 hashIdx } = 24B
+        const int32_t oMeshList = off(m_off.Avatar_MeshComponentList, kFB_Avatar_MeshCompList);
+        if (oMeshList >= 0) {
+            const uintptr_t mapPtr = avatarComp + static_cast<uintptr_t>(oMeshList);
+            const uintptr_t entriesPtr = safeReadPtr(mapPtr + 0x0);
+            const int32_t maxIndex = safeReadS32(mapPtr + 0x28);  // NumBits
+            if (entriesPtr >= 0x10000 && maxIndex > 0 && maxIndex <= 256) {
+                const int32_t wordCount = (maxIndex + 31) / 32;
+                // InlineFlags[4] 覆盖前 128 bits; 超出部分使用 SecondaryData
+                const uintptr_t secondaryFlags = safeReadPtr(mapPtr + 0x20);
+                for (int32_t wi = 0; wi < wordCount; ++wi) {
+                    uint32_t flags = 0;
+                    if (wi < 4) {
+                        safeReadMemory(mapPtr + 0x10 + static_cast<uintptr_t>(wi) * 4, &flags, sizeof(flags));
+                    } else if (secondaryFlags >= 0x10000) {
+                        safeReadMemory(secondaryFlags + static_cast<uintptr_t>(wi) * 4, &flags, sizeof(flags));
+                    }
+                    if (flags == 0) continue;
+                    for (int bit = 0; bit < 32; ++bit) {
+                        if (!(flags & (1u << bit))) continue;
+                        int32_t idx = wi * 32 + bit;
+                        if (idx >= maxIndex) break;
+                        uintptr_t comp = safeReadPtr(entriesPtr + static_cast<uintptr_t>(idx) * 24 + 8);
+                        tryAddCandidate(comp, "Avatar.meshCompList");
+                    }
+                }
+            }
+        }
+
+        // SkeletalMeshCompPool TArray 遍历
+        const int32_t oPool = off(m_off.Avatar_SkeletalMeshCompPool, kFB_Avatar_SkelMeshPool);
+        if (oPool >= 0) {
+            ue4::TArray<uintptr_t> pool{};
+            if (safeReadMemory(avatarComp + oPool, &pool, sizeof(pool)) && isUsableRemoteArray(pool, 64)) {
+                const uintptr_t pdata = reinterpret_cast<uintptr_t>(pool.Data);
+                for (int i = 0; i < pool.Num; ++i) {
+                    uintptr_t comp = safeReadPtr(pdata + static_cast<uintptr_t>(i) * 8);
+                    tryAddCandidate(comp, "Avatar.SkelPool");
+                }
+            }
+        }
+    }
+
+    // 1d. FPPComp -> _AvatarComp -> MasterBoneComponent
+    const uintptr_t fppComp = safeReadPtr(characterPtr + oFPPComp);
+    if (fppComp >= 0x10000) {
+        int32_t fppAvatarOff = -1;
+        // 先尝试反射
+        const std::string fppClass = readClassName(fppComp);
+        if (!fppClass.empty() && fppClass[0] != '<') {
+            for (const char* fn : {"_AvatarComp", "AvatarComp", "AvatarComponent"}) {
+                if (const ue4inf::UEFieldInfo* fi = m_interface.findFieldInHierarchy(fppClass, fn)) {
+                    fppAvatarOff = fi->offset; break;
+                }
+            }
+        }
+        if (fppAvatarOff < 0) fppAvatarOff = kFB_FPP_AvatarComp;
+
+        const uintptr_t fppAvatar = safeReadPtr(fppComp + static_cast<uintptr_t>(fppAvatarOff));
+        if (fppAvatar >= 0x10000 && fppAvatar != avatarComp) {
+            const uintptr_t fppMasterBone = safeReadPtr(fppAvatar + oMasterBone);
+            tryAddCandidate(fppMasterBone, "FPP.Avatar.MasterBone");
+        }
+    }
+
+    if (meshCandidates.empty()) return false;
+
+    // ---- 额外诊断: 检查 MasterBoneComponent 和全身骨骼资产 ----
+    static Clock::time_point s_lastMasterBoneDiagTime;
+    if (shouldLogEvery(s_lastMasterBoneDiagTime, std::chrono::milliseconds(5000))) {
+        // MasterBoneComponent 诊断
+        uintptr_t mbComp = (avatarComp >= 0x10000) ? safeReadPtr(avatarComp + oMasterBone) : 0;
+        std::string mbClass = (mbComp >= 0x10000) ? readClassName(mbComp) : "NULL";
+        uintptr_t mbSkelMesh = (mbComp >= 0x10000) ? safeReadPtr(mbComp + oSkelMesh) : 0;
+        uintptr_t mbSkeleton = 0;
+        int mbRefBoneCount = 0;
+        std::string mbBoneSample;
+        if (mbSkelMesh >= 0x10000) {
+            int32_t so = (m_off.SkeletalMeshAsset_Skeleton >= 0) ? m_off.SkeletalMeshAsset_Skeleton : 0x48;
+            mbSkeleton = safeReadPtr(mbSkelMesh + so);
+            if (mbSkeleton >= 0x10000) {
+                int32_t ro = (m_off.Skeleton_RefBoneNames >= 0) ? m_off.Skeleton_RefBoneNames : 0x280;
+                ue4::TArray<ue4::FName> rbn{};
+                if (safeReadMemory(mbSkeleton + ro, &rbn, sizeof(rbn)) && isUsableRemoteArray(rbn, kMaxBoneNameCount)) {
+                    mbRefBoneCount = rbn.Num;
+                    uintptr_t rbnData = reinterpret_cast<uintptr_t>(rbn.Data);
+                    int cnt = std::min(rbn.Num, 10);
+                    for (int i = 0; i < cnt; ++i) {
+                        ue4::FName fn{}; safeReadMemory(rbnData + i * sizeof(ue4::FName), &fn, sizeof(fn));
+                        std::string nm = (fn.ComparisonIndex >= 0 && fn.ComparisonIndex < m_numNames) ? getNameByIndex(fn.ComparisonIndex) : "?";
+                        if (!mbBoneSample.empty()) mbBoneSample += ",";
+                        mbBoneSample += nm;
+                    }
+                }
+            }
+        }
+        // MasterPose chain from Char.Mesh
+        uintptr_t mpDest = followMasterPose(charMesh);
+        std::string mpClass = (mpDest >= 0x10000 && mpDest != charMesh) ? readClassName(mpDest) : "same/null";
+        uintptr_t mpSkelMesh = (mpDest >= 0x10000 && mpDest != charMesh) ? safeReadPtr(mpDest + oSkelMesh) : 0;
+        // DefaultCharacterMesh / LastSkeletalMesh
+        uintptr_t defMesh = safeReadPtr(characterPtr + oDefaultMesh);
+        uintptr_t lastSkel = safeReadPtr(characterPtr + oLastSkelMesh);
+        LOG(LOG_LEVEL_INFO,
+            "[Skeleton] DIAG char=%p avatar=%p MB={%p cls=%s skel=%p skeleton=%p bones=%d [%s]} MP={%p cls=%s skel=%p} def=%p last=%p",
+            (void*)characterPtr, (void*)avatarComp,
+            (void*)mbComp, mbClass.c_str(), (void*)mbSkelMesh, (void*)mbSkeleton, mbRefBoneCount, mbBoneSample.c_str(),
+            (void*)mpDest, mpClass.c_str(), (void*)mpSkelMesh,
+            (void*)defMesh, (void*)lastSkel);
+    }
+
+    // ---- Step 2: 选择有最多 transforms 的组件作为骨骼坐标源 ----
+    // 按 transformCount 降序排列, 优先使用拥有最多骨骼变换数据的组件
+    std::sort(meshCandidates.begin(), meshCandidates.end(),
+              [](const MeshCandidate& a, const MeshCandidate& b) { return a.transformCount > b.transformCount; });
+
+    // ---- Step 3: 收集所有 SkeletalMesh 资产候选 (用于骨骼名称映射) ----
+    std::vector<uintptr_t> assetCandidates;
+
+    auto addAssetFromComp = [&](uintptr_t comp) {
+        if (comp < 0x10000) return;
+        uintptr_t asset = safeReadPtr(comp + oSkelMesh);
+        addUniquePtr(assetCandidates, asset);
+    };
+
+    for (const auto& mc : meshCandidates) addAssetFromComp(mc.comp);
+
+    // DefaultCharacterMesh / LastSkeletalMesh (通常是全身骨骼)
+    addUniquePtr(assetCandidates, safeReadPtr(characterPtr + oDefaultMesh));
+    addUniquePtr(assetCandidates, safeReadPtr(characterPtr + oLastSkelMesh));
+
+    // ---- Step 4: 对每个组件 × 每个资产, 找最优 (transforms × 骨骼匹配) ----
+    struct BestResult {
+        uintptr_t comp = 0;
+        uintptr_t asset = 0;
+        uintptr_t transformDataPtr = 0;
+        int transformCount = 0;
+        int matched = 0;
+        RemoteTransform componentToWorld{};
+        BoneAssetCacheEntry boneMap{};
+        const char* source = "";
+    } best;
+    best.boneMap.trackedBoneIndices.fill(-1);
+
+    std::string debugInfo; // 诊断日志
+
+    // 先构建候选诊断信息 (包括 transformCount==0 的)
+    for (const auto& mc : meshCandidates) {
+        if (debugInfo.size() < 800) {
+            // 读取原始 TArray 头部数据用于诊断
+            struct { uintptr_t data; int32_t num; int32_t max; } rawArr{};
+            safeReadMemory(mc.comp + oCachedTransforms, &rawArr, sizeof(rawArr));
+            uintptr_t skelMeshAsset = safeReadPtr(mc.comp + oSkelMesh);
+            std::string compClass = readClassName(mc.comp);
+            char buf[256];
+            snprintf(buf, sizeof(buf), "[%s cls=%s t=%d raw={%p,%d,%d} skel=%p]",
+                     mc.source, compClass.c_str(), mc.transformCount,
+                     (void*)rawArr.data, rawArr.num, rawArr.max,
+                     (void*)skelMeshAsset);
+            debugInfo += buf;
+        }
+    }
+
+    for (const auto& mc : meshCandidates) {
+        if (mc.transformCount < 2) continue;
+
+        ue4::TArray<RemoteTransform> cachedArr{};
+        if (!readCachedTransforms(mc.comp, cachedArr)) continue;
+
+        RemoteTransform ctw{};
+        if (!readComponentToWorld(mc.comp, ctw)) continue;
+
+        for (uintptr_t assetPtr : assetCandidates) {
+            if (assetPtr < 0x10000) continue;
+
+            BoneAssetCacheEntry boneMap;
+            if (!resolveTrackedBoneIndices(assetPtr, boneMap)) continue;
+
+            int availableMatched = 0;
+            for (int32_t bi : boneMap.trackedBoneIndices) {
+                if (bi >= 0 && bi < cachedArr.Num) availableMatched++;
+            }
+
+            if (availableMatched > best.matched) {
+                best.comp = mc.comp;
+                best.asset = assetPtr;
+                best.transformDataPtr = reinterpret_cast<uintptr_t>(cachedArr.Data);
+                best.transformCount = cachedArr.Num;
+                best.matched = availableMatched;
+                best.componentToWorld = ctw;
+                best.boneMap = boneMap;
+                best.source = mc.source;
+            }
+        }
+    }
+
+    // ---- Step 5: 如果名称匹配不足, 诊断 ----
+    if (best.matched < kMinRenderableBoneMatches) {
+        if (shouldLogEvery(s_lastSkeletonDebugLogTime, std::chrono::milliseconds(3000))) {
+            // 采样第一个候选的资产骨骼名 (不管 transformCount)
+            std::string sampleBones;
+            for (const auto& mc : meshCandidates) {
+                uintptr_t asset = safeReadPtr(mc.comp + oSkelMesh);
+                if (asset < 0x10000) continue;
+                const int32_t skelOff2 = (m_off.SkeletalMeshAsset_Skeleton >= 0) ? m_off.SkeletalMeshAsset_Skeleton : 0x48;
+                const int32_t refOff2 = (m_off.Skeleton_RefBoneNames >= 0) ? m_off.Skeleton_RefBoneNames : 0x280;
+                uintptr_t skelPtr = safeReadPtr(asset + skelOff2);
+                if (skelPtr < 0x10000) { sampleBones += "skel=NULL;"; continue; }
+                ue4::TArray<ue4::FName> rbn{};
+                if (!safeReadMemory(skelPtr + refOff2, &rbn, sizeof(rbn))) { sampleBones += "rbn=READFAIL;"; continue; }
+                if (!isUsableRemoteArray(rbn, kMaxBoneNameCount)) {
+                    char tmp[96]; snprintf(tmp, sizeof(tmp), "rbn=BAD{%p,%d,%d};",
+                                           (void*)reinterpret_cast<uintptr_t>(rbn.Data), rbn.Num, rbn.Max);
+                    sampleBones += tmp; continue;
+                }
+                uintptr_t rbnData = reinterpret_cast<uintptr_t>(rbn.Data);
+                int cnt = std::min(rbn.Num, 20);
+                for (int i = 0; i < cnt; ++i) {
+                    ue4::FName fn{};
+                    if (!safeReadMemory(rbnData + static_cast<uintptr_t>(i) * sizeof(ue4::FName), &fn, sizeof(fn))) continue;
+                    std::string raw = (fn.ComparisonIndex >= 0 && fn.ComparisonIndex < m_numNames)
+                                       ? getNameByIndex(fn.ComparisonIndex) : "?";
+                    if (!sampleBones.empty()) sampleBones += ",";
+                    sampleBones += raw;
+                }
+                break; // 只采样一个
+            }
+
+            // 也尝试从 DefaultCharacterMesh/LastSkeletalMesh 采样
+            std::string altBones;
+            for (uintptr_t altAsset : assetCandidates) {
+                if (altAsset < 0x10000) continue;
+                const int32_t skelOff3 = (m_off.SkeletalMeshAsset_Skeleton >= 0) ? m_off.SkeletalMeshAsset_Skeleton : 0x48;
+                const int32_t refOff3 = (m_off.Skeleton_RefBoneNames >= 0) ? m_off.Skeleton_RefBoneNames : 0x280;
+                uintptr_t skelPtr = safeReadPtr(altAsset + skelOff3);
+                if (skelPtr < 0x10000) continue;
+                ue4::TArray<ue4::FName> rbn{};
+                if (!safeReadMemory(skelPtr + refOff3, &rbn, sizeof(rbn)) || !isUsableRemoteArray(rbn, kMaxBoneNameCount)) continue;
+                uintptr_t rbnData = reinterpret_cast<uintptr_t>(rbn.Data);
+                int cnt = std::min(rbn.Num, 10);
+                char hdr[64]; snprintf(hdr, sizeof(hdr), "asset=%p n=%d:", (void*)altAsset, rbn.Num);
+                altBones += hdr;
+                for (int i = 0; i < cnt; ++i) {
+                    ue4::FName fn{};
+                    if (!safeReadMemory(rbnData + static_cast<uintptr_t>(i) * sizeof(ue4::FName), &fn, sizeof(fn))) continue;
+                    std::string raw = (fn.ComparisonIndex >= 0 && fn.ComparisonIndex < m_numNames)
+                                       ? getNameByIndex(fn.ComparisonIndex) : "?";
+                    altBones += " " + raw;
+                }
+                break; // 只看一个有效的
+            }
+
+            LOG(LOG_LEVEL_INFO,
+                "[Skeleton] MISS key=%u matched=%d candidates=%zu assets=%zu %s",
+                outPlayer.playerKey, best.matched,
+                meshCandidates.size(), assetCandidates.size(),
+                debugInfo.c_str());
+            LOG(LOG_LEVEL_INFO,
+                "[Skeleton] MISS-bones key=%u compBones=[%s] altBones=[%s]",
+                outPlayer.playerKey, sampleBones.c_str(), altBones.c_str());
+            writeSkeletonLogf(
+                "[Skeleton] MISS key=%u matched=%d candidates=%zu assets=%zu %s compBones=[%s] altBones=[%s]",
+                outPlayer.playerKey, best.matched,
+                meshCandidates.size(), assetCandidates.size(),
+                debugInfo.c_str(), sampleBones.c_str(), altBones.c_str());
+        }
+        return false;
+    }
+
+    // ---- Step 6: 读取骨骼变换并转换到世界坐标 ----
+    int resolvedBoneCount = 0;
+    for (size_t slot = 0; slot < TRACKED_BONE_COUNT; ++slot) {
+        const int32_t boneIndex = best.boneMap.trackedBoneIndices[slot];
+        if (boneIndex < 0 || boneIndex >= best.transformCount) continue;
+
+        RemoteTransform boneTransform{};
+        if (!safeReadMemory(best.transformDataPtr + static_cast<uintptr_t>(boneIndex) * sizeof(RemoteTransform),
+                            &boneTransform, sizeof(boneTransform)))
+            continue;
+
+        const FVector3 worldPos = transformPosition(best.componentToWorld, boneTransform.translation);
+        if (!hasUsablePlayerPosition(worldPos)) continue;
+
+        outPlayer.bones[slot].x = worldPos.x;
+        outPlayer.bones[slot].y = worldPos.y;
+        outPlayer.bones[slot].z = worldPos.z;
+        outPlayer.boneMask |= (1u << static_cast<uint32_t>(slot));
+        resolvedBoneCount++;
+    }
+
+    if (outPlayer.boneMask == 0) return false;
+
+    if (shouldLogEvery(s_lastSkeletonDebugLogTime, std::chrono::milliseconds(5000))) {
+        LOG(LOG_LEVEL_INFO,
+            "[Skeleton] OK key=%u resolved=%d/%d src=%s transforms=%d mask=0x%X",
+            outPlayer.playerKey, resolvedBoneCount, best.matched,
+            best.source, best.transformCount, outPlayer.boneMask);
+        writeSkeletonLogf(
+            "[Skeleton] OK key=%u resolved=%d/%d src=%s transforms=%d mask=0x%X",
+            outPlayer.playerKey, resolvedBoneCount, best.matched,
+            best.source, best.transformCount, outPlayer.boneMask);
+    }
     return true;
 }
 
@@ -1232,6 +2072,42 @@ void MatchMonitor::writeLog(const char* line) {
     if (m_logLineCount % 50 == 0) fflush(m_logFp);
 }
 
+void MatchMonitor::writeSkeletonLog(const char* line) {
+    if (nullptr == line || '\0' == line[0]) return;
+
+    std::lock_guard<std::mutex> lock(m_logMutex);
+    mkdir(m_logDir.c_str(), 0777);
+
+    std::string path = m_logDir + "skeleton_log.txt";
+    FILE* fp = fopen(path.c_str(), "a");
+    if (!fp) {
+        fp = fopen("/data/local/tmp/ue4_skeleton_log.txt", "a");
+        if (!fp) return;
+    }
+
+    fprintf(fp, "%s\n", line);
+    fflush(fp);
+    fclose(fp);
+}
+
+void MatchMonitor::writeSkeletonLogf(const char* fmt, ...) {
+    if (nullptr == fmt || '\0' == fmt[0]) return;
+
+    char message[1024] = {};
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(message, sizeof(message), fmt, args);
+    va_end(args);
+
+    char line[1200] = {};
+    snprintf(line,
+             sizeof(line),
+             "[%llu] %s",
+             static_cast<unsigned long long>(nowMonotonicMs()),
+             message);
+    writeSkeletonLog(line);
+}
+
 void MatchMonitor::closeLog() {
     std::lock_guard<std::mutex> lock(m_logMutex);
     if (!m_logFp) return;
@@ -1371,6 +2247,7 @@ void MatchMonitor::pollPlayers() {
         dp.posY = cur->pos.y;
         dp.posZ = cur->pos.z;
         dp.isTeammate = isTeammate;
+        fillPlayerSkeleton(cur->characterPtr, dp);
         drawData.players.push_back(dp);
         cur = cur->next;
     }
@@ -1380,6 +2257,29 @@ void MatchMonitor::pollPlayers() {
     if (shouldDumpPlayerLog) {
         LOG(LOG_LEVEL_INFO, "[Players] %d alive (%d team + %d enemy) / %d total",
             aliveCount, aliveTeam, aliveEnemy, m_playerList.size());
+
+        int playersWithBones = 0;
+        int totalBonePoints = 0;
+        for (const auto& player : drawData.players) {
+            if (player.boneMask == 0) {
+                continue;
+            }
+            playersWithBones++;
+
+            uint32_t mask = player.boneMask;
+            while (mask != 0) {
+                totalBonePoints += static_cast<int>(mask & 1u);
+                mask >>= 1u;
+            }
+        }
+
+        writeSkeletonLogf("[SkeletonSummary] world=%s state=%s players=%zu alive=%d withBones=%d totalBonePoints=%d",
+                          drawData.worldName.c_str(),
+                          drawData.matchState.c_str(),
+                          drawData.players.size(),
+                          drawData.aliveCount,
+                          playersWithBones,
+                          totalBonePoints);
 
         char logBuf[512];
         const int limit = (enemies.size() < 40) ? static_cast<int>(enemies.size()) : 40;
@@ -1464,6 +2364,10 @@ void MatchMonitor::pollMatchStateLoop() {
                     m_lastCompletedCharacterScanEpoch = 0;
                     m_currentMatchState.clear();
                     openLog();
+                    writeSkeletonLogf("=== Skeleton Log Start pid=%d state=%s world=%s ===",
+                                      getpid(),
+                                      ms.state.c_str(),
+                                      ms.worldName.c_str());
                     char logBuf[256];
                     snprintf(logBuf, sizeof(logBuf), ">>> ★ 进入对局 State=%s World=%s", ms.state.c_str(), ms.worldName.c_str());
                     writeLog(logBuf);
@@ -1471,6 +2375,7 @@ void MatchMonitor::pollMatchStateLoop() {
                     detectObserverType();
                 } else if (!m_isInMatch && wasInMatch) {
                     LOG(LOG_LEVEL_INFO, "★ 离开对局! 共追踪 %d 名玩家", m_playerList.size());
+                    writeSkeletonLogf("=== Skeleton Log End trackedPlayers=%d ===", m_playerList.size());
                     ue4draw::DrawGameData emptyData;
                     emptyData.inMatch = false;
                     ue4draw::SharedUE4Data::getInstance().pushData(emptyData);

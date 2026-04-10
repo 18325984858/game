@@ -5,6 +5,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <array>
 #include <mutex>
 #include <algorithm>
 #include <cstring>
@@ -12,7 +13,7 @@
 
 // 前向声明
 namespace ue4inf { class UE4Interface; }
-namespace ue4draw { struct DrawGameData; }
+namespace ue4draw { struct DrawGameData; struct DrawPlayerInfo; }
 
 // =====================================================================
 //  PUBG Mobile 和平精英 — 对局状态监控 + 玩家坐标采集 (C++ 原生实现)
@@ -58,6 +59,7 @@ static constexpr int MONITOR_IDLE_SLEEP_MS    = 1;
 static constexpr int STATE_LOG_INTERVAL_MS    = 1000;
 static constexpr int PLAYER_LOG_INTERVAL_MS   = 1000;
 static constexpr float MAX_CULL_DIST_SQ       = 1.0e18f;
+static constexpr size_t TRACKED_BONE_COUNT    = 17;
 
 // =====================================================================
 //  ResolvedOffsets — 通过 UE4Interface 动态查找的游戏特定偏移
@@ -112,8 +114,29 @@ struct ResolvedOffsets {
     int32_t Char_TeamID                 = -1;
     int32_t Char_PlayerKey              = -1;
     int32_t Char_PlayerName             = -1;
+    int32_t Char_Mesh                   = -1;
     int32_t Char_bDead                  = -1;
     int32_t Char_CurrentNetCullDistSq   = -1;
+
+    // STExtraBaseCharacter
+    int32_t STBase_AvatarComponent      = -1;
+    int32_t STBase_FPPComp              = -1;
+    int32_t STBase_DefaultCharacterMesh = -1;
+    int32_t STBase_LastSkeletalMesh     = -1;
+
+    // AvatarComponent
+    int32_t Avatar_MasterBoneComponent  = -1;
+    int32_t Avatar_SkeletalMeshCompPool = -1;
+    int32_t Avatar_MeshComponentList    = -1;
+    int32_t Avatar_EntityTickList       = -1;
+    int32_t Avatar_AvatarEntityList     = -1;
+
+    // Skeletal / bone chain
+    int32_t SkinnedMesh_MasterPoseComponent          = -1;
+    int32_t SkinnedMesh_SkeletalMesh                    = -1;
+    int32_t SkeletalMeshComp_CachedComponentSpaceTransforms = -1;
+    int32_t SkeletalMeshAsset_Skeleton                 = -1;
+    int32_t Skeleton_RefBoneNames                      = -1;
 
     /// 所有关键偏移是否已成功解析
     bool isValid() const;
@@ -321,6 +344,7 @@ private:
 
     // ---- Actor 位置 ----
     bool getActorLocation(uintptr_t actorPtr, FVector3& outLoc);
+    bool fillPlayerSkeleton(uintptr_t characterPtr, ue4draw::DrawPlayerInfo& outPlayer);
 
     // ---- 类继承链检查 ----
     bool isSubclassOf(uintptr_t classPtr, const char* targetName);
@@ -350,6 +374,8 @@ private:
     // ---- 日志 ----
     void openLog();
     void writeLog(const char* line);
+    void writeSkeletonLog(const char* line);
+    void writeSkeletonLogf(const char* fmt, ...);
     void closeLog();
 
     // ---- 偏移解析 ----
@@ -359,6 +385,15 @@ private:
     void computeBatchReadBounds();
     size_t m_psReadSize = 0;     // PlayerState 需要批量读取的字节数
     size_t m_charReadSize = 0;   // Character 需要批量读取的字节数
+
+    struct BoneAssetCacheEntry {
+        std::array<int32_t, TRACKED_BONE_COUNT> trackedBoneIndices{};
+        int matchedCount = 0;
+    };
+
+    bool resolveTrackedBoneIndices(uintptr_t skeletalMeshAssetPtr, BoneAssetCacheEntry& outEntry);
+    int matchBoneNamesFromFNameArray(uintptr_t dataPtr, int count, BoneAssetCacheEntry& entry);
+    int matchBoneNamesFromBoneInfoArray(uintptr_t dataPtr, int count, int stride, BoneAssetCacheEntry& entry);
 
     // ---- 成员变量 ----
     ue4inf::UE4Interface& m_interface;  // UE4 反射查询接口
@@ -393,6 +428,7 @@ private:
     std::unordered_map<uintptr_t, uint64_t> m_lastNetCullPatchMs;
     std::unordered_map<uintptr_t, bool> m_characterClassSet;
     std::unordered_map<int, std::string> m_nameCache;
+    std::unordered_map<uintptr_t, BoneAssetCacheEntry> m_boneAssetCache;
 
     FILE* m_logFp = nullptr;
     int   m_logLineCount = 0;
