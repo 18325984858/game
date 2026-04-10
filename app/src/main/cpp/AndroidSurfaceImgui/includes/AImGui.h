@@ -98,6 +98,7 @@ namespace android
         size_t m_maxPacketSize = 8 * 1024 * 1024; // 8MB, enough for Chinese font atlas exchange
         sockaddr_in m_transportAddress{};
         int m_serverFd = -1, m_clientFd = -1;
+        std::atomic<bool> m_clientConnected{false};  // 渲染线程安全的连接状态
         std::unique_ptr<std::thread> m_serverWorkerThread;
         std::vector<uint8_t> m_serverFontData;
         std::vector<uint8_t> m_serverRenderData, m_serverRenderDataBack;

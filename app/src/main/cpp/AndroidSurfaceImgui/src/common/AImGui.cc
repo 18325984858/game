@@ -675,8 +675,8 @@ namespace android
             {
             case RenderState::ReadData:
             {
-                // 空闲状态: 如果有之前渲染过的帧, 刷新为透明 (防止退出后残留)
-                if (m_renderFrameCount > 0 && m_clientFd < 0) {
+                // 空闲: client 断开后清屏一次, 防止残留
+                if (m_renderFrameCount > 0 && !m_clientConnected.load(std::memory_order_acquire)) {
                     glClear(GL_COLOR_BUFFER_BIT);
                     eglSwapBuffers(m_defaultDisplay, m_eglSurface);
                     m_renderFrameCount = 0;
@@ -1275,6 +1275,7 @@ namespace android
                 m_serverFontPacketReceived = false;
             }
             LogInfo("[AImGui] Server accepted client fd=%d", m_clientFd);
+            m_clientConnected.store(true, std::memory_order_release);
 
             uint32_t packetSize = 0;
             while (m_state)
@@ -1363,6 +1364,7 @@ namespace android
             }
 
             // 客户端断开后清空渲染数据, 渲染线程会在 ReadData 状态做 glClear
+            m_clientConnected.store(false, std::memory_order_release);
             {
                 std::lock_guard<std::mutex> lock(m_renderDataMutex);
                 m_serverRenderData.clear();

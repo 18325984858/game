@@ -1,4 +1,4 @@
-﻿#include "pubgmhd.h"
+#include "pubgmhd.h"
 #include "../libUE4Struct/ilbUE4Struct.h"
 #include "../interface/interface.h"
 #include "../Draw/UE4Draw.h"
@@ -964,15 +964,8 @@ bool MatchMonitor::resolveTrackedBoneIndices(uintptr_t skeletalMeshAssetPtr, Bon
 
     const auto cached = m_boneAssetCache.find(skeletalMeshAssetPtr);
     if (cached != m_boneAssetCache.end()) {
-        // 验证缓存: 检查 FReferenceSkeleton 数据指针是否仍然有效
-        constexpr uintptr_t kRefBoneInfoOffset = 0x238;
-        const uintptr_t curData = safeReadPtr(skeletalMeshAssetPtr + kRefBoneInfoOffset);
-        if (curData >= 0x10000) {
-            outEntry = cached->second;
-            return outEntry.matchedCount > 0;
-        }
-        // 指针已失效 (GC移动了对象), 移除缓存条目
-        m_boneAssetCache.erase(cached);
+        outEntry = cached->second;
+        return outEntry.matchedCount > 0;
     }
 
     BoneAssetCacheEntry entry;
@@ -1173,16 +1166,20 @@ bool MatchMonitor::fillPlayerSkeleton(uintptr_t characterPtr, ue4draw::DrawPlaye
     addAsset(safeReadPtr(characterPtr + off(m_off.STBase_LastSkeletalMesh, kFB_LastSkelMesh)));
 
     // ---- åŒ¹é…: æ‰¾æœ€ä¼˜ (ç»„ä»¶ Ã— èµ„äº§) ----
-    uintptr_t bestComp = 0, bestAsset = 0, bestTransformData = 0;
+    // ---- 匹配并一次性拷贝骨骼变换到栈缓冲 (避免 TOCTOU 竞争) ----
+    static constexpr int kMaxTransformSlots = 256;
+    RemoteTransform localTransforms[kMaxTransformSlots];
     int bestCount = 0, bestMatched = 0;
     RemoteTransform bestCtw{};
     BoneAssetCacheEntry bestMap{};
     bestMap.trackedBoneIndices.fill(-1);
+    bool bestCopied = false;
 
     for (const auto& c : candidates) {
-        if (c.count < 2) continue;
+        if (c.count < 2 || c.count > kMaxTransformSlots) continue;
         ue4::TArray<RemoteTransform> arr{};
         if (!readTransformArray(c.comp, arr)) continue;
+        if (arr.Num > kMaxTransformSlots) continue;
         RemoteTransform ctw{};
         if (!safeReadMemory(c.comp + oCtw, &ctw, sizeof(ctw))) continue;
 
@@ -1193,18 +1190,18 @@ bool MatchMonitor::fillPlayerSkeleton(uintptr_t characterPtr, ue4draw::DrawPlaye
             for (int32_t bi : map.trackedBoneIndices)
                 if (bi >= 0 && bi < arr.Num) avail++;
             if (avail > bestMatched) {
-                bestComp = c.comp; bestAsset = asset;
-                bestTransformData = reinterpret_cast<uintptr_t>(arr.Data);
                 bestCount = arr.Num; bestMatched = avail;
                 bestCtw = ctw; bestMap = map;
+                // 一次性拷贝全部变换到栈, 避免后续读取时指针被 UE4 重分配
+                bestCopied = safeReadMemory(
+                    reinterpret_cast<uintptr_t>(arr.Data),
+                    localTransforms,
+                    static_cast<size_t>(arr.Num) * sizeof(RemoteTransform));
             }
         }
     }
 
-    if (bestMatched < kMinRenderableBoneMatches) {
-        if (shouldLogEvery(s_lastSkeletonLogTime, std::chrono::milliseconds(3000)))
-            LOG(LOG_LEVEL_INFO, "[Skeleton] miss key=%u cands=%zu assets=%zu best=%d",
-                outPlayer.playerKey, candidates.size(), assets.size(), bestMatched);
+    if (bestMatched < kMinRenderableBoneMatches || !bestCopied) {
         return false;
     }
 
@@ -1214,9 +1211,7 @@ bool MatchMonitor::fillPlayerSkeleton(uintptr_t characterPtr, ue4draw::DrawPlaye
     for (size_t slot = 0; slot < TRACKED_BONE_COUNT; ++slot) {
         int32_t bi = bestMap.trackedBoneIndices[slot];
         if (bi < 0 || bi >= bestCount) continue;
-        RemoteTransform bt{};
-        if (!safeReadMemory(bestTransformData + static_cast<uintptr_t>(bi) * sizeof(RemoteTransform), &bt, sizeof(bt)))
-            continue;
+        const RemoteTransform& bt = localTransforms[bi];
         FVector3 wp = transformPosition(bestCtw, bt.translation);
         if (!hasUsablePlayerPosition(wp)) continue;
         // 骨骼一致性: 距离玩家根位置过远说明数据已失效
@@ -1965,11 +1960,26 @@ void MatchMonitor::pollPlayers() {
         // 骨骼: 尝试从活数据填充, 失败则用缓存 (防闪烁, 支持骑马)
         bool freshBones = fillPlayerSkeleton(cur->characterPtr, dp);
         if (freshBones) {
-            // 更新缓存
-            for (size_t i = 0; i < 17; ++i)
-                cur->cachedBones[i] = {dp.bones[i].x, dp.bones[i].y, dp.bones[i].z};
-            cur->cachedBoneMask = dp.boneMask;
-            cur->cachedBoneTimestampMs = nowMonotonicMs();
+            // 只在新数据骨骼数 >= 缓存时才更新 (防止部分数据覆盖完整缓存)
+            int newBoneCount = 0;
+            uint32_t m = dp.boneMask;
+            while (m) { newBoneCount += m & 1; m >>= 1; }
+            int cachedBoneCount = 0;
+            m = cur->cachedBoneMask;
+            while (m) { cachedBoneCount += m & 1; m >>= 1; }
+
+            if (newBoneCount >= cachedBoneCount) {
+                for (size_t i = 0; i < 17; ++i)
+                    cur->cachedBones[i] = {dp.bones[i].x, dp.bones[i].y, dp.bones[i].z};
+                cur->cachedBoneMask = dp.boneMask;
+                cur->cachedBoneTimestampMs = nowMonotonicMs();
+            } else {
+                // 新数据不如缓存完整, 用缓存
+                for (size_t i = 0; i < 17; ++i)
+                    dp.bones[i] = {cur->cachedBones[i].x, cur->cachedBones[i].y, cur->cachedBones[i].z};
+                dp.boneMask = cur->cachedBoneMask;
+                cur->cachedBoneTimestampMs = nowMonotonicMs(); // 延长缓存有效期
+            }
         } else if (cur->cachedBoneMask != 0) {
             // 使用缓存的骨骼 (最多保留 2000ms, 平滑过渡)
             const uint64_t age = nowMonotonicMs() - cur->cachedBoneTimestampMs;
