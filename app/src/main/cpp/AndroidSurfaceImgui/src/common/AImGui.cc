@@ -673,6 +673,16 @@ namespace android
         {
             switch (m_renderState)
             {
+            case RenderState::ReadData:
+            {
+                // 空闲状态: 如果有之前渲染过的帧, 刷新为透明 (防止退出后残留)
+                if (m_renderFrameCount > 0 && m_clientFd < 0) {
+                    glClear(GL_COLOR_BUFFER_BIT);
+                    eglSwapBuffers(m_defaultDisplay, m_eglSurface);
+                    m_renderFrameCount = 0;
+                }
+                break;
+            }
             case RenderState::SetFont:
             {
                 if (!m_options.exchangeFontData)
@@ -1352,16 +1362,11 @@ namespace android
                 close(clientFd);
             }
 
-            // 客户端断开后清空渲染数据并刷新一帧, 避免画面残留
+            // 客户端断开后清空渲染数据, 渲染线程会在 ReadData 状态做 glClear
             {
                 std::lock_guard<std::mutex> lock(m_renderDataMutex);
                 m_serverRenderData.clear();
                 m_renderState = RenderState::ReadData;
-            }
-            if (m_defaultDisplay && m_eglSurface)
-            {
-                glClear(GL_COLOR_BUFFER_BIT);
-                eglSwapBuffers(m_defaultDisplay, m_eglSurface);
             }
 
             if (m_state)
