@@ -1351,6 +1351,19 @@ namespace android
                 shutdown(clientFd, SHUT_RDWR);
                 close(clientFd);
             }
+
+            // 客户端断开后清空渲染数据并刷新一帧, 避免画面残留
+            {
+                std::lock_guard<std::mutex> lock(m_renderDataMutex);
+                m_serverRenderData.clear();
+                m_renderState = RenderState::ReadData;
+            }
+            if (m_defaultDisplay && m_eglSurface)
+            {
+                glClear(GL_COLOR_BUFFER_BIT);
+                eglSwapBuffers(m_defaultDisplay, m_eglSurface);
+            }
+
             if (m_state)
                 LogInfo("[AImGui] Server client disconnected, waiting next client");
         }

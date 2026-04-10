@@ -301,8 +301,8 @@ int drawPlayerSkeleton(ImDrawList* drawList,
                        ImU32 color,
                        float screenW,
                        float screenH) {
-    // 至少需要 5 个骨骼点才值得绘制 (避免零星点闪烁)
-    if (countTrackedBones(player) < 5) return 0;
+    // 至少需要 3 个骨骼点才绘制
+    if (countTrackedBones(player) < 3) return 0;
 
     int segmentCount = 0;
     for (const BoneSegment& segment : kSkeletonSegments) {
@@ -311,16 +311,12 @@ int drawPlayerSkeleton(ImDrawList* drawList,
             || !projectBonePoint(data, player, segment.to, screenW, screenH, toX, toY))
             continue;
 
-        // 跳过投影后距离过大的线段 (异常数据保护)
         float dx = toX - fromX, dy = toY - fromY;
         if (dx * dx + dy * dy > screenH * screenH) continue;
 
         drawList->AddLine(ImVec2(fromX, fromY), ImVec2(toX, toY), color, 1.5f);
         segmentCount++;
     }
-
-    // 只在有线段时才绘制关节点 (避免孤立点)
-    if (segmentCount < 3) return segmentCount;
 
     for (size_t boneIndex = 0; boneIndex < kTrackedBoneCount; ++boneIndex) {
         float px, py;
