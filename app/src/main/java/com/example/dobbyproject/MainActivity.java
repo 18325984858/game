@@ -61,6 +61,8 @@ import java.io.OutputStream;
 import java.io.File;
 import java.util.zip.ZipFile;
 import java.util.zip.ZipEntry;
+
+import android.app.AlertDialog;
 public class MainActivity extends AppCompatActivity {
 
     // --- 1. LogUtil 保持不变 ---
@@ -162,6 +164,11 @@ public class MainActivity extends AppCompatActivity {
                 return;
             }
 
+            if ("⚠ 游戏未安装".equals(btnPubgLaunch.getText().toString())) {
+                Toast.makeText(this, "和平精英未安装，请先安装游戏", Toast.LENGTH_SHORT).show();
+                return;
+            }
+
             if (!ensureOverlayPermission()) {
                 updateStatus("请授予悬浮窗权限后重试");
                 return;
@@ -189,10 +196,25 @@ public class MainActivity extends AppCompatActivity {
         // ── 启动时初始化检测 ──
         updateStatus("正在检测环境...");
         new Thread(() -> {
+            boolean rootOk = checkRootAccess();
+            if (!rootOk) {
+                runOnUiThread(() -> {
+                    findViewById(android.R.id.content).setVisibility(View.INVISIBLE);
+                    new AlertDialog.Builder(this)
+                            .setTitle("Root 权限不可用")
+                            .setMessage("本应用需要 Root 权限才能正常运行。\n请确保设备已 Root 并授予本应用 Root 权限后重新打开。")
+                            .setPositiveButton("退出", (dialog, which) -> finish())
+                            .setCancelable(false)
+                            .show();
+                });
+                return;
+            }
+
             boolean selinuxOk = checkSelinuxPermissive();
             boolean inputOk = checkInputPermission();
             boolean fontOk = checkFileExists("/data/local/tmp/chinese.ttf");
             boolean gameInstalled = checkGameInstalled();
+            boolean pubgInstalled = checkPackageInstalled(PUBG_PACKAGE);
 
             runOnUiThread(() -> {
                 StringBuilder sb = new StringBuilder();
@@ -217,9 +239,16 @@ public class MainActivity extends AppCompatActivity {
                 if (!gameInstalled) {
                     btnLaunch.setEnabled(false);
                     btnLaunch.setText("⚠ 游戏未安装");
-                    sb.append("游戏未安装 ✗");
+                    sb.append("LOL未安装 ✗  ");
                 } else {
-                    sb.append("游戏已安装 ✓");
+                    sb.append("LOL已安装 ✓  ");
+                }
+                if (!pubgInstalled) {
+                    btnPubgLaunch.setEnabled(false);
+                    btnPubgLaunch.setText("⚠ 游戏未安装");
+                    sb.append("和平精英未安装 ✗");
+                } else {
+                    sb.append("和平精英已安装 ✓");
                 }
                 updateStatus(sb.length() > 0 ? sb.toString().trim() : "就绪");
             });
@@ -413,6 +442,20 @@ public class MainActivity extends AppCompatActivity {
     }
 
     /**
+     * 检测设备是否已授予 Root 权限
+     */
+    private boolean checkRootAccess() {
+        try {
+            Process p = Runtime.getRuntime().exec("su -c id");
+            BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream()));
+            String line = reader.readLine();
+            int exitCode = p.waitFor();
+            return exitCode == 0 && line != null && line.contains("uid=0");
+        } catch (Exception ignored) {}
+        return false;
+    }
+
+    /**
      * 检测 SELinux 是否已经是 Permissive 模式
      */
     private boolean checkSelinuxPermissive() {
@@ -456,10 +499,14 @@ public class MainActivity extends AppCompatActivity {
      * 检测目标游戏是否已安装（通过 root 权限绕过 Android 11+ 包可见性限制）
      */
     private boolean checkGameInstalled() {
+        return checkPackageInstalled(g_packFileName);
+    }
+
+    private boolean checkPackageInstalled(String packageName) {
         try {
             Process p = Runtime.getRuntime().exec("su");
             DataOutputStream os = new DataOutputStream(p.getOutputStream());
-            os.writeBytes("pm list packages " + g_packFileName + " | grep -q " + g_packFileName + " && echo INSTALLED\n");
+            os.writeBytes("pm list packages " + packageName + " | grep -q " + packageName + " && echo INSTALLED\n");
             os.writeBytes("exit\n");
             os.flush();
             BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream()));

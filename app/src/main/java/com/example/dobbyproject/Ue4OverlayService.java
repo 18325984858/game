@@ -20,6 +20,7 @@ import android.view.Display;
 import android.view.Gravity;
 import android.view.Surface;
 import android.view.TextureView;
+import android.view.View;
 import android.view.WindowManager;
 import android.view.WindowMetrics;
 
@@ -142,7 +143,8 @@ public class Ue4OverlayService extends Service {
         releaseOverlaySurface();
 
         try {
-            windowManager.removeView(overlayTextureView);
+            overlayTextureView.setVisibility(View.INVISIBLE);
+            windowManager.removeViewImmediate(overlayTextureView);
         } catch (Exception e) {
             Log.e(TAG, "移除 Overlay TextureView 失败", e);
         }

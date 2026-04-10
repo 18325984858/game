@@ -93,6 +93,11 @@ void overlayThreadMain(ANativeWindow* window, int width, int height, int rotateT
             std::this_thread::yield();
         }
 
+        // 渲染一帧空帧清除 Surface 上的残留内容
+        imgui->BeginFrame();
+        imgui->EndFrame();
+        OLOG(LOG_LEVEL_INFO, "公开 Overlay 已渲染空帧清除画面");
+
         if (inputThread.joinable()) {
             inputThread.join();
         }
