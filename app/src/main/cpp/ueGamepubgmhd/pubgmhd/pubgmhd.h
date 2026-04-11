@@ -189,6 +189,10 @@ struct ResolvedOffsets {
     int32_t BTC_HorizontalRecoilFactorModifier = -1;
     int32_t BTC_AccVerticalRecoilTarget = -1;
 
+    // Weapon — 当前武器
+    int32_t Char_CurWeapon                = -1;  // STExtraBaseCharacter.CurWeapon
+    int32_t Weapon_BulletTrackComp        = -1;  // STExtraShootWeapon.BulletTrackComp
+
     /// 所有关键偏移是否已成功解析
     bool isValid() const;
 };
@@ -401,6 +405,17 @@ struct CharacterSpeedInfo {
 };
 
 // =====================================================================
+//  WeaponBulletParams — 武器子弹参数 (用于弹道物理预测)
+// =====================================================================
+struct WeaponBulletParams {
+    bool valid = false;
+    float bulletSpeed = 75000.0f;       // cm/s (默认 ~750 m/s)
+    float gravityScale = 1.0f;          // ProjectileMovementComponent.ProjectileGravityScale
+    float launchGravityScale = 1.0f;    // STExtraShootWeaponBulletBase.LaunchGravityScale
+    float maxNoGravityRange = 0.0f;     // cm, 此范围内不受重力影响
+};
+
+// =====================================================================
 //  MatchMonitor — 对局状态监控 + 玩家坐标采集 主类
 // =====================================================================
 class MatchMonitor {
@@ -475,6 +490,12 @@ private:
     RecoilInfo getRecoilInfo(uintptr_t bulletTrackCompPtr);
     CharacterSpeedInfo getCharacterSpeedInfo(uintptr_t characterPtr);
 
+    // ---- 弹道物理模拟 ----
+    FVector3 predictBallisticAimPoint(const FVector3& shooterPos, const FVector3& targetPos,
+                                       const FVector3& targetVelocity, const WeaponBulletParams& params);
+    WeaponBulletParams getLocalWeaponBulletParams();
+    FVector3 getTargetVelocity(uintptr_t characterPtr);
+
     // ---- 自瞄 ----
     void aimAtNearestEnemy();
 
@@ -544,10 +565,15 @@ private:
 
     // Aimbot
     bool          m_aimbotEnabled = true;
-    int           m_aimbotTargetBone = 4;  // 默认瞄头 (TRACKED_BONE_COUNT 索引: 4=head)
+    int           m_aimbotTargetBone = 3;  // 默认瞄脖子 (TRACKED_BONE_COUNT 索引: 3=neck, 4=head)
     uint32_t      m_aimbotLockedKey = 0;   // 当前锁定目标的 playerKey (0=未锁定)
     float         m_aimbotSmoothing = 8.0f; // 平滑系数 (越大越平滑, 1=瞬移)
     uint64_t      m_lastAimbotWriteMs = 0;  // 上次写入 ControlRotation 的时间 (限频)
+
+    // 弹道预测缓存
+    WeaponBulletParams m_cachedBulletParams;
+    uint64_t      m_lastBulletParamReadMs = 0;
+    std::unordered_map<uintptr_t, WeaponBulletParams> m_weaponParamsCache;  // 按武器指针缓存
 
     // Aimbot 日志
     FILE*         m_aimbotLogFp = nullptr;

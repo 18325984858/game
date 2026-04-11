@@ -409,7 +409,7 @@ static void runSurfacePreflight(const JavaDisplayInfo& displayInfo) {
             .name = "UE4-AImGui-Preflight",
             .width = displayInfo.width,
             .height = displayInfo.height,
-            .skipScreenshot = false,
+            .skipScreenshot = true,
         });
         if (!preflightWindow) {
             GERR("AImGui 预检: Create 返回空窗口");

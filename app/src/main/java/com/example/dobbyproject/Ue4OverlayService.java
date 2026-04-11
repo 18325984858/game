@@ -127,7 +127,8 @@ public class Ue4OverlayService extends Service {
                 | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
                 | WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                 | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-                | WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED;
+                | WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED
+                | WindowManager.LayoutParams.FLAG_SECURE;
 
         WindowManager.LayoutParams layoutParams = new WindowManager.LayoutParams(
                 displaySize.x,

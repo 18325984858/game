@@ -686,6 +686,10 @@ bool MatchMonitor::initOffsets() {
     RESOLVE_OFFSET_MULTI(m_off.BTC_HorizontalRecoilFactorModifier, "HorizontalRecoilFactorModifier", "BulletTrackComponent");
     RESOLVE_OFFSET_MULTI(m_off.BTC_AccVerticalRecoilTarget, "AccVerticalRecoilTarget", "BulletTrackComponent");
 
+    // Weapon — 当前武器 (弹道预测需要)
+    RESOLVE_OFFSET_MULTI(m_off.Char_CurWeapon,           "CurWeapon",           "STExtraBaseCharacter", "STExtraCharacter", "UAECharacter");
+    RESOLVE_OFFSET_MULTI(m_off.Weapon_BulletTrackComp,   "BulletTrackComp",     "STExtraShootWeapon", "STExtraWeapon");
+
     LOG(LOG_LEVEL_INFO, "[InitOffsets] 解析完成, isValid=%d", m_off.isValid());
     LOG(LOG_LEVEL_INFO, "[InitOffsets] World.GameState=0x%X GS.PlayerArray=0x%X PS.PlayerKey=0x%X",
         m_off.World_GameState, m_off.GS_PlayerArray, m_off.PS_PlayerKey);
@@ -698,6 +702,8 @@ bool MatchMonitor::initOffsets() {
         m_off.PMC_InitialSpeed, m_off.PMC_MaxSpeed, m_off.PMC_ProjectileGravityScale);
     LOG(LOG_LEVEL_INFO, "[InitOffsets] BTC: VRecoil=0x%X HRecoil=0x%X CurRecoil=0x%X",
         m_off.BTC_VerticalRecoilTarget, m_off.BTC_HorizontalRecoilTarget, m_off.BTC_CurRecoilValue);
+    LOG(LOG_LEVEL_INFO, "[InitOffsets] Weapon: CurWeapon=0x%X BulletTrackComp=0x%X",
+        m_off.Char_CurWeapon, m_off.Weapon_BulletTrackComp);
 
     return m_off.isValid();
 }
@@ -2034,6 +2040,248 @@ CharacterSpeedInfo MatchMonitor::getCharacterSpeedInfo(uintptr_t characterPtr) {
 }
 
 // =====================================================================
+//  getTargetVelocity — 读取目标角色的当前移动速度向量
+//
+//  通过 Character → CharacterMovement → CMC.Velocity 获取
+//  用于弹道预测中的目标移动前置量计算
+// =====================================================================
+FVector3 MatchMonitor::getTargetVelocity(uintptr_t characterPtr) {
+    FVector3 vel{};
+    if (characterPtr < 0x10000) return vel;
+
+    const int32_t offCMC = (m_off.Char_CharacterMovement >= 0) ? m_off.Char_CharacterMovement : 0x658;
+    const uintptr_t cmcPtr = safeReadPtr(characterPtr + offCMC);
+    if (cmcPtr < 0x10000) return vel;
+
+    const int32_t offVel = (m_off.CMC_Velocity >= 0) ? m_off.CMC_Velocity : 0x13C;
+    vel.x = safeReadFloat(cmcPtr + offVel);
+    vel.y = safeReadFloat(cmcPtr + offVel + 4);
+    vel.z = safeReadFloat(cmcPtr + offVel + 8);
+
+    // 过滤异常速度
+    if (!std::isfinite(vel.x) || !std::isfinite(vel.y) || !std::isfinite(vel.z)) {
+        return FVector3{};
+    }
+    // 速度过大说明数据异常 (>200 m/s = 20000 cm/s 不合理)
+    const float speedSq = vel.x * vel.x + vel.y * vel.y + vel.z * vel.z;
+    if (speedSq > 20000.0f * 20000.0f) {
+        return FVector3{};
+    }
+
+    return vel;
+}
+
+// =====================================================================
+//  getLocalWeaponBulletParams — 获取本地玩家当前武器的弹速/重力参数
+//
+//  读取路径: Character → CurWeapon → 反射查找弹速字段
+//  缓存策略: 以武器指针为 key, 同一把武器只查找一次反射
+//  回退: 如果无法读取, 使用 PUBG Mobile 常见默认值 (750 m/s, 重力1.0)
+// =====================================================================
+WeaponBulletParams MatchMonitor::getLocalWeaponBulletParams() {
+    const uint64_t nowMs = nowMonotonicMs();
+    // 每 500ms 重新读取武器指针 (防止换枪后失效)
+    if (m_cachedBulletParams.valid && nowMs - m_lastBulletParamReadMs < 500) {
+        return m_cachedBulletParams;
+    }
+
+    WeaponBulletParams params;
+
+    // 获取本地玩家角色
+    PlayerNode* myNode = (m_myPlayerKey != 0) ? m_playerList.findByKey(m_myPlayerKey) : m_playerList.head();
+    if (!myNode || myNode->characterPtr < 0x10000) {
+        return params; // 返回默认值
+    }
+
+    // 尝试读取 CurWeapon
+    uintptr_t weaponPtr = 0;
+    if (m_off.Char_CurWeapon >= 0) {
+        weaponPtr = safeReadPtr(myNode->characterPtr + m_off.Char_CurWeapon);
+    }
+
+    if (weaponPtr >= 0x10000) {
+        // 检查武器指针缓存
+        auto cacheIt = m_weaponParamsCache.find(weaponPtr);
+        if (cacheIt != m_weaponParamsCache.end()) {
+            params = cacheIt->second;
+            m_cachedBulletParams = params;
+            m_lastBulletParamReadMs = nowMs;
+            return params;
+        }
+
+        // 通过反射查找弹速/重力字段
+        const std::string weaponClass = readClassName(weaponPtr);
+        if (!weaponClass.empty() && weaponClass[0] != '<') {
+            // 查找弹速
+            for (const char* fieldName : {"BulletInitSpeed", "FireBulletInitSpeed",
+                                          "BulletSpeed", "InitBulletSpeed", "BulletFireSpeed"}) {
+                const auto* fi = m_interface.findFieldInHierarchy(weaponClass, fieldName);
+                if (fi && fi->offset > 0) {
+                    float speed = safeReadFloat(weaponPtr + fi->offset);
+                    if (std::isfinite(speed) && speed > 1000.0f && speed < 200000.0f) {
+                        params.bulletSpeed = speed;
+                        params.valid = true;
+                        LOG(LOG_LEVEL_INFO, "[Ballistic] Found %s.%s = %.0f cm/s",
+                            weaponClass.c_str(), fieldName, speed);
+                        break;
+                    }
+                }
+            }
+
+            // 查找重力缩放
+            for (const char* fieldName : {"BulletGravityScale", "GravityScale",
+                                          "ProjectileGravityScale", "BulletGravity"}) {
+                const auto* fi = m_interface.findFieldInHierarchy(weaponClass, fieldName);
+                if (fi && fi->offset > 0) {
+                    float grav = safeReadFloat(weaponPtr + fi->offset);
+                    if (std::isfinite(grav) && grav >= 0.0f && grav <= 10.0f) {
+                        params.gravityScale = grav;
+                        LOG(LOG_LEVEL_INFO, "[Ballistic] Found %s.%s = %.2f",
+                            weaponClass.c_str(), fieldName, grav);
+                        break;
+                    }
+                }
+            }
+
+            // 查找无重力范围
+            for (const char* fieldName : {"MaxNoGravityRange", "NoGravityRange"}) {
+                const auto* fi = m_interface.findFieldInHierarchy(weaponClass, fieldName);
+                if (fi && fi->offset > 0) {
+                    float range = safeReadFloat(weaponPtr + fi->offset);
+                    if (std::isfinite(range) && range >= 0.0f && range < 100000.0f) {
+                        params.maxNoGravityRange = range;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // 限制武器缓存大小
+        if (m_weaponParamsCache.size() > 64) {
+            m_weaponParamsCache.clear();
+        }
+        m_weaponParamsCache[weaponPtr] = params;
+    }
+
+    m_cachedBulletParams = params;
+    m_lastBulletParamReadMs = nowMs;
+
+    static Clock::time_point s_lastBulletLog;
+    if (shouldLogEvery(s_lastBulletLog, std::chrono::milliseconds(5000))) {
+        writeAimbotLog("[Ballistic] bulletSpeed=%.0f gravScale=%.2f launchGrav=%.2f noGravRange=%.0f valid=%d",
+            params.bulletSpeed, params.gravityScale, params.launchGravityScale,
+            params.maxNoGravityRange, params.valid);
+    }
+
+    return params;
+}
+
+// =====================================================================
+//  predictBallisticAimPoint — 弹道物理模拟, 计算预测瞄准点
+//
+//  输入:
+//    shooterPos     — 射手位置 (相机/枪口, UE4 坐标 cm)
+//    targetPos      — 目标位置 (骨骼/角色位置)
+//    targetVelocity — 目标当前速度向量 (cm/s)
+//    params         — 武器子弹参数 (弹速, 重力, 无重力范围)
+//
+//  物理模型:
+//    1. 子弹以 bulletSpeed 发射, 飞行时间 t = distance / bulletSpeed
+//    2. 目标移动前置: predictedPos = targetPos + targetVelocity × t
+//    3. 重力下坠补偿: 在无重力范围外, drop = ½ × g × t²
+//       g = 980 cm/s² × gravityScale × launchGravityScale
+//    4. 迭代求解: 预测位置改变距离 → 重新计算飞行时间 → 收敛
+//
+//  返回: 补偿后的瞄准点 (需瞄准此点以命中移动目标)
+// =====================================================================
+FVector3 MatchMonitor::predictBallisticAimPoint(
+    const FVector3& shooterPos,
+    const FVector3& targetPos,
+    const FVector3& targetVelocity,
+    const WeaponBulletParams& params)
+{
+    constexpr float kUE4Gravity = 980.0f;    // UE4 默认重力加速度 cm/s²
+    constexpr int kMaxIterations = 8;        // 增加迭代次数, 远距离需要更多步骤收敛
+    constexpr float kConvergenceThreshold = 0.00005f; // 收敛精度提升: 0.05ms
+
+    const float bulletSpeed = (params.bulletSpeed > 100.0f) ? params.bulletSpeed : 75000.0f;
+    const float gravity = kUE4Gravity * params.gravityScale * params.launchGravityScale;
+    const float noGravRange = (params.maxNoGravityRange > 0.0f) ? params.maxNoGravityRange : 0.0f;
+
+    // 检查目标速度是否有意义 (静止目标且无重力 → 无需预测)
+    const float targetSpeedSq = targetVelocity.x * targetVelocity.x
+                               + targetVelocity.y * targetVelocity.y
+                               + targetVelocity.z * targetVelocity.z;
+    const bool targetMoving = (targetSpeedSq > 1.0f);
+
+    if (!targetMoving && gravity < 0.01f) {
+        return targetPos; // 静止目标 + 无重力 → 直接瞄准
+    }
+
+    // 使用水平距离计算飞行时间 (更物理正确: 子弹水平速度近似恒定)
+    FVector3 predicted = targetPos;
+    float lastFlightTime = 0.0f;
+
+    for (int iter = 0; iter < kMaxIterations; ++iter) {
+        const float dx = predicted.x - shooterPos.x;
+        const float dy = predicted.y - shooterPos.y;
+        const float dz = predicted.z - shooterPos.z;
+
+        // 水平距离用于计算飞行时间 (重力仅影响z轴, 不影响水平速度)
+        const float horizDistSq = dx * dx + dy * dy;
+        const float totalDistSq = horizDistSq + dz * dz;
+        if (totalDistSq < 1.0f) break;
+
+        const float horizDist = std::sqrt(horizDistSq);
+        // 飞行时间基于3D距离 (近距离)/水平距离 (远距离) 混合
+        // 远距离时水平距离更准确, 因为重力使实际弹道弯曲
+        const float totalDist = std::sqrt(totalDistSq);
+        const float flightTime = (horizDist > 100.0f) ? (horizDist / bulletSpeed) : (totalDist / bulletSpeed);
+
+        // 收敛检查
+        if (iter > 0 && std::fabs(flightTime - lastFlightTime) < kConvergenceThreshold) break;
+        lastFlightTime = flightTime;
+
+        // 目标移动前置: 假设目标在子弹飞行时间内保持当前速度方向和大小
+        predicted.x = targetPos.x + targetVelocity.x * flightTime;
+        predicted.y = targetPos.y + targetVelocity.y * flightTime;
+        // Z轴: 目标移动 + 目标自身重力 (跳跃/下落中的敌人)
+        predicted.z = targetPos.z + targetVelocity.z * flightTime;
+
+        // 重力下坠补偿: 子弹在飞行过程中受重力作用下坠
+        if (gravity > 0.01f) {
+            float gravTime;
+            if (noGravRange > 0.0f && horizDist > 1.0f) {
+                if (horizDist > noGravRange) {
+                    gravTime = (horizDist - noGravRange) / bulletSpeed;
+                } else {
+                    gravTime = 0.0f;
+                }
+            } else {
+                gravTime = flightTime;
+            }
+            // 标准抛物线: drop = ½gt²
+            const float drop = 0.5f * gravity * gravTime * gravTime;
+            predicted.z += drop;
+        }
+    }
+
+    // 安全检查: 预测结果必须有限且合理
+    if (!std::isfinite(predicted.x) || !std::isfinite(predicted.y) || !std::isfinite(predicted.z)) {
+        return targetPos;
+    }
+    // 预测偏移不应超过 100 米 (10000 cm), 否则数据可能异常
+    const float offsetSq = (predicted.x - targetPos.x) * (predicted.x - targetPos.x)
+                          + (predicted.y - targetPos.y) * (predicted.y - targetPos.y)
+                          + (predicted.z - targetPos.z) * (predicted.z - targetPos.z);
+    if (offsetSq > 10000.0f * 10000.0f) {
+        return targetPos;
+    }
+
+    return predicted;
+}
+
+// =====================================================================
 //  自瞄 — 开镜时锁定200米内血量最少的敌人直至死亡
 //
 //  修复:
@@ -2098,27 +2346,43 @@ void MatchMonitor::aimAtNearestEnemy() {
     constexpr uint64_t kMaxBoneAgeMs = 2000;                 // 骨骼数据有效期
     const float smoothT = std::clamp(1.0f / m_aimbotSmoothing, 0.05f, 1.0f);
 
-    const int boneIdx = m_aimbotTargetBone;  // 4=head
+    const int boneIdx = m_aimbotTargetBone;  // 3=neck
+    // 骨骼回退链: 脖子 → 头部 → 脊椎上段 → 位置偏移
+    constexpr int kBoneFallback[] = {3, 4, 2};  // Neck, Head, SpineUpper
+    constexpr int kBoneFallbackCount = 3;
 
-    // ---- 辅助: 从 PlayerNode 获取瞄准坐标 ----
+    // ---- 辅助: 从 PlayerNode 获取瞄准坐标 (带骨骼回退链) ----
     auto getTargetPos = [&](const PlayerNode* node, FVector3& outTgt) -> bool {
-        // 优先用骨骼 (检查新鲜度)
-        if (boneIdx >= 0 && boneIdx < static_cast<int>(TRACKED_BONE_COUNT)
-            && (node->cachedBoneMask & (1u << boneIdx)) != 0
-            && (nowMs - node->cachedBoneTimestampMs) < kMaxBoneAgeMs) {
-            const float tx = node->cachedBones[boneIdx].x;
-            const float ty = node->cachedBones[boneIdx].y;
-            const float tz = node->cachedBones[boneIdx].z;
-            if (std::isfinite(tx) && std::isfinite(ty) && std::isfinite(tz)
-                && (std::fabs(tx) > 1.0f || std::fabs(ty) > 1.0f)) {
-                outTgt = {tx, ty, tz};
-                return true;
+        // 优先用目标骨骼, 不可用则沿回退链尝试
+        if ((nowMs - node->cachedBoneTimestampMs) < kMaxBoneAgeMs && node->cachedBoneMask != 0) {
+            // 首选: 用户设置的目标骨骼
+            if (boneIdx >= 0 && boneIdx < static_cast<int>(TRACKED_BONE_COUNT)
+                && (node->cachedBoneMask & (1u << boneIdx)) != 0) {
+                const auto& b = node->cachedBones[boneIdx];
+                if (std::isfinite(b.x) && std::isfinite(b.y) && std::isfinite(b.z)
+                    && (std::fabs(b.x) > 1.0f || std::fabs(b.y) > 1.0f)) {
+                    outTgt = {b.x, b.y, b.z};
+                    return true;
+                }
+            }
+            // 回退链: Neck → Head → SpineUpper
+            for (int fi = 0; fi < kBoneFallbackCount; ++fi) {
+                int bi = kBoneFallback[fi];
+                if (bi == boneIdx) continue; // 已经试过
+                if (bi < 0 || bi >= static_cast<int>(TRACKED_BONE_COUNT)) continue;
+                if ((node->cachedBoneMask & (1u << bi)) == 0) continue;
+                const auto& b = node->cachedBones[bi];
+                if (std::isfinite(b.x) && std::isfinite(b.y) && std::isfinite(b.z)
+                    && (std::fabs(b.x) > 1.0f || std::fabs(b.y) > 1.0f)) {
+                    outTgt = {b.x, b.y, b.z};
+                    return true;
+                }
             }
         }
-        // 回退: 角色位置 + 头部高度偏移
+        // 最终回退: 角色位置 + 脖子高度偏移 (~145cm 人物, 脖子约 130cm)
         if (std::isfinite(node->pos.x) && std::isfinite(node->pos.y) && std::isfinite(node->pos.z)
             && (std::fabs(node->pos.x) > 1.0f || std::fabs(node->pos.y) > 1.0f)) {
-            outTgt = {node->pos.x, node->pos.y, node->pos.z + 60.0f};
+            outTgt = {node->pos.x, node->pos.y, node->pos.z + 50.0f};
             return true;
         }
         return false;
@@ -2142,20 +2406,27 @@ void MatchMonitor::aimAtNearestEnemy() {
         if (locked && locked->liveState == 0 && locked->health > 0.0f) {
             FVector3 tgt{};
             float distSq = 0.0f, aimPitch = 0.0f, aimYaw = 0.0f;
-            if (getTargetPos(locked, tgt) && calcAim(tgt, distSq, aimPitch, aimYaw)) {
-                // 平滑插值
-                float finalPitch = lerpAngle(curPitch, aimPitch, smoothT);
-                float finalYaw   = lerpAngle(curYaw,   aimYaw,   smoothT);
-                writeMemFloat(ctrlRotAddr + 0, finalPitch);
-                writeMemFloat(ctrlRotAddr + 4, finalYaw);
-                m_lastAimbotWriteMs = nowMs;
+            if (getTargetPos(locked, tgt)) {
+                // 弹道物理预测: 补偿子弹飞行时间内的重力下坠和目标移动
+                FVector3 targetVel = getTargetVelocity(locked->characterPtr);
+                WeaponBulletParams wp = getLocalWeaponBulletParams();
+                FVector3 predicted = predictBallisticAimPoint({camX, camY, camZ}, tgt, targetVel, wp);
+                if (calcAim(predicted, distSq, aimPitch, aimYaw)) {
+                    // 平滑插值
+                    float finalPitch = lerpAngle(curPitch, aimPitch, smoothT);
+                    float finalYaw   = lerpAngle(curYaw,   aimYaw,   smoothT);
+                    writeMemFloat(ctrlRotAddr + 0, finalPitch);
+                    writeMemFloat(ctrlRotAddr + 4, finalYaw);
+                    m_lastAimbotWriteMs = nowMs;
 
-                static Clock::time_point s_lastLockLog;
-                if (shouldLogEvery(s_lastLockLog, std::chrono::milliseconds(2000))) {
-                    writeAimbotLog("[Aimbot] Tracking key=%u hp=%.0f dist=%.0fm",
-                        m_aimbotLockedKey, locked->health, std::sqrt(distSq) / 100.0f);
+                    static Clock::time_point s_lastLockLog;
+                    if (shouldLogEvery(s_lastLockLog, std::chrono::milliseconds(2000))) {
+                        writeAimbotLog("[Aimbot] Tracking key=%u hp=%.0f dist=%.0fm ballistic=(%.1f,%.1f,%.1f)",
+                            m_aimbotLockedKey, locked->health, std::sqrt(distSq) / 100.0f,
+                            predicted.x - tgt.x, predicted.y - tgt.y, predicted.z - tgt.z);
+                    }
+                    return;
                 }
-                return;
             }
         }
         // 锁定失效
@@ -2163,9 +2434,9 @@ void MatchMonitor::aimAtNearestEnemy() {
         m_aimbotLockedKey = 0;
     }
 
-    // ---- 选择新目标: 200米内血量最少的敌人 ----
-    float bestHP = 1e18f;
-    float bestDistSq = 1e18f;
+    // ---- 选择新目标: 准心最近的敌人 (FOV 角度最小优先, 距离加权) ----
+    // 评分 = 准心角度偏移 + 距离惩罚, 越小越优
+    float bestScore = 1e18f;
     PlayerNode* bestNode = nullptr;
     FVector3 bestTarget{};
 
@@ -2178,9 +2449,15 @@ void MatchMonitor::aimAtNearestEnemy() {
         FVector3 tgt{};
         float distSq = 0.0f, aimPitch = 0.0f, aimYaw = 0.0f;
         if (getTargetPos(cur, tgt) && calcAim(tgt, distSq, aimPitch, aimYaw)) {
-            if (cur->health < bestHP || (cur->health == bestHP && distSq < bestDistSq)) {
-                bestHP = cur->health;
-                bestDistSq = distSq;
+            // 准心偏移角度 (度)
+            const float dPitch = normalizeAngle180(aimPitch - curPitch);
+            const float dYaw   = normalizeAngle180(aimYaw - curYaw);
+            const float angleDeg = std::sqrt(dPitch * dPitch + dYaw * dYaw);
+            // 距离权重: 每100米增加1度等效偏移
+            const float distMeters = std::sqrt(distSq) / 100.0f;
+            const float score = angleDeg + distMeters * 0.01f;
+            if (score < bestScore) {
+                bestScore = score;
                 bestNode = cur;
                 bestTarget = tgt;
             }
@@ -2191,13 +2468,18 @@ void MatchMonitor::aimAtNearestEnemy() {
     if (!bestNode) return;
 
     m_aimbotLockedKey = bestNode->playerKey;
-    writeAimbotLog("[Aimbot] New lock: key=%u name=%s hp=%.0f dist=%.0fm",
+    float lockDistSq = 0.0f, lockPitch = 0.0f, lockYaw = 0.0f;
+    calcAim(bestTarget, lockDistSq, lockPitch, lockYaw);
+    writeAimbotLog("[Aimbot] New lock: key=%u name=%s hp=%.0f dist=%.0fm score=%.1f",
         bestNode->playerKey, bestNode->playerName.c_str(), bestNode->health,
-        std::sqrt(bestDistSq) / 100.0f);
+        std::sqrt(lockDistSq) / 100.0f, bestScore);
 
-    // 首次锁定也用平滑 (不瞬移)
+    // 首次锁定也用平滑 (不瞬移), 应用弹道物理预测
+    FVector3 targetVel = getTargetVelocity(bestNode->characterPtr);
+    WeaponBulletParams wp = getLocalWeaponBulletParams();
+    FVector3 predictedTarget = predictBallisticAimPoint({camX, camY, camZ}, bestTarget, targetVel, wp);
     float aimPitch = 0.0f, aimYaw = 0.0f, distSq = 0.0f;
-    if (calcAim(bestTarget, distSq, aimPitch, aimYaw)) {
+    if (calcAim(predictedTarget, distSq, aimPitch, aimYaw)) {
         float finalPitch = lerpAngle(curPitch, aimPitch, smoothT);
         float finalYaw   = lerpAngle(curYaw,   aimYaw,   smoothT);
         writeMemFloat(ctrlRotAddr + 0, finalPitch);
