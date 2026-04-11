@@ -111,6 +111,16 @@ struct ResolvedOffsets {
     // Controller
     int32_t Ctrl_ControlRotation        = -1;  // FRotator (Pitch, Yaw, Roll)
 
+    // Actor (通用)
+    int32_t Actor_Owner                 = -1;  // AActor::Owner
+
+    // PlayerController (相机相关)
+    int32_t PC_PlayerCameraManager      = -1;  // PlayerController.PlayerCameraManager
+
+    // PlayerCameraManager
+    int32_t PCM_CameraCache             = -1;  // PlayerCameraManager.CameraCache
+    int32_t PCM_DefaultFOV              = -1;  // PlayerCameraManager.DefaultFOV
+
     // Character (UAECharacter / STExtraCharacter / STExtraBaseCharacter)
     int32_t Char_Health                 = -1;
     int32_t Char_HealthMax              = -1;
@@ -119,6 +129,7 @@ struct ResolvedOffsets {
     int32_t Char_PlayerName             = -1;
     int32_t Char_Mesh                   = -1;
     int32_t Char_bDead                  = -1;
+    int32_t Char_bMarkScopeIn           = -1;  // Character.bMarkScopeIn (开镜状态)
     int32_t Char_CurrentNetCullDistSq   = -1;
 
     // STExtraBaseCharacter
@@ -446,6 +457,17 @@ private:
     // Aimbot
     bool          m_aimbotEnabled = true;
     int           m_aimbotTargetBone = 4;  // 默认瞄头 (TRACKED_BONE_COUNT 索引: 4=head)
+    uint32_t      m_aimbotLockedKey = 0;   // 当前锁定目标的 playerKey (0=未锁定)
+    float         m_aimbotSmoothing = 8.0f; // 平滑系数 (越大越平滑, 1=瞬移)
+    uint64_t      m_lastAimbotWriteMs = 0;  // 上次写入 ControlRotation 的时间 (限频)
+
+    // Aimbot 日志
+    FILE*         m_aimbotLogFp = nullptr;
+    std::mutex    m_aimbotLogMutex;
+    void          openAimbotLog();
+    void          writeAimbotLog(const char* fmt, ...);
+    void          closeAimbotLog();
+    bool          isLocalPlayerScoping();  // 读取本地角色 bMarkScopeIn
 
     FILE* m_logFp = nullptr;
     int   m_logLineCount = 0;

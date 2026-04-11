@@ -485,13 +485,31 @@ float UE4Overlay::distance3D(float x1, float y1, float z1, float x2, float y2, f
 //  主绘制入口
 // =====================================================================
 void UE4Overlay::drawOverlay(const DrawGameData& data) {
-    // 确认 ImGui frame 处于活跃状态, 防止从错误线程或 frame 外调用时 assert 崩溃
     ImGuiContext* ctx = ImGui::GetCurrentContext();
     if (!ctx || !ctx->WithinFrameScope) {
         return;
     }
 
-    const DrawGameData renderData = stabilizeRenderData(data);
+    // 数据源存活检测: 超过 5 秒无 pushData 则清除 ESP (游戏进程可能已死)
+    const int64_t staleness = SharedUE4Data::getInstance().msSinceLastPush();
+    const bool dataSourceStale = (staleness > 5000);
+
+    const DrawGameData& inputData = data;
+    DrawGameData staleOverride;
+    const DrawGameData* renderInput = &inputData;
+    if (dataSourceStale && inputData.inMatch) {
+        staleOverride = inputData;
+        staleOverride.inMatch = false;
+        staleOverride.players.clear();
+        staleOverride.aliveCount = 0;
+        renderInput = &staleOverride;
+        static Clock::time_point s_lastStaleLog;
+        if (shouldLogEvery(s_lastStaleLog, std::chrono::milliseconds(3000))) {
+            DLOG(LOG_LEVEL_INFO, "data source stale (%lldms), clearing overlay", (long long)staleness);
+        }
+    }
+
+    const DrawGameData renderData = stabilizeRenderData(*renderInput);
     ImGuiIO& io = ImGui::GetIO();
     float screenW = io.DisplaySize.x;
     float screenH = io.DisplaySize.y;
@@ -589,6 +607,14 @@ void UE4Overlay::drawMenu(const DrawGameData& data) {
         settingsChanged |= ImGui::Checkbox("边缘箭头", &m_enableFallbackESP);
         settingsChanged |= ImGui::Checkbox("玩家列表", &m_enablePlayerList);
         settingsChanged |= ImGui::Checkbox("触点", &m_enableTouchPoint);
+        {
+            bool aimbotOn = m_enableAimbot;
+            if (ImGui::Checkbox("锁定目标 (开镜自瞄)", &aimbotOn)) {
+                m_enableAimbot = aimbotOn;
+                ue4draw::SharedUE4Data::getInstance().setAimbotEnabled(aimbotOn);
+                settingsChanged = true;
+            }
+        }
         ImGui::Separator();
         settingsChanged |= ImGui::SliderFloat("最大距离", &m_espMaxDist, 100.0f, 2000.0f, "%.0f m");
 

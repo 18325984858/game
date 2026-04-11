@@ -79,10 +79,8 @@ std::string resolveUe4GuiTracePath() {
 }
 
 void writeGuiTrace(int priority, const char* fmt, va_list args) {
-    if (!g_runtimeLogEnabled) {
-        return;
-    }
-
+    // GUI 线程日志始终写入文件 (不受 g_runtimeLogEnabled 控制)
+    // 因为 GUI 线程先于 WorkerThread 启动, 此时 g_runtimeLogEnabled 尚未设置
     char message[1024] = {};
     vsnprintf(message, sizeof(message), fmt, args);
 
@@ -652,8 +650,37 @@ static void UE4GuiThread() {
     Clock::time_point lastDisplayRefresh;
     JavaDisplayInfo activeDisplayInfo = displayInfo;
 
+    // 检测游戏目标进程是否存活 (每 2 秒检查一次)
+    auto isGameProcessAlive = []() -> bool {
+        // 检查自身进程的 cmdline 是否还包含游戏包名
+        // 如果进程被 kill, 这个函数不会执行, 但如果是温和退出可以检测到
+        char cmdline[256] = {};
+        int fd = open("/proc/self/cmdline", O_RDONLY);
+        if (fd < 0) return false;
+        ssize_t n = read(fd, cmdline, sizeof(cmdline) - 1);
+        close(fd);
+        if (n <= 0) return false;
+        return strstr(cmdline, "pubgmhd") != nullptr;
+    };
+    Clock::time_point lastAliveCheck;
+
     // 渲染主循环
     while (true) {
+        // 每 2 秒检查游戏进程是否存活, 不存活则发送空帧后退出
+        if (shouldLogEvery(lastAliveCheck, std::chrono::milliseconds(2000))) {
+            if (!isGameProcessAlive()) {
+                GLOG("RenderClient: 游戏进程已退出, 发送空帧清除 overlay");
+                for (int i = 0; i < 3; i++) {
+                    imgui->BeginFrame();
+                    // 不绘制任何内容, 让 overlay 变透明
+                    imgui->EndFrame();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(16));
+                }
+                GLOG("RenderClient: 渲染循环退出");
+                break;
+            }
+        }
+
         imgui->BeginFrame();
 
         if (shouldLogEvery(lastDisplayRefresh, std::chrono::milliseconds(1000))) {
@@ -866,8 +893,11 @@ bool MyStartPointUE4(void* plibUE4ModeBase, void* pGNames,
     uintptr_t base = reinterpret_cast<uintptr_t>(plibUE4ModeBase);
     void* pGWorldGlobal = reinterpret_cast<void*>(base + 0x14988578);
 
-    GLOG("MyStartPointUE4: base=%p GNames=%p GWorldSnapshot=%p GWorldGlobal=%p GUObjectArray=%p moduleSize=0x%llX",
-        plibUE4ModeBase, pGNames, pGWorld, pGWorldGlobal, pGUObjectArray, (unsigned long long)moduleSize);
+    // 在启动任何线程之前读取日志开关, 确保 GUI 线程启动时日志已开启
+    g_runtimeLogEnabled = readLogEnabled();
+
+    GLOG("MyStartPointUE4: base=%p GNames=%p GWorldSnapshot=%p GWorldGlobal=%p GUObjectArray=%p moduleSize=0x%llX log=%d",
+        plibUE4ModeBase, pGNames, pGWorld, pGWorldGlobal, pGUObjectArray, (unsigned long long)moduleSize, g_runtimeLogEnabled ? 1 : 0);
 
     LOG(LOG_LEVEL_INFO, "[MyStartPointUE4] 启动 UE4 工作线程");
 

@@ -4,6 +4,7 @@
 #include <imgui/imgui.h>
 #include <mutex>
 #include <atomic>
+#include <chrono>
 #include <vector>
 #include <array>
 #include <string>
@@ -99,6 +100,7 @@ struct DrawGameData {
 //  赋值时析构正在被 Reader 引用的容器导致堆损坏 (Scudo misaligned ptr)
 // =====================================================================
 class SharedUE4Data {
+    using Clock = std::chrono::steady_clock;
 public:
     static SharedUE4Data& getInstance() {
         static SharedUE4Data instance;
@@ -114,6 +116,7 @@ public:
         m_buffers[writeIdx] = data;
         m_frontIndex = writeIdx;
         m_inMatch.store(data.inMatch, std::memory_order_release);
+        m_lastPushTime.store(Clock::now().time_since_epoch().count(), std::memory_order_release);
     }
 
     /// Reader 端: 拷贝最新数据到 outData (仅 GUI 线程调用)
@@ -122,8 +125,22 @@ public:
         outData = m_buffers[m_frontIndex];
     }
 
+    /// 获取上次 pushData 距今的毫秒数 (用于检测数据源是否存活)
+    int64_t msSinceLastPush() const {
+        auto last = m_lastPushTime.load(std::memory_order_acquire);
+        if (last == 0) return -1;  // 从未推送过
+        auto now = Clock::now().time_since_epoch().count();
+        auto diff = now - last;
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            Clock::duration(diff)).count();
+    }
+
     bool isInMatch() const { return m_inMatch.load(std::memory_order_acquire); }
     void setInMatch(bool v) { m_inMatch.store(v, std::memory_order_release); }
+
+    /// GUI ↔ 后台线程: 自瞄开关 (GUI 线程写, MatchMonitor 线程读)
+    bool isAimbotEnabled() const { return m_aimbotEnabled.load(std::memory_order_acquire); }
+    void setAimbotEnabled(bool v) { m_aimbotEnabled.store(v, std::memory_order_release); }
 
 private:
     SharedUE4Data() = default;
@@ -131,6 +148,8 @@ private:
     std::array<DrawGameData, 2> m_buffers{};
     int m_frontIndex = 0;
     std::atomic<bool> m_inMatch{false};
+    std::atomic<bool> m_aimbotEnabled{true};
+    std::atomic<int64_t> m_lastPushTime{0};  // Clock::duration::count()
 };
 
 // =====================================================================
@@ -154,6 +173,7 @@ private:
     bool m_enableFallbackESP = true;   // 投影失败时绘制屏边箭头
     bool m_enablePlayerList = true;    // 玩家坐标/血量调试面板
     bool m_enableTouchPoint = true;    // 手指按下绘制触点
+    bool m_enableAimbot     = true;     // 自瞄锁定目标
     float m_minimapSize    = 200.0f;   // 小地图大小
     float m_minimapRangeMeters = 180.0f; // 小地图半径对应的现实距离 (米)
     float m_espMaxDist     = 500.0f;   // ESP 最大显示距离 (米)

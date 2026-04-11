@@ -143,8 +143,8 @@ bool safeReadMemory(uintptr_t addr, void* out, size_t size) {
     return true;
 }
 
-// å®‰å…¨å†™å…¥: ä¸Ž safeReadMemory åŒæ ·çš„ sigsetjmp ä¿æŠ¤
-// å†™å…¥å·²é‡Šæ”¾çš„ Actor å†…å­˜æ—¶æ•èŽ· SIGSEGV/SIGBUS è€Œéžå´©æºƒ
+// 安全写入: 与 safeReadMemory 同样的 sigsetjmp 保护
+// 写入已释放的 Actor 内存时捕获 SIGSEGV/SIGBUS 而非崩溃
 bool safeWriteMemory(uintptr_t addr, const void* src, size_t size) {
     if (src == nullptr || size == 0 || addr < 0x10000) {
         return false;
@@ -363,7 +363,7 @@ bool shouldLogEvery(Clock::time_point& lastLogTime, std::chrono::milliseconds in
 }
 
 // =====================================================================
-//  è§‚æˆ˜ç±»åž‹åç§°
+//  观战类型名称
 // =====================================================================
 const char* observerTypeName(EObserverType type) {
     switch (type) {
@@ -377,7 +377,7 @@ const char* observerTypeName(EObserverType type) {
 }
 
 // =====================================================================
-//  PlayerList å®žçŽ°
+//  PlayerList 实现
 // =====================================================================
 PlayerList::~PlayerList() { clear(); }
 
@@ -451,14 +451,14 @@ void PlayerList::remove(uint32_t playerKey) {
 }
 
 // =====================================================================
-//  ResolvedOffsets::isValid æ£€æŸ¥å…³é”®åç§»æ˜¯å¦éƒ½å·²è§£
+//  ResolvedOffsets::isValid 检查关键偏移是否都已解
 // =====================================================================
 bool ResolvedOffsets::isValid() const {
-    // æ ¸å¿ƒåç§»: æ²¡æœ‰è¿™äº›å°±æ— æ³•è¿è¡Œ
+    // 核心偏移: 没有这些就无法运行
     bool core = World_GameState >= 0
              && GS_PlayerArray >= 0
              && Actor_RootComponent >= 0;
-    // çŽ©å®¶æ•°æ®: æ²¡æœ‰è¿™äº›å°±æ— æ³•é‡‡é›†çŽ©å®¶ä¿¡æ¯
+    // 玩家数据: 没有这些就无法采集玩家信息
     bool player = PS_PlayerKey >= 0
                && PS_TeamID >= 0
                && Char_Health >= 0
@@ -467,17 +467,17 @@ bool ResolvedOffsets::isValid() const {
 }
 
 // =====================================================================
-//  initOffsets é€šè¿‡ UE4Interface åŠ¨æ€æŸ¥æ‰¾æ‰€æœ‰æ¸¸æˆå
+//  initOffsets 通过 UE4Interface 动态查找所有游戏偏
 // =====================================================================
-// è¾…åŠ©: æŸ¥æ‰¾åç§», å¤±è´¥æ—¶æ‰“å°è­¦å‘Š
+// 辅助: 查找偏移, 失败时打印警告
 #define RESOLVE_OFFSET(target, className, fieldName) do { \
     int32_t _off = m_interface.getFieldOffsetInHierarchy(className, fieldName); \
     if (_off >= 0) { target = _off; \
         LOG(LOG_LEVEL_INFO, "[InitOffsets] %s.%s = 0x%X", className, fieldName, _off); } \
-    else { LOG(LOG_LEVEL_WARN, "[InitOffsets] æœªæ‰¾åˆ° %s.%s", className, fieldName); } \
+    else { LOG(LOG_LEVEL_WARN, "[InitOffsets] 未找到 %s.%s", className, fieldName); } \
 } while(0)
 
-// è¾…åŠ©: å°è¯•å¤šä¸ªç±»åæŸ¥æ‰¾åŒä¸€å­—æ®µ, æ²¿ç»§æ‰¿é“¾æœç´¢ (ç¬¬ä¸€ä¸ªåŒ¹é…å³è¿”å›ž)
+// 辅助: 尝试多个类名查找同一字段, 沿继承链搜索 (第一个匹配即返回)
 #define RESOLVE_OFFSET_MULTI(target, fieldName, ...) do { \
     const char* _classes[] = { __VA_ARGS__ }; \
     std::string _owner; \
@@ -487,7 +487,7 @@ bool ResolvedOffsets::isValid() const {
             LOG(LOG_LEVEL_INFO, "[InitOffsets] %s.%s = 0x%X (via %s)", _cn, fieldName, _fi->offset, _owner.c_str()); \
             break; } \
     } \
-    if (target < 0) { LOG(LOG_LEVEL_WARN, "[InitOffsets] æœªæ‰¾åˆ° %s (å°è¯•äº† %zu ä¸ªç±»+ç»§æ‰¿é“¾)", fieldName, sizeof(_classes)/sizeof(_classes[0])); } \
+    if (target < 0) { LOG(LOG_LEVEL_WARN, "[InitOffsets] 未找到 %s (尝试了 %zu 个类+继承链)", fieldName, sizeof(_classes)/sizeof(_classes[0])); } \
 } while(0)
 
 uintptr_t resolveWeakObjectPtr(uintptr_t guObjectArrayPtr, uintptr_t weakPtrAddr) {
@@ -552,19 +552,19 @@ uintptr_t resolveWeakObjectPtr(uintptr_t guObjectArrayPtr, uintptr_t weakPtrAddr
 }
 
 bool MatchMonitor::initOffsets() {
-    LOG(LOG_LEVEL_INFO, "[InitOffsets] å¼€å§‹é€šè¿‡åå°„è§£æžåç§»...");
+    LOG(LOG_LEVEL_INFO, "[InitOffsets] 开始通过反射解析偏移...");
 
     // UWorld
     RESOLVE_OFFSET(m_off.World_GameState,         "World", "GameState");
     RESOLVE_OFFSET(m_off.World_AuthorityGameMode,  "World", "AuthorityGameMode");
 
-    // GameState / GameStateBase â€” MatchState å£°æ˜Žåœ¨ GameState è€Œéž GameStateBase
+    // GameState / GameStateBase — MatchState 声明在 GameState 而非 GameStateBase
     RESOLVE_OFFSET_MULTI(m_off.GS_MatchState,      "MatchState",         "GameState", "GameStateBase", "UAEGameState");
     RESOLVE_OFFSET_MULTI(m_off.GS_bHasBegunPlay,   "bHasBegunPlay",      "GameStateBase", "GameState", "UAEGameState");
     RESOLVE_OFFSET_MULTI(m_off.GS_ElapsedTime,     "ElapsedTime",        "GameStateBase", "GameState", "UAEGameState");
     RESOLVE_OFFSET_MULTI(m_off.GS_PlayerArray,     "PlayerArray",        "GameStateBase", "GameState", "UAEGameState");
 
-    // UAEGameState â€” å­—æ®µå¯èƒ½åœ¨çˆ¶ç±»æˆ–å­ç±»ä¸Š
+    // UAEGameState — 字段可能在父类或子类上
     RESOLVE_OFFSET_MULTI(m_off.GS_PlayerNum,       "PlayerNum",          "UAEGameState", "GameState", "STExtraGameState");
     RESOLVE_OFFSET_MULTI(m_off.GS_TotalPlayerNum,  "TotalPlayerNum",     "UAEGameState", "GameState", "STExtraGameState");
     RESOLVE_OFFSET_MULTI(m_off.GS_GameType,        "GameType",           "UAEGameState", "GameState", "STExtraGameState");
@@ -591,8 +591,8 @@ bool MatchMonitor::initOffsets() {
     RESOLVE_OFFSET(m_off.Actor_RootComponent,     "Actor", "RootComponent");
     RESOLVE_OFFSET_MULTI(m_off.Actor_NetCullDistSq, "NetCullDistanceSquared", "Actor", "Character", "Pawn");
 
-    // SceneComponent â€” ä½¿ç”¨ ComponentToWorld.Translation (ä¸–ç•Œåæ ‡, éž RelativeLocation)
-    // ComponentToWorld æ˜¯ FTransform, Translation åœ¨ FTransform+0x10
+    // SceneComponent — 使用 ComponentToWorld.Translation (世界坐标, 非 RelativeLocation)
+    // ComponentToWorld 是 FTransform, Translation 在 FTransform+0x10
     {
         int32_t ctw = m_interface.getFieldOffsetInHierarchy("SceneComponent", "ComponentToWorld");
         if (ctw >= 0) {
@@ -600,7 +600,7 @@ bool MatchMonitor::initOffsets() {
             m_off.SceneComp_Translation = ctw + 0x10; // FTransform.Translation offset
             LOG(LOG_LEVEL_INFO, "[InitOffsets] SceneComponent.ComponentToWorld+0x10 = 0x%X", m_off.SceneComp_Translation);
         } else {
-            LOG(LOG_LEVEL_WARN, "[InitOffsets] ComponentToWorld æœªæ‰¾åˆ°, å›žé€€ 0x200");
+            LOG(LOG_LEVEL_WARN, "[InitOffsets] ComponentToWorld 未找到, 回退 0x200");
             m_off.SceneComp_ComponentToWorld = 0x1F0;
             m_off.SceneComp_Translation = 0x200;
         }
@@ -625,6 +625,9 @@ bool MatchMonitor::initOffsets() {
     RESOLVE_OFFSET_MULTI(m_off.Char_HealthMax,     "HealthMax",          "STExtraCharacter", "UAECharacter", "STExtraBaseCharacter");
     RESOLVE_OFFSET_MULTI(m_off.Char_bDead,         "bDead",              "STExtraCharacter", "UAECharacter", "STExtraBaseCharacter");
 
+    // Character — bMarkScopeIn (开镜状态, 用于自瞄条件判断)
+    RESOLVE_OFFSET_MULTI(m_off.Char_bMarkScopeIn,  "bMarkScopeIn",       "Character", "UAECharacter", "STExtraCharacter", "STExtraBaseCharacter");
+
     // STExtraBaseCharacter
     RESOLVE_OFFSET_MULTI(m_off.Char_CurrentNetCullDistSq, "CurrentNetCullDistanceSquared", "STExtraBaseCharacter", "STExtraCharacter", "UAECharacter");
     RESOLVE_OFFSET_MULTI(m_off.STBase_AvatarComponent, "AvatarComponent", "STExtraBaseCharacter", "STExtraCharacter");
@@ -646,11 +649,12 @@ bool MatchMonitor::initOffsets() {
     RESOLVE_OFFSET_MULTI(m_off.SkeletalMeshAsset_Skeleton, "Skeleton", "SkeletalMesh");
     RESOLVE_OFFSET_MULTI(m_off.Skeleton_RefBoneNames, "RefBoneNames", "Skeleton");
 
-    LOG(LOG_LEVEL_INFO, "[InitOffsets] è§£æžå®Œæˆ, isValid=%d", m_off.isValid());
+    LOG(LOG_LEVEL_INFO, "[InitOffsets] 解析完成, isValid=%d", m_off.isValid());
     LOG(LOG_LEVEL_INFO, "[InitOffsets] World.GameState=0x%X GS.PlayerArray=0x%X PS.PlayerKey=0x%X",
         m_off.World_GameState, m_off.GS_PlayerArray, m_off.PS_PlayerKey);
     LOG(LOG_LEVEL_INFO, "[InitOffsets] Actor.RootComponent=0x%X Char.Health=0x%X Char.HealthMax=0x%X",
         m_off.Actor_RootComponent, m_off.Char_Health, m_off.Char_HealthMax);
+    LOG(LOG_LEVEL_INFO, "[InitOffsets] Char.bMarkScopeIn=0x%X (ADS detection)", m_off.Char_bMarkScopeIn);
 
     return m_off.isValid();
 }
@@ -659,7 +663,7 @@ bool MatchMonitor::initOffsets() {
 #undef RESOLVE_OFFSET_MULTI
 
 // =====================================================================
-//  å®‰å…¨å†…å­˜è¯»å–
+//  安全内存读取
 // =====================================================================
 uintptr_t MatchMonitor::safeReadPtr(uintptr_t addr) {
     uintptr_t val = 0;
@@ -692,14 +696,14 @@ float MatchMonitor::safeReadFloat(uintptr_t addr) {
 }
 
 // =====================================================================
-//  BatchMemReader é™æ€æ¡¥æŽ¥
+//  BatchMemReader 静态桥接
 // =====================================================================
 bool BatchMemReader::safeReadMemoryStatic(uintptr_t addr, void* out, size_t size) {
     return safeReadMemory(addr, out, size);
 }
 
 // =====================================================================
-//  åç§»èŒƒå›´è®¡ç®— â€” ç¡®å®š PlayerState / Character æ‰¹é‡è¯»å–æ‰€éœ€çš„å­—èŠ‚æ•°
+//  偏移范围计算 — 确定 PlayerState / Character 批量读取所需的字节数
 // =====================================================================
 void MatchMonitor::computeBatchReadBounds() {
     auto maxOff = [](std::initializer_list<int32_t> offsets, size_t fieldSize) -> size_t {
@@ -710,7 +714,7 @@ void MatchMonitor::computeBatchReadBounds() {
         return (mx > 0) ? static_cast<size_t>(mx) + fieldSize : 0;
     };
 
-    // PlayerState: åŒ…å«æ‰€æœ‰ PS_* åç§»ä¸­æœ€å¤§å€¼ + padding
+    // PlayerState: 包含所有 PS_* 偏移中最大值 + padding
     m_psReadSize = maxOff({
         m_off.PS_PlayerKey, m_off.PS_TeamID, m_off.PS_bAIPlayer,
         m_off.PS_LiveState, m_off.PS_PlayerHealth, m_off.PS_PlayerHealthMax,
@@ -718,7 +722,7 @@ void MatchMonitor::computeBatchReadBounds() {
         m_off.PS_SelfLocAndRot >= 0 ? m_off.PS_SelfLocAndRot + 12 : 0  // FVector3 = 12 bytes
     }, 8);  // 8 bytes for pointer fields
 
-    // Character: åŒ…å«æ‰€æœ‰ Char_* åç§» + Actor_RootComponent
+    // Character: 包含所有 Char_* 偏移 + Actor_RootComponent
     m_charReadSize = maxOff({
         m_off.Char_Health, m_off.Char_HealthMax, m_off.Char_bDead,
         m_off.Char_PlayerKey, m_off.Char_TeamID,
@@ -726,14 +730,14 @@ void MatchMonitor::computeBatchReadBounds() {
         m_off.Char_CurrentNetCullDistSq
     }, 8);
 
-    // BatchMemReader::read() ä¼šè‡ªåŠ¨å°†è¶…å‡º kMaxBatchSize çš„éƒ¨åˆ†æˆªæ–­,
-    // get() å¯¹æœªå‘½ä¸­ç¼“å†²çš„å­—æ®µè‡ªåŠ¨å›žé€€åˆ°å•ç‹¬è¯»å–, æ— éœ€åœ¨æ­¤ clamp
-    LOG(LOG_LEVEL_INFO, "[BatchRead] PS æ‰¹é‡è¯»å–èŒƒå›´: %zu bytes (buf=%zu), Char æ‰¹é‡è¯»å–èŒƒå›´: %zu bytes (buf=%zu)",
+    // BatchMemReader::read() 会自动将超出 kMaxBatchSize 的部分截断,
+    // get() 对未命中缓冲的字段自动回退到单独读取, 无需在此 clamp
+    LOG(LOG_LEVEL_INFO, "[BatchRead] PS 批量读取范围: %zu bytes (buf=%zu), Char 批量读取范围: %zu bytes (buf=%zu)",
         m_psReadSize, BatchMemReader::kMaxBatchSize, m_charReadSize, BatchMemReader::kMaxBatchSize);
 }
 
 // =====================================================================
-//  å®‰å…¨å†…å­˜å†™å…¥ (ä¿¡å·ä¿æŠ¤, é˜²æ­¢å†™å…¥å·²é‡Šæ”¾å†…å­˜æ—¶å´©æºƒ)
+//  安全内存写入 (信号保护, 防止写入已释放内存时崩溃)
 // =====================================================================
 bool MatchMonitor::writeMemU8(uintptr_t addr, uint8_t val) {
     if (addr == 0) return false;
@@ -746,23 +750,23 @@ bool MatchMonitor::writeMemFloat(uintptr_t addr, float val) {
 }
 
 // =====================================================================
-//  FName è§£æž
+//  FName 解析
 // =====================================================================
 std::string MatchMonitor::getNameByIndex(int index) {
     auto it = m_nameCache.find(index);
     if (it != m_nameCache.end()) return it->second;
     if (index < 0 || index >= m_numNames) return "";
 
-    // é€šè¿‡ safeRead è®¿é—® GNames æ•°ç»„, é¿å…æ¸¸æˆé‡åˆ†é…æ—¶è£¸è§£å¼•ç”¨å´©æºƒ
+    // 通过 safeRead 访问 GNames 数组, 避免游戏重分配时裸解引用崩溃
     uintptr_t namesBase = m_gNames;
     int ci = index / ue4::NAMES_ELEMENTS_PER_CHUNK;
     int wi = index % ue4::NAMES_ELEMENTS_PER_CHUNK;
 
-    // Chunks[ci] æ˜¯æŒ‡é’ˆæ•°ç»„, æ¯ä¸ªå…ƒç´  8 å­—èŠ‚
+    // Chunks[ci] 是指针数组, 每个元素 8 字节
     uintptr_t chkPtr = safeReadPtr(namesBase + static_cast<uintptr_t>(ci) * 8);
     if (chkPtr == 0 || chkPtr < 0x10000) return "";
 
-    // chk[wi] æ˜¯ FNameEntry* æ•°ç»„
+    // chk[wi] 是 FNameEntry* 数组
     uintptr_t entryPtr = safeReadPtr(chkPtr + static_cast<uintptr_t>(wi) * 8);
     if (entryPtr == 0 || entryPtr < 0x10000) return "";
 
@@ -772,7 +776,7 @@ std::string MatchMonitor::getNameByIndex(int index) {
 
     std::string name;
     if (!isWide) {
-        // è¯»å– ANSI å­—ç¬¦ä¸² (entryPtr + 0x0C)
+        // 读取 ANSI 字符串 (entryPtr + 0x0C)
         char buf[256] = {};
         safeReadMemory(entryPtr + 0x0C, buf, sizeof(buf) - 1);
         buf[sizeof(buf) - 1] = '\0';
@@ -815,14 +819,14 @@ std::string MatchMonitor::readClassName(uintptr_t objPtr) {
 }
 
 // =====================================================================
-//  FString è¯»å– (UE4 Android: UTF-16LE -> UTF-8)
+//  FString 读取 (UE4 Android: UTF-16LE -> UTF-8)
 // =====================================================================
 std::string MatchMonitor::readFString(uintptr_t addr) {
     uintptr_t dataPtr = safeReadPtr(addr);
     int32_t num = safeReadS32(addr + 8);
     if (dataPtr == 0 || num <= 0 || num > 256) return "";
 
-    // ä¸€æ¬¡æ€§å®‰å…¨è¯»å–æ•´ä¸ª UTF-16 ç¼“å†²åŒº, é¿å…è£¸è§£å¼•ç”¨å´©æºƒ
+    // 一次性安全读取整个 UTF-16 缓冲区, 避免裸解引用崩溃
     const size_t byteLen = static_cast<size_t>(num) * 2;
     uint16_t buf[256] = {};
     if (!safeReadMemory(dataPtr, buf, byteLen)) return "";
@@ -846,7 +850,7 @@ std::string MatchMonitor::readFString(uintptr_t addr) {
 }
 
 // =====================================================================
-//  å¯¹å±€çŠ¶æ€è¯»
+//  对局状态读
 // =====================================================================
 MatchState MatchMonitor::getMatchState() {
     MatchState ms;
@@ -873,7 +877,7 @@ MatchState MatchMonitor::getMatchState() {
         }
     }
 
-    // åˆ¤æ–­æ˜¯å¦åœ¨å¯¹å±€: æŽ’é™¤å¤§åŽ…/UI åœ°å›¾
+    // 判断是否在对局: 排除大厅/UI 地图
     ms.inMatch = ms.worldName.find("Editor_login") == std::string::npos
               && ms.worldName.find("UImap") == std::string::npos
               && ms.worldName.find("Lobby") == std::string::npos
@@ -884,7 +888,7 @@ MatchState MatchMonitor::getMatchState() {
 }
 
 // =====================================================================
-//  Actor ä½ç½®è¯»å–
+//  Actor 位置读取
 // =====================================================================
 bool MatchMonitor::getActorLocation(uintptr_t actorPtr, FVector3& outLoc) {
     if (actorPtr == 0) return false;
@@ -900,7 +904,7 @@ bool MatchMonitor::getActorLocation(uintptr_t actorPtr, FVector3& outLoc) {
     return true;
 }
 
-// ä»Ž FName æ•°ç»„åŒ¹é…éª¨éª¼ç´¢å¼•
+// 从 FName 数组匹配骨骼索引
 int MatchMonitor::matchBoneNamesFromFNameArray(uintptr_t dataPtr, int count, BoneAssetCacheEntry& entry) {
     entry.trackedBoneIndices.fill(-1);
     entry.matchedCount = 0;
@@ -930,7 +934,7 @@ int MatchMonitor::matchBoneNamesFromFNameArray(uintptr_t dataPtr, int count, Bon
     return entry.matchedCount;
 }
 
-// ä»Ž FMeshBoneInfo æ•°ç»„ (strideå­—èŠ‚, FNameåœ¨åç§»0) åŒ¹é…éª¨éª¼ç´¢å¼•
+// 从 FMeshBoneInfo 数组 (stride字节, FName在偏移0) 匹配骨骼索引
 int MatchMonitor::matchBoneNamesFromBoneInfoArray(uintptr_t dataPtr, int count, int stride, BoneAssetCacheEntry& entry) {
     entry.trackedBoneIndices.fill(-1);
     entry.matchedCount = 0;
@@ -974,7 +978,7 @@ bool MatchMonitor::resolveTrackedBoneIndices(uintptr_t skeletalMeshAssetPtr, Bon
     BoneAssetCacheEntry entry;
     entry.trackedBoneIndices.fill(-1);
 
-    // æ–¹æ³•1: SkeletalMesh+0x238 FReferenceSkeleton (å…¨èº«éª¨éª¼, stride=16)
+    // 方法1: SkeletalMesh+0x238 FReferenceSkeleton (全身骨骼, stride=16)
     constexpr uintptr_t kRefBoneInfoOffset = 0x238;
     const uintptr_t boneInfoData = safeReadPtr(skeletalMeshAssetPtr + kRefBoneInfoOffset);
     const int32_t boneInfoNum = safeReadS32(skeletalMeshAssetPtr + kRefBoneInfoOffset + 8);
@@ -985,13 +989,13 @@ bool MatchMonitor::resolveTrackedBoneIndices(uintptr_t skeletalMeshAssetPtr, Bon
             outEntry = entry;
             return true;
         }
-        // stride=16 ä¸å¤Ÿ, è¯• stride=8 (çº¯ FName æ•°ç»„)
+        // stride=16 不够, 试 stride=8 (纯 FName 数组)
         BoneAssetCacheEntry trial;
         if (matchBoneNamesFromFNameArray(boneInfoData, boneInfoNum, trial) > entry.matchedCount)
             entry = trial;
     }
 
-    // æ–¹æ³•2: Skeleton â†’ RefBoneNames
+    // 方法2: Skeleton → RefBoneNames
     const int32_t skelOff = (m_off.SkeletalMeshAsset_Skeleton >= 0) ? m_off.SkeletalMeshAsset_Skeleton : 0x48;
     const int32_t refOff = (m_off.Skeleton_RefBoneNames >= 0) ? m_off.Skeleton_RefBoneNames : 0x280;
     const uintptr_t skeletonPtr = safeReadPtr(skeletalMeshAssetPtr + skelOff);
@@ -1012,14 +1016,14 @@ bool MatchMonitor::resolveTrackedBoneIndices(uintptr_t skeletalMeshAssetPtr, Bon
 }
 
 // =====================================================================
-//  fillPlayerSkeleton â€” å¡«å……çŽ©å®¶éª¨éª¼ä¸–ç•Œåæ ‡
+//  fillPlayerSkeleton — 填充玩家骨骼世界坐标
 //
-//  æµç¨‹: æ”¶é›†å€™é€‰ç»„ä»¶ â†’ é€‰æœ€å¤š transforms çš„ â†’ åŒ¹é…éª¨éª¼å â†’ åæ ‡å˜æ¢
+//  流程: 收集候选组件 → 选最多 transforms 的 → 匹配骨骼名 → 坐标变换
 // =====================================================================
 bool MatchMonitor::fillPlayerSkeleton(uintptr_t characterPtr, ue4draw::DrawPlayerInfo& outPlayer) {
     static Clock::time_point s_lastSkeletonLogTime;
 
-    // dump.cs é™æ€åç§» (åå°„å¤±è´¥æ—¶çš„å›žé€€)
+    // dump.cs 静态偏移 (反射失败时的回退)
     constexpr int32_t kFB_Char_Mesh         = 0x650;
     constexpr int32_t kFB_ComponentToWorld   = 0x1F0;
     constexpr int32_t kFB_SkeletalMesh       = 0x7F0;
@@ -1059,7 +1063,7 @@ bool MatchMonitor::fillPlayerSkeleton(uintptr_t characterPtr, ue4draw::DrawPlaye
     const int32_t oAvatar    = off(m_off.STBase_AvatarComponent, kFB_AvatarComp);
     const int32_t oMasterB   = off(m_off.Avatar_MasterBoneComponent, kFB_MasterBone);
 
-    // ---- è¾…åŠ© ----
+    // ---- 辅助 ----
     auto readTransformArray = [&](uintptr_t comp, ue4::TArray<RemoteTransform>& out) -> bool {
         if (comp < 0x10000) return false;
         if (safeReadMemory(comp + oCached, &out, sizeof(out)) && isUsableRemoteArray(out, kMaxBoneNameCount))
@@ -1079,7 +1083,7 @@ bool MatchMonitor::fillPlayerSkeleton(uintptr_t characterPtr, ue4draw::DrawPlaye
         return comp;
     };
 
-    // ---- æ”¶é›†å€™é€‰ç»„ä»¶ ----
+    // ---- 收集候选组件 ----
     struct Candidate { uintptr_t comp; int count; };
     std::vector<Candidate> candidates;
     candidates.reserve(12);
@@ -1092,13 +1096,13 @@ bool MatchMonitor::fillPlayerSkeleton(uintptr_t characterPtr, ue4draw::DrawPlaye
         candidates.push_back({comp, n});
     };
 
-    // 1. Character.Mesh + MasterPose é“¾
+    // 1. Character.Mesh + MasterPose 链
     const uintptr_t charMesh = safeReadPtr(characterPtr + oMesh);
     tryAdd(charMesh);
     uintptr_t masterRoot = followMasterPose(charMesh);
     if (masterRoot != charMesh) tryAdd(masterRoot);
 
-    // 2. AvatarComponent â†’ MasterBoneComponent + meshComponentList + SkelPool
+    // 2. AvatarComponent → MasterBoneComponent + meshComponentList + SkelPool
     const uintptr_t avatar = safeReadPtr(characterPtr + oAvatar);
     if (avatar >= 0x10000) {
         uintptr_t masterBone = safeReadPtr(avatar + oMasterB);
@@ -1136,7 +1140,7 @@ bool MatchMonitor::fillPlayerSkeleton(uintptr_t characterPtr, ue4draw::DrawPlaye
         }
     }
 
-    // 3. FPPComp â†’ _AvatarComp â†’ MasterBone
+    // 3. FPPComp → _AvatarComp → MasterBone
     const uintptr_t fpp = safeReadPtr(characterPtr + off(m_off.STBase_FPPComp, kFB_FPPComp));
     if (fpp >= 0x10000) {
         int32_t fppAvatarOff = kFB_FPPAvatar;
@@ -1153,11 +1157,11 @@ bool MatchMonitor::fillPlayerSkeleton(uintptr_t characterPtr, ue4draw::DrawPlaye
 
     if (candidates.empty()) return false;
 
-    // ---- æŒ‰ transformCount é™åº ----
+    // ---- 按 transformCount 降序 ----
     std::sort(candidates.begin(), candidates.end(),
               [](const Candidate& a, const Candidate& b) { return a.count > b.count; });
 
-    // ---- æ”¶é›† SkeletalMesh èµ„äº§ ----
+    // ---- 收集 SkeletalMesh 资产 ----
     std::vector<uintptr_t> assets;
     assets.reserve(candidates.size() + 2);
     auto addAsset = [&](uintptr_t ptr) {
@@ -1168,7 +1172,7 @@ bool MatchMonitor::fillPlayerSkeleton(uintptr_t characterPtr, ue4draw::DrawPlaye
     addAsset(safeReadPtr(characterPtr + off(m_off.STBase_DefaultCharacterMesh, kFB_DefaultMesh)));
     addAsset(safeReadPtr(characterPtr + off(m_off.STBase_LastSkeletalMesh, kFB_LastSkelMesh)));
 
-    // ---- åŒ¹é…: æ‰¾æœ€ä¼˜ (ç»„ä»¶ Ã— èµ„äº§) ----
+    // ---- 匹配: 找最优 (组件 × 资产) ----
     // ---- 匹配并一次性拷贝骨骼变换到栈缓冲 (避免 TOCTOU 竞争) ----
     static constexpr int kMaxTransformSlots = 256;
     RemoteTransform localTransforms[kMaxTransformSlots];
@@ -1208,7 +1212,7 @@ bool MatchMonitor::fillPlayerSkeleton(uintptr_t characterPtr, ue4draw::DrawPlaye
         return false;
     }
 
-    // ---- è¯»å–éª¨éª¼å˜æ¢ â†’ ä¸–ç•Œåæ ‡ ----
+    // ---- 读取骨骼变换 → 世界坐标 ----
     int resolved = 0;
     const float rootX = outPlayer.posX, rootY = outPlayer.posY, rootZ = outPlayer.posZ;
     for (size_t slot = 0; slot < TRACKED_BONE_COUNT; ++slot) {
@@ -1234,7 +1238,7 @@ bool MatchMonitor::fillPlayerSkeleton(uintptr_t characterPtr, ue4draw::DrawPlaye
 }
 
 // =====================================================================
-//  ç±»ç»§æ‰¿é“¾æ£€
+//  类继承链检
 // =====================================================================
 bool MatchMonitor::isSubclassOf(uintptr_t classPtr, const char* targetName) {
     uintptr_t currentPtr = classPtr;
@@ -1250,7 +1254,7 @@ bool MatchMonitor::isSubclassOf(uintptr_t classPtr, const char* targetName) {
 
 
 // =====================================================================
-//  è§‚æˆ˜ç±»åž‹æ£€
+//  观战类型检
 // =====================================================================
 uintptr_t MatchMonitor::getLocalPlayerController() {
     uintptr_t worldPtr = safeReadPtr(m_gWorld);
@@ -1261,7 +1265,7 @@ uintptr_t MatchMonitor::getLocalPlayerController() {
     uintptr_t arrayData = safeReadPtr(gsPtr + m_off.GS_PlayerArray);
     int32_t arrayNum = safeReadS32(gsPtr + m_off.GS_PlayerArray + 8);
     if (arrayData == 0 || arrayNum <= 0) return 0;
-    uintptr_t psPtr = safeReadPtr(arrayData); // PlayerArray[0] = æœ¬åœ°çŽ©å®¶ PlayerState
+    uintptr_t psPtr = safeReadPtr(arrayData); // PlayerArray[0] = 本地玩家 PlayerState
     if (psPtr == 0) return 0;
     return safeReadPtr(psPtr + 0x98); // AActor::Owner = PlayerController
 }
@@ -1269,7 +1273,7 @@ uintptr_t MatchMonitor::getLocalPlayerController() {
 EObserverType MatchMonitor::detectObserverType() {
     uintptr_t pc = getLocalPlayerController();
     if (pc == 0) {
-        LOG(LOG_LEVEL_INFO, "æ— æ³•èŽ·å–æœ¬åœ° PlayerController");
+        LOG(LOG_LEVEL_INFO, "无法获取本地 PlayerController");
         return EObserverType::None;
     }
     bool bIsObserver = safeReadU8(pc + m_off.PC_bIsObserver) != 0;
@@ -1296,7 +1300,7 @@ EObserverType MatchMonitor::detectObserverType() {
 bool MatchMonitor::setObserverType(EObserverType type) {
     uintptr_t pc = getLocalPlayerController();
     if (pc == 0) {
-        LOG(LOG_LEVEL_ERROR, "[SetObserver] æ— æ³•èŽ·å– PlayerController");
+        LOG(LOG_LEVEL_ERROR, "[SetObserver] 无法获取 PlayerController");
         return false;
     }
     switch (type) {
@@ -1322,10 +1326,10 @@ bool MatchMonitor::setObserverType(EObserverType type) {
             writeMemU8(pc + m_off.PC_bIsObserverHost, 0);
             break;
         default:
-            LOG(LOG_LEVEL_ERROR, "[SetObserver] æ— æ•ˆç±»åž‹: %d", static_cast<int>(type));
+            LOG(LOG_LEVEL_ERROR, "[SetObserver] 无效类型: %d", static_cast<int>(type));
             return false;
     }
-    LOG(LOG_LEVEL_INFO, "[SetObserver] å·²è®¾ç½®ä¸º EObserverType_%s (%d)",
+    LOG(LOG_LEVEL_INFO, "[SetObserver] 已设置为 EObserverType_%s (%d)",
         observerTypeName(type), static_cast<int>(type));
 
     char logBuf[128];
@@ -1335,11 +1339,11 @@ bool MatchMonitor::setObserverType(EObserverType type) {
 }
 
 // =====================================================================
-//  ç½‘ç»œå¯è§èŒƒå›´ä¿®æ”¹
+//  网络可见范围修改
 // =====================================================================
 void MatchMonitor::patchActorNetCull(uintptr_t actorPtr) {
     if (actorPtr == 0) return;
-    // ä»…åœ¨ InProgress çŠ¶æ€å†™å…¥ NetCullDist, é¿å…åœ¨åŠ è½½/é£žæœº/è·³ä¼žé˜¶æ®µè§¦å‘ç½‘ç»œå¼‚å¸¸æ–­å¼€
+    // 仅在 InProgress 状态写入 NetCullDist, 避免在加载/飞机/跳伞阶段触发网络异常断开
     if (m_currentMatchState != "InProgress") return;
     const uint64_t nowMs = nowMonotonicMs();
     const uint64_t patchIntervalMs = getNetCullPatchIntervalMs(m_currentMatchElapsedSeconds);
@@ -1356,7 +1360,7 @@ void MatchMonitor::patchActorNetCull(uintptr_t actorPtr) {
 }
 
 // =====================================================================
-//  GUObjectArray æ‰«ææ‰€Character
+//  GUObjectArray 扫描所Character
 // =====================================================================
 int MatchMonitor::scanCharacters() {
     const int scanBudget = getCharacterScanBudget(m_currentMatchElapsedSeconds);
@@ -1374,7 +1378,7 @@ int MatchMonitor::scanCharacters() {
         m_lastCharacterScanMs = nowMs;
     }
 
-    // é€šè¿‡ safeRead è®¿é—® GUObjectArray, é¿å…æ¸¸æˆé‡åˆ†é…æ—¶è£¸è§£å¼•ç”¨å´©æºƒ
+    // 通过 safeRead 访问 GUObjectArray, 避免游戏重分配时裸解引用崩溃
     uintptr_t objArrayAddr = m_gUObjectArray;
     // FUObjectArray: NumChunks @ +0xF8, TotalNumElements @ +0x100
     int numChunks = safeReadS32(objArrayAddr + 0xF8);
@@ -1400,9 +1404,9 @@ int MatchMonitor::scanCharacters() {
 
     while (processedItems < scanBudget && visitedChunks < numChunks) {
         const int ci = m_characterScanChunkIndex;
-        // ChunkPtrs @ +0xC8, æ¯ä¸ªæŒ‡é’ˆ 8 å­—èŠ‚
+        // ChunkPtrs @ +0xC8, 每个指针 8 字节
         uintptr_t chunkBase = safeReadPtr(objArrayAddr + 0xC8 + static_cast<uintptr_t>(ci) * 8);
-        // ChunkElementCounts @ +0xE8, æ¯ä¸ª int32 4 å­—èŠ‚
+        // ChunkElementCounts @ +0xE8, 每个 int32 4 字节
         const int chunkCount = safeReadS32(objArrayAddr + 0xE8 + static_cast<uintptr_t>(ci) * 4);
 
         if (chunkBase == 0 || chunkBase < 0x10000 || chunkCount <= 0) {
@@ -1417,12 +1421,12 @@ int MatchMonitor::scanCharacters() {
             wi = 0;
         }
 
-        // FUObjectItem å¤§å° = 24 å­—èŠ‚ (Object* @ +0x00)
+        // FUObjectItem 大小 = 24 字节 (Object* @ +0x00)
         static constexpr size_t kFUObjectItemSize = 24;
         BatchMemReader charBatch;
 
         while (wi < chunkCount && processedItems < scanBudget) {
-            // é€šè¿‡ safeReadPtr è¯»å– FUObjectItem.Object
+            // 通过 safeReadPtr 读取 FUObjectItem.Object
             uintptr_t objPtr = safeReadPtr(chunkBase + static_cast<uintptr_t>(wi) * kFUObjectItemSize);
             processedItems++;
             wi++;
@@ -1439,7 +1443,7 @@ int MatchMonitor::scanCharacters() {
                 if (!isChar) continue;
             }
 
-            // ----- æ‰¹é‡è¯»å– Character (best-effort, get() è‡ªåŠ¨å›žé€€) -----
+            // ----- 批量读取 Character (best-effort, get() 自动回退) -----
             charBatch.read(objPtr, m_charReadSize);
 
             uint32_t playerKey = charBatch.getU32(m_off.Char_PlayerKey);
@@ -1457,7 +1461,7 @@ int MatchMonitor::scanCharacters() {
             std::string playerName = readFString(objPtr + m_off.Char_PlayerName);
 
             FVector3 loc;
-            // ä½ç½®: é€šè¿‡ RootComponent -> SceneComponent èŽ·å–
+            // 位置: 通过 RootComponent -> SceneComponent 获取
             if (m_off.Actor_RootComponent >= 0) {
                 const uintptr_t rootComp = charBatch.getPtr(m_off.Actor_RootComponent);
                 if (rootComp != 0 && m_off.SceneComp_Translation >= 0) {
@@ -1510,13 +1514,13 @@ int MatchMonitor::scanCharacters() {
 }
 
 // =====================================================================
-//  éåŽ† PlayerArray, æ›´æ–°åŒå‘é“¾è¡¨
+//  遍历 PlayerArray, 更新双向链表
 // =====================================================================
 int MatchMonitor::updatePlayerList(uintptr_t gameStatePtr) {
     uintptr_t arrayData = safeReadPtr(gameStatePtr + m_off.GS_PlayerArray);
     int32_t arrayNum = safeReadS32(gameStatePtr + m_off.GS_PlayerArray + 8);
 
-    // è¯»å– GameState çš„å…¨å±€çŽ©å®¶è®¡æ•° (åç§»å¯èƒ½æœªè§£æž, å®‰å…¨æ£€æŸ¥)
+    // 读取 GameState 的全局玩家计数 (偏移可能未解析, 安全检查)
     int32_t totalPlayerNum = m_off.GS_TotalPlayerNum >= 0 ? safeReadS32(gameStatePtr + m_off.GS_TotalPlayerNum) : 0;
     int32_t playerNum = m_off.GS_PlayerNum >= 0 ? safeReadS32(gameStatePtr + m_off.GS_PlayerNum) : 0;
     int32_t aliveNum = m_off.GS_AlivePlayerNum >= 0 ? safeReadS32(gameStatePtr + m_off.GS_AlivePlayerNum) : 0;
@@ -1531,9 +1535,9 @@ int MatchMonitor::updatePlayerList(uintptr_t gameStatePtr) {
 
     if (arrayData == 0 || arrayNum <= 0 || arrayNum > 500) return 0;
 
-    // ----- è¯»å–å…¨éƒ¨ PlayerState æŒ‡é’ˆ -----
-    // åŽ»æŽ‰æ‰¹é‡è¯»å–: TArray æŒ‡é’ˆæ•°ç»„å¯èƒ½è·¨é¡µè¾¹ç•Œå¯¼è‡´æ•´å— memcpy å¤±è´¥,
-    // è€Œé€ä¸ª safeReadPtr å¯ä»¥è·³è¿‡å•ä¸ªæ— æ•ˆæ¡ç›®è€Œä¸ä¸¢å¤±å…¨éƒ¨çŽ©å®¶
+    // ----- 读取全部 PlayerState 指针 -----
+    // 去掉批量读取: TArray 指针数组可能跨页边界导致整块 memcpy 失败,
+    // 而逐个 safeReadPtr 可以跳过单个无效条目而不丢失全部玩家
     std::vector<uintptr_t> psPtrs(static_cast<size_t>(arrayNum), 0);
     for (int i = 0; i < arrayNum; i++) {
         psPtrs[i] = safeReadPtr(arrayData + i * 8);
@@ -1541,17 +1545,17 @@ int MatchMonitor::updatePlayerList(uintptr_t gameStatePtr) {
 
     std::unordered_map<uint32_t, bool> seenKeys;
     int updated = 0;
-    BatchMemReader psBatch;   // å¤ç”¨, é¿å…æ¯æ¬¡å¾ªçŽ¯é‡æ–°æž„é€ 
+    BatchMemReader psBatch;   // 复用, 避免每次循环重新构造
     BatchMemReader charBatch;
 
     for (int i = 0; i < arrayNum; i++) {
         const uintptr_t psPtr = psPtrs[i];
         if (psPtr == 0) continue;
 
-        // ----- æ‰¹é‡è¯»å– PlayerState (best-effort, get() è‡ªåŠ¨å›žé€€) -----
+        // ----- 批量读取 PlayerState (best-effort, get() 自动回退) -----
         psBatch.read(psPtr, m_psReadSize);
 
-        // ä»Žæœ¬åœ°ç¼“å†²æå–å­—æ®µ (å‘½ä¸­ç¼“å†²=é›¶å¼€é”€, æœªå‘½ä¸­=è‡ªåŠ¨å›žé€€åˆ°å•ç‹¬è¯»å–)
+        // 从本地缓冲提取字段 (命中缓冲=零开销, 未命中=自动回退到单独读取)
         const uint32_t playerKey = psBatch.getU32(m_off.PS_PlayerKey);
         if (playerKey == 0) continue;
 
@@ -1561,14 +1565,14 @@ int MatchMonitor::updatePlayerList(uintptr_t gameStatePtr) {
         float health = psBatch.getFloat(m_off.PS_PlayerHealth);
         float healthMax = psBatch.getFloat(m_off.PS_PlayerHealthMax);
         int32_t kills = psBatch.getS32(m_off.PS_Kills);
-        // FString éœ€è¦è·ŸéšæŒ‡é’ˆ, ä»éœ€å•ç‹¬è¯»å–
+        // FString 需要跟随指针, 仍需单独读取
         std::string playerName = readFString(psPtr + m_off.PS_PlayerName);
 
-        // ä¼˜å…ˆé€šè¿‡ CharacterOwner -> RootComponent èŽ·å–ç²¾ç¡®ä½ç½®
+        // 优先通过 CharacterOwner -> RootComponent 获取精确位置
         FVector3 loc;
         const uintptr_t charOwner = psBatch.getPtr(m_off.PS_CharacterOwner);
         if (charOwner != 0) {
-            // ----- æ‰¹é‡è¯»å– Character (best-effort, get() è‡ªåŠ¨å›žé€€) -----
+            // ----- 批量读取 Character (best-effort, get() 自动回退) -----
             charBatch.read(charOwner, m_charReadSize);
 
             if (m_off.Char_Health >= 0) {
@@ -1587,7 +1591,7 @@ int MatchMonitor::updatePlayerList(uintptr_t gameStatePtr) {
                 const bool bDead = (charBatch.getU8(m_off.Char_bDead) & 1) != 0;
                 liveState = bDead ? 1 : 0;
             }
-            // ä½ç½®: é€šè¿‡ RootComponent -> SceneComponent èŽ·å–
+            // 位置: 通过 RootComponent -> SceneComponent 获取
             if (m_off.Actor_RootComponent >= 0) {
                 const uintptr_t rootComp = charBatch.getPtr(m_off.Actor_RootComponent);
                 if (rootComp != 0 && m_off.SceneComp_Translation >= 0) {
@@ -1600,7 +1604,7 @@ int MatchMonitor::updatePlayerList(uintptr_t gameStatePtr) {
             }
             patchActorNetCull(charOwner);
         }
-        // å›žé€€SelfLocAndRot
+        // 回退SelfLocAndRot
         if (loc.x == 0 && loc.y == 0 && loc.z == 0 && m_off.PS_SelfLocAndRot >= 0) {
             loc = psBatch.getVec3(m_off.PS_SelfLocAndRot);
         }
@@ -1622,7 +1626,7 @@ int MatchMonitor::updatePlayerList(uintptr_t gameStatePtr) {
         seenKeys[playerKey] = true;
         updated++;
 
-        // è®°å½•æœ¬åœ°çŽ©å®¶ key / TeamID
+        // 记录本地玩家 key / TeamID
         if (i == 0) {
             if (teamID > 0) {
                 m_myTeamID = teamID;
@@ -1631,7 +1635,7 @@ int MatchMonitor::updatePlayerList(uintptr_t gameStatePtr) {
         }
     }
 
-    // ç§»é™¤å·²é€€å‡ºçš„çŽ©å®¶
+    // 移除已退出的玩家
     std::vector<uint32_t> toRemove;
     PlayerNode* cur = m_playerList.head();
     while (cur) {
@@ -1647,7 +1651,7 @@ int MatchMonitor::updatePlayerList(uintptr_t gameStatePtr) {
     }
     for (uint32_t key : toRemove) m_playerList.remove(key);
 
-    // æ‰«æ GUObjectArray èŽ·å–é™„è¿‘çš„ Character (åŒ…æ‹¬æ•Œäºº)ï¼Œæ”¹ä¸ºè·¨å¤šæ¬¡è½®è¯¢çš„åˆ†ç‰‡æ‰«æã€‚
+    // 扫描 GUObjectArray 获取附近的 Character (包括敌人)，改为跨多次轮询的分片扫描。
     scanCharacters();
 
     return updated;
@@ -1760,120 +1764,245 @@ void MatchMonitor::fillCameraSnapshot(ue4draw::DrawGameData& drawData) {
 }
 
 // =====================================================================
-//  自瞄 — 计算最近敌人方向并写入 ControlRotation
+//  Aimbot 日志 — 写入独立文件方便排查
+// =====================================================================
+void MatchMonitor::openAimbotLog() {
+    std::lock_guard<std::mutex> lock(m_aimbotLogMutex);
+    if (m_aimbotLogFp) return;
+    mkdir(m_logDir.c_str(), 0777);
+    std::string path = m_logDir + "aimbot_log.txt";
+    m_aimbotLogFp = fopen(path.c_str(), "a");
+    if (m_aimbotLogFp) {
+        fprintf(m_aimbotLogFp, "=== Aimbot Log Start ===\n");
+        fflush(m_aimbotLogFp);
+    }
+}
+
+void MatchMonitor::writeAimbotLog(const char* fmt, ...) {
+    std::lock_guard<std::mutex> lock(m_aimbotLogMutex);
+    if (!m_aimbotLogFp) return;
+    auto now = Clock::now();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+    fprintf(m_aimbotLogFp, "[%lld] ", static_cast<long long>(ms));
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(m_aimbotLogFp, fmt, args);
+    va_end(args);
+    fprintf(m_aimbotLogFp, "\n");
+    fflush(m_aimbotLogFp);
+}
+
+void MatchMonitor::closeAimbotLog() {
+    std::lock_guard<std::mutex> lock(m_aimbotLogMutex);
+    if (m_aimbotLogFp) {
+        fprintf(m_aimbotLogFp, "=== Aimbot Log End ===\n");
+        fclose(m_aimbotLogFp);
+        m_aimbotLogFp = nullptr;
+    }
+}
+
+// =====================================================================
+//  开镜检测 — 读取本地角色的 bMarkScopeIn
+// =====================================================================
+bool MatchMonitor::isLocalPlayerScoping() {
+    if (m_off.Char_bMarkScopeIn < 0) return false;
+    PlayerNode* myNode = (m_myPlayerKey != 0) ? m_playerList.findByKey(m_myPlayerKey) : nullptr;
+    if (!myNode) myNode = m_playerList.head();
+    if (!myNode || myNode->characterPtr == 0) return false;
+    uint8_t scopeVal = safeReadU8(myNode->characterPtr + static_cast<uintptr_t>(m_off.Char_bMarkScopeIn));
+    return scopeVal != 0;
+}
+
+// =====================================================================
+//  角度工具
+// =====================================================================
+namespace {
+float normalizeAngle180(float a) {
+    a = std::fmod(a + 180.0f, 360.0f);
+    if (a < 0.0f) a += 360.0f;
+    return a - 180.0f;
+}
+float lerpAngle(float from, float to, float t) {
+    float diff = normalizeAngle180(to - from);
+    return from + diff * t;
+}
+} // anonymous namespace
+
+// =====================================================================
+//  自瞄 — 开镜时锁定200米内血量最少的敌人直至死亡
+//
+//  修复:
+//    - 角度平滑插值, 防止瞬间跳转导致相机抖动
+//    - 限频 30ms 写入一次 ControlRotation, 避免与游戏引擎争抢
+//    - 骨骼数据新鲜度检查 (>2秒视为过期)
+//    - 读取当前 ControlRotation 做差值插值而非直接覆盖
 // =====================================================================
 void MatchMonitor::aimAtNearestEnemy() {
     if (!m_aimbotEnabled) return;
+    // 读取菜单开关 (GUI 线程通过 SharedUE4Data 设置)
+    if (!ue4draw::SharedUE4Data::getInstance().isAimbotEnabled()) {
+        if (m_aimbotLockedKey != 0) {
+            m_aimbotLockedKey = 0;
+        }
+        return;
+    }
     if (m_off.Ctrl_ControlRotation < 0) return;
+
+    if (!m_aimbotLogFp) openAimbotLog();
+
+    // 条件1: 必须开镜
+    const bool scoping = isLocalPlayerScoping();
+    if (!scoping) {
+        if (m_aimbotLockedKey != 0) {
+            writeAimbotLog("[Aimbot] Scope out, clearing locked target key=%u", m_aimbotLockedKey);
+            m_aimbotLockedKey = 0;
+        }
+        return;
+    }
+
+    // 限频: 至少 30ms 写入一次, 防止与引擎争抢
+    const uint64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        Clock::now().time_since_epoch()).count();
+    if (nowMs - m_lastAimbotWriteMs < 30) return;
 
     const uintptr_t pc = getLocalPlayerController();
     if (pc == 0) return;
 
+    // 读取当前 ControlRotation (用于平滑插值)
+    const uintptr_t ctrlRotAddr = pc + static_cast<uintptr_t>(m_off.Ctrl_ControlRotation);
+    const float curPitch = safeReadFloat(ctrlRotAddr + 0);
+    const float curYaw   = safeReadFloat(ctrlRotAddr + 4);
+    if (!std::isfinite(curPitch) || !std::isfinite(curYaw)) return;
+
     // 读取当前相机位置作为射线起点
-    const uintptr_t pcm = safeReadPtr(pc + 0x658);  // PlayerCameraManager
+    const int32_t pcmOff2 = (m_off.PC_PlayerCameraManager >= 0) ? m_off.PC_PlayerCameraManager : 0x658;
+    const uintptr_t pcm = safeReadPtr(pc + pcmOff2);
     if (pcm == 0) return;
 
-    const float camX = safeReadFloat(pcm + 0x650 + 0x0);
-    const float camY = safeReadFloat(pcm + 0x650 + 0x4);
-    const float camZ = safeReadFloat(pcm + 0x650 + 0x8);
+    const int32_t camCacheOff = (m_off.PCM_CameraCache >= 0) ? m_off.PCM_CameraCache : 0x640;
+    const int32_t camPovOff = camCacheOff + 0x10;
+    const float camX = safeReadFloat(pcm + camPovOff + 0x0);
+    const float camY = safeReadFloat(pcm + camPovOff + 0x4);
+    const float camZ = safeReadFloat(pcm + camPovOff + 0x8);
     if (!std::isfinite(camX) || !std::isfinite(camY) || !std::isfinite(camZ)) return;
     if (std::fabs(camX) < 1.0f && std::fabs(camY) < 1.0f && std::fabs(camZ) < 1.0f) return;
 
-    // 找最近的存活敌人 (有有效骨骼数据)
+    constexpr float kMaxDistUU = 20000.0f;                  // 200米
+    constexpr float kMaxDistSq = kMaxDistUU * kMaxDistUU;
+    constexpr float kMinDistSq = 100.0f;
+    constexpr uint64_t kMaxBoneAgeMs = 2000;                 // 骨骼数据有效期
+    const float smoothT = std::clamp(1.0f / m_aimbotSmoothing, 0.05f, 1.0f);
+
     const int boneIdx = m_aimbotTargetBone;  // 4=head
+
+    // ---- 辅助: 从 PlayerNode 获取瞄准坐标 ----
+    auto getTargetPos = [&](const PlayerNode* node, FVector3& outTgt) -> bool {
+        // 优先用骨骼 (检查新鲜度)
+        if (boneIdx >= 0 && boneIdx < static_cast<int>(TRACKED_BONE_COUNT)
+            && (node->cachedBoneMask & (1u << boneIdx)) != 0
+            && (nowMs - node->cachedBoneTimestampMs) < kMaxBoneAgeMs) {
+            const float tx = node->cachedBones[boneIdx].x;
+            const float ty = node->cachedBones[boneIdx].y;
+            const float tz = node->cachedBones[boneIdx].z;
+            if (std::isfinite(tx) && std::isfinite(ty) && std::isfinite(tz)
+                && (std::fabs(tx) > 1.0f || std::fabs(ty) > 1.0f)) {
+                outTgt = {tx, ty, tz};
+                return true;
+            }
+        }
+        // 回退: 角色位置 + 头部高度偏移
+        if (std::isfinite(node->pos.x) && std::isfinite(node->pos.y) && std::isfinite(node->pos.z)
+            && (std::fabs(node->pos.x) > 1.0f || std::fabs(node->pos.y) > 1.0f)) {
+            outTgt = {node->pos.x, node->pos.y, node->pos.z + 60.0f};
+            return true;
+        }
+        return false;
+    };
+
+    // ---- 辅助: 计算到目标的距离平方和方向角 ----
+    auto calcAim = [&](const FVector3& tgt, float& outDistSq, float& outPitch, float& outYaw) -> bool {
+        const float dx = tgt.x - camX, dy = tgt.y - camY, dz = tgt.z - camZ;
+        outDistSq = dx * dx + dy * dy + dz * dz;
+        if (outDistSq < kMinDistSq || outDistSq > kMaxDistSq) return false;
+        const float d2D = std::sqrt(dx * dx + dy * dy);
+        if (d2D < 0.01f) return false;
+        outYaw   = std::atan2(dy, dx) * (180.0f / 3.14159265f);
+        outPitch = std::atan2(dz, d2D) * (180.0f / 3.14159265f);
+        return std::isfinite(outYaw) && std::isfinite(outPitch);
+    };
+
+    // ---- 检查当前锁定目标是否仍然有效 ----
+    if (m_aimbotLockedKey != 0) {
+        PlayerNode* locked = m_playerList.findByKey(m_aimbotLockedKey);
+        if (locked && locked->liveState == 0 && locked->health > 0.0f) {
+            FVector3 tgt{};
+            float distSq = 0.0f, aimPitch = 0.0f, aimYaw = 0.0f;
+            if (getTargetPos(locked, tgt) && calcAim(tgt, distSq, aimPitch, aimYaw)) {
+                // 平滑插值
+                float finalPitch = lerpAngle(curPitch, aimPitch, smoothT);
+                float finalYaw   = lerpAngle(curYaw,   aimYaw,   smoothT);
+                writeMemFloat(ctrlRotAddr + 0, finalPitch);
+                writeMemFloat(ctrlRotAddr + 4, finalYaw);
+                m_lastAimbotWriteMs = nowMs;
+
+                static Clock::time_point s_lastLockLog;
+                if (shouldLogEvery(s_lastLockLog, std::chrono::milliseconds(2000))) {
+                    writeAimbotLog("[Aimbot] Tracking key=%u hp=%.0f dist=%.0fm",
+                        m_aimbotLockedKey, locked->health, std::sqrt(distSq) / 100.0f);
+                }
+                return;
+            }
+        }
+        // 锁定失效
+        writeAimbotLog("[Aimbot] Lost lock key=%u, re-selecting", m_aimbotLockedKey);
+        m_aimbotLockedKey = 0;
+    }
+
+    // ---- 选择新目标: 200米内血量最少的敌人 ----
+    float bestHP = 1e18f;
     float bestDistSq = 1e18f;
+    PlayerNode* bestNode = nullptr;
     FVector3 bestTarget{};
-    bool found = false;
 
     PlayerNode* cur = m_playerList.head();
     while (cur) {
-        // 跳过自己
-        if (m_myPlayerKey != 0 && cur->playerKey == m_myPlayerKey) {
-            cur = cur->next;
-            continue;
-        }
-        // 跳过队友
-        if (m_myTeamID > 0 && cur->teamID == m_myTeamID) {
-            cur = cur->next;
-            continue;
-        }
-        // 跳过死亡
-        if (cur->liveState != 0 || cur->health <= 0.0f) {
-            cur = cur->next;
-            continue;
-        }
-        // 需要有目标骨骼数据
-        if (boneIdx >= 0 && boneIdx < static_cast<int>(TRACKED_BONE_COUNT)
-            && (cur->cachedBoneMask & (1u << boneIdx)) != 0) {
-            const float tx = cur->cachedBones[boneIdx].x;
-            const float ty = cur->cachedBones[boneIdx].y;
-            const float tz = cur->cachedBones[boneIdx].z;
-            if (std::isfinite(tx) && std::isfinite(ty) && std::isfinite(tz)
-                && (std::fabs(tx) > 1.0f || std::fabs(ty) > 1.0f)) {
-                const float dx = tx - camX;
-                const float dy = ty - camY;
-                const float dz = tz - camZ;
-                const float distSq = dx * dx + dy * dy + dz * dz;
-                if (distSq < bestDistSq && distSq > 100.0f) {  // >10cm 避免自瞄
-                    bestDistSq = distSq;
-                    bestTarget = {tx, ty, tz};
-                    found = true;
-                }
-            }
-        } else {
-            // 没有骨骼数据，用角色位置 + 高度偏移瞄准上半身
-            if (std::isfinite(cur->pos.x) && std::isfinite(cur->pos.y) && std::isfinite(cur->pos.z)
-                && (std::fabs(cur->pos.x) > 1.0f || std::fabs(cur->pos.y) > 1.0f)) {
-                const float tx = cur->pos.x;
-                const float ty = cur->pos.y;
-                const float tz = cur->pos.z + 60.0f;  // 大约头部高度偏移
-                const float dx = tx - camX;
-                const float dy = ty - camY;
-                const float dz = tz - camZ;
-                const float distSq = dx * dx + dy * dy + dz * dz;
-                if (distSq < bestDistSq && distSq > 100.0f) {
-                    bestDistSq = distSq;
-                    bestTarget = {tx, ty, tz};
-                    found = true;
-                }
+        if (m_myPlayerKey != 0 && cur->playerKey == m_myPlayerKey) { cur = cur->next; continue; }
+        if (m_myTeamID > 0 && cur->teamID == m_myTeamID) { cur = cur->next; continue; }
+        if (cur->liveState != 0 || cur->health <= 0.0f) { cur = cur->next; continue; }
+
+        FVector3 tgt{};
+        float distSq = 0.0f, aimPitch = 0.0f, aimYaw = 0.0f;
+        if (getTargetPos(cur, tgt) && calcAim(tgt, distSq, aimPitch, aimYaw)) {
+            if (cur->health < bestHP || (cur->health == bestHP && distSq < bestDistSq)) {
+                bestHP = cur->health;
+                bestDistSq = distSq;
+                bestNode = cur;
+                bestTarget = tgt;
             }
         }
         cur = cur->next;
     }
 
-    if (!found) return;
+    if (!bestNode) return;
 
-    // 计算方向角
-    const float dx = bestTarget.x - camX;
-    const float dy = bestTarget.y - camY;
-    const float dz = bestTarget.z - camZ;
-    const float dist2D = std::sqrt(dx * dx + dy * dy);
-    if (dist2D < 0.01f) return;
+    m_aimbotLockedKey = bestNode->playerKey;
+    writeAimbotLog("[Aimbot] New lock: key=%u name=%s hp=%.0f dist=%.0fm",
+        bestNode->playerKey, bestNode->playerName.c_str(), bestNode->health,
+        std::sqrt(bestDistSq) / 100.0f);
 
-    // UE4 FRotator: Pitch=绕Y轴(仰角), Yaw=绕Z轴(水平), Roll=绕X轴
-    // UE4 坐标系: X=前, Y=右, Z=上
-    // atan2(Y, X) 给出 Yaw; atan2(Z, 水平距离) 给出 Pitch
-    float aimYaw   = std::atan2(dy, dx) * (180.0f / 3.14159265f);
-    float aimPitch = std::atan2(dz, dist2D) * (180.0f / 3.14159265f);
-
-    if (!std::isfinite(aimYaw) || !std::isfinite(aimPitch)) return;
-
-    // 写入 ControlRotation (FRotator: Pitch@+0, Yaw@+4, Roll@+8)
-    const uintptr_t ctrlRotAddr = pc + static_cast<uintptr_t>(m_off.Ctrl_ControlRotation);
-    writeMemFloat(ctrlRotAddr + 0, aimPitch);
-    writeMemFloat(ctrlRotAddr + 4, aimYaw);
-    // Roll 保持不变
-
-    static Clock::time_point s_lastAimLog;
-    if (shouldLogEvery(s_lastAimLog, std::chrono::milliseconds(2000))) {
-        LOG(LOG_LEVEL_INFO, "[Aimbot] -> (%.1f, %.1f, %.1f) dist=%.0f pitch=%.2f yaw=%.2f",
-            bestTarget.x, bestTarget.y, bestTarget.z,
-            std::sqrt(bestDistSq), aimPitch, aimYaw);
+    // 首次锁定也用平滑 (不瞬移)
+    float aimPitch = 0.0f, aimYaw = 0.0f, distSq = 0.0f;
+    if (calcAim(bestTarget, distSq, aimPitch, aimYaw)) {
+        float finalPitch = lerpAngle(curPitch, aimPitch, smoothT);
+        float finalYaw   = lerpAngle(curYaw,   aimYaw,   smoothT);
+        writeMemFloat(ctrlRotAddr + 0, finalPitch);
+        writeMemFloat(ctrlRotAddr + 4, finalYaw);
+        m_lastAimbotWriteMs = nowMs;
     }
 }
 
 // =====================================================================
-//  æ—¥å¿—å·¥å…·
+//  日志工具
 // =====================================================================
 void MatchMonitor::openLog() {
     std::lock_guard<std::mutex> lock(m_logMutex);
@@ -1939,14 +2068,14 @@ void MatchMonitor::closeLog() {
     writeLog("");
     writeLog("=== Log ended ===");
     fclose(m_logFp);
-    LOG(LOG_LEVEL_INFO, "æ—¥å¿—å·²ä¿å­˜: %s%s (%d lines)",
+    LOG(LOG_LEVEL_INFO, "日志已保存: %s%s (%d lines)",
         m_logDir.c_str(), m_logFile.c_str(), m_logLineCount);
     m_logFp = nullptr;
     m_logLineCount = 0;
 }
 
 // =====================================================================
-//  çŽ©å®¶æ•°æ®è½®è¯¢
+//  玩家数据轮询
 // =====================================================================
 void MatchMonitor::pollPlayers() {
     static Clock::time_point s_lastPlayerLogTime;
@@ -1967,14 +2096,14 @@ void MatchMonitor::pollPlayers() {
         m_currentMatchElapsedSeconds = -1;
     }
 
-    // å¼€å±€é™é»˜æœŸ: çŠ¶æ€æœªè¾¾åˆ° InProgress å‰ä¸è¿›è¡ŒçŽ©å®¶æ•°æ®è¯»å†™,
-    // è®©æ¸¸æˆå®Œæˆèµ„æºåŠ è½½ã€é£žæœºèˆªçº¿ã€è·³ä¼žç­‰æµç¨‹
+    // 开局静默期: 状态未达到 InProgress 前不进行玩家数据读写,
+    // 让游戏完成资源加载、飞机航线、跳伞等流程
     m_currentMatchState = ms.state;
     const bool isInProgress = (ms.state == "InProgress");
     if (!isInProgress) {
         static Clock::time_point s_lastGraceLogTime;
         if (shouldLogEvery(s_lastGraceLogTime, std::chrono::milliseconds(3000))) {
-            LOG(LOG_LEVEL_INFO, "[Grace] ç­‰å¾…å¯¹å±€è¿›å…¥ InProgress (å½“å‰: %s, å·²ç»è¿‡: %ds), è·³è¿‡çŽ©å®¶è¯»å–",
+            LOG(LOG_LEVEL_INFO, "[Grace] 等待对局进入 InProgress (当前: %s, 已经过: %ds), 跳过玩家读取",
                 ms.state.c_str(), m_currentMatchElapsedSeconds);
         }
         return;
@@ -2006,7 +2135,7 @@ void MatchMonitor::pollPlayers() {
         return;
     }
 
-    // æŽ¨é€æ•°æ®åˆ°ç»˜åˆ¶å±‚
+    // 推送数据到绘制层
     ue4draw::DrawGameData drawData;
     drawData.inMatch = true;
     drawData.worldName = ms.worldName;
@@ -2015,7 +2144,7 @@ void MatchMonitor::pollPlayers() {
     drawData.totalCount = m_playerList.size();
     drawData.players.reserve(static_cast<size_t>(m_playerList.size()));
 
-    // èŽ·å–è‡ªå·±çš„ä½ç½® (PlayerArray[0])
+    // 获取自己的位置 (PlayerArray[0])
     PlayerNode* myNode = m_myPlayerKey != 0 ? m_playerList.findByKey(m_myPlayerKey) : nullptr;
     if (!myNode) {
         myNode = m_playerList.head();
@@ -2153,7 +2282,7 @@ void MatchMonitor::pollPlayers() {
                  p->health, p->healthMax,
                  p->pos.x, p->pos.y, p->pos.z,
                  p->kills, p->playerName.c_str());
-            snprintf(logBuf, sizeof(logBuf), " â˜… T%d %.0f/%.0fHP (%.0f, %.0f, %.0f) %s",
+            snprintf(logBuf, sizeof(logBuf), " ★ T%d %.0f/%.0fHP (%.0f, %.0f, %.0f) %s",
                      p->teamID, p->health, p->healthMax,
                      p->pos.x, p->pos.y, p->pos.z, p->playerName.c_str());
             writeLog(logBuf);
@@ -2165,7 +2294,7 @@ void MatchMonitor::pollPlayers() {
                  p->health, p->healthMax,
                  p->pos.x, p->pos.y, p->pos.z,
                  p->kills, p->playerName.c_str());
-            snprintf(logBuf, sizeof(logBuf), " â—‹ T%d %.0f/%.0fHP (%.0f, %.0f, %.0f) %s",
+            snprintf(logBuf, sizeof(logBuf), " ○ T%d %.0f/%.0fHP (%.0f, %.0f, %.0f) %s",
                      p->teamID, p->health, p->healthMax,
                      p->pos.x, p->pos.y, p->pos.z, p->playerName.c_str());
             writeLog(logBuf);
@@ -2177,7 +2306,7 @@ void MatchMonitor::pollPlayers() {
 }
 
 // =====================================================================
-//  å¯¹å±€çŠ¶æ€è½®è¯¢å¾ª(åŽå°çº¿ç¨‹)
+//  对局状态轮询循(后台线程)
 // =====================================================================
 void MatchMonitor::pollMatchStateLoop() {
     LOG(LOG_LEVEL_INFO, "Monitor thread started (state %dms, player %dms)",
@@ -2237,12 +2366,14 @@ void MatchMonitor::pollMatchStateLoop() {
                     writeLog("");
                     detectObserverType();
                 } else if (!m_isInMatch && wasInMatch) {
-                    LOG(LOG_LEVEL_INFO, "â˜… ç¦»å¼€å¯¹å±€! å…±è¿½è¸ª %d åçŽ©å®¶", m_playerList.size());
+                    LOG(LOG_LEVEL_INFO, "★ 离开对局! 共追踪 %d 名玩家", m_playerList.size());
                     writeSkeletonLogf("=== Skeleton Log End trackedPlayers=%d ===", m_playerList.size());
                     ue4draw::DrawGameData emptyData;
                     emptyData.inMatch = false;
                     ue4draw::SharedUE4Data::getInstance().pushData(emptyData);
                     closeLog();
+                    closeAimbotLog();
+                    m_aimbotLockedKey = 0;
                     m_playerList.clear();
                     m_lastNetCullPatchMs.clear();
                     m_characterClassSet.clear();
@@ -2269,7 +2400,7 @@ void MatchMonitor::pollMatchStateLoop() {
         }
 
         if (stateChanged || shouldLogEvery(lastStateLogTime, std::chrono::milliseconds(STATE_LOG_INTERVAL_MS))) {
-            std::string status = m_isInMatch ? "â˜… å¯¹å±€ä¸­" : "â—‹ éžå¯¹å±€";
+            std::string status = m_isInMatch ? "★ 对局中" : "○ 非对局";
             LOG(LOG_LEVEL_INFO, "[%s] State=%s World=%s Players=%d",
                 status.c_str(), lastKnownState.state.c_str(), lastKnownState.worldName.c_str(), m_playerList.size());
         }
@@ -2277,11 +2408,11 @@ void MatchMonitor::pollMatchStateLoop() {
         std::this_thread::sleep_for(std::chrono::milliseconds(MONITOR_IDLE_SLEEP_MS));
     }
 
-    LOG(LOG_LEVEL_INFO, "ç›‘æŽ§çº¿ç¨‹é€€å‡º");
+    LOG(LOG_LEVEL_INFO, "监控线程退出");
 }
 
 // =====================================================================
-//  MatchMonitor æž„æžæž„/start/stop
+//  MatchMonitor 构析构/start/stop
 // =====================================================================
 MatchMonitor::MatchMonitor(uintptr_t moduleBase, uintptr_t gNames, uintptr_t gWorld,
                            uintptr_t gUObjectArray, uint64_t moduleSize,
@@ -2304,26 +2435,26 @@ MatchMonitor::~MatchMonitor() {
 
 bool MatchMonitor::start() {
     if (m_running) {
-        LOG(LOG_LEVEL_INFO, "ç›‘æŽ§å·²åœ¨è¿è¡Œ");
+        LOG(LOG_LEVEL_INFO, "监控已在运行");
         return true;
     }
 
-    // éªŒè¯ GNames (NumElements @ m_gNames + 0x1400)
+    // 验证 GNames (NumElements @ m_gNames + 0x1400)
     m_numNames = safeReadS32(m_gNames + 0x1400);
     if (m_numNames <= 0) {
-        LOG(LOG_LEVEL_ERROR, "GNames æ— æ•ˆ, numNames=%d", m_numNames);
+        LOG(LOG_LEVEL_ERROR, "GNames 无效, numNames=%d", m_numNames);
         return false;
     }
     LOG(LOG_LEVEL_INFO, "Base=%p GNames=%p numNames=%d GWorld=%p GUObjectArray=%p",
         (void*)m_moduleBase, (void*)m_gNames, m_numNames, (void*)m_gWorld, (void*)m_gUObjectArray);
 
-    // éªŒè¯ entry[0] == "None"
+    // 验证 entry[0] == "None"
     std::string entry0 = getNameByIndex(0);
     LOG(LOG_LEVEL_INFO, "Entry[0]='%s' %s", entry0.c_str(), (entry0 == "None") ? "OK" : "BAD");
 
-    // é€šè¿‡ UE4Interface åŠ¨æ€è§£æžæ‰€æœ‰æ¸¸æˆåç§»
+    // 通过 UE4Interface 动态解析所有游戏偏移
     if (!initOffsets()) {
-        LOG(LOG_LEVEL_ERROR, "åç§»è§£æžå¤±è´¥, æ— æ³•å¯åŠ¨ç›‘æŽ§");
+        LOG(LOG_LEVEL_ERROR, "偏移解析失败, 无法启动监控");
         return false;
     }
     computeBatchReadBounds();
@@ -2343,17 +2474,24 @@ bool MatchMonitor::start() {
     m_lastCompletedCharacterScanEpoch = 0;
 
     std::thread(&MatchMonitor::pollMatchStateLoop, this).detach();
-    LOG(LOG_LEVEL_INFO, "=== å¯¹å±€ç›‘æŽ§+çŽ©å®¶é‡‡é›†å·²å¯åŠ¨ ===");
+    LOG(LOG_LEVEL_INFO, "=== 对局监控+玩家采集已启动 ===");
     return true;
 }
 
 void MatchMonitor::stop() {
     if (!m_running) return;
     m_running = false;
-    // ç­‰å¾…çº¿ç¨‹å®‰å…¨é€€å‡º (è½®è¯¢å‘¨æœŸ + ä½™é‡)
+    // 等待线程安全退出 (轮询周期 + 余量)
     std::this_thread::sleep_for(std::chrono::milliseconds(POLL_INTERVAL_MS + 200));
+
+    // 推送空数据清除绘制层残留, 防止退出后 overlay 仍显示旧帧
+    ue4draw::DrawGameData emptyData;
+    emptyData.inMatch = false;
+    ue4draw::SharedUE4Data::getInstance().pushData(emptyData);
+
     closeLog();
-    LOG(LOG_LEVEL_INFO, "=== ç›‘æŽ§å·²åœæ­¢ ===");
+    closeAimbotLog();
+    LOG(LOG_LEVEL_INFO, "=== 监控已停止 ===");
 }
 
 } // namespace pubgmhd

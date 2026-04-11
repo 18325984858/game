@@ -1,5 +1,6 @@
 package com.example.dobbyproject;
 
+import android.app.ActivityManager;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
@@ -35,6 +36,8 @@ public class Ue4OverlayService extends Service {
     private static final int NOTIFICATION_ID = 1107;
     private static final float TOUCH_PASSTHROUGH_ALPHA = 0.7f;
     private static final long OVERLAY_LAYOUT_SYNC_INTERVAL_MS = 500L;
+    private static final String GAME_PACKAGE = "com.tencent.tmgp.pubgmhd";
+    private static final long GAME_ALIVE_CHECK_INTERVAL_MS = 2000L;
 
     private WindowManager windowManager;
     private OverlayTextureView overlayTextureView;
@@ -48,6 +51,14 @@ public class Ue4OverlayService extends Service {
             if (overlayTextureView != null) {
                 mainHandler.postDelayed(this, OVERLAY_LAYOUT_SYNC_INTERVAL_MS);
             }
+        }
+    };
+    private final Runnable gameAliveCheckRunnable = new Runnable() {
+        @Override
+        public void run() {
+            // 不再自动检测游戏进程, 因为 /proc 扫描在隐藏模块时会误判
+            // overlay 的清理由 C++ 层 stale data 超时检测处理
+            mainHandler.postDelayed(this, GAME_ALIVE_CHECK_INTERVAL_MS);
         }
     };
 
@@ -86,6 +97,7 @@ public class Ue4OverlayService extends Service {
     public void onDestroy() {
         PublicOverlayBridge.stopRenderer();
         mainHandler.removeCallbacks(overlayLayoutSyncRunnable);
+        mainHandler.removeCallbacks(gameAliveCheckRunnable);
         removeOverlayView();
         stopForeground(STOP_FOREGROUND_REMOVE);
         super.onDestroy();
@@ -131,6 +143,7 @@ public class Ue4OverlayService extends Service {
 
         windowManager.addView(overlayTextureView, layoutParams);
         startOverlayLayoutSync();
+        startGameAliveCheck();
         Log.i(TAG, "Overlay TextureView 已添加 alpha=" + TOUCH_PASSTHROUGH_ALPHA + " size=" + displaySize.x + "x" + displaySize.y);
     }
 
@@ -287,5 +300,39 @@ public class Ue4OverlayService extends Service {
         @Override
         public void onSurfaceTextureUpdated(SurfaceTexture surfaceTexture) {
         }
+    }
+
+    private void startGameAliveCheck() {
+        mainHandler.removeCallbacks(gameAliveCheckRunnable);
+        mainHandler.postDelayed(gameAliveCheckRunnable, GAME_ALIVE_CHECK_INTERVAL_MS);
+    }
+
+    private boolean isGameProcessRunning() {
+        try {
+            java.io.File procDir = new java.io.File("/proc");
+            java.io.File[] entries = procDir.listFiles();
+            if (entries == null) return true; // 无法访问 /proc, 假设存活
+            for (java.io.File entry : entries) {
+                if (!entry.isDirectory()) continue;
+                try {
+                    Integer.parseInt(entry.getName());
+                } catch (NumberFormatException e) {
+                    continue; // 非 PID 目录
+                }
+                java.io.File cmdline = new java.io.File(entry, "cmdline");
+                try (java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.FileReader(cmdline))) {
+                    String line = reader.readLine();
+                    if (line != null && line.contains(GAME_PACKAGE)) {
+                        return true;
+                    }
+                } catch (Exception ignored) {
+                    // 无权限读取, 跳过
+                }
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "检查游戏进程失败", e);
+            return true; // 检查失败时假设存活, 避免误杀
+        }
+        return false;
     }
 }
