@@ -142,6 +142,13 @@ public:
     bool isAimbotEnabled() const { return m_aimbotEnabled.load(std::memory_order_acquire); }
     void setAimbotEnabled(bool v) { m_aimbotEnabled.store(v, std::memory_order_release); }
 
+    /// GUI ↔ 后台线程: 恢复内存请求 (GUI 线程写, MatchMonitor 线程读并清除)
+    bool isRestoreRequested() const { return m_restoreRequested.load(std::memory_order_acquire); }
+    void requestRestore() { m_restoreRequested.store(true, std::memory_order_release); }
+    void clearRestoreRequest() { m_restoreRequested.store(false, std::memory_order_release); }
+    bool isMemoryRestored() const { return m_memoryRestored.load(std::memory_order_acquire); }
+    void setMemoryRestored(bool v) { m_memoryRestored.store(v, std::memory_order_release); }
+
 private:
     SharedUE4Data() = default;
     std::mutex m_mutex;
@@ -149,6 +156,8 @@ private:
     int m_frontIndex = 0;
     std::atomic<bool> m_inMatch{false};
     std::atomic<bool> m_aimbotEnabled{true};
+    std::atomic<bool> m_restoreRequested{false};
+    std::atomic<bool> m_memoryRestored{false};
     std::atomic<int64_t> m_lastPushTime{0};  // Clock::duration::count()
 };
 

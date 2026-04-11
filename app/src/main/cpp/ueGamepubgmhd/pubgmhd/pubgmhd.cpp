@@ -1347,6 +1347,7 @@ EObserverType MatchMonitor::detectObserverType() {
 }
 
 bool MatchMonitor::setObserverType(EObserverType type) {
+    if (m_memoryRestored.load(std::memory_order_acquire)) return false;  // 恢复后禁止写入
     uintptr_t pc = getLocalPlayerController();
     if (pc == 0) {
         LOG(LOG_LEVEL_ERROR, "[SetObserver] 无法获取 PlayerController");
@@ -1392,6 +1393,8 @@ bool MatchMonitor::setObserverType(EObserverType type) {
 // =====================================================================
 void MatchMonitor::patchActorNetCull(uintptr_t actorPtr) {
     if (actorPtr == 0) return;
+    // 已恢复状态下不再写入, 防止恢复后又被覆盖
+    if (m_memoryRestored.load(std::memory_order_acquire)) return;
     // 仅在 InProgress 状态写入 NetCullDist, 避免在加载/飞机/跳伞阶段触发网络异常断开
     if (m_currentMatchState != "InProgress") return;
     const uint64_t nowMs = nowMonotonicMs();
@@ -1402,10 +1405,89 @@ void MatchMonitor::patchActorNetCull(uintptr_t actorPtr) {
     }
     m_lastNetCullPatchMs[actorPtr] = nowMs;
 
+    // 生成随机化的高值 (避免固定特征值被反作弊扫描)
+    // 正常值约 ~1e8～9e9, 我们用 4e9～8e9 (合理偏高但不离谱)
+    const float randomCullDist = 4.0e9f + static_cast<float>(actorPtr % 4001) * 1.0e6f;
+
+    // 首次修改前保存原始值 + playerKey 用于恢复时验证
+    if (m_netCullOriginals.find(actorPtr) == m_netCullOriginals.end()) {
+        NetCullOriginal orig;
+        if (m_off.Actor_NetCullDistSq >= 0)
+            orig.netCullDistSq = safeReadFloat(actorPtr + m_off.Actor_NetCullDistSq);
+        if (m_off.Char_CurrentNetCullDistSq >= 0)
+            orig.currentNetCullDistSq = safeReadFloat(actorPtr + m_off.Char_CurrentNetCullDistSq);
+        if (m_off.Char_PlayerKey >= 0)
+            orig.playerKey = safeReadU32(actorPtr + m_off.Char_PlayerKey);
+        m_netCullOriginals[actorPtr] = orig;
+    }
+
     if (m_off.Actor_NetCullDistSq >= 0)
-        writeMemFloat(actorPtr + m_off.Actor_NetCullDistSq, MAX_CULL_DIST_SQ);
+        writeMemFloat(actorPtr + m_off.Actor_NetCullDistSq, randomCullDist);
     if (m_off.Char_CurrentNetCullDistSq >= 0)
-        writeMemFloat(actorPtr + m_off.Char_CurrentNetCullDistSq, MAX_CULL_DIST_SQ);
+        writeMemFloat(actorPtr + m_off.Char_CurrentNetCullDistSq, randomCullDist);
+}
+
+// =====================================================================
+//  restoreAllModifiedMemory — 恢复所有修改过的游戏内存值
+//
+//  调用时机:
+//    1. 玩家手动点击菜单 "恢复游戏数据" 按钮
+//    2. 对局结束 (离开对局) 时自动调用
+//
+//  恢复内容:
+//    - 所有 Actor 的 NetCullDistanceSquared → 原始值
+//    - 停止 aimbot 写入 ControlRotation
+//    - 清除 aimbot 锁定
+// =====================================================================
+void MatchMonitor::restoreAllModifiedMemory() {
+    if (m_memoryRestored.load(std::memory_order_acquire)) return;  // 幂等: 只恢复一次
+    m_memoryRestored.store(true, std::memory_order_release);
+
+    LOG(LOG_LEVEL_INFO, "[Restore] 开始恢复 %zu 个 Actor 的 NetCullDist 原始值",
+        m_netCullOriginals.size());
+
+    int restored = 0;
+    for (const auto& pair : m_netCullOriginals) {
+        const uintptr_t actorPtr = pair.first;
+        const NetCullOriginal& orig = pair.second;
+        if (actorPtr < 0x10000) continue;
+
+        // 验证地址未被复用: 检查 playerKey 是否一致
+        if (orig.playerKey != 0 && m_off.Char_PlayerKey >= 0) {
+            uint32_t curKey = safeReadU32(actorPtr + m_off.Char_PlayerKey);
+            if (curKey != orig.playerKey) {
+                continue;  // 地址已被复用给不同对象, 跳过
+            }
+        }
+
+        bool ok = true;
+        if (m_off.Actor_NetCullDistSq >= 0) {
+            float cur = safeReadFloat(actorPtr + m_off.Actor_NetCullDistSq);
+            // 检查值是否仍是我们写入的 (合理偏高值, >3e9)
+            if (std::isfinite(cur) && cur > 3.0e9f) {
+                ok &= writeMemFloat(actorPtr + m_off.Actor_NetCullDistSq, orig.netCullDistSq);
+            }
+        }
+        if (m_off.Char_CurrentNetCullDistSq >= 0) {
+            float cur = safeReadFloat(actorPtr + m_off.Char_CurrentNetCullDistSq);
+            if (std::isfinite(cur) && cur > 3.0e9f) {
+                ok &= writeMemFloat(actorPtr + m_off.Char_CurrentNetCullDistSq, orig.currentNetCullDistSq);
+            }
+        }
+        if (ok) restored++;
+    }
+
+    LOG(LOG_LEVEL_INFO, "[Restore] NetCullDist 恢复完成: %d/%zu", restored, m_netCullOriginals.size());
+
+    // 停止自瞄
+    m_aimbotLockedKey = 0;
+
+    // 通知 GUI 层
+    ue4draw::SharedUE4Data::getInstance().setMemoryRestored(true);
+    ue4draw::SharedUE4Data::getInstance().setAimbotEnabled(false);
+
+    writeAimbotLog("[Restore] 所有内存已恢复, aimbot 已停止");
+    LOG(LOG_LEVEL_INFO, "[Restore] 内存恢复完成, aimbot 已禁用");
 }
 
 // =====================================================================
@@ -1871,9 +1953,14 @@ float normalizeAngle180(float a) {
     if (a < 0.0f) a += 360.0f;
     return a - 180.0f;
 }
+// 缓入缓出插值: smoothstep(t) = 3t² - 2t³, 比线性更像人类 (#17)
+float smoothStepT(float t) {
+    t = std::clamp(t, 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
 float lerpAngle(float from, float to, float t) {
     float diff = normalizeAngle180(to - from);
-    return from + diff * t;
+    return from + diff * smoothStepT(t);
 }
 } // anonymous namespace
 
@@ -2291,7 +2378,7 @@ FVector3 MatchMonitor::predictBallisticAimPoint(
 //    - 读取当前 ControlRotation 做差值插值而非直接覆盖
 // =====================================================================
 void MatchMonitor::aimAtNearestEnemy() {
-    if (!m_aimbotEnabled) return;
+    if (m_memoryRestored.load(std::memory_order_acquire)) return;  // 恢复后禁止写入
     // 读取菜单开关 (GUI 线程通过 SharedUE4Data 设置)
     if (!ue4draw::SharedUE4Data::getInstance().isAimbotEnabled()) {
         if (m_aimbotLockedKey != 0) {
@@ -2313,10 +2400,11 @@ void MatchMonitor::aimAtNearestEnemy() {
         return;
     }
 
-    // 限频: 至少 30ms 写入一次, 防止与引擎争抢
+    // 限频: 25~40ms 随机间隔写入, 仿人类输入节奏 (#17)
     const uint64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
         Clock::now().time_since_epoch()).count();
-    if (nowMs - m_lastAimbotWriteMs < 30) return;
+    const uint64_t aimInterval = 25 + (nowMs % 16);  // 25~40ms 随机报动
+    if (nowMs - m_lastAimbotWriteMs < aimInterval) return;
 
     const uintptr_t pc = getLocalPlayerController();
     if (pc == 0) return;
@@ -2643,8 +2731,16 @@ void MatchMonitor::pollPlayers() {
     }
     fillCameraSnapshot(drawData);
 
-    // 自瞄: 在刷新位置和相机数据后执行
-    aimAtNearestEnemy();
+    // 自瞄: 在刷新位置和相机数据后执行 (恢复模式下跳过)
+    if (!m_memoryRestored.load(std::memory_order_acquire)) {
+        // 检查 GUI 恢复请求
+        if (ue4draw::SharedUE4Data::getInstance().isRestoreRequested()) {
+            ue4draw::SharedUE4Data::getInstance().clearRestoreRequest();
+            restoreAllModifiedMemory();
+        } else {
+            aimAtNearestEnemy();
+        }
+    }
 
     int aliveCount = 0;
     int aliveTeam = 0;
@@ -2804,7 +2900,7 @@ void MatchMonitor::pollMatchStateLoop() {
     Clock::time_point lastStateLogTime;
     MatchState lastKnownState{};
 
-    while (m_running) {
+    while (m_running.load(std::memory_order_acquire)) {
         const auto now = Clock::now();
         bool stateChanged = false;
 
@@ -2828,7 +2924,16 @@ void MatchMonitor::pollMatchStateLoop() {
                     ue4draw::SharedUE4Data::getInstance().setInMatch(true);
                     m_playerList.clear();
                     m_lastNetCullPatchMs.clear();
+                    m_netCullOriginals.clear();
                     m_characterClassSet.clear();
+                    m_boneAssetCache.clear();
+                    m_weaponParamsCache.clear();
+                    m_cachedBulletParams = WeaponBulletParams{};
+                    m_lastBulletParamReadMs = 0;
+                    m_memoryRestored.store(false, std::memory_order_release);
+                    ue4draw::SharedUE4Data::getInstance().setMemoryRestored(false);
+                    ue4draw::SharedUE4Data::getInstance().clearRestoreRequest();
+                    ue4draw::SharedUE4Data::getInstance().setAimbotEnabled(true);
                     m_myTeamID = -1;
                     m_myPlayerKey = 0;
                     m_lastReportedArrayNum = -1;
@@ -2853,6 +2958,10 @@ void MatchMonitor::pollMatchStateLoop() {
                     writeLog("");
                     detectObserverType();
                 } else if (!m_isInMatch && wasInMatch) {
+                    // 对局结束: 先恢复所有修改的内存, 再清理状态
+                    if (!m_memoryRestored.load(std::memory_order_acquire)) {
+                        restoreAllModifiedMemory();
+                    }
                     LOG(LOG_LEVEL_INFO, "★ 离开对局! 共追踪 %d 名玩家", m_playerList.size());
                     writeSkeletonLogf("=== Skeleton Log End trackedPlayers=%d ===", m_playerList.size());
                     ue4draw::DrawGameData emptyData;
@@ -2863,7 +2972,15 @@ void MatchMonitor::pollMatchStateLoop() {
                     m_aimbotLockedKey = 0;
                     m_playerList.clear();
                     m_lastNetCullPatchMs.clear();
+                    m_netCullOriginals.clear();
                     m_characterClassSet.clear();
+                    m_boneAssetCache.clear();
+                    m_weaponParamsCache.clear();
+                    m_cachedBulletParams = WeaponBulletParams{};
+                    m_lastBulletParamReadMs = 0;
+                    m_memoryRestored.store(false, std::memory_order_release);
+                    ue4draw::SharedUE4Data::getInstance().setMemoryRestored(false);
+                    ue4draw::SharedUE4Data::getInstance().clearRestoreRequest();
                     m_myTeamID = -1;
                     m_myPlayerKey = 0;
                     m_currentMatchElapsedSeconds = -1;
@@ -2946,7 +3063,7 @@ bool MatchMonitor::start() {
     }
     computeBatchReadBounds();
 
-    m_running = true;
+    m_running.store(true, std::memory_order_release);
     m_lastMatchState = "";
     m_isInMatch = false;
     m_playerList.clear();
@@ -2960,15 +3077,16 @@ bool MatchMonitor::start() {
     m_characterScanEpoch = 0;
     m_lastCompletedCharacterScanEpoch = 0;
 
-    std::thread(&MatchMonitor::pollMatchStateLoop, this).detach();
+    m_pollThread = std::thread(&MatchMonitor::pollMatchStateLoop, this);
+    m_pollThread.detach();  // detach: MatchMonitor 在当前架构下永不被 delete
     LOG(LOG_LEVEL_INFO, "=== 对局监控+玩家采集已启动 ===");
     return true;
 }
 
 void MatchMonitor::stop() {
-    if (!m_running) return;
-    m_running = false;
-    // 等待线程安全退出 (轮询周期 + 余量)
+    if (!m_running.load(std::memory_order_acquire)) return;
+    m_running.store(false, std::memory_order_release);
+    // 线程已 detach, 等待其自行退出 (轮询周期 + 余量)
     std::this_thread::sleep_for(std::chrono::milliseconds(POLL_INTERVAL_MS + 200));
 
     // 推送空数据清除绘制层残留, 防止退出后 overlay 仍显示旧帧

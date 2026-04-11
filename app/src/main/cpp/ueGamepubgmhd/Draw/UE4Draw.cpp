@@ -618,6 +618,22 @@ void UE4Overlay::drawMenu(const DrawGameData& data) {
         ImGui::Separator();
         settingsChanged |= ImGui::SliderFloat("最大距离", &m_espMaxDist, 100.0f, 2000.0f, "%.0f m");
 
+        // 恢复内存按钮 (对局中显示)
+        if (data.inMatch) {
+            ImGui::Separator();
+            const bool alreadyRestored = ue4draw::SharedUE4Data::getInstance().isMemoryRestored();
+            if (alreadyRestored) {
+                ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f), "✓ 内存已恢复 (安全)");
+            } else {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.2f, 0.1f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1.0f, 0.3f, 0.1f, 1.0f));
+                if (ImGui::Button("恢复游戏数据 (结算前点击)", ImVec2(280.0f, 36.0f))) {
+                    ue4draw::SharedUE4Data::getInstance().requestRestore();
+                }
+                ImGui::PopStyleColor(2);
+            }
+        }
+
         if (data.inMatch) {
             int playersWithBones = 0;
             int totalBonePoints = 0;

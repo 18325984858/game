@@ -76,13 +76,31 @@ void overlayThreadMain(ANativeWindow* window, int width, int height, int rotateT
         // 否则 ImGui::IO 的 InputEventsQueue 会多线程竞争导致 ImVector 越界崩溃
 
         Clock::time_point lastHeartbeatLog;
+        bool clientWasConnected = false;  // 追踪 RenderClient 是否曾连接过
+        int clientDisconnectFrames = 0;   // Client 断开后的帧计数
         while (!g_overlayStopRequested.load(std::memory_order_acquire)) {
             imgui->ProcessInputEvent();
             imgui->BeginFrame();
             imgui->EndFrame();
 
+            // 检测 RenderClient 断线: 游戏进程退出时 TCP 连接断开
+            const bool clientNow = imgui->m_clientConnected.load(std::memory_order_acquire);
+            if (clientNow) {
+                clientWasConnected = true;
+                clientDisconnectFrames = 0;
+            } else if (clientWasConnected) {
+                clientDisconnectFrames++;
+                // Client 曾连接但已断开超过 60 帧 (~1秒): 清屏并退出
+                if (clientDisconnectFrames > 60) {
+                    OLOG(LOG_LEVEL_INFO, "公开 Overlay: RenderClient 断线, 清除画面并退出");
+                    imgui->BeginFrame();
+                    imgui->EndFrame();
+                    break;
+                }
+            }
+
             if (shouldLogEvery(lastHeartbeatLog, std::chrono::milliseconds(3000))) {
-                OLOG(LOG_LEVEL_INFO, "公开 Overlay 心跳 width=%d height=%d", width, height);
+                OLOG(LOG_LEVEL_INFO, "公开 Overlay 心跳 width=%d height=%d client=%d", width, height, clientNow ? 1 : 0);
             }
 
             // 帧节拍: 避免 yield() 导致 CPU 满载空转, 降低系统调度压力

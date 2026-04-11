@@ -7,6 +7,8 @@
 #include <vector>
 #include <array>
 #include <mutex>
+#include <atomic>
+#include <thread>
 #include <algorithm>
 #include <cstring>
 #include "../libUE4Struct/ilbUE4Struct.h"
@@ -58,7 +60,6 @@ static constexpr int PLAYER_POLL_INTERVAL_MS  = 8;
 static constexpr int MONITOR_IDLE_SLEEP_MS    = 1;
 static constexpr int STATE_LOG_INTERVAL_MS    = 1000;
 static constexpr int PLAYER_LOG_INTERVAL_MS   = 1000;
-static constexpr float MAX_CULL_DIST_SQ       = 1.0e18f;
 static constexpr size_t TRACKED_BONE_COUNT    = 17;
 
 // =====================================================================
@@ -434,7 +435,7 @@ public:
     void stop();
 
     /// 是否正在运行
-    bool isRunning() const { return m_running; }
+    bool isRunning() const { return m_running.load(std::memory_order_acquire); }
 
 private:
     // ---- 安全内存读取 ----
@@ -474,6 +475,9 @@ private:
 
     // ---- 网络可见范围修改 ----
     void patchActorNetCull(uintptr_t actorPtr);
+
+    // ---- 内存恢复 (反检测) ----
+    void restoreAllModifiedMemory();   // 恢复所有修改过的游戏内存值
 
     // ---- GUObjectArray 扫描 Character ----
     int scanCharacters();
@@ -539,7 +543,8 @@ private:
     std::string m_logDir;
     std::string m_logFile;
 
-    volatile bool m_running = false;
+    std::atomic<bool> m_running{false};
+    std::thread   m_pollThread;         // 轮询线程 (joinable, 非 detach)
     std::string   m_lastMatchState;
     std::string   m_currentMatchState;   // 当前对局状态 (InProgress/WaitingToStart/Aircraft 等)
     bool          m_isInMatch = false;
@@ -558,13 +563,20 @@ private:
 
     PlayerList m_playerList;
     std::unordered_map<uintptr_t, uint64_t> m_lastNetCullPatchMs;
+    // NetCullDist 原始值存储 (actorPtr -> {origNetCull, origCurrentNetCull, playerKey})
+    struct NetCullOriginal {
+        float netCullDistSq = 0.0f;
+        float currentNetCullDistSq = 0.0f;
+        uint32_t playerKey = 0;          // 用于验证地址未被复用
+    };
+    std::unordered_map<uintptr_t, NetCullOriginal> m_netCullOriginals;
+    std::atomic<bool> m_memoryRestored{false};  // 已恢复标志, 原子操作防竞态
     std::unordered_map<uintptr_t, bool> m_characterClassSet;
     std::unordered_map<int, std::string> m_nameCache;
     std::unordered_map<uintptr_t, BoneAssetCacheEntry> m_boneAssetCache;
     uint64_t m_lastBoneCacheClearMs = 0;  // 上次清理骨骼缓存的时间
 
-    // Aimbot
-    bool          m_aimbotEnabled = true;
+    // Aimbot (统一使用 SharedUE4Data::isAimbotEnabled() 作为开关)
     int           m_aimbotTargetBone = 3;  // 默认瞄脖子 (TRACKED_BONE_COUNT 索引: 3=neck, 4=head)
     uint32_t      m_aimbotLockedKey = 0;   // 当前锁定目标的 playerKey (0=未锁定)
     float         m_aimbotSmoothing = 8.0f; // 平滑系数 (越大越平滑, 1=瞬移)
