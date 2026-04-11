@@ -649,12 +649,55 @@ bool MatchMonitor::initOffsets() {
     RESOLVE_OFFSET_MULTI(m_off.SkeletalMeshAsset_Skeleton, "Skeleton", "SkeletalMesh");
     RESOLVE_OFFSET_MULTI(m_off.Skeleton_RefBoneNames, "RefBoneNames", "Skeleton");
 
+    // Character → CharacterMovement 组件指针
+    RESOLVE_OFFSET_MULTI(m_off.Char_CharacterMovement, "CharacterMovement", "Character", "UAECharacter", "STExtraCharacter");
+
+    // CharacterMovementComponent — 人物移动速度
+    RESOLVE_OFFSET_MULTI(m_off.CMC_MaxWalkSpeed,         "MaxWalkSpeed",         "CharacterMovementComponent");
+    RESOLVE_OFFSET_MULTI(m_off.CMC_MaxWalkSpeedCrouched, "MaxWalkSpeedCrouched", "CharacterMovementComponent");
+    RESOLVE_OFFSET_MULTI(m_off.CMC_MaxSwimSpeed,         "MaxSwimSpeed",         "CharacterMovementComponent");
+    RESOLVE_OFFSET_MULTI(m_off.CMC_MaxFlySpeed,          "MaxFlySpeed",          "CharacterMovementComponent");
+    RESOLVE_OFFSET_MULTI(m_off.CMC_MaxAcceleration,      "MaxAcceleration",      "CharacterMovementComponent");
+    RESOLVE_OFFSET_MULTI(m_off.CMC_GravityScale,         "GravityScale",         "CharacterMovementComponent");
+    RESOLVE_OFFSET_MULTI(m_off.CMC_JumpZVelocity,        "JumpZVelocity",        "CharacterMovementComponent");
+    RESOLVE_OFFSET_MULTI(m_off.CMC_Velocity,             "Velocity",             "MovementComponent", "CharacterMovementComponent");
+
+    // STExtraShootWeaponBulletBase — 子弹 Actor
+    RESOLVE_OFFSET_MULTI(m_off.Bullet_PMComp,            "PMComp",              "STExtraShootWeaponBulletBase");
+    RESOLVE_OFFSET_MULTI(m_off.Bullet_LaunchGravityScale, "LaunchGravityScale", "STExtraShootWeaponBulletBase");
+    RESOLVE_OFFSET_MULTI(m_off.Bullet_MaxNoGravityRange, "MaxNoGravityRange",   "STExtraShootWeaponBulletBase");
+    RESOLVE_OFFSET_MULTI(m_off.Bullet_ShootDir,          "ShootDir",            "STExtraShootWeaponBulletBase");
+
+    // ProjectileMovementComponent — 弹道运动
+    RESOLVE_OFFSET_MULTI(m_off.PMC_InitialSpeed,          "InitialSpeed",          "ProjectileMovementComponent");
+    RESOLVE_OFFSET_MULTI(m_off.PMC_MaxSpeed,              "MaxSpeed",              "ProjectileMovementComponent");
+    RESOLVE_OFFSET_MULTI(m_off.PMC_Velocity,              "Velocity",              "MovementComponent", "ProjectileMovementComponent");
+    RESOLVE_OFFSET_MULTI(m_off.PMC_ProjectileGravityScale, "ProjectileGravityScale", "ProjectileMovementComponent");
+
+    // BulletTrackComponent — 后坐力
+    RESOLVE_OFFSET_MULTI(m_off.BTC_CurRecoilValue,          "CurRecoilValue",          "BulletTrackComponent");
+    RESOLVE_OFFSET_MULTI(m_off.BTC_VerticalRecoilTarget,    "VerticalRecoilTarget",    "BulletTrackComponent");
+    RESOLVE_OFFSET_MULTI(m_off.BTC_HorizontalRecoilTarget,  "HorizontalRecoilTarget",  "BulletTrackComponent");
+    RESOLVE_OFFSET_MULTI(m_off.BTC_VerticalRecoveryTarget,  "VerticalRecoveryTarget",  "BulletTrackComponent");
+    RESOLVE_OFFSET_MULTI(m_off.BTC_PoseRecoilFactor,        "PoseRecoilFactor",        "BulletTrackComponent");
+    RESOLVE_OFFSET_MULTI(m_off.BTC_AccessoriesVRecoilFactor, "AccessoriesVRecoilFactor", "BulletTrackComponent");
+    RESOLVE_OFFSET_MULTI(m_off.BTC_VerticalRecoilFactorModifier, "VerticalRecoilFactorModifier", "BulletTrackComponent");
+    RESOLVE_OFFSET_MULTI(m_off.BTC_AccessoriesHRecoilFactor, "AccessoriesHRecoilFactor", "BulletTrackComponent");
+    RESOLVE_OFFSET_MULTI(m_off.BTC_HorizontalRecoilFactorModifier, "HorizontalRecoilFactorModifier", "BulletTrackComponent");
+    RESOLVE_OFFSET_MULTI(m_off.BTC_AccVerticalRecoilTarget, "AccVerticalRecoilTarget", "BulletTrackComponent");
+
     LOG(LOG_LEVEL_INFO, "[InitOffsets] 解析完成, isValid=%d", m_off.isValid());
     LOG(LOG_LEVEL_INFO, "[InitOffsets] World.GameState=0x%X GS.PlayerArray=0x%X PS.PlayerKey=0x%X",
         m_off.World_GameState, m_off.GS_PlayerArray, m_off.PS_PlayerKey);
     LOG(LOG_LEVEL_INFO, "[InitOffsets] Actor.RootComponent=0x%X Char.Health=0x%X Char.HealthMax=0x%X",
         m_off.Actor_RootComponent, m_off.Char_Health, m_off.Char_HealthMax);
     LOG(LOG_LEVEL_INFO, "[InitOffsets] Char.bMarkScopeIn=0x%X (ADS detection)", m_off.Char_bMarkScopeIn);
+    LOG(LOG_LEVEL_INFO, "[InitOffsets] CMC: MaxWalkSpeed=0x%X GravityScale=0x%X Velocity=0x%X",
+        m_off.CMC_MaxWalkSpeed, m_off.CMC_GravityScale, m_off.CMC_Velocity);
+    LOG(LOG_LEVEL_INFO, "[InitOffsets] PMC: InitialSpeed=0x%X MaxSpeed=0x%X GravityScale=0x%X",
+        m_off.PMC_InitialSpeed, m_off.PMC_MaxSpeed, m_off.PMC_ProjectileGravityScale);
+    LOG(LOG_LEVEL_INFO, "[InitOffsets] BTC: VRecoil=0x%X HRecoil=0x%X CurRecoil=0x%X",
+        m_off.BTC_VerticalRecoilTarget, m_off.BTC_HorizontalRecoilTarget, m_off.BTC_CurRecoilValue);
 
     return m_off.isValid();
 }
@@ -1827,6 +1870,168 @@ float lerpAngle(float from, float to, float t) {
     return from + diff * t;
 }
 } // anonymous namespace
+
+// =====================================================================
+//  getBulletInfo — 从子弹 Actor 获取弹速/重力数据
+//
+//  参数: bulletActorPtr = STExtraShootWeaponBulletBase 实例指针
+//  链路: BulletActor → PMComp(+0x5C8) → ProjectileMovementComponent
+//        BulletActor → LaunchGravityScale(+0x5D8)
+//        BulletActor → MaxNoGravityRange(+0x5D4)
+//        BulletActor → ShootDir(+0x610)
+// =====================================================================
+BulletInfo MatchMonitor::getBulletInfo(uintptr_t bulletActorPtr) {
+    BulletInfo info;
+    if (bulletActorPtr == 0 || bulletActorPtr < 0x10000) {
+        LOG(LOG_LEVEL_WARN, "[BulletInfo] bulletActorPtr 无效: %p", (void*)bulletActorPtr);
+        return info;
+    }
+
+    // 从子弹 Actor 读取直属字段
+    const int32_t offLaunchGrav = (m_off.Bullet_LaunchGravityScale >= 0) ? m_off.Bullet_LaunchGravityScale : 0x5D8;
+    const int32_t offMaxNoGrav  = (m_off.Bullet_MaxNoGravityRange >= 0) ? m_off.Bullet_MaxNoGravityRange : 0x5D4;
+    const int32_t offShootDir   = (m_off.Bullet_ShootDir >= 0) ? m_off.Bullet_ShootDir : 0x610;
+
+    info.launchGravityScale = safeReadFloat(bulletActorPtr + offLaunchGrav);
+    info.maxNoGravityRange  = safeReadS32(bulletActorPtr + offMaxNoGrav);
+    info.shootDir.x = safeReadFloat(bulletActorPtr + offShootDir);
+    info.shootDir.y = safeReadFloat(bulletActorPtr + offShootDir + 4);
+    info.shootDir.z = safeReadFloat(bulletActorPtr + offShootDir + 8);
+
+    // 获取 ProjectileMovementComponent 指针
+    const int32_t offPMComp = (m_off.Bullet_PMComp >= 0) ? m_off.Bullet_PMComp : 0x5C8;
+    const uintptr_t pmcPtr = safeReadPtr(bulletActorPtr + offPMComp);
+    if (pmcPtr == 0 || pmcPtr < 0x10000) {
+        LOG(LOG_LEVEL_WARN, "[BulletInfo] PMComp 为空 bullet=%p offset=0x%X", (void*)bulletActorPtr, offPMComp);
+        info.valid = true; // 子弹自身字段有效, 只是没有 PMC
+        return info;
+    }
+
+    // 从 ProjectileMovementComponent 读取弹速/重力
+    const int32_t offInitSpeed = (m_off.PMC_InitialSpeed >= 0) ? m_off.PMC_InitialSpeed : 0x164;
+    const int32_t offMaxSpeed  = (m_off.PMC_MaxSpeed >= 0) ? m_off.PMC_MaxSpeed : 0x168;
+    const int32_t offVelocity  = (m_off.PMC_Velocity >= 0) ? m_off.PMC_Velocity : 0x13C;
+    const int32_t offGravScale = (m_off.PMC_ProjectileGravityScale >= 0) ? m_off.PMC_ProjectileGravityScale : 0x180;
+
+    info.initialSpeed          = safeReadFloat(pmcPtr + offInitSpeed);
+    info.maxSpeed              = safeReadFloat(pmcPtr + offMaxSpeed);
+    info.velocity.x            = safeReadFloat(pmcPtr + offVelocity);
+    info.velocity.y            = safeReadFloat(pmcPtr + offVelocity + 4);
+    info.velocity.z            = safeReadFloat(pmcPtr + offVelocity + 8);
+    info.projectileGravityScale = safeReadFloat(pmcPtr + offGravScale);
+    info.valid = true;
+
+    LOG(LOG_LEVEL_INFO, "[BulletInfo] initSpeed=%.1f maxSpeed=%.1f vel=(%.1f,%.1f,%.1f) gravScale=%.2f launchGrav=%.2f noGravRange=%d",
+        info.initialSpeed, info.maxSpeed,
+        info.velocity.x, info.velocity.y, info.velocity.z,
+        info.projectileGravityScale, info.launchGravityScale, info.maxNoGravityRange);
+
+    return info;
+}
+
+// =====================================================================
+//  getRecoilInfo — 从 BulletTrackComponent 获取后坐力数据
+//
+//  参数: bulletTrackCompPtr = BulletTrackComponent 实例指针
+//        (通过武器的组件列表获取, 或通过 GUObjectArray 扫描)
+//  链路: WeaponActor → BulletTrackComponent
+//        BulletTrackComponent.CurRecoilValue      (+0x1C0)
+//        BulletTrackComponent.VerticalRecoilTarget (+0x1C4)
+//        BulletTrackComponent.HorizontalRecoilTarget (+0x1C8)
+// =====================================================================
+RecoilInfo MatchMonitor::getRecoilInfo(uintptr_t bulletTrackCompPtr) {
+    RecoilInfo info;
+    if (bulletTrackCompPtr == 0 || bulletTrackCompPtr < 0x10000) {
+        LOG(LOG_LEVEL_WARN, "[RecoilInfo] bulletTrackCompPtr 无效: %p", (void*)bulletTrackCompPtr);
+        return info;
+    }
+
+    const int32_t offCurRecoil   = (m_off.BTC_CurRecoilValue >= 0)          ? m_off.BTC_CurRecoilValue          : 0x1C0;
+    const int32_t offVRecoil     = (m_off.BTC_VerticalRecoilTarget >= 0)    ? m_off.BTC_VerticalRecoilTarget    : 0x1C4;
+    const int32_t offHRecoil     = (m_off.BTC_HorizontalRecoilTarget >= 0)  ? m_off.BTC_HorizontalRecoilTarget  : 0x1C8;
+    const int32_t offVRecovery   = (m_off.BTC_VerticalRecoveryTarget >= 0)  ? m_off.BTC_VerticalRecoveryTarget  : 0x1CC;
+    const int32_t offPoseRecoil  = (m_off.BTC_PoseRecoilFactor >= 0)        ? m_off.BTC_PoseRecoilFactor        : 0x1D4;
+    const int32_t offAccVRecoil  = (m_off.BTC_AccessoriesVRecoilFactor >= 0) ? m_off.BTC_AccessoriesVRecoilFactor : 0x1D8;
+    const int32_t offVModifier   = (m_off.BTC_VerticalRecoilFactorModifier >= 0) ? m_off.BTC_VerticalRecoilFactorModifier : 0x1E0;
+    const int32_t offAccHRecoil  = (m_off.BTC_AccessoriesHRecoilFactor >= 0) ? m_off.BTC_AccessoriesHRecoilFactor : 0x1E4;
+    const int32_t offHModifier   = (m_off.BTC_HorizontalRecoilFactorModifier >= 0) ? m_off.BTC_HorizontalRecoilFactorModifier : 0x1F0;
+    const int32_t offAccVTarget  = (m_off.BTC_AccVerticalRecoilTarget >= 0) ? m_off.BTC_AccVerticalRecoilTarget : 0x5B0;
+
+    info.curRecoilValue          = safeReadFloat(bulletTrackCompPtr + offCurRecoil);
+    info.verticalRecoilTarget    = safeReadFloat(bulletTrackCompPtr + offVRecoil);
+    info.horizontalRecoilTarget  = safeReadFloat(bulletTrackCompPtr + offHRecoil);
+    info.verticalRecoveryTarget  = safeReadFloat(bulletTrackCompPtr + offVRecovery);
+    info.poseRecoilFactor        = safeReadFloat(bulletTrackCompPtr + offPoseRecoil);
+    info.accVRecoilFactor        = safeReadFloat(bulletTrackCompPtr + offAccVRecoil);
+    info.vRecoilFactorModifier   = safeReadFloat(bulletTrackCompPtr + offVModifier);
+    info.accHRecoilFactor        = safeReadFloat(bulletTrackCompPtr + offAccHRecoil);
+    info.hRecoilFactorModifier   = safeReadFloat(bulletTrackCompPtr + offHModifier);
+    info.accVerticalRecoilTarget = safeReadFloat(bulletTrackCompPtr + offAccVTarget);
+    info.valid = true;
+
+    LOG(LOG_LEVEL_INFO, "[RecoilInfo] curRecoil=%.2f vTarget=%.2f hTarget=%.2f vRecovery=%.2f pose=%.2f accV=%.2f vMod=%.2f accH=%.2f hMod=%.2f accVTgt=%.2f",
+        info.curRecoilValue, info.verticalRecoilTarget, info.horizontalRecoilTarget,
+        info.verticalRecoveryTarget, info.poseRecoilFactor, info.accVRecoilFactor,
+        info.vRecoilFactorModifier, info.accHRecoilFactor, info.hRecoilFactorModifier,
+        info.accVerticalRecoilTarget);
+
+    return info;
+}
+
+// =====================================================================
+//  getCharacterSpeedInfo — 从角色获取移动速度/重力数据
+//
+//  参数: characterPtr = Character Actor 实例指针
+//  链路: Character → CharacterMovement(+0x658) → CharacterMovementComponent
+//        CMC.MaxWalkSpeed         (+0x264)
+//        CMC.MaxWalkSpeedCrouched (+0x268)
+//        CMC.GravityScale         (+0x20C)
+//        CMC.JumpZVelocity        (+0x214)
+//        CMC.Velocity             (+0x13C, 继承自 MovementComponent)
+// =====================================================================
+CharacterSpeedInfo MatchMonitor::getCharacterSpeedInfo(uintptr_t characterPtr) {
+    CharacterSpeedInfo info;
+    if (characterPtr == 0 || characterPtr < 0x10000) {
+        LOG(LOG_LEVEL_WARN, "[SpeedInfo] characterPtr 无效: %p", (void*)characterPtr);
+        return info;
+    }
+
+    // 获取 CharacterMovementComponent 指针
+    const int32_t offCMC = (m_off.Char_CharacterMovement >= 0) ? m_off.Char_CharacterMovement : 0x658;
+    const uintptr_t cmcPtr = safeReadPtr(characterPtr + offCMC);
+    if (cmcPtr == 0 || cmcPtr < 0x10000) {
+        LOG(LOG_LEVEL_WARN, "[SpeedInfo] CharacterMovement 为空 char=%p offset=0x%X", (void*)characterPtr, offCMC);
+        return info;
+    }
+
+    const int32_t offWalk      = (m_off.CMC_MaxWalkSpeed >= 0)         ? m_off.CMC_MaxWalkSpeed         : 0x264;
+    const int32_t offCrouch    = (m_off.CMC_MaxWalkSpeedCrouched >= 0) ? m_off.CMC_MaxWalkSpeedCrouched : 0x268;
+    const int32_t offSwim      = (m_off.CMC_MaxSwimSpeed >= 0)         ? m_off.CMC_MaxSwimSpeed         : 0x26C;
+    const int32_t offFly       = (m_off.CMC_MaxFlySpeed >= 0)          ? m_off.CMC_MaxFlySpeed          : 0x270;
+    const int32_t offAccel     = (m_off.CMC_MaxAcceleration >= 0)      ? m_off.CMC_MaxAcceleration      : 0x278;
+    const int32_t offGrav      = (m_off.CMC_GravityScale >= 0)         ? m_off.CMC_GravityScale         : 0x20C;
+    const int32_t offJump      = (m_off.CMC_JumpZVelocity >= 0)        ? m_off.CMC_JumpZVelocity        : 0x214;
+    const int32_t offVelocity  = (m_off.CMC_Velocity >= 0)             ? m_off.CMC_Velocity             : 0x13C;
+
+    info.maxWalkSpeed         = safeReadFloat(cmcPtr + offWalk);
+    info.maxWalkSpeedCrouched = safeReadFloat(cmcPtr + offCrouch);
+    info.maxSwimSpeed         = safeReadFloat(cmcPtr + offSwim);
+    info.maxFlySpeed          = safeReadFloat(cmcPtr + offFly);
+    info.maxAcceleration      = safeReadFloat(cmcPtr + offAccel);
+    info.gravityScale         = safeReadFloat(cmcPtr + offGrav);
+    info.jumpZVelocity        = safeReadFloat(cmcPtr + offJump);
+    info.velocity.x           = safeReadFloat(cmcPtr + offVelocity);
+    info.velocity.y           = safeReadFloat(cmcPtr + offVelocity + 4);
+    info.velocity.z           = safeReadFloat(cmcPtr + offVelocity + 8);
+    info.valid = true;
+
+    LOG(LOG_LEVEL_INFO, "[SpeedInfo] walk=%.1f crouch=%.1f swim=%.1f fly=%.1f accel=%.1f grav=%.2f jump=%.1f vel=(%.1f,%.1f,%.1f)",
+        info.maxWalkSpeed, info.maxWalkSpeedCrouched, info.maxSwimSpeed, info.maxFlySpeed,
+        info.maxAcceleration, info.gravityScale, info.jumpZVelocity,
+        info.velocity.x, info.velocity.y, info.velocity.z);
+
+    return info;
+}
 
 // =====================================================================
 //  自瞄 — 开镜时锁定200米内血量最少的敌人直至死亡

@@ -152,6 +152,43 @@ struct ResolvedOffsets {
     int32_t SkeletalMeshAsset_Skeleton                 = -1;
     int32_t Skeleton_RefBoneNames                      = -1;
 
+    // Character — CharacterMovement 组件指针
+    int32_t Char_CharacterMovement      = -1;  // Character.CharacterMovement (UCharacterMovementComponent*)
+
+    // CharacterMovementComponent — 人物移动速度
+    int32_t CMC_MaxWalkSpeed            = -1;  // +0x264
+    int32_t CMC_MaxWalkSpeedCrouched    = -1;  // +0x268
+    int32_t CMC_MaxSwimSpeed            = -1;  // +0x26C
+    int32_t CMC_MaxFlySpeed             = -1;  // +0x270
+    int32_t CMC_MaxAcceleration         = -1;  // +0x278
+    int32_t CMC_GravityScale            = -1;  // +0x20C
+    int32_t CMC_JumpZVelocity           = -1;  // +0x214
+    int32_t CMC_Velocity                = -1;  // MovementComponent.Velocity +0x13C
+
+    // STExtraShootWeaponBulletBase — 子弹相关
+    int32_t Bullet_PMComp               = -1;  // STExtraShootWeaponBulletBase.PMComp
+    int32_t Bullet_LaunchGravityScale   = -1;  // STExtraShootWeaponBulletBase.LaunchGravityScale
+    int32_t Bullet_MaxNoGravityRange    = -1;  // STExtraShootWeaponBulletBase.MaxNoGravityRange
+    int32_t Bullet_ShootDir             = -1;  // STExtraShootWeaponBulletBase.ShootDir
+
+    // ProjectileMovementComponent — 弹道运动
+    int32_t PMC_InitialSpeed            = -1;  // +0x164
+    int32_t PMC_MaxSpeed                = -1;  // +0x168
+    int32_t PMC_Velocity                = -1;  // MovementComponent.Velocity +0x13C
+    int32_t PMC_ProjectileGravityScale  = -1;  // +0x180
+
+    // BulletTrackComponent — 后坐力
+    int32_t BTC_CurRecoilValue          = -1;
+    int32_t BTC_VerticalRecoilTarget    = -1;
+    int32_t BTC_HorizontalRecoilTarget  = -1;
+    int32_t BTC_VerticalRecoveryTarget  = -1;
+    int32_t BTC_PoseRecoilFactor        = -1;
+    int32_t BTC_AccessoriesVRecoilFactor = -1;
+    int32_t BTC_VerticalRecoilFactorModifier = -1;
+    int32_t BTC_AccessoriesHRecoilFactor = -1;
+    int32_t BTC_HorizontalRecoilFactorModifier = -1;
+    int32_t BTC_AccVerticalRecoilTarget = -1;
+
     /// 所有关键偏移是否已成功解析
     bool isValid() const;
 };
@@ -318,6 +355,52 @@ struct MatchState {
 };
 
 // =====================================================================
+//  BulletInfo — 子弹速度/重力数据
+// =====================================================================
+struct BulletInfo {
+    bool valid = false;
+    float initialSpeed = 0.0f;          // ProjectileMovementComponent.InitialSpeed
+    float maxSpeed = 0.0f;              // ProjectileMovementComponent.MaxSpeed
+    FVector3 velocity;                  // ProjectileMovementComponent.Velocity
+    float projectileGravityScale = 0.0f; // ProjectileMovementComponent.ProjectileGravityScale
+    float launchGravityScale = 0.0f;    // STExtraShootWeaponBulletBase.LaunchGravityScale
+    int32_t maxNoGravityRange = 0;      // STExtraShootWeaponBulletBase.MaxNoGravityRange
+    FVector3 shootDir;                  // STExtraShootWeaponBulletBase.ShootDir
+};
+
+// =====================================================================
+//  RecoilInfo — 枪械后坐力数据
+// =====================================================================
+struct RecoilInfo {
+    bool valid = false;
+    float curRecoilValue = 0.0f;        // BulletTrackComponent.CurRecoilValue
+    float verticalRecoilTarget = 0.0f;  // BulletTrackComponent.VerticalRecoilTarget
+    float horizontalRecoilTarget = 0.0f; // BulletTrackComponent.HorizontalRecoilTarget
+    float verticalRecoveryTarget = 0.0f; // BulletTrackComponent.VerticalRecoveryTarget
+    float poseRecoilFactor = 0.0f;      // BulletTrackComponent.PoseRecoilFactor
+    float accVRecoilFactor = 0.0f;      // BulletTrackComponent.AccessoriesVRecoilFactor
+    float vRecoilFactorModifier = 0.0f; // BulletTrackComponent.VerticalRecoilFactorModifier
+    float accHRecoilFactor = 0.0f;      // BulletTrackComponent.AccessoriesHRecoilFactor
+    float hRecoilFactorModifier = 0.0f; // BulletTrackComponent.HorizontalRecoilFactorModifier
+    float accVerticalRecoilTarget = 0.0f; // BulletTrackComponent.AccVerticalRecoilTarget
+};
+
+// =====================================================================
+//  CharacterSpeedInfo — 人物移动速度数据
+// =====================================================================
+struct CharacterSpeedInfo {
+    bool valid = false;
+    float maxWalkSpeed = 0.0f;          // CharacterMovementComponent.MaxWalkSpeed
+    float maxWalkSpeedCrouched = 0.0f;  // CharacterMovementComponent.MaxWalkSpeedCrouched
+    float maxSwimSpeed = 0.0f;          // CharacterMovementComponent.MaxSwimSpeed
+    float maxFlySpeed = 0.0f;           // CharacterMovementComponent.MaxFlySpeed
+    float maxAcceleration = 0.0f;       // CharacterMovementComponent.MaxAcceleration
+    float gravityScale = 0.0f;          // CharacterMovementComponent.GravityScale
+    float jumpZVelocity = 0.0f;         // CharacterMovementComponent.JumpZVelocity
+    FVector3 velocity;                  // MovementComponent.Velocity (当前速度向量)
+};
+
+// =====================================================================
 //  MatchMonitor — 对局状态监控 + 玩家坐标采集 主类
 // =====================================================================
 class MatchMonitor {
@@ -386,6 +469,11 @@ private:
     // ---- 高频轻量刷新 ----
     void refreshTrackedPlayersFast();
     void fillCameraSnapshot(ue4draw::DrawGameData& drawData);
+
+    // ---- 子弹/后坐力/速度数据获取 ----
+    BulletInfo getBulletInfo(uintptr_t bulletActorPtr);
+    RecoilInfo getRecoilInfo(uintptr_t bulletTrackCompPtr);
+    CharacterSpeedInfo getCharacterSpeedInfo(uintptr_t characterPtr);
 
     // ---- 自瞄 ----
     void aimAtNearestEnemy();
