@@ -636,13 +636,17 @@ static void UE4GuiThread() {
 
     GLOG("AImGui RenderClient 初始化完成");
 
-    std::thread([imguiPtr = imgui.get()]() {
+    // RenderClient 的输入线程: ProcessInputEvent 通过 TCP 阻塞读取输入事件,
+    // 不能放在渲染线程中 (poll 最长 1s 会阻塞帧循环)。
+    std::atomic<bool> inputThreadRunning{true};
+    std::thread inputThread([imguiPtr = imgui.get(), &inputThreadRunning]() {
         GLOG("RenderClient 输入线程启动");
-        while (true) {
+        while (inputThreadRunning.load(std::memory_order_acquire)) {
+            // ProcessInputEvent 内部: ReadData(poll) → AddMousePosEvent 等
             imguiPtr->ProcessInputEvent();
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
-    }).detach();
+        GLOG("RenderClient 输入线程退出");
+    });
 
     ue4draw::DrawGameData gameData;
     ue4draw::UE4Overlay overlay;
@@ -670,9 +674,9 @@ static void UE4GuiThread() {
         if (shouldLogEvery(lastAliveCheck, std::chrono::milliseconds(2000))) {
             if (!isGameProcessAlive()) {
                 GLOG("RenderClient: 游戏进程已退出, 发送空帧清除 overlay");
+                inputThreadRunning.store(false, std::memory_order_release);
                 for (int i = 0; i < 3; i++) {
                     imgui->BeginFrame();
-                    // 不绘制任何内容, 让 overlay 变透明
                     imgui->EndFrame();
                     std::this_thread::sleep_for(std::chrono::milliseconds(16));
                 }
@@ -726,8 +730,11 @@ static void UE4GuiThread() {
         }
 
         imgui->EndFrame();
-        std::this_thread::yield();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
+
+    inputThreadRunning.store(false, std::memory_order_release);
+    if (inputThread.joinable()) inputThread.join();
 }
 
 static void UE4WorkerThread(void* plibUE4ModeBase, void* pGNames,

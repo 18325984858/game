@@ -20,6 +20,7 @@
 #include <string>
 #include <atomic>
 #include <mutex>
+#include <chrono>
 #include <condition_variable>
 
 namespace android
@@ -107,6 +108,7 @@ namespace android
         uint64_t m_fontPacketCount = 0;
         uint64_t m_renderPacketCount = 0;
         uint64_t m_renderFrameCount = 0;
+        std::chrono::steady_clock::time_point m_clientDisconnectTime{};
         size_t m_lastFontPacketSize = 0;
         size_t m_lastRenderPacketSize = 0;
         size_t m_lastRenderDecodedSize = 0;

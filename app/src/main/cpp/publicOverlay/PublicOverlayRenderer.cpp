@@ -72,17 +72,12 @@ void overlayThreadMain(ANativeWindow* window, int width, int height, int rotateT
             return;
         }
 
-        std::thread inputThread([imguiPtr = imgui.get()]() {
-            OLOG(LOG_LEVEL_INFO, "公开 Overlay 输入线程启动");
-            while (!g_overlayStopRequested.load(std::memory_order_acquire)) {
-                imguiPtr->ProcessInputEvent();
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            }
-            OLOG(LOG_LEVEL_INFO, "公开 Overlay 输入线程退出");
-        });
+        // 注意: ProcessInputEvent 必须与 BeginFrame/EndFrame 在同一线程调用,
+        // 否则 ImGui::IO 的 InputEventsQueue 会多线程竞争导致 ImVector 越界崩溃
 
         Clock::time_point lastHeartbeatLog;
         while (!g_overlayStopRequested.load(std::memory_order_acquire)) {
+            imgui->ProcessInputEvent();
             imgui->BeginFrame();
             imgui->EndFrame();
 
@@ -90,17 +85,14 @@ void overlayThreadMain(ANativeWindow* window, int width, int height, int rotateT
                 OLOG(LOG_LEVEL_INFO, "公开 Overlay 心跳 width=%d height=%d", width, height);
             }
 
-            std::this_thread::yield();
+            // 帧节拍: 避免 yield() 导致 CPU 满载空转, 降低系统调度压力
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
 
         // 渲染一帧空帧清除 Surface 上的残留内容
         imgui->BeginFrame();
         imgui->EndFrame();
         OLOG(LOG_LEVEL_INFO, "公开 Overlay 已渲染空帧清除画面");
-
-        if (inputThread.joinable()) {
-            inputThread.join();
-        }
 
         OLOG(LOG_LEVEL_INFO, "公开 Overlay 渲染线程退出");
     } catch (const std::exception& exception) {

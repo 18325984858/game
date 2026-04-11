@@ -675,11 +675,19 @@ namespace android
             {
             case RenderState::ReadData:
             {
-                // 空闲: client 断开后清屏一次, 防止残留
+                // 断连后保持最后一帧显示, 超过宽限期再清屏, 防止瞬断闪烁
                 if (m_renderFrameCount > 0 && !m_clientConnected.load(std::memory_order_acquire)) {
-                    glClear(GL_COLOR_BUFFER_BIT);
-                    eglSwapBuffers(m_defaultDisplay, m_eglSurface);
-                    m_renderFrameCount = 0;
+                    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - m_clientDisconnectTime).count();
+                    if (elapsed >= 3000) {
+                        glClear(GL_COLOR_BUFFER_BIT);
+                        eglSwapBuffers(m_defaultDisplay, m_eglSurface);
+                        {
+                            std::lock_guard<std::mutex> lock(m_renderDataMutex);
+                            m_serverRenderData.clear();
+                        }
+                        m_renderFrameCount = 0;
+                    }
                 }
                 break;
             }
@@ -1302,20 +1310,22 @@ namespace android
                     break;
                 }
 
-                if (RenderState::ReadData != m_renderState)
-                    continue;
                 if (m_options.exchangeFontData && !m_serverFontPacketReceived) // NOTE: First packet is font data
                 {
+                    // 字体包必须在 ReadData 状态处理
+                    if (RenderState::ReadData != m_renderState.load(std::memory_order_acquire))
+                        continue;
                     std::lock_guard<std::mutex> lock(m_renderDataMutex);
                     m_serverFontData.swap(m_serverRenderDataBack);
                     m_serverFontPacketReceived = true;
                     m_fontPacketCount++;
                     m_lastFontPacketSize = packetSize;
                     LogInfo("[AImGui] Server received font packet size=%u", packetSize);
-                    m_renderState = RenderState::SetFont;
+                    m_renderState.store(RenderState::SetFont, std::memory_order_release);
                 }
                 else
                 {
+                    // 渲染数据始终保存最新帧, 不再丢弃
                     std::lock_guard<std::mutex> lock(m_renderDataMutex);
                     if (!m_options.compressionFrameData)
                         m_serverRenderData.swap(m_serverRenderDataBack);
@@ -1351,7 +1361,7 @@ namespace android
                                 m_lastRenderPacketSize,
                                 m_lastRenderDecodedSize);
                     }
-                    m_renderState = RenderState::Rendering;
+                    m_renderState.store(RenderState::Rendering, std::memory_order_release);
                 }
             }
 
@@ -1363,13 +1373,10 @@ namespace android
                 close(clientFd);
             }
 
-            // 客户端断开后清空渲染数据, 渲染线程会在 ReadData 状态做 glClear
+            // 客户端断开: 记录时间, 保留最后一帧数据, 由渲染线程在宽限期后清屏
+            m_clientDisconnectTime = std::chrono::steady_clock::now();
             m_clientConnected.store(false, std::memory_order_release);
-            {
-                std::lock_guard<std::mutex> lock(m_renderDataMutex);
-                m_serverRenderData.clear();
-                m_renderState = RenderState::ReadData;
-            }
+            m_renderState.store(RenderState::ReadData, std::memory_order_release);
 
             if (m_state)
                 LogInfo("[AImGui] Server client disconnected, waiting next client");

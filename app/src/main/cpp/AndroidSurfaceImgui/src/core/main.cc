@@ -4,6 +4,28 @@
 #include <jni.h>
 
 #include <thread>
+#include <cstdio>
+#include <cstring>
+#include <fcntl.h>
+#include <unistd.h>
+
+static bool shouldStartDemoGui()
+{
+    char cmdline[256] = {};
+    int fd = open("/proc/self/cmdline", O_RDONLY);
+    if (fd < 0) return false;
+    ssize_t n = read(fd, cmdline, sizeof(cmdline) - 1);
+    close(fd);
+    if (n <= 0) return false;
+    cmdline[n] = '\0';
+    // overlay 服务进程: 由 PublicOverlayRenderer 驱动, 不能启动 demo Gui
+    if (strstr(cmdline, ":overlay") != nullptr) return false;
+    // 游戏进程 (注入): 由 uestart.cpp 的 UE4GuiThread 驱动, 不能启动 demo Gui
+    if (strstr(cmdline, "pubgmhd") != nullptr) return false;
+    if (strstr(cmdline, "tmgp.dfm") != nullptr) return false;
+    // 仅在 dobbyproject 主进程中启动 demo Gui (调试用途)
+    return strstr(cmdline, "dobbyproject") != nullptr && strstr(cmdline, ":") == nullptr;
+}
 
 void Gui()
 {
@@ -80,7 +102,16 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved)
 {
     LogInfo("[=] =============================================Injected so has been loaded.=============================================");
 
-    std::thread(Gui).detach();
+    // demo Gui 仅在 dobbyproject 主进程中启动 (调试用途)
+    // overlay 进程由 PublicOverlayRenderer 驱动, 游戏进程由 UE4GuiThread 驱动
+    if (shouldStartDemoGui())
+    {
+        std::thread(Gui).detach();
+    }
+    else
+    {
+        LogInfo("[=] Non-main process or injected target, skipping demo Gui thread");
+    }
 
     return JNI_VERSION_1_6;
 }

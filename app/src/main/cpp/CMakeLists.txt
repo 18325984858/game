@@ -64,7 +64,7 @@ add_subdirectory(AndroidSurfaceImgui)
 # 添加编译定义
 add_definitions(-D_GNU_SOURCE)
 
-# 检测目标架构
+# 检测目标架�?
 if(${ANDROID_ABI} STREQUAL "arm64-v8a")
     add_definitions(-D__aarch64__)
     message("构建 ARM64 架构")
@@ -117,13 +117,13 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
         "unityGame/interface/interface.cpp"
         "unityGame/il2cppHeader/il2cppHeader.cpp"
         "Injector/Injector.cpp"
-        "ueGame/libUE4Struct/ilbUE4Struct.cpp"
-        "ueGame/libUE4Dumper/UE4Dumper.cpp"
-        "ueGame/libUE4Header/UE4Header.cpp"
-        "ueGame/interface/interface.cpp"
-        "ueGame/Draw/UE4Draw.cpp"
-        "ueGame/pubgmhd/pubgmhd.cpp"
-        "ueGame/uestart.cpp"
+        "ueGamepubgmhd/libUE4Struct/ilbUE4Struct.cpp"
+        "ueGamepubgmhd/libUE4Dumper/UE4Dumper.cpp"
+        "ueGamepubgmhd/libUE4Header/UE4Header.cpp"
+        "ueGamepubgmhd/interface/interface.cpp"
+        "ueGamepubgmhd/Draw/UE4Draw.cpp"
+        "ueGamepubgmhd/pubgmhd/pubgmhd.cpp"
+        "ueGamepubgmhd/uestart.cpp"
 )
 
 # Specifies libraries CMake should link to your target library. You
@@ -158,7 +158,7 @@ if(USE_WINDOWS_LLVM_FRONTEND AND ENABLE_WINDOWS_LLVM_OBFUSCATION)
         message(STATUS "WINDOWS_LLVM_MEDIUM_PASSES=${WINDOWS_LLVM_MEDIUM_PASSES}")
         message(STATUS "WINDOWS_LLVM_HEAVY_PASSES=${WINDOWS_LLVM_HEAVY_PASSES}")
 
-        # 强制包含注解头，使 Polaris pass 对所有函数生效
+        # 强制包含注解头，�?Polaris pass 对所有函数生�?
         target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE OBFU_ENABLE_ANNOTATIONS)
         target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE
                 "-include" "${CMAKE_CURRENT_SOURCE_DIR}/unityGame/obfu_attrs.h"
@@ -170,8 +170,8 @@ if(USE_WINDOWS_LLVM_FRONTEND AND ENABLE_WINDOWS_LLVM_OBFUSCATION)
                 "unityGame/Draw/Draw.cpp"
                 "unityGame/Symbol/Symbol.cpp"
                 "unityGame/li2cppDumper/li2cppdumper.cpp"
-                "ueGame/libUE4Struct/ilbUE4Struct.cpp"
-                "ueGame/libUE4Dumper/UE4Dumper.cpp"
+                "ueGamepubgmhd/libUE4Struct/ilbUE4Struct.cpp"
+                "ueGamepubgmhd/libUE4Dumper/UE4Dumper.cpp"
                 PROPERTIES COMPILE_OPTIONS "-mllvm;-passes=${WINDOWS_LLVM_MEDIUM_PASSES}"
         )
 
@@ -184,8 +184,8 @@ if(USE_WINDOWS_LLVM_FRONTEND AND ENABLE_WINDOWS_LLVM_OBFUSCATION)
 endif()
 
 ######################################################################################################
-# 独立注入器可执行文件 (需要通过 su 以 root 运行)
-# 伪装为 .so 文件, 让 Gradle 自动打包进 APK
+# 独立注入器可执行文件 (需要通过 su �?root 运行)
+# 伪装�?.so 文件, �?Gradle 自动打包�?APK
 ######################################################################################################
 add_executable(injector
         "Injector/injector_main.cpp"
@@ -207,7 +207,7 @@ if(USE_WINDOWS_LLVM_FRONTEND AND ENABLE_WINDOWS_LLVM_OBFUSCATION)
         )
 endif()
 
-# 重命名为 libinjector.so, Gradle 只打包 lib*.so 到 APK
+# 重命名为 libinjector.so, Gradle 只打�?lib*.so �?APK
 set_target_properties(injector PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}"
         OUTPUT_NAME "injector"

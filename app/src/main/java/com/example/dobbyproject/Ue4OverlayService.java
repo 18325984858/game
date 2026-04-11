@@ -43,6 +43,9 @@ public class Ue4OverlayService extends Service {
     private OverlayTextureView overlayTextureView;
     private Surface overlaySurface;
     private WindowManager.LayoutParams overlayLayoutParams;
+    private int lastRendererWidth = 0;
+    private int lastRendererHeight = 0;
+    private int lastRendererRotation = -1;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final Runnable overlayLayoutSyncRunnable = new Runnable() {
         @Override
@@ -277,16 +280,27 @@ public class Ue4OverlayService extends Service {
             releaseOverlaySurface();
             overlaySurface = new Surface(surfaceTexture);
             PublicOverlayBridge.startRenderer(overlaySurface, width, height, rotateTheta);
+            lastRendererWidth = width;
+            lastRendererHeight = height;
+            lastRendererRotation = rotateTheta;
         }
 
         @Override
         public void onSurfaceTextureSizeChanged(SurfaceTexture surfaceTexture, int width, int height) {
             int rotateTheta = getCurrentDisplayRotationDegrees();
+            // 尺寸和旋转均未变化时跳过重建, 避免 layout sync 触发的无效重启闪烁
+            if (width == lastRendererWidth && height == lastRendererHeight && rotateTheta == lastRendererRotation) {
+                Log.d(TAG, "onSurfaceTextureSizeChanged same size/rotation, skip restart");
+                return;
+            }
             Log.i(TAG, "onSurfaceTextureSizeChanged width=" + width + " height=" + height + " rotate=" + rotateTheta);
             PublicOverlayBridge.stopRenderer();
             releaseOverlaySurface();
             overlaySurface = new Surface(surfaceTexture);
             PublicOverlayBridge.startRenderer(overlaySurface, width, height, rotateTheta);
+            lastRendererWidth = width;
+            lastRendererHeight = height;
+            lastRendererRotation = rotateTheta;
         }
 
         @Override
