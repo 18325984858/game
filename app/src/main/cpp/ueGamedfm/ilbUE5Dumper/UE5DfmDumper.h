@@ -58,6 +58,22 @@ public:
     uintptr_t getModuleBase() const { return m_moduleBase; }
     uintptr_t getModuleSize() const { return m_moduleSize; }
     const std::string& getOutputPath() const { return m_outputPath; }
+    uint32_t getOffGUObjectArrayNum() const { return m_offGUObjectArrayNum; }
+
+    // ---- 安全内存读取 (public, 供 interface 等外部使用) ----
+    static uintptr_t rp(uintptr_t addr);
+    static uint32_t r32(uintptr_t addr);
+    static int32_t rs32(uintptr_t addr);
+    static bool ok(uintptr_t p);
+
+    // ---- 名称解析 (public, 供 interface 等外部使用) ----
+    std::string oname(uintptr_t objPtr) const;
+    std::string ffname(uintptr_t fieldPtr) const;
+    std::string ffclassname(uintptr_t fieldPtr) const;
+    std::string getFullPath(uintptr_t objPtr) const;
+
+    // ---- GUObjectArray 访问 (public) ----
+    uintptr_t getobj(int index) const;
 
 private:
     uintptr_t m_moduleBase;
@@ -71,26 +87,15 @@ private:
     uint32_t m_offGUObjectArrayChunks; // GUObjectArray.Chunks 偏移
     uint32_t m_offGWorld;              // GWorld 偏移
 
-    // ---- 安全内存读取 ----
-    static uintptr_t rp(uintptr_t addr);
-    static uint32_t r32(uintptr_t addr);
-    static int32_t rs32(uintptr_t addr);
+    // ---- 安全内存读取 (private helpers) ----
     static uint16_t r16(uintptr_t addr);
     static uint8_t r8(uintptr_t addr);
-    static bool ok(uintptr_t p);
 
     // ---- NamePool 解码 (混淆: NOT+XOR, 9-case mask) ----
     static uint8_t amask(int length);
     std::string resolveName(uint32_t id) const;
     std::string fname(uintptr_t addr) const;
-    std::string oname(uintptr_t objPtr) const;
-    std::string ffname(uintptr_t fieldPtr) const;
-    std::string ffclassname(uintptr_t fieldPtr) const;
     std::string className(uintptr_t objPtr) const;
-    std::string getFullPath(uintptr_t objPtr) const;
-
-    // ---- GUObjectArray 访问 ----
-    uintptr_t getobj(int index) const;
 
     // ---- 属性类型映射 ----
     std::string ptype(const std::string& cn, uintptr_t fpPtr) const;
