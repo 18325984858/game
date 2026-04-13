@@ -29,6 +29,11 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".SoDumperActivity"
+            android:exported="false"
+            android:label="SO Dumper" />
+
         <service
             android:name=".Ue4OverlayService"
             android:enabled="true"

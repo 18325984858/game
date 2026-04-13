@@ -156,6 +156,13 @@ public class MainActivity extends AppCompatActivity {
         Button btnFont = findViewById(R.id.btn_deploy_font);
         Button btnLaunch = findViewById(R.id.btn_launch);
         Button btnPubgLaunch = findViewById(R.id.btn_pubg_launch);
+        Button btnSoDumper = findViewById(R.id.btn_so_dumper);
+
+        // ── SO Dumper 入口 ──
+        btnSoDumper.setOnClickListener(v -> {
+            Intent soDumperIntent = new Intent(this, SoDumperActivity.class);
+            startActivity(soDumperIntent);
+        });
 
         // ── 和平精英启动按钮 ──
         btnPubgLaunch.setOnClickListener(v -> {

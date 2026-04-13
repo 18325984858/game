@@ -84,7 +84,7 @@ void overlayThreadMain(ANativeWindow* window, int width, int height, int rotateT
             imgui->EndFrame();
 
             // 检测 RenderClient 断线: 游戏进程退出时 TCP 连接断开
-            const bool clientNow = imgui->m_clientConnected.load(std::memory_order_acquire);
+            const bool clientNow = imgui->IsClientConnected();
             if (clientNow) {
                 clientWasConnected = true;
                 clientDisconnectFrames = 0;

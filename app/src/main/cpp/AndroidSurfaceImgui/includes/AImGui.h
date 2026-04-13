@@ -74,6 +74,8 @@ namespace android
 
         void SetupWindowInfo(void *windowInfo);
 
+        bool IsClientConnected() const { return m_clientConnected.load(std::memory_order_acquire); }
+
         constexpr operator bool() const
         {
             return m_state;

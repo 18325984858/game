@@ -175,6 +175,21 @@
 
     </LinearLayout>
 
+    <!-- 分隔线 -->
+    <View
+        android:layout_width="match_parent"
+        android:layout_height="1dp"
+        android:background="#CCCCCC"
+        android:layout_marginBottom="16dp" />
+
+    <!-- SO Dumper 入口 -->
+    <Button
+        android:id="@+id/btn_so_dumper"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="📦 SO Dumper (Dump + ELF修复)"
+        android:layout_marginBottom="16dp" />
+
     <!-- 状态显示 -->
     <TextView
         android:id="@+id/tv_status"

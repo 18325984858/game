@@ -1,0 +1,143 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    tools:context=".SoDumperActivity">
+
+<LinearLayout
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:gravity="center_horizontal"
+    android:padding="24dp">
+
+    <!-- 标题 -->
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="SO Dumper"
+        android:textSize="20sp"
+        android:textStyle="bold"
+        android:layout_marginBottom="20dp" />
+
+    <!-- 搜索框 -->
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="搜索应用 (模糊匹配包名)"
+        android:textSize="13sp"
+        android:textColor="#888888"
+        android:layout_marginBottom="4dp" />
+
+    <AutoCompleteTextView
+        android:id="@+id/et_search"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:hint="输入包名关键词..."
+        android:textColor="#000000"
+        android:textColorHint="#999999"
+        android:inputType="text"
+        android:singleLine="true"
+        android:padding="12dp"
+        android:background="@android:drawable/edit_text"
+        android:layout_marginBottom="8dp" />
+
+    <!-- 刷新按钮 -->
+    <Button
+        android:id="@+id/btn_refresh"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="🔄 刷新进程列表"
+        android:layout_marginBottom="16dp" />
+
+    <!-- 分隔线 -->
+    <View
+        android:layout_width="match_parent"
+        android:layout_height="1dp"
+        android:background="#CCCCCC"
+        android:layout_marginBottom="16dp" />
+
+    <!-- 选择应用 -->
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="① 选择目标应用"
+        android:textSize="14sp"
+        android:textStyle="bold"
+        android:layout_marginBottom="6dp" />
+
+    <Spinner
+        android:id="@+id/spinner_apps"
+        android:layout_width="match_parent"
+        android:layout_height="48dp"
+        android:background="@android:drawable/btn_dropdown"
+        android:layout_marginBottom="16dp" />
+
+    <!-- 选择 SO -->
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="② 选择 SO 模块"
+        android:textSize="14sp"
+        android:textStyle="bold"
+        android:layout_marginBottom="6dp" />
+
+    <EditText
+        android:id="@+id/et_module_search"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:hint="搜索 SO 名称..."
+        android:textColor="#000000"
+        android:textColorHint="#999999"
+        android:inputType="text"
+        android:singleLine="true"
+        android:padding="12dp"
+        android:background="@android:drawable/edit_text"
+        android:layout_marginBottom="8dp" />
+
+    <Spinner
+        android:id="@+id/spinner_modules"
+        android:layout_width="match_parent"
+        android:layout_height="48dp"
+        android:background="@android:drawable/btn_dropdown"
+        android:layout_marginBottom="16dp" />
+
+    <!-- 分隔线 -->
+    <View
+        android:layout_width="match_parent"
+        android:layout_height="1dp"
+        android:background="#CCCCCC"
+        android:layout_marginBottom="16dp" />
+
+    <!-- Dump 按钮 -->
+    <Button
+        android:id="@+id/btn_dump"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="📦 Dump SO + 修复 ELF"
+        android:enabled="false"
+        android:layout_marginBottom="12dp" />
+
+    <!-- 进度条 -->
+    <ProgressBar
+        android:id="@+id/progress_dump"
+        style="?android:attr/progressBarStyleHorizontal"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:indeterminate="true"
+        android:visibility="gone"
+        android:layout_marginBottom="12dp" />
+
+    <!-- 状态显示 -->
+    <TextView
+        android:id="@+id/tv_dump_status"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="就绪 - 选择应用和 SO 后点击 Dump"
+        android:textSize="13sp"
+        android:textColor="#666666"
+        android:lineSpacingExtra="4dp" />
+
+</LinearLayout>
+</ScrollView>
