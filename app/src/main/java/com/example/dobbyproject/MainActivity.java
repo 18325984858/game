@@ -105,6 +105,8 @@ public class MainActivity extends AppCompatActivity {
     private TextView tvStatus;
     private CheckBox cbPubgDumper;
     private CheckBox cbPubgHeader;
+    private CheckBox cbDfmDumper;
+    private CheckBox cbDfmHeader;
 
     private static final String UE4_OVERLAY_STATUS = "UE4 公开 Overlay 已启动";
 
@@ -124,6 +126,8 @@ public class MainActivity extends AppCompatActivity {
         CheckBox cbLog = findViewById(R.id.cb_log);
         cbPubgDumper = findViewById(R.id.cb_pubg_dumper);
         cbPubgHeader = findViewById(R.id.cb_pubg_header);
+        cbDfmDumper = findViewById(R.id.cb_dfm_dumper);
+        cbDfmHeader = findViewById(R.id.cb_dfm_header);
 
         // ── 折叠区域: lol手游 ──
         TextView tvSectionHeader = findViewById(R.id.tv_section_lol_header);
@@ -151,11 +155,25 @@ public class MainActivity extends AppCompatActivity {
             }
         });
 
+        // ── 折叠区域: 三角洲 ──
+        TextView tvDfmHeader = findViewById(R.id.tv_section_dfm_header);
+        LinearLayout layoutDfmContent = findViewById(R.id.layout_dfm_content);
+        tvDfmHeader.setOnClickListener(v -> {
+            if (layoutDfmContent.getVisibility() == View.VISIBLE) {
+                layoutDfmContent.setVisibility(View.GONE);
+                tvDfmHeader.setText("▶ 三角洲");
+            } else {
+                layoutDfmContent.setVisibility(View.VISIBLE);
+                tvDfmHeader.setText("▼ 三角洲");
+            }
+        });
+
         Button btnSelinux = findViewById(R.id.btn_selinux);
         Button btnInputPerm = findViewById(R.id.btn_input_perm);
         Button btnFont = findViewById(R.id.btn_deploy_font);
         Button btnLaunch = findViewById(R.id.btn_launch);
         Button btnPubgLaunch = findViewById(R.id.btn_pubg_launch);
+        Button btnDfmLaunch = findViewById(R.id.btn_dfm_launch);
         Button btnSoDumper = findViewById(R.id.btn_so_dumper);
 
         // ── SO Dumper 入口 ──
@@ -200,6 +218,42 @@ public class MainActivity extends AppCompatActivity {
             Toast.makeText(this, "正在启动和平精英并注入..." + options, Toast.LENGTH_SHORT).show();
         });
 
+        // ── 三角洲启动按钮 ──
+        btnDfmLaunch.setOnClickListener(v -> {
+            if (!selinuxDone) {
+                Toast.makeText(this, "请先设置宽容模式", Toast.LENGTH_SHORT).show();
+                return;
+            }
+
+            if ("⚠ 游戏未安装".equals(btnDfmLaunch.getText().toString())) {
+                Toast.makeText(this, "三角洲未安装，请先安装游戏", Toast.LENGTH_SHORT).show();
+                return;
+            }
+
+            if (!ensureOverlayPermission()) {
+                updateStatus("请授予悬浮窗权限后重试");
+                return;
+            }
+
+            startUe4OverlayService();
+            btnDfmLaunch.setEnabled(false);
+
+            boolean enableUeDumper = cbDfmDumper.isChecked();
+            boolean enableUeHeader = cbDfmHeader.isChecked();
+            boolean enableLog = cbLog.isChecked();
+
+            clearDumpMarkers();
+            writeFiletoTargetDfm();
+            launchAndInjectDfm(enableUeDumper, enableUeHeader, enableLog);
+
+            String options2 = "";
+            if (enableUeDumper) options2 += " [UE4 Dumper]";
+            if (enableUeHeader) options2 += " [UE4 Header]";
+            btnDfmLaunch.setText("✅ 游戏已启动" + options2);
+            updateStatus(UE4_OVERLAY_STATUS + " | 三角洲启动中..." + options2);
+            Toast.makeText(this, "正在启动三角洲并注入..." + options2, Toast.LENGTH_SHORT).show();
+        });
+
         // ── 启动时初始化检测 ──
         updateStatus("正在检测环境...");
         new Thread(() -> {
@@ -222,6 +276,7 @@ public class MainActivity extends AppCompatActivity {
             boolean fontOk = checkFileExists("/data/local/tmp/chinese.ttf");
             boolean gameInstalled = checkGameInstalled();
             boolean pubgInstalled = checkPackageInstalled(PUBG_PACKAGE);
+            boolean dfmInstalled = checkPackageInstalled(DFM_PACKAGE);
 
             runOnUiThread(() -> {
                 StringBuilder sb = new StringBuilder();
@@ -253,9 +308,16 @@ public class MainActivity extends AppCompatActivity {
                 if (!pubgInstalled) {
                     btnPubgLaunch.setEnabled(false);
                     btnPubgLaunch.setText("⚠ 游戏未安装");
-                    sb.append("和平精英未安装 ✗");
+                    sb.append("和平精英未安装 ✗  ");
                 } else {
-                    sb.append("和平精英已安装 ✓");
+                    sb.append("和平精英已安装 ✓  ");
+                }
+                if (!dfmInstalled) {
+                    btnDfmLaunch.setEnabled(false);
+                    btnDfmLaunch.setText("⚠ 游戏未安装");
+                    sb.append("三角洲未安装 ✗");
+                } else {
+                    sb.append("三角洲已安装 ✓");
                 }
                 updateStatus(sb.length() > 0 ? sb.toString().trim() : "就绪");
             });
@@ -1048,6 +1110,14 @@ public class MainActivity extends AppCompatActivity {
     private static final String PUBG_INJECTOR_TRACE = "/data/local/tmp/injector_trace.txt";
     private static final String PUBG_UE4_GUI_TRACE = "/data/data/" + PUBG_PACKAGE + "/cache/ue4_gui_trace.txt";
 
+    // ═══════════════════════════════════════════════════════════════════
+    //  三角洲 (Delta Force Mobile) 注入流程
+    // ═══════════════════════════════════════════════════════════════════
+
+    private static final String DFM_PACKAGE = "com.tencent.tmgp.dfm";
+    private static final String DFM_INJECTOR_TRACE = "/data/local/tmp/dfm_injector_trace.txt";
+    private static final String DFM_UE4_GUI_TRACE = "/data/data/" + DFM_PACKAGE + "/cache/ue4_gui_trace.txt";
+
     /**
      * 拷贝 SO 到和平精英目标目录
      */
@@ -1184,6 +1254,125 @@ public class MainActivity extends AppCompatActivity {
                 runOnUiThread(() -> {
                     stopUe4OverlayService();
                     updateStatus("和平精英注入异常");
+                });
+            }
+        }).start();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  三角洲 (Delta Force Mobile) 注入方法
+    // ═══════════════════════════════════════════════════════════════════
+
+    /**
+     * 拷贝 SO 到三角洲目标目录
+     */
+    public void writeFiletoTargetDfm() {
+        String srcFile = g_nativeLibPath + (g_nativeLibPath.endsWith("/") ? "" : "/") + "libdobbyproject.so";
+        String dstDir = "/data/data/" + DFM_PACKAGE + "/files";
+        String dstFile = dstDir + "/libdobbyproject.so";
+
+        LogUtil.i("[DFM] 源文件: " + srcFile);
+        LogUtil.i("[DFM] 拷贝 SO -> " + dstFile);
+
+        String cmd = "mkdir -p " + dstDir + "\n" +
+                "cp -f " + srcFile + " " + dstFile + "\n" +
+                "chmod 777 " + dstFile + "\n" +
+                "sync\nexit\n";
+
+        String[] suVariants = {"su -M", "su -mm", "su"};
+        for (String suCmd : suVariants) {
+            try {
+                Process p = Runtime.getRuntime().exec(suCmd);
+                DataOutputStream os = new DataOutputStream(p.getOutputStream());
+                os.writeBytes(cmd);
+                os.flush();
+                int exitCode = p.waitFor();
+                if (exitCode == 0) {
+                    LogUtil.i("[DFM] ✓ " + suCmd + " 拷贝成功");
+                    return;
+                }
+            } catch (Exception e) {
+                LogUtil.i("[DFM] " + suCmd + " 不可用");
+            }
+        }
+        LogUtil.e("[DFM] 所有 su 方式均失败", null);
+    }
+
+    /**
+     * 启动三角洲并注入 (DFM 模式)
+     */
+    public void launchAndInjectDfm(boolean enableUeDumper, boolean enableUeHeader, boolean enableLog) {
+        String soPath = "/data/data/" + DFM_PACKAGE + "/files/libdobbyproject.so";
+        String injectorDst = "/data/local/tmp/injector";
+
+        new Thread(() -> {
+            try {
+                // 1. 部署 injector
+                LogUtil.i("[DFM] 部署 injector");
+                Process deployP = Runtime.getRuntime().exec("su");
+                DataOutputStream deployOs = new DataOutputStream(deployP.getOutputStream());
+                deployOs.writeBytes("cp -f " + g_nativeLibPath + "/libinjector.so " + injectorDst + "\n");
+                deployOs.writeBytes("chmod 755 " + injectorDst + "\n");
+                deployOs.writeBytes("exit\n");
+                deployOs.flush();
+                deployP.waitFor();
+
+                // 2. 启动三角洲
+                LogUtil.i("[DFM] 启动三角洲");
+                Process launchP = Runtime.getRuntime().exec("su");
+                DataOutputStream launchOs = new DataOutputStream(launchP.getOutputStream());
+                launchOs.writeBytes("monkey -p " + DFM_PACKAGE + " -c android.intent.category.LAUNCHER 1 2>/dev/null\n");
+                launchOs.writeBytes("exit\n");
+                launchOs.flush();
+                launchP.waitFor();
+
+                // 3. 等待游戏初始化
+                LogUtil.i("[DFM] 等待 15 秒游戏初始化...");
+                Thread.sleep(15000);
+
+                // 4. 写入配置文件
+                Process cfgP = Runtime.getRuntime().exec("su");
+                DataOutputStream cfgOs = new DataOutputStream(cfgP.getOutputStream());
+                String cfgContent = "ue_dumper=" + (enableUeDumper ? "1" : "0") + "\n"
+                                  + "ue_header=" + (enableUeHeader ? "1" : "0") + "\n"
+                                  + "log=" + (enableLog ? "1" : "0") + "\n";
+                cfgOs.writeBytes("echo '" + cfgContent + "' > /data/local/tmp/dobby_config.txt\n");
+                cfgOs.writeBytes("chmod 644 /data/local/tmp/dobby_config.txt\n");
+                cfgOs.writeBytes("rm -f " + DFM_INJECTOR_TRACE + " " + DFM_UE4_GUI_TRACE + "\n");
+                cfgOs.writeBytes("exit\n");
+                cfgOs.flush();
+                cfgP.waitFor();
+
+                // 5. 执行注入 (dfm 模式, 单次注入, 不重试 — DFM 无 GUI overlay trace 文件)
+                LogUtil.i("[DFM] 执行注入: " + injectorDst + " " + DFM_PACKAGE + " " + soPath + " dfm");
+                Process p = Runtime.getRuntime().exec("su");
+                DataOutputStream os = new DataOutputStream(p.getOutputStream());
+                os.writeBytes(injectorDst + " " + DFM_PACKAGE + " " + soPath + " dfm 2>&1\n");
+                os.writeBytes("exit $?\n");
+                os.flush();
+
+                BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream()));
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    LogUtil.i("[DFM] " + line);
+                }
+                int exitCode = p.waitFor();
+                LogUtil.i("[DFM] 注入完成, exitCode=" + exitCode);
+
+                runOnUiThread(() -> {
+                    if (exitCode == 0) {
+                        updateStatus("三角洲注入成功");
+                    } else {
+                        stopUe4OverlayService();
+                        updateStatus("三角洲注入失败 (code=" + exitCode + ")");
+                    }
+                });
+
+            } catch (Exception e) {
+                LogUtil.e("[DFM] 注入异常: " + e.getMessage(), e);
+                runOnUiThread(() -> {
+                    stopUe4OverlayService();
+                    updateStatus("三角洲注入异常");
                 });
             }
         }).start();

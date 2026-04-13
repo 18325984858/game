@@ -16,18 +16,25 @@
 
 using namespace std;
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /**
- * @brief   业务逻辑启动入口函数
- * @param   pli2cppModeBase         il2cpp 模块基地址（libil2cpp.so 在内存中的加载地址）
+ * @brief   LOL 业务逻辑启动入口函数
+ * @param   pli2cppModeBase         il2cpp 模块基址（libil2cpp.so 在内存中的加载地址）
  * @param   pCodeRegistration       代码注册表指针（Il2CppCodeRegistration*）
  * @param   pMetadataRegistration   元数据注册表指针（Il2CppMetadataRegistration*）
  * @param   pGlobalMetadataHeader   全局元数据头指针（Il2CppGlobalMetadataHeader*）
  * @param   pMetadataImagesTable    元数据镜像表指针（Il2CppImageGlobalMetadata*）
  * @return  成功返回 true，失败返回 false
  */
-bool MyStartPoint(void *pli2cppModeBase=nullptr,void *pCodeRegistration=nullptr, void *pMetadataRegistration=nullptr,
+__attribute__((visibility("default")))
+bool MyStartPointLOL(void *pli2cppModeBase=nullptr,void *pCodeRegistration=nullptr, void *pMetadataRegistration=nullptr,
                   void *pGlobalMetadataHeader=nullptr,void*pMetadataImagesTable=nullptr);
 
-
+#ifdef __cplusplus
+}
+#endif
 
 #endif //DOBBY_PROJECT_START_H

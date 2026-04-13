@@ -1340,18 +1340,19 @@ namespace toast_util {
 } // namespace toast_util
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// MyStartPoint — 注入入口
+// MyStartPointLOL — 注入入口
 // ═══════════════════════════════════════════════════════════════════════════════
 
-bool MyStartPoint(void *pli2cppModeBase, void *pCodeRegistration, void *pMetadataRegistration,
+extern "C" __attribute__((visibility("default")))
+bool MyStartPointLOL(void *pli2cppModeBase, void *pCodeRegistration, void *pMetadataRegistration,
                   void *pGlobalMetadataHeader, void *pMetadataImagesTable) {
     try {
         if (pli2cppModeBase == nullptr) {
-            LOG(LOG_LEVEL_INFO, "[MyStartPoint] 独立应用模式 — 跳过");
+            LOG(LOG_LEVEL_INFO, "[MyStartPointLOL] 独立应用模式 — 跳过");
             return false;
         }
 
-        LOG(LOG_LEVEL_INFO, "[MyStartPoint] 注入模式 — 启动数据采集 + eglSwapBuffers Hook 绘制");
+        LOG(LOG_LEVEL_INFO, "[MyStartPointLOL] 注入模式 — 启动数据采集 + eglSwapBuffers Hook 绘制");
         installCrashGuard();
 
         // 读取配置
@@ -1360,40 +1361,40 @@ bool MyStartPoint(void *pli2cppModeBase, void *pCodeRegistration, void *pMetadat
         // 按配置在独立线程中执行 Dumper / Header（不阻塞主注入流程）
         if (config.enableHeader) {
             std::thread([=]() {
-                LOG(LOG_LEVEL_INFO, "[MyStartPoint] [线程] 启用 il2cppHeader — 导出头文件");
+                LOG(LOG_LEVEL_INFO, "[MyStartPointLOL] [线程] 启用 il2cppHeader — 导出头文件");
                 try {
                     li2cppHeader::li2cppHeader il2cppH(pli2cppModeBase, pCodeRegistration,
                                                        pMetadataRegistration, pGlobalMetadataHeader, pMetadataImagesTable);
                     il2cppH.start();
-                    LOG(LOG_LEVEL_INFO, "[MyStartPoint] [线程] il2cppHeader 完成");
+                    LOG(LOG_LEVEL_INFO, "[MyStartPointLOL] [线程] il2cppHeader 完成");
                     toast_util::showToast("il2cppHeader 导出完成");
                     int fd = open("/data/local/tmp/dobby_header_done", O_WRONLY | O_CREAT | O_TRUNC, 0644);
                     if (fd >= 0) { write(fd, "done", 4); close(fd); }
                 } catch (const std::exception& e) {
-                    LOG(LOG_LEVEL_ERROR, "[MyStartPoint] il2cppHeader 异常: %s", e.what());
+                    LOG(LOG_LEVEL_ERROR, "[MyStartPointLOL] il2cppHeader 异常: %s", e.what());
                     toast_util::showToast("il2cppHeader 导出失败");
                 } catch (...) {
-                    LOG(LOG_LEVEL_ERROR, "[MyStartPoint] il2cppHeader 未知异常");
+                    LOG(LOG_LEVEL_ERROR, "[MyStartPointLOL] il2cppHeader 未知异常");
                     toast_util::showToast("il2cppHeader 导出失败");
                 }
             }).detach();
         }
         if (config.enableDumper) {
             std::thread([=]() {
-                LOG(LOG_LEVEL_INFO, "[MyStartPoint] [线程] 启用 il2cppDumper — 导出 dump");
+                LOG(LOG_LEVEL_INFO, "[MyStartPointLOL] [线程] 启用 il2cppDumper — 导出 dump");
                 try {
                     li2cpp::li2cppDumper il2cppD(pli2cppModeBase, pCodeRegistration,
                                                  pMetadataRegistration, pGlobalMetadataHeader, pMetadataImagesTable);
                     il2cppD.initInfo();
-                    LOG(LOG_LEVEL_INFO, "[MyStartPoint] [线程] il2cppDumper 完成");
+                    LOG(LOG_LEVEL_INFO, "[MyStartPointLOL] [线程] il2cppDumper 完成");
                     toast_util::showToast("il2cppDumper 导出完成");
                     int fd = open("/data/local/tmp/dobby_dumper_done", O_WRONLY | O_CREAT | O_TRUNC, 0644);
                     if (fd >= 0) { write(fd, "done", 4); close(fd); }
                 } catch (const std::exception& e) {
-                    LOG(LOG_LEVEL_ERROR, "[MyStartPoint] il2cppDumper 异常: %s", e.what());
+                    LOG(LOG_LEVEL_ERROR, "[MyStartPointLOL] il2cppDumper 异常: %s", e.what());
                     toast_util::showToast("il2cppDumper 导出失败");
                 } catch (...) {
-                    LOG(LOG_LEVEL_ERROR, "[MyStartPoint] il2cppDumper 未知异常");
+                    LOG(LOG_LEVEL_ERROR, "[MyStartPointLOL] il2cppDumper 未知异常");
                     toast_util::showToast("il2cppDumper 导出失败");
                 }
             }).detach();
@@ -1415,11 +1416,11 @@ bool MyStartPoint(void *pli2cppModeBase, void *pCodeRegistration, void *pMetadat
         return true;
     }
     catch (const std::exception& e) {
-        LOG(LOG_LEVEL_ERROR, "[MyStartPoint] 异常: %s", e.what());
+        LOG(LOG_LEVEL_ERROR, "[MyStartPointLOL] 异常: %s", e.what());
         return false;
     }
     catch (...) {
-        LOG(LOG_LEVEL_ERROR, "[MyStartPoint] 未知异常");
+        LOG(LOG_LEVEL_ERROR, "[MyStartPointLOL] 未知异常");
         return false;
     }
 }

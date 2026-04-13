@@ -859,7 +859,7 @@ static void UE4WorkerThread(void* plibUE4ModeBase, void* pGNames,
         LOG(LOG_LEVEL_INFO, "[UE4Worker] UE4Interface 采集完成, 共 %d 个类", interface->getClassCount());
 
         // 3. 创建 MatchMonitor, 通过 interface 动态解析偏移
-        // pGWorld 已在 MyStartPointUE4 入口处计算为 GWorld 全局变量地址
+        // pGWorld 即 GWorld 全局变量地址 (由 Injector 传入 base+offset)
         auto* monitor = new pubgmhd::MatchMonitor(
             reinterpret_cast<uintptr_t>(plibUE4ModeBase),
             reinterpret_cast<uintptr_t>(pGNames),
@@ -883,44 +883,39 @@ static void UE4WorkerThread(void* plibUE4ModeBase, void* pGNames,
 }
 
 extern "C" __attribute__((visibility("default")))
-bool MyStartPointUE4(void* plibUE4ModeBase, void* pGNames,
+bool MyStartPointPUBG(void* plibUE4ModeBase, void* pGNames,
                      void* pGWorld, void* pGUObjectArray, uint64_t moduleSize, void* pData) {
     if (!plibUE4ModeBase || !pGNames || !pGWorld || !pGUObjectArray) {
-        GERR("MyStartPointUE4: 参数为空 base=%p GNames=%p GWorld=%p GUObjectArray=%p",
+        GERR("MyStartPointPUBG: 参数为空 base=%p GNames=%p GWorld=%p GUObjectArray=%p",
              plibUE4ModeBase,
              pGNames,
              pGWorld,
              pGUObjectArray);
-        LOG(LOG_LEVEL_ERROR, "[MyStartPointUE4] 参数为空: base=%p GNames=%p GWorld=%p GUObjectArray=%p",
+        LOG(LOG_LEVEL_ERROR, "[MyStartPointPUBG] 参数为空: base=%p GNames=%p GWorld=%p GUObjectArray=%p",
             plibUE4ModeBase, pGNames, pGWorld, pGUObjectArray);
         return false;
     }
 
-    // 在入口处计算 GWorld 全局变量地址 (偏移只在这里使用)
-    uintptr_t base = reinterpret_cast<uintptr_t>(plibUE4ModeBase);
-    void* pGWorldGlobal = reinterpret_cast<void*>(base + 0x14988578);
-
     // 在启动任何线程之前读取日志开关, 确保 GUI 线程启动时日志已开启
     g_runtimeLogEnabled = readLogEnabled();
 
-    GLOG("MyStartPointUE4: base=%p GNames=%p GWorldSnapshot=%p GWorldGlobal=%p GUObjectArray=%p moduleSize=0x%llX log=%d",
-        plibUE4ModeBase, pGNames, pGWorld, pGWorldGlobal, pGUObjectArray, (unsigned long long)moduleSize, g_runtimeLogEnabled ? 1 : 0);
+    GLOG("MyStartPointPUBG: base=%p GNames=%p GWorld=%p GUObjectArray=%p moduleSize=0x%llX log=%d",
+        plibUE4ModeBase, pGNames, pGWorld, pGUObjectArray, (unsigned long long)moduleSize, g_runtimeLogEnabled ? 1 : 0);
 
-    LOG(LOG_LEVEL_INFO, "[MyStartPointUE4] 启动 UE4 工作线程");
+    LOG(LOG_LEVEL_INFO, "[MyStartPointPUBG] 启动 UE4 工作线程");
 
     bool expected = false;
     if (g_ue4GuiThreadStarted.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-        GLOG("MyStartPointUE4: 启动 UE4 GUI 线程");
-        LOG(LOG_LEVEL_INFO, "[MyStartPointUE4] 启动 UE4 GUI 线程");
+        GLOG("MyStartPointPUBG: 启动 UE4 GUI 线程");
+        LOG(LOG_LEVEL_INFO, "[MyStartPointPUBG] 启动 UE4 GUI 线程");
         std::thread(UE4GuiThread).detach();
     } else {
-        GLOG("MyStartPointUE4: UE4 GUI 线程已存在, 跳过重复启动");
-        LOG(LOG_LEVEL_INFO, "[MyStartPointUE4] UE4 GUI 线程已存在, 跳过重复启动");
+        GLOG("MyStartPointPUBG: UE4 GUI 线程已存在, 跳过重复启动");
+        LOG(LOG_LEVEL_INFO, "[MyStartPointPUBG] UE4 GUI 线程已存在, 跳过重复启动");
     }
 
-    // 传递 pGWorldGlobal (全局变量地址) 而非 pGWorld (快照值)
     std::thread(UE4WorkerThread, plibUE4ModeBase, pGNames,
-                pGWorldGlobal, pGUObjectArray, moduleSize, pData).detach();
+                pGWorld, pGUObjectArray, moduleSize, pData).detach();
 
     return true;
 }

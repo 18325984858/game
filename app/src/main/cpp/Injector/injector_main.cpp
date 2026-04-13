@@ -9,8 +9,8 @@
 
 int main(int argc, char* argv[]) {
     if (argc < 3) {
-        fprintf(stderr, "用法: %s <package_name> <so_path> <lol|pubg>\n", argv[0]);
-        fprintf(stderr, "  必须指定注入模式 (lol 或 pubg)\n");
+        fprintf(stderr, "用法: %s <package_name> <so_path> <lol|pubg|dfm>\n", argv[0]);
+        fprintf(stderr, "  必须指定注入模式 (lol, pubg 或 dfm)\n");
         return 1;
     }
 
@@ -27,14 +27,18 @@ int main(int argc, char* argv[]) {
         mode = Injector::MODE_PUBG;
     } else if (strcmp(argv[3], "lol") == 0) {
         mode = Injector::MODE_LOL;
+    } else if (strcmp(argv[3], "dfm") == 0) {
+        mode = Injector::MODE_DFM;
     } else {
-        fprintf(stderr, "[Injector] 未知模式: %s (支持: lol, pubg)\n", argv[3]);
+        fprintf(stderr, "[Injector] 未知模式: %s (支持: lol, pubg, dfm)\n", argv[3]);
         return 1;
     }
 
     fprintf(stdout, "[Injector] 包名: %s\n", packageName);
     fprintf(stdout, "[Injector] SO: %s\n", soPath);
-    fprintf(stdout, "[Injector] 模式: %s\n", mode == Injector::MODE_PUBG ? "PUBG" : "LOL");
+    fprintf(stdout, "[Injector] 模式: %s\n",
+            mode == Injector::MODE_PUBG ? "PUBG" :
+            mode == Injector::MODE_DFM  ? "DFM"  : "LOL");
 
     int ret = Injector::injectByPackageName(packageName, soPath, mode);
     fprintf(stdout, "[Injector] 结果: %d\n", ret);

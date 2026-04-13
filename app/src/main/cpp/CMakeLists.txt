@@ -124,6 +124,9 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
         "ueGamepubgmhd/Draw/UE4Draw.cpp"
         "ueGamepubgmhd/pubgmhd/pubgmhd.cpp"
         "ueGamepubgmhd/uestart.cpp"
+        "ueGamedfm/uestart.cpp"
+        "ueGamedfm/ilbUE5Struct/UE5DfmStruct.cpp"
+        "ueGamedfm/ilbUE5Dumper/UE5DfmDumper.cpp"
         "soDumper/so_dumper.cpp"
         "soDumper/so_dumper_jni.cpp"
 )
@@ -148,6 +151,9 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
         AndroidSurfaceImgui/modules
         AndroidSurfaceImgui/third_party
         AndroidSurfaceImgui/third_party/imgui
+        ueGamedfm
+        ueGamedfm/ilbUE5Struct
+        ueGamedfm/ilbUE5Dumper
 )
 
 target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE

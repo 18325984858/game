@@ -6,6 +6,7 @@
 #include <csetjmp>
 #include <csignal>
 #include <cstring>
+#include <cstddef>
 #include <sys/stat.h>
 
 // =====================================================================
@@ -52,11 +53,18 @@ namespace ue5dfm {
 
 // ===================== 构造/析构 =====================================
 
-UE5DfmDumper::UE5DfmDumper(uintptr_t moduleBase, uintptr_t moduleSize, const std::string& outputPath)
+UE5DfmDumper::UE5DfmDumper(uintptr_t moduleBase, uintptr_t moduleSize,
+                           uint32_t offNamePool, uint32_t offGUObjectArrayNum,
+                           uint32_t offGUObjectArrayChunks, uint32_t offGWorld,
+                           const std::string& outputPath)
     : m_moduleBase(moduleBase)
     , m_moduleSize(moduleSize)
     , m_outputPath(outputPath)
     , m_initialized(false)
+    , m_offNamePool(offNamePool)
+    , m_offGUObjectArrayNum(offGUObjectArrayNum)
+    , m_offGUObjectArrayChunks(offGUObjectArrayChunks)
+    , m_offGWorld(offGWorld)
 {
 }
 
@@ -147,11 +155,11 @@ uint8_t UE5DfmDumper::amask(int l) {
 std::string UE5DfmDumper::resolveName(uint32_t id) const {
     if (id == 0) return "None";
 
-    uintptr_t pool = m_moduleBase + OFF_NAMEPOOL;
-    uint32_t bi = id >> NAMEPOOL_OFFSET_BITS;
+    uintptr_t pool = m_moduleBase + m_offNamePool;
+    uint32_t bi = id >> FNameEntryAllocator::OffsetBits;
     uint32_t bo = (id & 0x3FFFF) << 1;
 
-    uintptr_t bp = rp(pool + OFF_NAMEPOOL_BLOCKS + static_cast<uintptr_t>(bi) * 8);
+    uintptr_t bp = rp(pool + offsetof(FNameEntryAllocator, Blocks) + static_cast<uintptr_t>(bi) * 8);
     if (!ok(bp)) return "?";
 
     uint16_t hdr = r16(bp + bo);
@@ -185,21 +193,21 @@ std::string UE5DfmDumper::fname(uintptr_t addr) const {
 }
 
 std::string UE5DfmDumper::oname(uintptr_t objPtr) const {
-    return fname(objPtr + OFF_UOBJ_FNAME);
+    return fname(objPtr + offsetof(UObjectBase, NamePrivate));
 }
 
 std::string UE5DfmDumper::ffname(uintptr_t fieldPtr) const {
-    return fname(fieldPtr + OFF_FFIELD_FNAME);
+    return fname(fieldPtr + offsetof(FField, NamePrivate));
 }
 
 std::string UE5DfmDumper::ffclassname(uintptr_t fieldPtr) const {
-    uintptr_t cls = rp(fieldPtr + OFF_FFIELD_CLASS);
+    uintptr_t cls = rp(fieldPtr + offsetof(FField, ClassPrivate));
     if (!ok(cls)) return "";
-    return fname(cls + OFF_FFIELDCLASS_FNAME);
+    return fname(cls + offsetof(FFieldClass, Name));
 }
 
 std::string UE5DfmDumper::className(uintptr_t objPtr) const {
-    uintptr_t cls = rp(objPtr + OFF_UOBJ_CLASS);
+    uintptr_t cls = rp(objPtr + offsetof(UObjectBase, ClassPrivate));
     if (!ok(cls)) return "Unknown";
     return oname(cls);
 }
@@ -211,7 +219,7 @@ std::string UE5DfmDumper::getFullPath(uintptr_t objPtr) const {
 
     while (ok(cur) && count < 16) {
         parts[count++] = oname(cur);
-        cur = rp(cur + OFF_UOBJ_OUTER);
+        cur = rp(cur + offsetof(UObjectBase, OuterPrivate));
     }
 
     std::string result;
@@ -225,17 +233,17 @@ std::string UE5DfmDumper::getFullPath(uintptr_t objPtr) const {
 // ===================== GUObjectArray 访问 ============================
 
 uintptr_t UE5DfmDumper::getobj(int index) const {
-    uintptr_t ct = rp(m_moduleBase + OFF_GUOBJECTARRAY_CHUNKS);
+    uintptr_t ct = rp(m_moduleBase + m_offGUObjectArrayChunks);
     if (!ok(ct)) return 0;
     uintptr_t cp = rp(ct + static_cast<uintptr_t>(static_cast<uint32_t>(index) >> 16) * 8);
     if (!ok(cp)) return 0;
-    return rp(cp + static_cast<uintptr_t>(index & 0xFFFF) * GUOBJ_ITEM_STRIDE);
+    return rp(cp + static_cast<uintptr_t>(index & 0xFFFF) * sizeof(FUObjectItem));
 }
 
 // ===================== 属性类型映射 ==================================
 
 std::string UE5DfmDumper::ptype(const std::string& cn, uintptr_t fpPtr) const {
-    uintptr_t sub = ok(fpPtr) ? rp(fpPtr + OFF_FPROP_SUBTYPE_PTR) : 0;
+    uintptr_t sub = ok(fpPtr) ? rp(fpPtr + offsetof(FPropertyFlat, SubTypePtr)) : 0;
     std::string sn = ok(sub) ? oname(sub) : "";
 
     if (cn.find("StructProperty") != std::string::npos)                   return sn.empty() ? "FStruct" : sn;
@@ -277,66 +285,66 @@ std::string UE5DfmDumper::ptype(const std::string& cn, uintptr_t fpPtr) const {
 void UE5DfmDumper::getInheritanceChain(uintptr_t objPtr, std::vector<uintptr_t>& chain) const {
     chain.clear();
     chain.push_back(objPtr);
-    uintptr_t sp = rp(objPtr + OFF_USTRUCT_SUPER);
+    uintptr_t sp = rp(objPtr + offsetof(UStruct, SuperStruct));
     while (ok(sp)) {
         chain.push_back(sp);
-        sp = rp(sp + OFF_USTRUCT_SUPER);
+        sp = rp(sp + offsetof(UStruct, SuperStruct));
     }
     std::reverse(chain.begin(), chain.end());
 }
 
 std::vector<UE5DfmDumper::FieldInfo> UE5DfmDumper::collectFields(uintptr_t structPtr, const std::string& ownerName) const {
     std::vector<FieldInfo> fields;
-    uintptr_t cur = rp(structPtr + OFF_USTRUCT_CHILD_PROPS);
+    uintptr_t cur = rp(structPtr + offsetof(UStruct, ChildProperties));
     int depth = 0;
 
     while (ok(cur) && depth < 4096) {
         depth++;
         std::string pcn = ffclassname(cur);
         if (pcn.find("Property") != std::string::npos) {
-            int32_t ad = rs32(cur + OFF_FPROP_ARRAY_DIM);
-            int32_t es = rs32(cur + OFF_FPROP_ELEMENT_SIZE);
+            int32_t ad = rs32(cur + offsetof(FPropertyFlat, ArrayDim));
+            int32_t es = rs32(cur + offsetof(FPropertyFlat, ElementSize));
             FieldInfo f;
             f.typeName = ptype(pcn, cur);
             f.propName = ffname(cur);
             f.propClassName = pcn;
-            f.offset = rs32(cur + OFF_FPROP_OFFSET);
+            f.offset = rs32(cur + offsetof(FPropertyFlat, Offset_Internal));
             f.size = es * (ad > 0 ? ad : 1);
-            f.pflags = r32(cur + OFF_FPROP_FLAGS);
+            f.pflags = r32(cur + offsetof(FPropertyFlat, PropertyFlags));
             f.owner = ownerName;
             fields.push_back(std::move(f));
         }
-        cur = rp(cur + OFF_FFIELD_NEXT);
+        cur = rp(cur + offsetof(FField, Next));
     }
     return fields;
 }
 
 std::vector<UE5DfmDumper::FuncInfo> UE5DfmDumper::collectFuncs(uintptr_t classPtr, const std::string& ownerName) const {
     std::vector<FuncInfo> funcs;
-    uintptr_t uf = rp(classPtr + OFF_USTRUCT_CHILDREN);
+    uintptr_t uf = rp(classPtr + offsetof(UStruct, Children));
     int depth = 0;
 
     while (ok(uf) && depth < 4096) {
         depth++;
-        uintptr_t ucl = rp(uf + OFF_UOBJ_CLASS);
+        uintptr_t ucl = rp(uf + offsetof(UObjectBase, ClassPrivate));
         if (ok(ucl)) {
             std::string uclName = oname(ucl);
             if (uclName == "Function" || uclName == "DelegateFunction") {
-                uint32_t ff = r32(uf + OFF_UFUNC_FLAGS);
-                uintptr_t nf = rp(uf + OFF_UFUNC_NATIVE_FUNC);
+                uint32_t ff = r32(uf + offsetof(UFunction, FunctionFlags));
+                uintptr_t nf = rp(uf + offsetof(UFunction, Func));
 
                 std::string retType = "void";
                 std::string paramStr;
                 int numParms = 0;
 
-                uintptr_t pc = rp(uf + OFF_USTRUCT_CHILD_PROPS);
+                uintptr_t pc = rp(uf + offsetof(UStruct, ChildProperties));
                 while (ok(pc)) {
                     numParms++;
                     std::string ppcn = ffclassname(pc);
                     if (ppcn.find("Property") != std::string::npos) {
                         std::string ppt = ptype(ppcn, pc);
                         std::string ppn = ffname(pc);
-                        uint32_t pf = r32(pc + OFF_FPROP_FLAGS);
+                        uint32_t pf = r32(pc + offsetof(FPropertyFlat, PropertyFlags));
 
                         if (pf & CPF_ReturnParm) {
                             retType = ppt;
@@ -347,7 +355,7 @@ std::vector<UE5DfmDumper::FuncInfo> UE5DfmDumper::collectFuncs(uintptr_t classPt
                             paramStr += ppt + " " + ppn;
                         }
                     }
-                    pc = rp(pc + OFF_FFIELD_NEXT);
+                    pc = rp(pc + offsetof(FField, Next));
                 }
 
                 std::string flags;
@@ -372,7 +380,7 @@ std::vector<UE5DfmDumper::FuncInfo> UE5DfmDumper::collectFuncs(uintptr_t classPt
                 funcs.push_back(std::move(fi));
             }
         }
-        uf = rp(uf + OFF_UFIELD_NEXT);
+        uf = rp(uf + offsetof(UField, Next));
     }
     return funcs;
 }
@@ -413,8 +421,8 @@ bool UE5DfmDumper::init() {
     }
 
     // 验证 NamePool 块指针
-    uintptr_t pool = m_moduleBase + OFF_NAMEPOOL;
-    uintptr_t firstBlock = rp(pool + OFF_NAMEPOOL_BLOCKS);
+    uintptr_t pool = m_moduleBase + m_offNamePool;
+    uintptr_t firstBlock = rp(pool + offsetof(FNameEntryAllocator, Blocks));
     if (!ok(firstBlock)) {
         LOG(LOG_LEVEL_ERROR, "[DfmDumper] NamePool 第一个块指针无效: pool=%p block0=%p",
             (void*)pool, (void*)firstBlock);
@@ -422,8 +430,8 @@ bool UE5DfmDumper::init() {
     }
 
     // 验证 GUObjectArray
-    uint32_t numElements = r32(m_moduleBase + OFF_GUOBJECTARRAY_NUM);
-    uintptr_t chunks = rp(m_moduleBase + OFF_GUOBJECTARRAY_CHUNKS);
+    uint32_t numElements = r32(m_moduleBase + m_offGUObjectArrayNum);
+    uintptr_t chunks = rp(m_moduleBase + m_offGUObjectArrayChunks);
     if (!ok(chunks) || numElements == 0) {
         LOG(LOG_LEVEL_ERROR, "[DfmDumper] GUObjectArray 无效: numElements=%u chunks=%p",
             numElements, (void*)chunks);
@@ -455,7 +463,7 @@ bool UE5DfmDumper::dumpSDK(const char* filePath) {
             static_cast<unsigned long>(m_moduleBase));
     fflush(fp);
 
-    uint32_t maxObj = r32(m_moduleBase + OFF_GUOBJECTARRAY_NUM);
+    uint32_t maxObj = r32(m_moduleBase + m_offGUObjectArrayNum);
     int typeCount = 0, fieldCount = 0, funcCount = 0;
 
     // 缓存: 避免重复收集同一个 UStruct 的字段/函数
@@ -466,7 +474,7 @@ bool UE5DfmDumper::dumpSDK(const char* filePath) {
         uintptr_t p = getobj(static_cast<int>(idx));
         if (!ok(p)) continue;
 
-        uintptr_t cp = rp(p + OFF_UOBJ_CLASS);
+        uintptr_t cp = rp(p + offsetof(UObjectBase, ClassPrivate));
         if (!ok(cp)) continue;
 
         std::string cn = oname(cp);
@@ -477,7 +485,7 @@ bool UE5DfmDumper::dumpSDK(const char* filePath) {
         else continue;
 
         std::string nm = oname(p);
-        uintptr_t outer = rp(p + OFF_UOBJ_OUTER);
+        uintptr_t outer = rp(p + offsetof(UObjectBase, OuterPrivate));
         std::string outerN = ok(outer) ? oname(outer) : "";
 
         // ---- Enum ----
@@ -486,11 +494,11 @@ bool UE5DfmDumper::dumpSDK(const char* filePath) {
             fprintf(fp, "// Enum %s%s\n", outerN.empty() ? "" : (outerN + ".").c_str(), nm.c_str());
             fprintf(fp, "enum %s {\n", nm.c_str());
 
-            uintptr_t dp = rp(p + OFF_UENUM_NAMES_DATA);
-            int32_t num = rs32(p + OFF_UENUM_NAMES_NUM);
+            uintptr_t dp = rp(p + offsetof(UEnum, Names));
+            int32_t num = rs32(p + (offsetof(UEnum, Names) + 8));
             if (ok(dp) && num > 0 && num < 10000) {
                 for (int32_t i = 0; i < num; i++) {
-                    uintptr_t elemAddr = dp + static_cast<uintptr_t>(i) * OFF_UENUM_ELEMENT_STRIDE;
+                    uintptr_t elemAddr = dp + static_cast<uintptr_t>(i) * sizeof(FEnumNamePair);
                     std::string elemName = fname(elemAddr);
                     int32_t elemVal = rs32(elemAddr + 8);
                     fprintf(fp, "\t%s = %d,\n", elemName.c_str(), elemVal);
@@ -504,7 +512,7 @@ bool UE5DfmDumper::dumpSDK(const char* filePath) {
         typeCount++;
         std::vector<uintptr_t> chain;
         getInheritanceChain(p, chain);
-        int32_t sz = rs32(p + OFF_USTRUCT_PROPERTIES_SIZE);
+        int32_t sz = rs32(p + offsetof(UStruct, PropertiesSize));
 
         // 继承链文字
         std::string inhStr;
@@ -637,10 +645,10 @@ bool UE5DfmDumper::dumpNames(const char* filePath) {
 
     LOG(LOG_LEVEL_INFO, "[DfmDumper] [Names] Starting...");
 
-    uintptr_t pool = m_moduleBase + OFF_NAMEPOOL;
+    uintptr_t pool = m_moduleBase + m_offNamePool;
     int numBlocks = 0;
-    for (int b = 0; b < static_cast<int>(NAMEPOOL_MAX_BLOCKS); b++) {
-        uintptr_t bp = rp(pool + OFF_NAMEPOOL_BLOCKS + static_cast<uintptr_t>(b) * 8);
+    for (int b = 0; b < static_cast<int>(FNameEntryAllocator::MaxBlocks); b++) {
+        uintptr_t bp = rp(pool + offsetof(FNameEntryAllocator, Blocks) + static_cast<uintptr_t>(b) * 8);
         if (!ok(bp)) break;
         numBlocks++;
     }
@@ -649,11 +657,11 @@ bool UE5DfmDumper::dumpNames(const char* filePath) {
     int totalNames = 0;
 
     for (int bi = 0; bi < numBlocks; bi++) {
-        uintptr_t bp = rp(pool + OFF_NAMEPOOL_BLOCKS + static_cast<uintptr_t>(bi) * 8);
+        uintptr_t bp = rp(pool + offsetof(FNameEntryAllocator, Blocks) + static_cast<uintptr_t>(bi) * 8);
         if (!ok(bp)) continue;
 
         uint32_t offset = 0;
-        while (offset < NAMEPOOL_BLOCK_SIZE - 4) {
+        while (offset < FNameEntryAllocator::BlockSizeBytes - 4) {
             uint16_t hdr = r16(bp + offset);
             if (hdr == 0) break;
 
@@ -664,9 +672,9 @@ bool UE5DfmDumper::dumpNames(const char* filePath) {
             int charBytes = isWide ? 2 : 1;
             int payloadBytes = length * charBytes;
             uint32_t totalSize = (2 + payloadBytes + 1) & ~1u;
-            if (offset + totalSize > NAMEPOOL_BLOCK_SIZE) break;
+            if (offset + totalSize > FNameEntryAllocator::BlockSizeBytes) break;
 
-            uint32_t id = (static_cast<uint32_t>(bi) << NAMEPOOL_OFFSET_BITS) | (offset >> 1);
+            uint32_t id = (static_cast<uint32_t>(bi) << FNameEntryAllocator::OffsetBits) | (offset >> 1);
             uintptr_t raw = bp + offset + 2;
 
             std::string decoded;
@@ -720,8 +728,8 @@ bool UE5DfmDumper::dumpObjects(const char* filePath) {
 
     LOG(LOG_LEVEL_INFO, "[DfmDumper] [Objects] Starting...");
 
-    uint32_t maxObj = r32(m_moduleBase + OFF_GUOBJECTARRAY_NUM);
-    uintptr_t ct = rp(m_moduleBase + OFF_GUOBJECTARRAY_CHUNKS);
+    uint32_t maxObj = r32(m_moduleBase + m_offGUObjectArrayNum);
+    uintptr_t ct = rp(m_moduleBase + m_offGUObjectArrayChunks);
     int count = 0;
 
     for (uint32_t idx = 0; idx < maxObj; idx++) {
@@ -729,10 +737,10 @@ bool UE5DfmDumper::dumpObjects(const char* filePath) {
         uint32_t wi = idx & 0xFFFF;
         uintptr_t cp = rp(ct + static_cast<uintptr_t>(ci) * 8);
         if (!ok(cp)) continue;
-        uintptr_t obj = rp(cp + static_cast<uintptr_t>(wi) * GUOBJ_ITEM_STRIDE);
+        uintptr_t obj = rp(cp + static_cast<uintptr_t>(wi) * sizeof(FUObjectItem));
         if (!ok(obj)) continue;
 
-        uintptr_t cls = rp(obj + OFF_UOBJ_CLASS);
+        uintptr_t cls = rp(obj + offsetof(UObjectBase, ClassPrivate));
         std::string clsName = ok(cls) ? oname(cls) : "None";
         fprintf(fp, "[%u] %s %s\n", idx, clsName.c_str(), getFullPath(obj).c_str());
         count++;
@@ -762,7 +770,7 @@ bool UE5DfmDumper::dumpGWorld(const char* filePath) {
 
     LOG(LOG_LEVEL_INFO, "[DfmDumper] [GWorld] Starting...");
 
-    uintptr_t gworldAddr = m_moduleBase + OFF_GWORLD;
+    uintptr_t gworldAddr = m_moduleBase + m_offGWorld;
     uintptr_t gworld = rp(gworldAddr);
 
     fprintf(fp, "// GWorld Dump\n// GWorld Global: 0x%lX\n// GWorld Ptr: 0x%lX\n\n",

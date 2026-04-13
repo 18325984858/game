@@ -48,7 +48,7 @@ Java_com_example_dobbyproject_MainActivity_stringFromJNI(
 
 
 
-    MyStartPoint();
+    MyStartPointLOL();
 
 
     return env->NewStringUTF(hello.c_str());

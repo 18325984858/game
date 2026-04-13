@@ -17,7 +17,19 @@ namespace ue5dfm {
 
 class UE5DfmDumper {
 public:
-    UE5DfmDumper(uintptr_t moduleBase, uintptr_t moduleSize, const std::string& outputPath = "");
+    /**
+     * @param moduleBase  libUE4.so 模块基址
+     * @param moduleSize  libUE4.so 模块大小
+     * @param offNamePool          NamePool 全局偏移 (相对 moduleBase)
+     * @param offGUObjectArrayNum  GUObjectArray.NumElements 全局偏移
+     * @param offGUObjectArrayChunks GUObjectArray.Chunks 全局偏移
+     * @param offGWorld            GWorld 全局偏移
+     * @param outputPath           输出目录路径
+     */
+    UE5DfmDumper(uintptr_t moduleBase, uintptr_t moduleSize,
+                 uint32_t offNamePool, uint32_t offGUObjectArrayNum,
+                 uint32_t offGUObjectArrayChunks, uint32_t offGWorld,
+                 const std::string& outputPath = "");
     ~UE5DfmDumper();
 
     void setModuleBase(uintptr_t base);
@@ -52,6 +64,12 @@ private:
     uintptr_t m_moduleSize;
     std::string m_outputPath;
     bool m_initialized;
+
+    // 全局变量偏移 (相对于 libUE4.so 基址, 由外部传入)
+    uint32_t m_offNamePool;            // NamePool 结构体偏移
+    uint32_t m_offGUObjectArrayNum;    // GUObjectArray.NumElements 偏移
+    uint32_t m_offGUObjectArrayChunks; // GUObjectArray.Chunks 偏移
+    uint32_t m_offGWorld;              // GWorld 偏移
 
     // ---- 安全内存读取 ----
     static uintptr_t rp(uintptr_t addr);

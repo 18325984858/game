@@ -235,9 +235,15 @@ static uint64_t getRemoteModuleSize(pid_t pid, const char* moduleName) {
 static pid_t waitForTargetProcessReady(const char* packageName, Injector::InjectMode mode) {
     constexpr int kDefaultWaitSeconds = 15;
     constexpr int kPubgWaitSeconds = 45;
+    constexpr int kDfmWaitSeconds  = 90;   // DFM UE5.4 引擎初始化较慢, 需要更长等待
     constexpr int kPubgStableSamples = 3;
+    constexpr int kDfmStableSamples  = 5;  // DFM 要求连续 5 次检测到 libUE4.so 才视为稳定
 
-    const int maxWaitSeconds = (mode == Injector::MODE_PUBG) ? kPubgWaitSeconds : kDefaultWaitSeconds;
+    // DFM 和 PUBG 都需要等待 libUE4.so 加载
+    const bool needUe4Wait = (mode == Injector::MODE_PUBG || mode == Injector::MODE_DFM);
+    const int maxWaitSeconds = (mode == Injector::MODE_DFM) ? kDfmWaitSeconds :
+                               (mode == Injector::MODE_PUBG) ? kPubgWaitSeconds : kDefaultWaitSeconds;
+    const int requiredStableSamples = (mode == Injector::MODE_DFM) ? kDfmStableSamples : kPubgStableSamples;
     pid_t lastPid = -1;
     int stableSamples = 0;
 
@@ -251,7 +257,7 @@ static pid_t waitForTargetProcessReady(const char* packageName, Injector::Inject
             continue;
         }
 
-        if (mode != Injector::MODE_PUBG) {
+        if (!needUe4Wait) {
             return pid;
         }
 
@@ -265,16 +271,18 @@ static pid_t waitForTargetProcessReady(const char* packageName, Injector::Inject
             stableSamples = 0;
         }
 
+        const char* modeTag = (mode == Injector::MODE_DFM) ? "DFM" : "PUBG";
         LOG(LOG_LEVEL_INFO,
-            "[Injector] PUBG 就绪检查 pid=%d libUE4=%s stable=%d/%d (%d/%d)",
+            "[Injector] %s 就绪检查 pid=%d libUE4=%s stable=%d/%d (%d/%d)",
+            modeTag,
             pid,
             ue4Loaded ? "yes" : "no",
             stableSamples,
-            kPubgStableSamples,
+            requiredStableSamples,
             attempt,
             maxWaitSeconds);
 
-        if (ue4Loaded && stableSamples >= kPubgStableSamples) {
+        if (ue4Loaded && stableSamples >= requiredStableSamples) {
             return pid;
         }
 
@@ -413,7 +421,8 @@ static int ptrace_call(pid_t pid, uint64_t funcAddr, uint64_t* params, int param
 // ═══════════════════════════════════════════════════════════════════════════════
 
 int Injector::injectRemote(pid_t pid, const char* soPath, InjectMode mode) {
-    LOG(LOG_LEVEL_INFO, "[Injector] 开始注入 pid=%d so=%s mode=%s", pid, soPath, mode == MODE_PUBG ? "PUBG" : "LOL");
+    LOG(LOG_LEVEL_INFO, "[Injector] 开始注入 pid=%d so=%s mode=%s", pid, soPath,
+        mode == MODE_PUBG ? "PUBG" : (mode == MODE_DFM ? "DFM" : "LOL"));
 
     // ── 1. Attach 到目标进程 ──
     if (ptrace(PTRACE_ATTACH, pid, nullptr, nullptr) < 0) {
@@ -517,7 +526,17 @@ int Injector::injectRemote(pid_t pid, const char* soPath, InjectMode mode) {
 
         if (mode == MODE_PUBG) {
             // ═══ PUBG (UE4) 注入路径 ═══
-            const char* funcName = "MyStartPointUE4";
+            //
+            // 全局偏移 (相对于 libUE4.so 基址):
+            //   GNames:        +0x146F9F30 (需解引用)
+            //   GUObjectArray: +0x14706480 (结构体地址, 不解引用)
+            //   GWorld:        +0x14988578 (需解引用)
+            //
+            static constexpr uint32_t PUBG_OFF_GNAMES         = 0x146F9F30;
+            static constexpr uint32_t PUBG_OFF_GUOBJECTARRAY  = 0x14706480;
+            static constexpr uint32_t PUBG_OFF_GWORLD         = 0x14988578;
+
+            const char* funcName = "MyStartPointPUBG";
             if (ptrace_writedata(pid, remoteMem, funcName, strlen(funcName) + 1) < 0) {
                 LOG(LOG_LEVEL_ERROR, "[Injector] 写入函数名失败");
                 goto cleanup;
@@ -526,10 +545,10 @@ int Injector::injectRemote(pid_t pid, const char* soPath, InjectMode mode) {
             uint64_t dlsymParams[2] = { dlopenResult, remoteMem };
             uint64_t funcAddr = 0;
             if (ptrace_call(pid, remoteDlsymAddr, dlsymParams, 2, &funcAddr) < 0 || funcAddr == 0) {
-                LOG(LOG_LEVEL_ERROR, "[Injector] dlsym 查找 MyStartPointUE4 失败");
+                LOG(LOG_LEVEL_ERROR, "[Injector] dlsym 查找 MyStartPointPUBG 失败");
                 goto cleanup;
             }
-            LOG(LOG_LEVEL_INFO, "[Injector] MyStartPointUE4 地址: %llx", (unsigned long long)funcAddr);
+            LOG(LOG_LEVEL_INFO, "[Injector] MyStartPointPUBG 地址: %llx", (unsigned long long)funcAddr);
 
             // 获取 libUE4.so 基址
             uint64_t ue4Base = getRemoteModuleBase(pid, "libUE4.so");
@@ -544,9 +563,9 @@ int Injector::injectRemote(pid_t pid, const char* soPath, InjectMode mode) {
             LOG(LOG_LEVEL_INFO, "[Injector] libUE4.so 大小: 0x%llx", (unsigned long long)ue4Size);
 
             // 读取 GNames/GUObjectArray/GWorld 指针
-            uint64_t pGNames        = ptrace_peekptr(pid, ue4Base + 0x146F9F30);
-            uint64_t pGUObjectArray = ue4Base + 0x14706480;  // 结构体地址, 不解引用
-            uint64_t pGWorld        = ptrace_peekptr(pid, ue4Base + 0x14988578);
+            uint64_t pGNames        = ptrace_peekptr(pid, ue4Base + PUBG_OFF_GNAMES);
+            uint64_t pGUObjectArray = ue4Base + PUBG_OFF_GUOBJECTARRAY;  // 结构体地址, 不解引用
+            uint64_t pGWorld        = ue4Base + PUBG_OFF_GWORLD;         // 全局变量地址, 不解引用
 
             LOG(LOG_LEVEL_INFO, "[Injector] GNames:        %llx", (unsigned long long)pGNames);
             LOG(LOG_LEVEL_INFO, "[Injector] GUObjectArray: %llx", (unsigned long long)pGUObjectArray);
@@ -561,24 +580,114 @@ int Injector::injectRemote(pid_t pid, const char* soPath, InjectMode mode) {
                 goto cleanup;
             }
 
-            // 调用 MyStartPointUE4(libUE4Base, pGNames, pGWorld, pGUObjectArray, moduleSize, NULL)
+            // 调用 MyStartPointPUBG(libUE4Base, pGNames, pGWorld, pGUObjectArray, moduleSize, NULL)
             uint64_t startParams[6] = { ue4Base, pGNames, pGWorld, pGUObjectArray, ue4Size, 0 };
-            LOG(LOG_LEVEL_INFO, "[Injector] 调用 MyStartPointUE4...");
+            LOG(LOG_LEVEL_INFO, "[Injector] 调用 MyStartPointPUBG...");
             uint64_t startRet = 0;
             if (ptrace_call(pid, funcAddr, startParams, 6, &startRet) < 0) {
-                LOG(LOG_LEVEL_ERROR, "[Injector] MyStartPointUE4 调用失败");
+                LOG(LOG_LEVEL_ERROR, "[Injector] MyStartPointPUBG 调用失败");
                 goto cleanup;
             }
-            LOG(LOG_LEVEL_INFO, "[Injector] ✓ MyStartPointUE4 返回: %lld", (long long)startRet);
+            LOG(LOG_LEVEL_INFO, "[Injector] ✓ MyStartPointPUBG 返回: %lld", (long long)startRet);
             if (startRet == 0) {
-                LOG(LOG_LEVEL_ERROR, "[Injector] MyStartPointUE4 返回 0, 视为失败");
+                LOG(LOG_LEVEL_ERROR, "[Injector] MyStartPointPUBG 返回 0, 视为失败");
+                goto cleanup;
+            }
+            result = 0;
+        } else if (mode == MODE_DFM) {
+            // ═══ DFM (UE5.4 三角洲) 注入路径 ═══
+            //
+            // 全局偏移 (相对于 libUE4.so 基址):
+            //   NamePool:          +0x1A343A00
+            //   GUObjectArray.Num: +0x1A36A75C
+            //   GUObjectArray.Chunks: +0x1A36A768
+            //   GWorld:            +0x1A65ECC8
+            //
+            static constexpr uint32_t DFM_OFF_NAMEPOOL          = 0x1A343A00;
+            static constexpr uint32_t DFM_OFF_GUOBJECTARRAY_NUM = 0x1A36A75C;
+            static constexpr uint32_t DFM_OFF_GUOBJECTARRAY_CHUNKS = 0x1A36A768;
+            static constexpr uint32_t DFM_OFF_GWORLD            = 0x1A65ECC8;
+
+            const char* funcName = "MyStartPointDFM";
+            if (ptrace_writedata(pid, remoteMem, funcName, strlen(funcName) + 1) < 0) {
+                LOG(LOG_LEVEL_ERROR, "[Injector] 写入函数名失败");
+                goto cleanup;
+            }
+
+            uint64_t dlsymParams[2] = { dlopenResult, remoteMem };
+            uint64_t funcAddr = 0;
+            if (ptrace_call(pid, remoteDlsymAddr, dlsymParams, 2, &funcAddr) < 0 || funcAddr == 0) {
+                LOG(LOG_LEVEL_ERROR, "[Injector] dlsym 查找 MyStartPointDFM 失败");
+                goto cleanup;
+            }
+            LOG(LOG_LEVEL_INFO, "[Injector] MyStartPointDFM 地址: %llx", (unsigned long long)funcAddr);
+
+            // 获取 libUE4.so 基址和大小
+            uint64_t ue4Base = getRemoteModuleBase(pid, "libUE4.so");
+            if (ue4Base == 0) {
+                LOG(LOG_LEVEL_ERROR, "[Injector] 无法找到 libUE4.so 基址");
+                goto cleanup;
+            }
+            uint64_t ue4Size = getRemoteModuleSize(pid, "libUE4.so");
+            LOG(LOG_LEVEL_INFO, "[Injector] libUE4.so 基址: %llx 大小: 0x%llx", (unsigned long long)ue4Base, (unsigned long long)ue4Size);
+
+            // 计算 UE5 全局变量地址 (基址 + 偏移)
+            uint64_t pNamePool          = ue4Base + DFM_OFF_NAMEPOOL;            // NamePool 结构体地址
+            uint64_t pGUObjectArrayNum  = ue4Base + DFM_OFF_GUOBJECTARRAY_NUM;   // GUObjectArray.NumElements 地址
+            uint64_t pGUObjectArrayChunks = ue4Base + DFM_OFF_GUOBJECTARRAY_CHUNKS; // GUObjectArray.Chunks 地址
+            uint64_t pGWorld            = ptrace_peekptr(pid, ue4Base + DFM_OFF_GWORLD); // GWorld (需解引用)
+
+            LOG(LOG_LEVEL_INFO, "[Injector] DFM NamePool:          %llx", (unsigned long long)pNamePool);
+            LOG(LOG_LEVEL_INFO, "[Injector] DFM GUObjArray.Num:    %llx", (unsigned long long)pGUObjectArrayNum);
+            LOG(LOG_LEVEL_INFO, "[Injector] DFM GUObjArray.Chunks: %llx", (unsigned long long)pGUObjectArrayChunks);
+            LOG(LOG_LEVEL_INFO, "[Injector] DFM GWorld:            %llx", (unsigned long long)pGWorld);
+
+            if (ue4Size == 0 || pGWorld == 0) {
+                LOG(LOG_LEVEL_ERROR,
+                    "[Injector] DFM 全局指针未就绪 ue4Size=0x%llx GWorld=%llx",
+                    (unsigned long long)ue4Size,
+                    (unsigned long long)pGWorld);
+                goto cleanup;
+            }
+
+            // 调用 MyStartPointDFM(libUE4Base, pNamePool, pGWorld, pGUObjArrayNum, pGUObjArrayChunks, moduleSize, NULL)
+            uint64_t startParams[7] = {
+                ue4Base,                // X0: plibUE4ModeBase - libUE4.so 基址
+                pNamePool,              // X1: pGNames - NamePool 结构体地址
+                pGWorld,                // X2: pGWorld - GWorld 指针 (已解引用)
+                pGUObjectArrayNum,      // X3: pGUObjectArray - NumElements 地址
+                pGUObjectArrayChunks,   // X4: pGUObjectArrayChunks - Chunks 地址
+                ue4Size,                // X5: moduleSize - libUE4.so 模块大小
+                0                       // X6: pData - 预留 (nullptr)
+            };
+            LOG(LOG_LEVEL_INFO, "[Injector] 调用 MyStartPointDFM...");
+            uint64_t startRet = 0;
+            if (ptrace_call(pid, funcAddr, startParams, 7, &startRet) < 0) {
+                LOG(LOG_LEVEL_ERROR, "[Injector] MyStartPointDFM 调用失败");
+                goto cleanup;
+            }
+            LOG(LOG_LEVEL_INFO, "[Injector] ✓ MyStartPointDFM 返回: %lld", (long long)startRet);
+            if (startRet == 0) {
+                LOG(LOG_LEVEL_ERROR, "[Injector] MyStartPointDFM 返回 0, 视为失败");
                 goto cleanup;
             }
             result = 0;
         } else {
         // ═══ LOL (il2cpp) 注入路径 ═══
         {
-            const char* funcName = "_Z12MyStartPointPvS_S_S_S_";
+            //
+            // 全局偏移 (相对于 libil2cpp.so 基址):
+            //   CodeRegistration:     +0x0F45D838 (需解引用)
+            //   MetadataRegistration: +0x0F45D840 (需解引用)
+            //   GlobalMetadataHeader: +0x0F45D858 (需解引用)
+            //   MetadataImagesTable:  +0x1D21140  (需解引用)
+            //
+            static constexpr uint32_t LOL_OFF_CODE_REG    = 0x0F45D838;
+            static constexpr uint32_t LOL_OFF_META_REG    = 0x0F45D840;
+            static constexpr uint32_t LOL_OFF_GLOBAL_META = 0x0F45D858;
+            static constexpr uint32_t LOL_OFF_META_IMAGES = 0x1D21140;
+
+            const char* funcName = "MyStartPointLOL";
             if (ptrace_writedata(pid, remoteMem, funcName, strlen(funcName) + 1) < 0) {
                 LOG(LOG_LEVEL_ERROR, "[Injector] 写入函数名失败");
                 goto cleanup;
@@ -587,7 +696,7 @@ int Injector::injectRemote(pid_t pid, const char* soPath, InjectMode mode) {
             uint64_t dlsymParams[2] = { dlopenResult, remoteMem };
             uint64_t myStartPointAddr = 0;
             if (ptrace_call(pid, remoteDlsymAddr, dlsymParams, 2, &myStartPointAddr) < 0 || myStartPointAddr == 0) {
-                LOG(LOG_LEVEL_ERROR, "[Injector] dlsym 查找 MyStartPoint 失败");
+                LOG(LOG_LEVEL_ERROR, "[Injector] dlsym 查找 MyStartPointLOL 失败");
                 goto cleanup;
             }
             LOG(LOG_LEVEL_INFO, "[Injector] MyStartPoint 地址: %llx", (unsigned long long)myStartPointAddr);
@@ -601,10 +710,10 @@ int Injector::injectRemote(pid_t pid, const char* soPath, InjectMode mode) {
             LOG(LOG_LEVEL_INFO, "[Injector] libil2cpp.so 基址: %llx", (unsigned long long)il2cppBase);
 
             // 读取 IL2CPP 元数据指针 (与 Frida JS 中的偏移一致)
-            uint64_t pCodeRegistration     = ptrace_peekptr(pid, il2cppBase + 0xF45D838);
-            uint64_t pMetadataRegistration  = ptrace_peekptr(pid, il2cppBase + 0xF45D840);
-            uint64_t pGlobalMetadataHeader  = ptrace_peekptr(pid, il2cppBase + 0xF45D858);
-            uint64_t pMetadataImagesTable   = ptrace_peekptr(pid, il2cppBase + 0x1D21140);
+            uint64_t pCodeRegistration     = ptrace_peekptr(pid, il2cppBase + LOL_OFF_CODE_REG);
+            uint64_t pMetadataRegistration  = ptrace_peekptr(pid, il2cppBase + LOL_OFF_META_REG);
+            uint64_t pGlobalMetadataHeader  = ptrace_peekptr(pid, il2cppBase + LOL_OFF_GLOBAL_META);
+            uint64_t pMetadataImagesTable   = ptrace_peekptr(pid, il2cppBase + LOL_OFF_META_IMAGES);
 
             LOG(LOG_LEVEL_INFO, "[Injector] pCodeRegistration:     %llx", (unsigned long long)pCodeRegistration);
             LOG(LOG_LEVEL_INFO, "[Injector] pMetadataRegistration: %llx", (unsigned long long)pMetadataRegistration);
@@ -723,13 +832,15 @@ pid_t Injector::findPidByName(const char* packageName) {
 
 int Injector::injectByPackageName(const char* packageName, const char* soPath, InjectMode mode) {
     LOG(LOG_LEVEL_INFO, "[Injector] 开始注入 package=%s so=%s mode=%s",
-        packageName, soPath, mode == MODE_PUBG ? "PUBG" : "LOL");
+        packageName, soPath,
+        mode == MODE_PUBG ? "PUBG" : (mode == MODE_DFM ? "DFM" : "LOL"));
 
     pid_t pid = waitForTargetProcessReady(packageName, mode);
 
     if (pid <= 0) {
-        if (mode == MODE_PUBG) {
-            LOG(LOG_LEVEL_ERROR, "[Injector] PUBG 目标进程未在就绪窗口内稳定并加载 libUE4.so: %s", packageName);
+        if (mode == MODE_PUBG || mode == MODE_DFM) {
+            LOG(LOG_LEVEL_ERROR, "[Injector] %s 目标进程未在就绪窗口内稳定并加载 libUE4.so: %s",
+                mode == MODE_DFM ? "DFM" : "PUBG", packageName);
         } else {
             LOG(LOG_LEVEL_ERROR, "[Injector] 等待 15 秒后目标进程仍未运行: %s", packageName);
         }

@@ -1,10 +1,12 @@
 #include "uestart.h"
 #include "../Log/log.h"
 #include "UE5DfmDumper.h"
+#include "UE5DfmStruct.h"
 #include <atomic>
 #include <thread>
 #include <chrono>
 #include <cstdarg>
+#include <cstddef>
 #include <fcntl.h>
 #include <unistd.h>
 #include <cstring>
@@ -177,16 +179,25 @@ namespace toast_util {
 } // namespace
 
 // =====================================================================
+//  DFM 全局变量偏移 (相对于 libUE4.so 基址)
+//  这些值由 Injector 在 ptrace 注入时确定, 此处硬编码用于引擎就绪探测
+// =====================================================================
+static constexpr uint32_t kOffNamePool            = 0x1A343A00;
+static constexpr uint32_t kOffGUObjectArrayNum    = 0x1A36A75C;
+static constexpr uint32_t kOffGUObjectArrayChunks = 0x1A36A768;
+static constexpr uint32_t kOffGWorld              = 0x1A65ECC8;
+
+// =====================================================================
 //  工作线程
 // =====================================================================
-static void DfmWorkerThread(void* plibUE4ModeBase, void* /*pGNames*/,
+static void DfmWorkerThread(void* plibUE5ModeBase, void* /*pGNames*/,
                             void* pGWorld, void* pGUObjectArray,
                             uint64_t moduleSize, void* /*pData*/) {
     LOG(LOG_LEVEL_INFO, "[DfmWorker] 工作线程启动");
     LOG(LOG_LEVEL_INFO, "[DfmWorker] libUE4Base=%p GWorld=%p GUObjectArray=%p moduleSize=0x%llX",
-        plibUE4ModeBase, pGWorld, pGUObjectArray, (unsigned long long)moduleSize);
+        plibUE5ModeBase, pGWorld, pGUObjectArray, (unsigned long long)moduleSize);
 
-    uintptr_t base = reinterpret_cast<uintptr_t>(plibUE4ModeBase);
+    uintptr_t base = reinterpret_cast<uintptr_t>(plibUE5ModeBase);
 
     // 等待游戏引擎完成初始化
     LOG(LOG_LEVEL_INFO, "[DfmWorker] 等待游戏引擎就绪...");
@@ -197,7 +208,7 @@ static void DfmWorkerThread(void* plibUE4ModeBase, void* /*pGNames*/,
 
         for (int i = 0; i < kMaxWaitSeconds * 2; i++) {
             // 验证 NamePool 第一个块指针
-            uintptr_t poolBlockAddr = base + ue5dfm::OFF_NAMEPOOL + ue5dfm::OFF_NAMEPOOL_BLOCKS;
+            uintptr_t poolBlockAddr = base + kOffNamePool + offsetof(ue5dfm::FNameEntryAllocator, Blocks);
             uintptr_t block0 = 0;
             bool namePoolOk = false;
             if (memFd >= 0 && poolBlockAddr >= 0x10000) {
@@ -209,7 +220,7 @@ static void DfmWorkerThread(void* plibUE4ModeBase, void* /*pGNames*/,
             // 验证 GUObjectArray numElements
             uint32_t numElements = 0;
             bool objArrayOk = false;
-            uintptr_t numAddr = base + ue5dfm::OFF_GUOBJECTARRAY_NUM;
+            uintptr_t numAddr = base + kOffGUObjectArrayNum;
             if (memFd >= 0 && numAddr >= 0x10000) {
                 if (pread(memFd, &numElements, sizeof(numElements), static_cast<off_t>(numAddr)) == sizeof(numElements)) {
                     objArrayOk = (numElements > 100);
@@ -217,7 +228,7 @@ static void DfmWorkerThread(void* plibUE4ModeBase, void* /*pGNames*/,
             }
 
             // 验证 GWorld
-            uintptr_t gworldAddr = base + ue5dfm::OFF_GWORLD;
+            uintptr_t gworldAddr = base + kOffGWorld;
             uintptr_t worldPtr = 0;
             bool worldOk = false;
             if (memFd >= 0 && gworldAddr >= 0x10000) {
@@ -252,6 +263,10 @@ static void DfmWorkerThread(void* plibUE4ModeBase, void* /*pGNames*/,
         ue5dfm::UE5DfmDumper dumper(
             base,
             static_cast<uintptr_t>(moduleSize),
+            kOffNamePool,
+            kOffGUObjectArrayNum,
+            kOffGUObjectArrayChunks,
+            kOffGWorld,
             "/data/data/com.tencent.tmgp.dfm/cache/ue5_dump/"
         );
 
@@ -279,23 +294,33 @@ static void DfmWorkerThread(void* plibUE4ModeBase, void* /*pGNames*/,
 // =====================================================================
 //  入口函数
 // =====================================================================
+static std::atomic<bool> g_dfmStarted{false};
+
 extern "C" __attribute__((visibility("default")))
-bool MyStartPointUE5(void* plibUE4ModeBase, void* pGNames,
-                     void* pGWorld, void* pGUObjectArray,
-                     uint64_t moduleSize, void* pData) {
-    if (!plibUE4ModeBase || !pGUObjectArray) {
-        DERR("MyStartPointUE4: 参数为空 base=%p GUObjectArray=%p",
-             plibUE4ModeBase, pGUObjectArray);
-        LOG(LOG_LEVEL_ERROR, "[MyStartPointUE4-DFM] 参数为空: base=%p GUObjectArray=%p",
-            plibUE4ModeBase, pGUObjectArray);
+bool MyStartPointDFM(void* plibUE5ModeBase, void* pGNames,
+                     void* pGWorld, void* pGUObjectArray, 
+                     void *pGUObjectArrayChunks,uint64_t moduleSize, void* pData) {
+    // 防重入: 注入器可能多次调用, 只启动一次工作线程
+    bool expected = false;
+    if (!g_dfmStarted.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        DLOG("MyStartPointDFM: 已启动过, 跳过重复调用");
+        LOG(LOG_LEVEL_INFO, "[MyStartPointDFM] 工作线程已存在, 跳过重复启动");
+        return true;
+    }
+
+    if (!plibUE5ModeBase || !pGUObjectArray) {
+        DERR("MyStartPointDFM: 参数为空 base=%p GUObjectArray=%p",
+             plibUE5ModeBase, pGUObjectArray);
+        LOG(LOG_LEVEL_ERROR, "[MyStartPointDFM] 参数为空: base=%p GUObjectArray=%p",
+            plibUE5ModeBase, pGUObjectArray);
         return false;
     }
 
-    DLOG("MyStartPointUE4-DFM: base=%p GNames=%p GWorld=%p GUObjectArray=%p moduleSize=0x%llX",
-         plibUE4ModeBase, pGNames, pGWorld, pGUObjectArray, (unsigned long long)moduleSize);
-    LOG(LOG_LEVEL_INFO, "[MyStartPointUE4-DFM] 启动 DFM 工作线程");
+    DLOG("MyStartPointDFM: base=%p GNames=%p GWorld=%p GUObjectArray=%p moduleSize=0x%llX",
+         plibUE5ModeBase, pGNames, pGWorld, pGUObjectArray, (unsigned long long)moduleSize);
+    LOG(LOG_LEVEL_INFO, "[MyStartPointDFM] 启动 DFM 工作线程");
 
-    std::thread(DfmWorkerThread, plibUE4ModeBase, pGNames,
+    std::thread(DfmWorkerThread, plibUE5ModeBase, pGNames,
                 pGWorld, pGUObjectArray, moduleSize, pData).detach();
 
     return true;

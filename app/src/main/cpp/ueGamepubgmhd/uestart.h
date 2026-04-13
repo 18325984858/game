@@ -20,7 +20,7 @@ extern "C" {
  * @return true 工作线程启动成功, false 参数校验失败
  */
 __attribute__((visibility("default")))
-bool MyStartPointUE4(void *plibUE4ModeBase, void *pGNames, void *pGWorld, void *pGUObjectArray, uint64_t moduleSize, void *pData);
+bool MyStartPointPUBG(void *plibUE4ModeBase, void *pGNames, void *pGWorld, void *pGUObjectArray, uint64_t moduleSize, void *pData);
 
 #ifdef __cplusplus
 }
