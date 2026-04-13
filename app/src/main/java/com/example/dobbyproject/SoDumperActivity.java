@@ -127,6 +127,15 @@ public class SoDumperActivity extends AppCompatActivity {
     // ═════════════════════════════════════════════════════════════════
 
     @Override
+    public boolean onOptionsItemSelected(android.view.MenuItem item) {
+        if (item.getItemId() == android.R.id.home) {
+            finish();
+            return true;
+        }
+        return super.onOptionsItemSelected(item);
+    }
+
+    @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_so_dumper);
@@ -139,6 +148,11 @@ public class SoDumperActivity extends AppCompatActivity {
         btnDump = findViewById(R.id.btn_dump);
         tvStatus = findViewById(R.id.tv_dump_status);
         progressBar = findViewById(R.id.progress_dump);
+
+        // ActionBar 返回箭头
+        if (getSupportActionBar() != null) {
+            getSupportActionBar().setDisplayHomeAsUpEnabled(true);
+        }
 
         // 初始化 adapter
         appAdapter = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, new ArrayList<>());
