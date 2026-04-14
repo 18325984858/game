@@ -242,8 +242,7 @@ static void DfmGuiThread() {
         }
     } resetGuard;
 
-    DLOG("DFM GUI 线程启动, 等待 10 秒...");
-    std::this_thread::sleep_for(std::chrono::seconds(10));
+    DLOG("DFM GUI 线程启动, 无限重试连接 Overlay 服务 (每 3 秒)...");
 
     DisplayInfo displayInfo = queryShellDisplayInfo();
     DLOG("AImGui RenderClient: %dx%d", displayInfo.width, displayInfo.height);
@@ -256,15 +255,30 @@ static void DfmGuiThread() {
         .tcpNoDelay = true,
         .disableVsync = true,
         .styleScale = 1.75f,
-        .fontSizePixels = 18.0f,
+        .fontSizePixels = 24.0f,
         .screenWidth = displayInfo.width,
         .screenHeight = displayInfo.height,
         .rotateTheta = displayInfo.rotateTheta,
         .clientConnectAddress = "127.0.0.1",
     };
 
+    // 检测游戏进程存活 (用于退出重试循环)
+    auto isGameAlive = []() -> bool {
+        char cmdline[256] = {};
+        int fd = open("/proc/self/cmdline", O_RDONLY);
+        if (fd < 0) return false;
+        ssize_t n = read(fd, cmdline, sizeof(cmdline) - 1);
+        close(fd);
+        return n > 0 && strstr(cmdline, "tmgp.dfm") != nullptr;
+    };
+
     std::unique_ptr<android::AImGui> imgui;
-    for (int attempt = 1; attempt <= 20; ++attempt) {
+    // 无限重试连接 — 用户可能先启动游戏再启动 app overlay 服务
+    for (int attempt = 1; ; ++attempt) {
+        if (!isGameAlive()) {
+            DLOG("RenderClient: 游戏进程已退出, 放弃连接");
+            return;
+        }
         try {
             imgui = std::make_unique<android::AImGui>(opts);
             DLOG("AImGui 构造完成: attempt=%d state=%d", attempt, *imgui ? 1 : 0);
@@ -276,8 +290,10 @@ static void DfmGuiThread() {
             imgui.reset();
         }
         if (imgui && *imgui) break;
-        DLOG("等待公开 Overlay 服务: attempt=%d/20", attempt);
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        if (attempt % 10 == 1) {
+            DLOG("等待公开 Overlay 服务: attempt=%d (每 3 秒重试)", attempt);
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(3));
     }
 
     if (!imgui || !(*imgui)) {
@@ -287,28 +303,11 @@ static void DfmGuiThread() {
 
     DLOG("AImGui RenderClient 初始化完成, 开始渲染循环");
 
-    // 输入线程 (ProcessInputEvent 阻塞读取, 不能放在渲染循环中)
-    std::atomic<bool> inputRunning{true};
-    std::thread inputThread([imguiPtr = imgui.get(), &inputRunning]() {
-        DLOG("RenderClient 输入线程启动");
-        while (inputRunning.load(std::memory_order_acquire)) {
-            imguiPtr->ProcessInputEvent();
-        }
-        DLOG("RenderClient 输入线程退出");
-    });
+    // 注意: ProcessInputEvent 必须与 BeginFrame/EndFrame 在同一线程调用,
+    // 否则 ImGui::IO 的 InputEventsQueue 会多线程竞争导致 ImVector 越界崩溃
 
     dfmdraw::DfmOverlay overlay;
     dfm::DrawDfmData gameData;
-
-    // 检测游戏进程存活
-    auto isGameAlive = []() -> bool {
-        char cmdline[256] = {};
-        int fd = open("/proc/self/cmdline", O_RDONLY);
-        if (fd < 0) return false;
-        ssize_t n = read(fd, cmdline, sizeof(cmdline) - 1);
-        close(fd);
-        return n > 0 && strstr(cmdline, "tmgp.dfm") != nullptr;
-    };
 
     auto lastAliveCheck = std::chrono::steady_clock::now();
 
@@ -320,13 +319,17 @@ static void DfmGuiThread() {
             lastAliveCheck = now;
             if (!isGameAlive()) {
                 DLOG("RenderClient: 游戏进程已退出");
-                inputRunning.store(false, std::memory_order_release);
                 for (int i = 0; i < 3; i++) {
                     imgui->BeginFrame(); imgui->EndFrame();
                     std::this_thread::sleep_for(std::chrono::milliseconds(16));
                 }
                 break;
             }
+        }
+
+        // 非阻塞地处理所有待处理输入事件 (同线程, 避免竞态)
+        while (imgui->PollInputReady(0)) {
+            imgui->ProcessInputEvent();
         }
 
         imgui->BeginFrame();
@@ -340,9 +343,6 @@ static void DfmGuiThread() {
         imgui->EndFrame();
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-
-    inputRunning.store(false, std::memory_order_release);
-    if (inputThread.joinable()) inputThread.join();
 }
 
 // =====================================================================

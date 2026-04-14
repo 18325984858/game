@@ -869,6 +869,14 @@ namespace android
         }
     }
 
+    bool AImGui::PollInputReady(int timeoutMs) const
+    {
+        if (!m_state || m_clientFd == -1)
+            return false;
+        pollfd pfd{.fd = m_clientFd, .events = POLLIN};
+        return poll(&pfd, 1, timeoutMs) > 0 && (pfd.revents & POLLIN);
+    }
+
     void AImGui::SetupWindowInfo(void *windowInfo)
     {
         ANativeWindowCreator::UpdateWindowInfo(m_nativeWindow, windowInfo);
@@ -1251,13 +1259,49 @@ namespace android
     {
         while (m_state)
         {
+            // 确保 listen socket 有效 (进程被 freeze/unfreeze 后 socket 可能失效)
+            if (0 > m_serverFd)
+            {
+                m_serverFd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+                if (0 > m_serverFd)
+                {
+                    LogError("[-] ServerWorker: socket recreate failed, %d:%s", errno, strerror(errno));
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                    continue;
+                }
+                int optVal = 1;
+                setsockopt(m_serverFd, SOL_SOCKET, SO_REUSEADDR, &optVal, sizeof(int));
+                if (0 > bind(m_serverFd, reinterpret_cast<sockaddr *>(&m_transportAddress), sizeof(m_transportAddress)))
+                {
+                    LogError("[-] ServerWorker: rebind failed, %d:%s", errno, strerror(errno));
+                    close(m_serverFd);
+                    m_serverFd = -1;
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                    continue;
+                }
+                if (0 > listen(m_serverFd, 1))
+                {
+                    LogError("[-] ServerWorker: relisten failed, %d:%s", errno, strerror(errno));
+                    close(m_serverFd);
+                    m_serverFd = -1;
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                    continue;
+                }
+                LogInfo("[AImGui] ServerWorker: listen socket recreated fd=%d port=%d",
+                        m_serverFd, ntohs(m_transportAddress.sin_port));
+            }
+
             m_clientFd = accept(m_serverFd, nullptr, nullptr);
             if (0 > m_clientFd)
             {
                 if (m_state)
                 {
-                    LogDebug("[-] Server accept client connect failed, %d:%s", errno, strerror(errno));
-                    m_state = false;
+                    LogDebug("[-] Server accept failed, %d:%s, will retry", errno, strerror(errno));
+                    // 关闭失效的 listen socket，下次循环重建
+                    close(m_serverFd);
+                    m_serverFd = -1;
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                    continue;
                 }
                 return;
             }

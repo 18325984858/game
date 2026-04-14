@@ -72,6 +72,9 @@ namespace android
 
         void ProcessInputEvent();
 
+        // 非阻塞检查是否有待处理的输入事件 (用于 RenderClient 同线程调用)
+        bool PollInputReady(int timeoutMs = 0) const;
+
         void SetupWindowInfo(void *windowInfo);
 
         bool IsClientConnected() const { return m_clientConnected.load(std::memory_order_acquire); }

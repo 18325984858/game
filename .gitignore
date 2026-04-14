@@ -19,3 +19,5 @@ local.properties
 NUL.o
 Windows-llvm/
 replay_pid*.log
+
+sdk_dump.cs

@@ -131,6 +131,7 @@ struct ResolvedOffsets {
     int32_t Streaming_LoadedLevel = 0x128;
 
     // LevelActorContainer
+    int32_t Level_ActorCluster    = 0xC8;    // Level → ActorCluster 容器指针
     int32_t Container_Actors      = 0x28;
 
     // InventoryItemInfo 大小
@@ -138,29 +139,49 @@ struct ResolvedOffsets {
 
     // ── 相机系统 (SDK dump 确认) ──
     // Controller
-    int32_t Ctrl_ControlRotation   = 0x3D8;   // Controller.ControlRotation (FRotator: Pitch/Yaw/Roll)
+    int32_t Ctrl_ControlRotation   = 0x3D8;   // Controller.ControlRotation (FRotator: Pitch/Yaw/Roll, Size=0xC)
+    int32_t Ctrl_Pawn              = 0x3A0;   // Controller.Pawn (SDK: 0x3A0)
+    int32_t Ctrl_PlayerState       = 0x378;   // Controller.PlayerState (SDK: 0x378)
 
     // PlayerController
+    int32_t PC_AcknowledgedPawn    = 0x3F0;   // PlayerController.AcknowledgedPawn (SDK: 0x3F0)
     int32_t PC_PlayerCameraManager = 0x408;   // PlayerController.PlayerCameraManager
+    int32_t PC_TargetViewRotation  = 0x41C;   // PlayerController.TargetViewRotation (FRotator, SDK: 0x41C)
 
-    // PlayerCameraManager
-    int32_t PCM_DefaultFOV         = 0x388;   // PlayerCameraManager.DefaultFOV
+    // PlayerCameraManager (SDK: class Size=0x4020)
+    int32_t PCM_DefaultFOV         = 0x388;   // PlayerCameraManager.DefaultFOV (float)
+    int32_t PCM_CameraCache        = 0x3E0;   // PlayerCameraManager.CameraCache (FCameraCacheEntry, Size=0x9D0)
+    int32_t PCM_LastFrameCache     = 0xDB0;   // PlayerCameraManager.LastFrameCameraCache
+    int32_t PCM_ViewTarget         = 0x1780;  // PlayerCameraManager.ViewTarget (TViewTarget, Size=0x9E0)
     int32_t PCM_CameraCachePrivate = 0x2B60;  // PlayerCameraManager.CameraCachePrivate (FCameraCacheEntry)
+    int32_t PCM_LastFrameCachePriv = 0x3530;  // PlayerCameraManager.LastFrameCameraCachePrivate
 
-    // FCameraCacheEntry.POV (FMinimalViewInfo) 内部偏移
-    // UE5 LargeWorldCoordinates: FVector=double[3], FRotator=double[3]
-    int32_t CamCache_LocationX    = 0x08;     // POV.Location.X (double)
-    int32_t CamCache_LocationY    = 0x10;     // POV.Location.Y (double)
-    int32_t CamCache_LocationZ    = 0x18;     // POV.Location.Z (double)
-    int32_t CamCache_RotPitch     = 0x20;     // POV.Rotation.Pitch (double)
-    int32_t CamCache_RotYaw       = 0x28;     // POV.Rotation.Yaw (double)
-    int32_t CamCache_RotRoll      = 0x30;     // POV.Rotation.Roll (double)
-    int32_t CamCache_FOV          = 0x38;     // POV.FOV (float)
+    // FCameraCacheEntry 内部偏移 (SDK 确认):
+    //   +0x00: float Timestamp
+    //   +0x10: MinimalViewInfo POV (Size=0x9C0)
+    //     POV+0x00: EncVector Location (0x10) — 加密, 不可直接读
+    //     POV+0x10: Rotator Rotation (0xC)  — Pitch/Yaw/Roll float
+    //     POV+0x1C: float FOV
+    //     POV+0x20: float DesiredFOV
+    // CacheEntry 绝对偏移 = 0x10(POV起始) + 字段偏移
+    int32_t CamCache_RotPitch     = 0x20;     // CacheEntry+0x10+0x10
+    int32_t CamCache_RotYaw       = 0x24;     // CacheEntry+0x10+0x14
+    int32_t CamCache_RotRoll      = 0x28;     // CacheEntry+0x10+0x18
+    int32_t CamCache_FOV          = 0x2C;     // CacheEntry+0x10+0x1C
+    int32_t CamCache_DesiredFOV   = 0x30;     // CacheEntry+0x10+0x20
+
+    // TViewTarget 内部偏移 (SDK 确认):
+    //   +0x00: Actor* Target
+    //   +0x10: MinimalViewInfo POV (Size=0x9C0) — 同上布局
+    int32_t ViewTarget_RotPitch   = 0x20;     // ViewTarget+0x10+0x10
+    int32_t ViewTarget_RotYaw     = 0x24;
+    int32_t ViewTarget_RotRoll    = 0x28;
+    int32_t ViewTarget_FOV        = 0x2C;     // ViewTarget+0x10+0x1C
 
     // ── 本地 PlayerController 查找链 (OwningGameInstance → LocalPlayers) ──
-    int32_t World_OwningGameInstance = 0x1A8;   // World.OwningGameInstance
+    int32_t World_OwningGameInstance = 0x190;   // World.OwningGameInstance (SDK: 0x190)
     int32_t GI_LocalPlayers          = 0x38;    // GameInstance.LocalPlayers (TArray<ULocalPlayer*>)
-    int32_t LP_PlayerController      = 0x30;    // LocalPlayer.PlayerController
+    int32_t LP_PlayerController      = 0x30;    // Player.PlayerController (SDK: 0x30)
 
     /// 关键偏移是否有效
     bool isValid() const {
@@ -402,8 +423,8 @@ private:
     std::atomic<bool> m_running{false};
     std::thread m_pollThread;
 
-    static constexpr int POLL_INTERVAL_MS = 250;
-    static constexpr int SCAN_INTERVAL_MS = 5000;
+    static constexpr int POLL_INTERVAL_MS = 16;          // 主循环间隔 (~60fps, 相机+位置高频更新)
+    static constexpr int SCAN_INTERVAL_MS = 5000;        // 完整 Actor 扫描间隔
     static constexpr int PLAYER_UPDATE_INTERVAL_MS = 1000;  // 玩家位置快速更新
 };
 

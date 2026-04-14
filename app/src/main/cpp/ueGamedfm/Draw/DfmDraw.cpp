@@ -86,9 +86,15 @@ bool DfmOverlay::worldToScreen(const dfm::DrawDfmData& cam,
 
     if (cZ <= kNearDepth) return false;
 
-    float tanHalf = std::tan(fov * 0.5f * DEG2RAD);
-    if (tanHalf < 0.01f) return false;
-    float focal = screenW * 0.5f / tanHalf;
+    // UE5 MaintainYFOV 模式:
+    //   FOV 存储为 16:9 参考宽高比下的水平 FOV (如 DefaultFOV=90)
+    //   先换算为垂直半角, 再算焦距 (焦距在任何宽高比下一致)
+    //   vFOV/2 = atan(tan(hFOV/2) / refAspect)
+    //   focal  = screenH/2 / tan(vFOV/2) = screenH/2 * refAspect / tan(hFOV/2)
+    constexpr float kRefAspect = 16.0f / 9.0f;
+    float tanHalfBase = std::tan(fov * 0.5f * DEG2RAD);
+    if (tanHalfBase < 0.01f) return false;
+    float focal = screenH * 0.5f * kRefAspect / tanHalfBase;
 
     sx = screenW * 0.5f + cX * focal / cZ;
     sy = screenH * 0.5f - cY * focal / cZ;
@@ -200,21 +206,34 @@ int DfmOverlay::drawESP(const dfm::DrawDfmData& data, float screenW, float scree
         && (std::fabs(data.camLocX) > 1.0f || std::fabs(data.camLocY) > 1.0f)
         && data.camFOV >= 30.0f && data.camFOV <= 170.0f;
     if (!camValid) {
-        // 显示诊断信息: 为什么 ESP 不绘制
         ImDrawList* dl = ImGui::GetForegroundDrawList();
         char diagBuf[256];
         snprintf(diagBuf, sizeof(diagBuf),
-            "ESP: cam(%.0f,%.0f,%.0f) yaw=%.1f fov=%.0f players=%zu",
+            "ESP off: cam(%.0f,%.0f,%.0f) yaw=%.1f fov=%.0f myPos(%.0f,%.0f,%.0f) players=%zu",
             data.camLocX, data.camLocY, data.camLocZ,
             data.camYaw, data.camFOV,
+            data.myPos.x, data.myPos.y, data.myPos.z,
             data.players.size());
         dl->AddText(ImVec2(screenW * 0.5f - 150, 40),
                     IM_COL32(255, 100, 100, 220), diagBuf);
         return 0;
     }
 
-    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    // 创建透明全屏窗口绘制 ESP (与 UE4Draw 相同方式)
+    ImGui::SetNextWindowPos(ImVec2(0, 0));
+    ImGui::SetNextWindowSize(ImVec2(screenW, screenH));
+    ImGui::Begin("##DfmESP", nullptr,
+        ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoDecoration |
+        ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+        ImGuiWindowFlags_NoBringToFrontOnFocus);
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    float myCx = screenW * 0.5f;
+    float myCy = screenH;
     int drawn = 0;
+
+    // UE5 角色半高 (capsule half-height, 单位: UU/cm)
+    constexpr float kCharacterHalfHeight = 90.0f;
 
     for (const auto& p : data.players) {
         if (p.hp <= 0) continue;
@@ -223,72 +242,142 @@ int DfmOverlay::drawESP(const dfm::DrawDfmData& data, float screenW, float scree
 
         float dist = distMeters(p.pos.x, p.pos.y, p.pos.z,
                                 data.camLocX, data.camLocY, data.camLocZ);
-        if (dist > m_espMaxDist) continue;
-
-        float footSX, footSY, headSX, headSY;
-        if (!worldToScreen(data, p.pos.x, p.pos.y, p.pos.z, screenW, screenH, footSX, footSY))
-            continue;
-        if (!worldToScreen(data, p.pos.x, p.pos.y, p.pos.z + 180.0f, screenW, screenH, headSX, headSY))
-            continue;
-
-        float boxH = std::fabs(footSY - headSY);
-        if (boxH < 5.0f || boxH > screenH) continue;
-        float boxW = boxH * 0.4f;
-
-        float topY = std::min(footSY, headSY);
-        float centerX = (footSX + headSX) * 0.5f;
+        if (dist > m_espMaxDist || dist < 1.0f) continue;
 
         ImU32 color;
         if (p.isAI) color = IM_COL32(255, 255, 0, 200);
         else if (p.teamId >= 0 && p.teamId == data.myTeamId) color = IM_COL32(0, 255, 0, 200);
         else color = IM_COL32(255, 50, 50, 230);
 
-        float left = centerX - boxW * 0.5f;
-        float right = centerX + boxW * 0.5f;
-        dl->AddRect(ImVec2(left, topY), ImVec2(right, topY + boxH), color, 0, 0, 1.5f);
+        // 投影脚底和头顶 (pos 是角色中心, ±半高)
+        float footSX, footSY, headSX, headSY;
+        bool footOk = worldToScreen(data, p.pos.x, p.pos.y, p.pos.z - kCharacterHalfHeight,
+                                     screenW, screenH, footSX, footSY);
+        bool headOk = worldToScreen(data, p.pos.x, p.pos.y, p.pos.z + kCharacterHalfHeight,
+                                     screenW, screenH, headSX, headSY);
 
-        if (m_enableSnapline) {
-            dl->AddLine(ImVec2(screenW * 0.5f, screenH), ImVec2(footSX, footSY),
-                        IM_COL32(255, 255, 255, 80), 1.0f);
+        if (footOk && headOk) {
+            float boxH = std::fabs(footSY - headSY);
+            float boxW = boxH * 0.48f;
+            float cx = (footSX + headSX) * 0.5f;
+            float topY = std::min(footSY, headSY);
+            float botY = std::max(footSY, headSY);
+
+            if (boxH > screenH * 0.9f) { /* 太大跳过 */ }
+            else if (boxH < 8.0f) {
+                // 远距离: 菱形标记 + 距离
+                if (cx >= -20 && cx <= screenW + 20 && topY >= -20 && botY <= screenH + 20) {
+                    float mx = cx, my = (topY + botY) * 0.5f;
+                    float sz = 6.0f;
+                    ImVec2 diamond[4] = {
+                        ImVec2(mx, my - sz), ImVec2(mx + sz, my),
+                        ImVec2(mx, my + sz), ImVec2(mx - sz, my)
+                    };
+                    dl->AddConvexPolyFilled(diamond, 4, (color & 0x00FFFFFF) | 0x60000000);
+                    dl->AddPolyline(diamond, 4, color, ImDrawFlags_Closed, 1.5f);
+
+                    if (m_enableDistance) {
+                        char buf[32]; snprintf(buf, sizeof(buf), "%.0fm", dist);
+                        dl->AddText(ImVec2(mx - 12, my + sz + 2), IM_COL32(200, 200, 200, 200), buf);
+                    }
+                    if (m_enableSnapline)
+                        dl->AddLine(ImVec2(myCx, myCy), ImVec2(mx, my), IM_COL32(255, 255, 255, 40), 1.0f);
+                    drawn++;
+                }
+            } else if (cx >= -boxW && cx <= screenW + boxW && topY >= -boxH && botY <= screenH + boxH) {
+                // ---- 主 ESP 方框 ----
+                float left = cx - boxW * 0.5f;
+                float right = cx + boxW * 0.5f;
+
+                // 黑色描边 + 彩色方框
+                dl->AddRect(ImVec2(left - 1, topY - 1), ImVec2(right + 1, botY + 1),
+                            IM_COL32(0, 0, 0, 150), 0, 0, 2.5f);
+                dl->AddRect(ImVec2(left, topY), ImVec2(right, botY), color, 0, 0, 2.0f);
+
+                // 射线
+                if (m_enableSnapline)
+                    dl->AddLine(ImVec2(myCx, myCy), ImVec2(cx, botY), IM_COL32(255, 255, 255, 100), 1.0f);
+
+                // 血条 (左侧竖条)
+                if (m_enableHP && p.maxHp > 0) {
+                    float ratio = std::clamp(p.hp / p.maxHp, 0.0f, 1.0f);
+                    float hpX = left - 5.0f;
+                    float hpFill = topY + (botY - topY) * (1.0f - ratio);
+                    dl->AddRectFilled(ImVec2(hpX - 3, topY), ImVec2(hpX, botY), IM_COL32(0, 0, 0, 150));
+                    dl->AddRectFilled(ImVec2(hpX - 3, hpFill), ImVec2(hpX, botY), hpColor(ratio));
+                }
+
+                // 名字 (顶部居中, 带背景)
+                if (m_enableName && !p.playerName.empty()) {
+                    const char* label = p.playerName.c_str();
+                    ImVec2 textSize = ImGui::CalcTextSize(label);
+                    float tx = cx - textSize.x * 0.5f;
+                    float ty = topY - textSize.y - 2;
+                    dl->AddRectFilled(ImVec2(tx - 2, ty - 1), ImVec2(tx + textSize.x + 2, ty + textSize.y + 1),
+                                      IM_COL32(0, 0, 0, 120), 2.0f);
+                    dl->AddText(ImVec2(tx, ty), IM_COL32(255, 255, 255, 230), label);
+                }
+
+                // 距离 (底部居中)
+                if (m_enableDistance) {
+                    char distBuf[32]; snprintf(distBuf, sizeof(distBuf), "%.0fm", dist);
+                    ImVec2 textSize = ImGui::CalcTextSize(distBuf);
+                    dl->AddText(ImVec2(cx - textSize.x * 0.5f, botY + 2), IM_COL32(200, 200, 200, 200), distBuf);
+                }
+
+                // 武器 (右侧)
+                if (!p.weapon.empty())
+                    dl->AddText(ImVec2(right + 4, topY), IM_COL32(150, 200, 255, 200), p.weapon.c_str());
+
+                // 护甲/头盔 (右侧下方)
+                if (m_enableArmor && (p.armor > 0 || p.helmet > 0)) {
+                    char armorBuf[48]; snprintf(armorBuf, sizeof(armorBuf), "A:%.0f H:%.0f", p.armor, p.helmet);
+                    dl->AddText(ImVec2(right + 4, topY + 14), IM_COL32(80, 200, 255, 190), armorBuf);
+                }
+
+                drawn++;
+            }
+        } else {
+            // ---- 屏幕外箭头 (与 UE4Draw fallback arrow 相同) ----
+            constexpr float DEG2RAD = 3.14159265358979f / 180.0f;
+            float dx = p.pos.x - data.camLocX, dy = p.pos.y - data.camLocY;
+            float camYawRad = std::remainder(data.camYaw, 360.0f) * DEG2RAD;
+            float fwdX = std::cos(camYawRad), fwdY = std::sin(camYawRad);
+            float rightX = -fwdY, rightY = fwdX;
+            float dotFwd = dx * fwdX + dy * fwdY;
+            float dotRight = dx * rightX + dy * rightY;
+
+            if (std::fabs(dotFwd) > 0.1f || std::fabs(dotRight) > 0.1f) {
+                float angle = std::atan2(dotRight, dotFwd);
+                constexpr float kMargin = 40.0f;
+                float halfW = screenW * 0.5f - kMargin;
+                float halfH = screenH * 0.5f - kMargin;
+                float scale = 1.0f / std::max(std::fabs(std::sin(angle)) / halfH,
+                                               std::fabs(std::cos(angle)) / halfW);
+                float ax = std::clamp(myCx + std::sin(angle) * std::min(scale, halfW), kMargin, screenW - kMargin);
+                float ay = std::clamp(screenH * 0.5f - std::cos(angle) * std::min(scale, halfH), kMargin, screenH - kMargin);
+
+                // 三角箭头
+                float arrowAngle = std::atan2(ay - screenH * 0.5f, ax - myCx);
+                ImVec2 tip(ax, ay);
+                ImVec2 fwd2(std::cos(arrowAngle), std::sin(arrowAngle));
+                ImVec2 side(-fwd2.y, fwd2.x);
+                ImVec2 bl(tip.x - fwd2.x * 16 + side.x * 7, tip.y - fwd2.y * 16 + side.y * 7);
+                ImVec2 br(tip.x - fwd2.x * 16 - side.x * 7, tip.y - fwd2.y * 16 - side.y * 7);
+                dl->AddTriangleFilled(tip, bl, br, color);
+                dl->AddTriangle(tip, bl, br, IM_COL32(0, 0, 0, 200), 1.5f);
+
+                // 距离标签
+                if (m_enableDistance) {
+                    char buf[32]; snprintf(buf, sizeof(buf), "%.0fm", dist);
+                    dl->AddText(ImVec2(ax - 12, ay + 10), IM_COL32(200, 200, 200, 200), buf);
+                }
+                drawn++;
+            }
         }
-
-        if (m_enableHP && p.maxHp > 0) {
-            float ratio = std::clamp(p.hp / p.maxHp, 0.0f, 1.0f);
-            float barW = 3.0f;
-            float barH = boxH * ratio;
-            dl->AddRectFilled(ImVec2(left - barW - 2, topY + boxH - barH),
-                              ImVec2(left - 2, topY + boxH), hpColor(ratio));
-            dl->AddRect(ImVec2(left - barW - 2, topY),
-                        ImVec2(left - 2, topY + boxH), IM_COL32(0, 0, 0, 150));
-        }
-
-        if (m_enableName && !p.playerName.empty()) {
-            dl->AddText(ImVec2(centerX - p.playerName.size() * 2.5f, topY - 16),
-                        IM_COL32(255, 255, 255, 230), p.playerName.c_str());
-        }
-
-        if (m_enableDistance) {
-            char buf[32];
-            snprintf(buf, sizeof(buf), "%.0fm", dist);
-            dl->AddText(ImVec2(centerX - 15, topY + boxH + 2),
-                        IM_COL32(200, 200, 200, 200), buf);
-        }
-
-        if (!p.weapon.empty()) {
-            dl->AddText(ImVec2(right + 4, topY),
-                        IM_COL32(150, 200, 255, 200), p.weapon.c_str());
-        }
-
-        // 护甲/头盔显示 (ESP 方框右侧)
-        if (m_enableArmor && (p.armor > 0 || p.helmet > 0)) {
-            char armorBuf[48];
-            snprintf(armorBuf, sizeof(armorBuf), "A:%.0f H:%.0f", p.armor, p.helmet);
-            dl->AddText(ImVec2(right + 4, topY + 14),
-                        IM_COL32(80, 200, 255, 190), armorBuf);
-        }
-
-        drawn++;
     }
+
+    ImGui::End();
     return drawn;
 }
 
@@ -477,7 +566,7 @@ void DfmOverlay::drawLootESP(const dfm::DrawDfmData& data, float screenW, float 
 void DfmOverlay::drawMinimap(const dfm::DrawDfmData& data, float screenW, float screenH) {
     bool myPosValid = hasValidPos(data.myPos.x, data.myPos.y, data.myPos.z);
     float cx = m_minimapSize * 0.5f + 15.0f;
-    float cy = screenH - m_minimapSize * 0.5f - 15.0f;
+    float cy = m_minimapSize * 0.5f + 50.0f;  // 左上角, 与游戏内置小地图位置对齐
     float radius = m_minimapSize * 0.5f;
     float rangeUU = m_minimapRange * 100.0f;
 
@@ -486,28 +575,6 @@ void DfmOverlay::drawMinimap(const dfm::DrawDfmData& data, float screenW, float 
     dl->AddCircleFilled(ImVec2(cx, cy), radius, IM_COL32(0, 0, 0, 140));
     dl->AddCircle(ImVec2(cx, cy), radius, IM_COL32(255, 255, 255, 100), 0, 1.5f);
     dl->AddCircleFilled(ImVec2(cx, cy), 4.0f, IM_COL32(0, 200, 255, 255));
-
-    // 视角方向指示 (FOV 扇形 + 朝向箭头)
-    if (std::isfinite(data.camYaw)) {
-        constexpr float DEG2RAD = 3.14159265f / 180.0f;
-        float yawRad = data.camYaw * DEG2RAD;
-        float fovHalf = (data.camFOV > 30.0f ? data.camFOV : 90.0f) * 0.5f * DEG2RAD;
-
-        // 朝向箭头
-        float arrowLen = radius * 0.35f;
-        float ax = cx + std::cos(yawRad) * arrowLen;
-        float ay = cy + std::sin(yawRad) * arrowLen;
-        dl->AddLine(ImVec2(cx, cy), ImVec2(ax, ay), IM_COL32(0, 200, 255, 200), 2.0f);
-
-        // FOV 扇形边线
-        float fovLen = radius * 0.9f;
-        float lx = cx + std::cos(yawRad - fovHalf) * fovLen;
-        float ly = cy + std::sin(yawRad - fovHalf) * fovLen;
-        float rx = cx + std::cos(yawRad + fovHalf) * fovLen;
-        float ry = cy + std::sin(yawRad + fovHalf) * fovLen;
-        dl->AddLine(ImVec2(cx, cy), ImVec2(lx, ly), IM_COL32(0, 200, 255, 60), 1.0f);
-        dl->AddLine(ImVec2(cx, cy), ImVec2(rx, ry), IM_COL32(0, 200, 255, 60), 1.0f);
-    }
 
     if (!myPosValid) {
         dl->AddText(ImVec2(cx - 30, cy - 6), IM_COL32(255, 100, 100, 200), "无定位");

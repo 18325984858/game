@@ -1,5 +1,7 @@
 package com.example.dobbyproject;
 
+import android.app.usage.UsageEvents;
+import android.app.usage.UsageStatsManager;
 import android.app.ActivityManager;
 import android.app.Notification;
 import android.app.NotificationChannel;
@@ -15,6 +17,7 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
+import android.os.PowerManager;
 import android.provider.Settings;
 import android.util.Log;
 import android.view.Display;
@@ -36,10 +39,14 @@ public class Ue4OverlayService extends Service {
     private static final int NOTIFICATION_ID = 1107;
     private static final float TOUCH_PASSTHROUGH_ALPHA = 0.7f;
     private static final long OVERLAY_LAYOUT_SYNC_INTERVAL_MS = 500L;
-    private static final String GAME_PACKAGE = "com.tencent.tmgp.pubgmhd";
+    private static final String[] GAME_PACKAGES = {
+        "com.tencent.tmgp.pubgmhd",
+        "com.tencent.tmgp.dfm"
+    };
     private static final long GAME_ALIVE_CHECK_INTERVAL_MS = 2000L;
 
     private WindowManager windowManager;
+    private PowerManager.WakeLock wakeLock;
     private OverlayTextureView overlayTextureView;
     private Surface overlaySurface;
     private WindowManager.LayoutParams overlayLayoutParams;
@@ -51,6 +58,7 @@ public class Ue4OverlayService extends Service {
         @Override
         public void run() {
             syncOverlayLayout();
+            updateOverlayVisibility();
             if (overlayTextureView != null) {
                 mainHandler.postDelayed(this, OVERLAY_LAYOUT_SYNC_INTERVAL_MS);
             }
@@ -59,22 +67,45 @@ public class Ue4OverlayService extends Service {
     private final Runnable gameAliveCheckRunnable = new Runnable() {
         @Override
         public void run() {
-            // 不再自动检测游戏进程, 因为 /proc 扫描在隐藏模块时会误判
-            // overlay 的清理由 C++ 层 stale data 超时检测处理
+            // 不检测游戏进程 — Android 14+ 无法可靠检测其他 UID 的进程
+            // overlay 清理依赖: RenderClient 断线 → RenderServer 检测到 → 清屏
+            // 用户手动 stopSelf 或系统回收
             mainHandler.postDelayed(this, GAME_ALIVE_CHECK_INTERVAL_MS);
         }
     };
 
+    private boolean isGameRunning() {
+        // Android 14+ getRunningAppProcesses() 只返回自己 UID 的进程，无法检测其他 app
+        // 改用 /proc 扫描
+        return isGameProcessRunning();
+    }
+
     @Override
     public void onCreate() {
         super.onCreate();
+        Log.w(TAG, "=== onCreate: overlay 服务启动 pid=" + android.os.Process.myPid() + " ===");
         windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
+
+        // 获取 PARTIAL_WAKE_LOCK 防止进程被 freeze (保持 CPU 活跃, TCP listen socket 不被清理)
+        PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+        if (pm != null) {
+            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "dobby:overlay_wakelock");
+            wakeLock.acquire();
+            Log.w(TAG, "=== WakeLock acquired ===");
+        }
+
         createNotificationChannel();
         Notification notification = buildNotification();
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
         } else {
             startForeground(NOTIFICATION_ID, notification);
+        }
+        // 尽早创建 overlay view, 不等 onStartCommand, 避免服务被冻结前未初始化
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M || Settings.canDrawOverlays(this)) {
+            ensureOverlayView();
+        } else {
+            Log.e(TAG, "onCreate: 缺少悬浮窗权限");
         }
     }
 
@@ -102,6 +133,10 @@ public class Ue4OverlayService extends Service {
         mainHandler.removeCallbacks(overlayLayoutSyncRunnable);
         mainHandler.removeCallbacks(gameAliveCheckRunnable);
         removeOverlayView();
+        if (wakeLock != null && wakeLock.isHeld()) {
+            wakeLock.release();
+            Log.w(TAG, "=== WakeLock released ===");
+        }
         stopForeground(STOP_FOREGROUND_REMOVE);
         super.onDestroy();
     }
@@ -116,7 +151,14 @@ public class Ue4OverlayService extends Service {
             return;
         }
 
-        overlayTextureView = new OverlayTextureView(this);
+        Log.w(TAG, "ensureOverlayView: 开始创建 TextureView pid=" + android.os.Process.myPid());
+
+        try {
+            overlayTextureView = new OverlayTextureView(this);
+        } catch (Exception e) {
+            Log.e(TAG, "ensureOverlayView: 创建 OverlayTextureView 失败", e);
+            return;
+        }
         Point displaySize = getCurrentDisplaySize();
 
         int windowType = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
@@ -127,8 +169,7 @@ public class Ue4OverlayService extends Service {
                 | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
                 | WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                 | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-                | WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED
-                | WindowManager.LayoutParams.FLAG_SECURE;
+                | WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED;
 
         WindowManager.LayoutParams layoutParams = new WindowManager.LayoutParams(
                 displaySize.x,
@@ -145,10 +186,16 @@ public class Ue4OverlayService extends Service {
         }
         overlayLayoutParams = layoutParams;
 
-        windowManager.addView(overlayTextureView, layoutParams);
+        try {
+            windowManager.addView(overlayTextureView, layoutParams);
+        } catch (Exception e) {
+            Log.e(TAG, "ensureOverlayView: addView 失败", e);
+            overlayTextureView = null;
+            return;
+        }
         startOverlayLayoutSync();
         startGameAliveCheck();
-        Log.i(TAG, "Overlay TextureView 已添加 alpha=" + TOUCH_PASSTHROUGH_ALPHA + " size=" + displaySize.x + "x" + displaySize.y);
+        Log.w(TAG, "=== Overlay TextureView 已添加 alpha=" + TOUCH_PASSTHROUGH_ALPHA + " size=" + displaySize.x + "x" + displaySize.y + " pid=" + android.os.Process.myPid() + " ===");
     }
 
     private void removeOverlayView() {
@@ -238,6 +285,39 @@ public class Ue4OverlayService extends Service {
         overlaySurface = null;
     }
 
+    private void updateOverlayVisibility() {
+        if (overlayTextureView == null) return;
+        boolean gameInFront = isGameInForeground();
+        int desired = gameInFront ? View.VISIBLE : View.INVISIBLE;
+        if (overlayTextureView.getVisibility() != desired) {
+            overlayTextureView.setVisibility(desired);
+        }
+    }
+
+    private boolean isGameInForeground() {
+        try {
+            UsageStatsManager usm = (UsageStatsManager) getSystemService(Context.USAGE_STATS_SERVICE);
+            if (usm == null) return true;
+            long now = System.currentTimeMillis();
+            UsageEvents events = usm.queryEvents(now - 2000, now);
+            String lastPkg = null;
+            while (events.hasNextEvent()) {
+                UsageEvents.Event event = new UsageEvents.Event();
+                events.getNextEvent(event);
+                if (event.getEventType() == UsageEvents.Event.ACTIVITY_RESUMED) {
+                    lastPkg = event.getPackageName();
+                }
+            }
+            if (lastPkg == null) return true; // 无法判断时默认显示
+            for (String pkg : GAME_PACKAGES) {
+                if (pkg.equals(lastPkg)) return true;
+            }
+            return false;
+        } catch (Exception e) {
+            return true; // 异常时默认显示
+        }
+    }
+
     private Notification buildNotification() {
         return new NotificationCompat.Builder(this, CHANNEL_ID)
                 .setSmallIcon(android.R.drawable.ic_menu_view)
@@ -256,7 +336,7 @@ public class Ue4OverlayService extends Service {
         NotificationChannel channel = new NotificationChannel(
                 CHANNEL_ID,
                 "UE4 Overlay",
-                NotificationManager.IMPORTANCE_MIN
+                NotificationManager.IMPORTANCE_DEFAULT
         );
         channel.setDescription("UE4 公开 API 调试悬浮层");
 
@@ -276,11 +356,12 @@ public class Ue4OverlayService extends Service {
         @Override
         public void onSurfaceTextureAvailable(SurfaceTexture surfaceTexture, int width, int height) {
             int rotateTheta = getCurrentDisplayRotationDegrees();
-            Log.i(TAG, "onSurfaceTextureAvailable width=" + width + " height=" + height + " rotate=" + rotateTheta);
+            Log.w(TAG, "=== onSurfaceTextureAvailable width=" + width + " height=" + height + " rotate=" + rotateTheta + " pid=" + android.os.Process.myPid() + " ===");
             PublicOverlayBridge.stopRenderer();
             releaseOverlaySurface();
             overlaySurface = new Surface(surfaceTexture);
-            PublicOverlayBridge.startRenderer(overlaySurface, width, height, rotateTheta);
+            boolean started = PublicOverlayBridge.startRenderer(overlaySurface, width, height, rotateTheta);
+            Log.w(TAG, "=== RenderServer started=" + started + " ===");
             lastRendererWidth = width;
             lastRendererHeight = height;
             lastRendererRotation = rotateTheta;
@@ -319,7 +400,8 @@ public class Ue4OverlayService extends Service {
 
     private void startGameAliveCheck() {
         mainHandler.removeCallbacks(gameAliveCheckRunnable);
-        mainHandler.postDelayed(gameAliveCheckRunnable, GAME_ALIVE_CHECK_INTERVAL_MS);
+        // 首次检查延迟 10 秒, 给游戏进程充足的启动时间
+        mainHandler.postDelayed(gameAliveCheckRunnable, 10_000L);
     }
 
     private boolean isGameProcessRunning() {
@@ -337,8 +419,12 @@ public class Ue4OverlayService extends Service {
                 java.io.File cmdline = new java.io.File(entry, "cmdline");
                 try (java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.FileReader(cmdline))) {
                     String line = reader.readLine();
-                    if (line != null && line.contains(GAME_PACKAGE)) {
-                        return true;
+                    if (line != null) {
+                        for (String pkg : GAME_PACKAGES) {
+                            if (line.contains(pkg)) {
+                                return true;
+                            }
+                        }
                     }
                 } catch (Exception ignored) {
                     // 无权限读取, 跳过

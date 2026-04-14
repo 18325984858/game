@@ -55,7 +55,7 @@ void overlayThreadMain(ANativeWindow* window, int width, int height, int rotateT
             .tcpNoDelay = true,
             .disableVsync = true,
             .styleScale = 1.75f,
-            .fontSizePixels = 18.0f,
+            .fontSizePixels = 24.0f,
             .screenWidth = width,
             .screenHeight = height,
             .rotateTheta = rotateTheta,

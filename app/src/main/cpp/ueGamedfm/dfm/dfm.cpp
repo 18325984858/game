@@ -208,15 +208,25 @@ bool DfmMatchMonitor::getActorLocation(uintptr_t actorPtr, FVector3& outLoc) con
     uintptr_t root = safeReadPtr(actorPtr + m_off.Actor_RootComponent);
     if (!ok(root)) return false;
 
-    outLoc.x = safeReadFloat(root + (m_off.Scene_ComponentToWorld + offsetof(FTransform, TranslationX)));
-    outLoc.y = safeReadFloat(root + (m_off.Scene_ComponentToWorld + offsetof(FTransform, TranslationY)));
-    outLoc.z = safeReadFloat(root + (m_off.Scene_ComponentToWorld + offsetof(FTransform, TranslationZ)));
+    float x = safeReadFloat(root + (m_off.Scene_ComponentToWorld + offsetof(FTransform, TranslationX)));
+    float y = safeReadFloat(root + (m_off.Scene_ComponentToWorld + offsetof(FTransform, TranslationY)));
+    float z = safeReadFloat(root + (m_off.Scene_ComponentToWorld + offsetof(FTransform, TranslationZ)));
 
-    // ComponentToWorld 全零时回退到 RelativeLocation
-    if (outLoc.x == 0.0f && outLoc.y == 0.0f && outLoc.z == 0.0f) {
-        outLoc.x = safeReadFloat(root + (m_off.Scene_RelativeLocation));
-        outLoc.y = safeReadFloat(root + (m_off.Scene_RelativeLocation + offsetof(FVector, Y)));
-        outLoc.z = safeReadFloat(root + (m_off.Scene_RelativeLocation + offsetof(FVector, Z)));
+    // 有效性检查: 排除 NaN/Inf/极大值
+    if (std::isfinite(x) && std::isfinite(y) && std::isfinite(z)
+        && std::fabs(x) < 1e8f && std::fabs(y) < 1e8f && std::fabs(z) < 1e8f) {
+        outLoc.x = x; outLoc.y = y; outLoc.z = z;
+        if (x != 0.0f || y != 0.0f || z != 0.0f) return true;
+    }
+
+    // ComponentToWorld 无效时回退到 RelativeLocation (注意: EncVector 可能加密)
+    x = safeReadFloat(root + (m_off.Scene_RelativeLocation));
+    y = safeReadFloat(root + (m_off.Scene_RelativeLocation + offsetof(FVector, Y)));
+    z = safeReadFloat(root + (m_off.Scene_RelativeLocation + offsetof(FVector, Z)));
+
+    if (std::isfinite(x) && std::isfinite(y) && std::isfinite(z)
+        && std::fabs(x) < 1e8f && std::fabs(y) < 1e8f && std::fabs(z) < 1e8f) {
+        outLoc.x = x; outLoc.y = y; outLoc.z = z;
     }
     return true;
 }
@@ -401,15 +411,8 @@ MatchState DfmMatchMonitor::getMatchState() const {
     ms.state = readFName(ms.gameStatePtr + m_off.GS_MatchState);
     if (ms.state != "InProgress" && ms.state != "WaitingToStart" &&
         ms.state != "WaitingPostMatch" && ms.state != "LeavingMap") {
-        // 动态偏移未命中, 尝试其他候选偏移 (GameMode.MatchState 等)
-        static const uint32_t fallbackOffsets[] = {0x410, 0x408};
-        for (auto off : fallbackOffsets) {
-            std::string s = readFName(ms.gameStatePtr + off);
-            if (s == "InProgress" || s == "WaitingToStart" || s == "WaitingPostMatch") {
-                ms.state = s;
-                break;
-            }
-        }
+        LOG(LOG_LEVEL_INFO, TAG " [matchState] MatchState FName 未命中已知值: '%s' (GS+0x%X)",
+            ms.state.c_str(), m_off.GS_MatchState);
     }
 
     ms.elapsedTimeSeconds = safeReadS32(ms.gameStatePtr + m_off.GS_ElapsedTime);
@@ -469,7 +472,7 @@ std::vector<uintptr_t> DfmMatchMonitor::getAllActors() const {
             return;
         }
         // 方式2: LevelActorContainer
-        uintptr_t ac = safeReadPtr(lv + 0xC8);
+        uintptr_t ac = safeReadPtr(lv + m_off.Level_ActorCluster);
         if (!ok(ac)) return;
         uintptr_t p = safeReadPtr(ac + m_off.Container_Actors);
         int32_t c = safeReadS32(ac + m_off.Container_Actors + offsetof(TArray<void*>, Num));
@@ -698,53 +701,24 @@ std::vector<ContainerItem> DfmMatchMonitor::readContainerItems(uintptr_t actorPt
 // =====================================================================
 
 uintptr_t DfmMatchMonitor::findLocalPlayerController() const {
-    // 缓存命中: 验证 PCM 仍然有效
-    if (ok(m_cachedPC)) {
-        uintptr_t pcm = safeReadPtr(m_cachedPC + m_off.PC_PlayerCameraManager);
-        if (ok(pcm)) return m_cachedPC;
-        m_cachedPC = 0; // 失效, 重新查找
-    }
-
+    // 每次都重新查找 (不缓存), 因为 DFM 切换场景时 PC 会变
     uintptr_t gworld = safeReadPtr(m_moduleBase + m_offGWorld);
     if (!ok(gworld)) return 0;
 
     // ── 路径 1: OwningGameInstance → LocalPlayers[0] → PlayerController ──
-    // 扫描 UWorld 中多个候选偏移找 OwningGameInstance
-    static const uint32_t giCandidates[] = {0x1A8, 0x1B0, 0x1B8, 0x1C0, 0x198, 0x1A0, 0x1C8, 0x1D0};
-    for (uint32_t giOff : giCandidates) {
-        uintptr_t gi = safeReadPtr(gworld + giOff);
-        if (!ok(gi)) continue;
-
-        // 验证: 有效 UObject (ClassPrivate 指针有效)
-        uintptr_t giCls = safeReadPtr(gi + offsetof(UObjectBase, ClassPrivate));
-        if (!ok(giCls)) continue;
-
-        // 检查类名包含 "GameInstance"
-        std::string clsName = readObjName(giCls);
-        if (clsName.find("GameInstance") == std::string::npos) continue;
-
-        // 在 GameInstance 中查找 LocalPlayers TArray (count 应为 1)
-        static const uint32_t lpCandidates[] = {0x38, 0x40, 0x48, 0x50, 0x58};
-        for (uint32_t lpOff : lpCandidates) {
-            uintptr_t lpArr = safeReadPtr(gi + lpOff);
-            int32_t lpCnt = safeReadS32(gi + lpOff + 8);
-            if (!ok(lpArr) || lpCnt < 1 || lpCnt > 4) continue;
-
+    uintptr_t gi = safeReadPtr(gworld + m_off.World_OwningGameInstance);
+    if (ok(gi)) {
+        uintptr_t lpArr = safeReadPtr(gi + m_off.GI_LocalPlayers);
+        int32_t lpCnt = safeReadS32(gi + m_off.GI_LocalPlayers + 8);
+        if (ok(lpArr) && lpCnt >= 1 && lpCnt <= 4) {
             uintptr_t lp0 = safeReadPtr(lpArr);
-            if (!ok(lp0)) continue;
-
-            // 在 LocalPlayer 中查找 PlayerController
-            static const uint32_t pcCandidates[] = {0x30, 0x38, 0x28, 0x40};
-            for (uint32_t pcOff : pcCandidates) {
-                uintptr_t pc = safeReadPtr(lp0 + pcOff);
-                if (!ok(pc)) continue;
-
-                uintptr_t pcm = safeReadPtr(pc + m_off.PC_PlayerCameraManager);
-                if (ok(pcm)) {
-                    m_cachedPC = pc;
-                    LOG(LOG_LEVEL_INFO, TAG " [camera] PC found: World+0x%X→GI+0x%X→LP+0x%X PC=%p PCM=%p",
-                        giOff, lpOff, pcOff, (void*)pc, (void*)pcm);
-                    return pc;
+            if (ok(lp0)) {
+                uintptr_t pc = safeReadPtr(lp0 + m_off.LP_PlayerController);
+                if (ok(pc)) {
+                    uintptr_t pcm = safeReadPtr(pc + m_off.PC_PlayerCameraManager);
+                    if (ok(pcm)) {
+                        return pc;
+                    }
                 }
             }
         }
@@ -763,7 +737,6 @@ uintptr_t DfmMatchMonitor::findLocalPlayerController() const {
                 if (!ok(owner)) continue;
                 uintptr_t pcm = safeReadPtr(owner + m_off.PC_PlayerCameraManager);
                 if (ok(pcm)) {
-                    m_cachedPC = owner;
                     LOG(LOG_LEVEL_INFO, TAG " [camera] PC via PA[%d].Owner: PC=%p PCM=%p",
                         i, (void*)owner, (void*)pcm);
                     return owner;
@@ -782,74 +755,113 @@ uintptr_t DfmMatchMonitor::findLocalPlayerController() const {
 
 void DfmMatchMonitor::fillCameraData(DrawDfmData& outData) const {
     uintptr_t pc = findLocalPlayerController();
-    if (!ok(pc)) return;
+    bool gotRotation = false;
+    bool gotLocation = false;
+    bool gotFov = false;
 
-    // 读取 ControlRotation (FRotator = 3 floats)
-    outData.camPitch = safeReadFloat(pc + m_off.Ctrl_ControlRotation);
-    outData.camYaw   = safeReadFloat(pc + m_off.Ctrl_ControlRotation + offsetof(FRotator, Yaw));
-    outData.camRoll  = safeReadFloat(pc + m_off.Ctrl_ControlRotation + offsetof(FRotator, Roll));
-
-    // 读取 PlayerCameraManager
-    uintptr_t pcm = safeReadPtr(pc + m_off.PC_PlayerCameraManager);
-    if (!ok(pcm)) return;
-
-    outData.camFOV = safeReadFloat(pcm + m_off.PCM_DefaultFOV);
-
-    // 读取 CameraCachePrivate.POV (UE5 LWC: double 坐标)
-    uintptr_t cache = pcm + m_off.PCM_CameraCachePrivate;
-
-    // 尝试 double 读取 (UE5 LargeWorldCoordinates)
-    double locX = safeReadDouble(cache + m_off.CamCache_LocationX);
-    double locY = safeReadDouble(cache + m_off.CamCache_LocationY);
-    double locZ = safeReadDouble(cache + m_off.CamCache_LocationZ);
-
-    // 验证: 如果 double 值合理 (非零且有限), 使用 double 版本
-    bool doubleValid = std::isfinite(locX) && std::isfinite(locY) && std::isfinite(locZ)
-        && (std::fabs(locX) > 1.0 || std::fabs(locY) > 1.0 || std::fabs(locZ) > 1.0);
-
-    if (doubleValid) {
-        outData.camLocX = static_cast<float>(locX);
-        outData.camLocY = static_cast<float>(locY);
-        outData.camLocZ = static_cast<float>(locZ);
-
-        // double 旋转
-        double pitch = safeReadDouble(cache + m_off.CamCache_RotPitch);
-        double yaw   = safeReadDouble(cache + m_off.CamCache_RotYaw);
-        double roll  = safeReadDouble(cache + m_off.CamCache_RotRoll);
-        if (std::isfinite(pitch) && std::isfinite(yaw)) {
-            outData.camPitch = static_cast<float>(pitch);
-            outData.camYaw   = static_cast<float>(yaw);
-            outData.camRoll  = static_cast<float>(roll);
+    if (ok(pc)) {
+        // ControlRotation (FRotator = 3 floats) — 最可靠的旋转源
+        float crPitch = safeReadFloat(pc + m_off.Ctrl_ControlRotation);
+        float crYaw   = safeReadFloat(pc + m_off.Ctrl_ControlRotation + offsetof(FRotator, Yaw));
+        float crRoll  = safeReadFloat(pc + m_off.Ctrl_ControlRotation + offsetof(FRotator, Roll));
+        if (std::isfinite(crPitch) && std::isfinite(crYaw) && std::isfinite(crRoll)
+            && std::fabs(crPitch) < 360.0f && std::fabs(crYaw) < 360.0f) {
+            outData.camPitch = crPitch;
+            outData.camYaw   = crYaw;
+            outData.camRoll  = crRoll;
+            gotRotation = true;
         }
 
-        float cacheFov = safeReadFloat(cache + m_off.CamCache_FOV);
-        if (cacheFov >= 30.0f && cacheFov <= 170.0f) {
-            outData.camFOV = cacheFov;
-        }
-    } else {
-        // 回退: 用 float 偏移试 (非 LWC 版本)
-        float fx = safeReadFloat(cache + 0x04);
-        float fy = safeReadFloat(cache + 0x08);
-        float fz = safeReadFloat(cache + 0x0C);
-        if (std::isfinite(fx) && (std::fabs(fx) > 1.0f || std::fabs(fy) > 1.0f)) {
-            outData.camLocX = fx;
-            outData.camLocY = fy;
-            outData.camLocZ = fz;
-            outData.camPitch = safeReadFloat(cache + 0x10);
-            outData.camYaw   = safeReadFloat(cache + 0x14);
-            outData.camRoll  = safeReadFloat(cache + 0x18);
-            float fov2 = safeReadFloat(cache + 0x1C);
-            if (fov2 >= 30.0f && fov2 <= 170.0f) outData.camFOV = fov2;
-        } else {
-            // 最终回退: 使用本地玩家位置 + ControlRotation 作为相机
-            if (std::fabs(outData.myPos.x) > 1.0f || std::fabs(outData.myPos.y) > 1.0f) {
-                outData.camLocX = outData.myPos.x;
-                outData.camLocY = outData.myPos.y;
-                outData.camLocZ = outData.myPos.z + 160.0f; // 大约眼睛高度
-                LOG(LOG_LEVEL_INFO, TAG " [camera] 回退: 使用玩家位置作为相机 (%.0f,%.0f,%.0f)",
-                    outData.camLocX, outData.camLocY, outData.camLocZ);
+        // 回退: TargetViewRotation (PC+0x41C) — 游戏复制的视角旋转
+        if (!gotRotation) {
+            float tvPitch = safeReadFloat(pc + m_off.PC_TargetViewRotation);
+            float tvYaw   = safeReadFloat(pc + m_off.PC_TargetViewRotation + offsetof(FRotator, Yaw));
+            float tvRoll  = safeReadFloat(pc + m_off.PC_TargetViewRotation + offsetof(FRotator, Roll));
+            if (std::isfinite(tvPitch) && std::isfinite(tvYaw)
+                && std::fabs(tvPitch) < 360.0f && std::fabs(tvYaw) < 360.0f) {
+                outData.camPitch = tvPitch;
+                outData.camYaw   = tvYaw;
+                outData.camRoll  = tvRoll;
+                gotRotation = true;
             }
         }
+
+        uintptr_t pcm = safeReadPtr(pc + m_off.PC_PlayerCameraManager);
+        if (ok(pcm)) {
+            // DefaultFOV
+            float defaultFov = safeReadFloat(pcm + m_off.PCM_DefaultFOV);
+            if (defaultFov >= 30.0f && defaultFov <= 170.0f) {
+                outData.camFOV = defaultFov;
+                gotFov = true;
+            }
+
+            // 尝试从多个相机缓存源读取 Rotation 和 FOV
+            // SDK dump 确认的 5 个缓存位置 (POV 内部布局相同):
+            //   CameraCache(0x3E0), LastFrameCache(0xDB0),
+            //   ViewTarget(0x1780), CameraCachePrivate(0x2B60),
+            //   LastFrameCachePriv(0x3530)
+            const int32_t kCacheSources[] = {
+                m_off.PCM_CameraCache,
+                m_off.PCM_LastFrameCache,
+                m_off.PCM_ViewTarget,
+                m_off.PCM_CameraCachePrivate,
+                m_off.PCM_LastFrameCachePriv,
+            };
+            for (int32_t srcOff : kCacheSources) {
+                uintptr_t src = pcm + srcOff;
+                float cPitch = safeReadFloat(src + m_off.CamCache_RotPitch);
+                float cYaw   = safeReadFloat(src + m_off.CamCache_RotYaw);
+                float cFov   = safeReadFloat(src + m_off.CamCache_FOV);
+
+                bool rotValid = std::isfinite(cPitch) && std::isfinite(cYaw)
+                    && (std::fabs(cPitch) > 0.001f || std::fabs(cYaw) > 0.001f)
+                    && std::fabs(cPitch) < 360.0f && std::fabs(cYaw) < 360.0f;
+                bool fovValid = cFov >= 30.0f && cFov <= 170.0f;
+
+                if (rotValid && !gotRotation) {
+                    float cRoll = safeReadFloat(src + m_off.CamCache_RotRoll);
+                    outData.camPitch = cPitch;
+                    outData.camYaw   = cYaw;
+                    outData.camRoll  = cRoll;
+                    gotRotation = true;
+                }
+                if (fovValid && !gotFov) {
+                    outData.camFOV = cFov;
+                    gotFov = true;
+                }
+                if (gotRotation && gotFov) break;
+            }
+        }
+    }
+
+    // Location: 使用 myPos + 眼高 (EncVector 加密无法直接读取)
+    if (!gotLocation && (std::fabs(outData.myPos.x) > 1.0f || std::fabs(outData.myPos.y) > 1.0f)) {
+        outData.camLocX = outData.myPos.x;
+        outData.camLocY = outData.myPos.y;
+        outData.camLocZ = outData.myPos.z + 160.0f;
+        gotLocation = true;
+    }
+
+    if (!gotFov) outData.camFOV = 90.0f;
+
+    static auto lastCamLog = std::chrono::steady_clock::now();
+    auto now = std::chrono::steady_clock::now();
+    if (std::chrono::duration_cast<std::chrono::seconds>(now - lastCamLog).count() >= 5) {
+        lastCamLog = now;
+        // 直接诊断: 打印所有 5 个缓存源的 FOV 值
+        uintptr_t diagPC = findLocalPlayerController();
+        uintptr_t diagPCM = ok(diagPC) ? safeReadPtr(diagPC + m_off.PC_PlayerCameraManager) : 0;
+        float diagDefFov = ok(diagPCM) ? safeReadFloat(diagPCM + m_off.PCM_DefaultFOV) : -1;
+        // 5 个缓存源: CameraCache, LastFrame, ViewTarget, Private, LastFramePriv
+        float f1 = ok(diagPCM) ? safeReadFloat(diagPCM + m_off.PCM_CameraCache + m_off.CamCache_FOV) : -1;
+        float f2 = ok(diagPCM) ? safeReadFloat(diagPCM + m_off.PCM_LastFrameCache + m_off.CamCache_FOV) : -1;
+        float f3 = ok(diagPCM) ? safeReadFloat(diagPCM + m_off.PCM_ViewTarget + m_off.ViewTarget_FOV) : -1;
+        float f4 = ok(diagPCM) ? safeReadFloat(diagPCM + m_off.PCM_CameraCachePrivate + m_off.CamCache_FOV) : -1;
+        float f5 = ok(diagPCM) ? safeReadFloat(diagPCM + m_off.PCM_LastFrameCachePriv + m_off.CamCache_FOV) : -1;
+        __android_log_print(ANDROID_LOG_INFO, "UE5-DFM",
+            "[cam] loc=%d rot=%d fov=%d PCM=%p defFov=%.1f fovs=[%.1f,%.1f,%.1f,%.1f,%.1f]",
+            gotLocation?1:0, gotRotation?1:0, gotFov?1:0,
+            (void*)diagPCM, diagDefFov, f1, f2, f3, f4, f5);
     }
 }
 
@@ -859,20 +871,68 @@ void DfmMatchMonitor::fillCameraData(DrawDfmData& outData) const {
 
 FVector3 DfmMatchMonitor::getMyPosition() const {
     FVector3 pos;
+
+    uintptr_t pc = findLocalPlayerController();
+    if (ok(pc)) {
+        // 方法1: PlayerController.AcknowledgedPawn (最直接, SDK 0x3F0)
+        uintptr_t ackPawn = safeReadPtr(pc + m_off.PC_AcknowledgedPawn);
+        if (ok(ackPawn)) {
+            getActorLocation(ackPawn, pos);
+            if (std::fabs(pos.x) > 1.0f || std::fabs(pos.y) > 1.0f) return pos;
+        }
+
+        // 方法2: Controller.Pawn (SDK 0x3A0)
+        uintptr_t pawn = safeReadPtr(pc + m_off.Ctrl_Pawn);
+        if (ok(pawn) && pawn != ackPawn) {
+            getActorLocation(pawn, pos);
+            if (std::fabs(pos.x) > 1.0f || std::fabs(pos.y) > 1.0f) return pos;
+        }
+
+        // 方法3: Controller.PlayerState → PawnPrivate
+        uintptr_t ps = safeReadPtr(pc + m_off.Ctrl_PlayerState);
+        if (ok(ps)) {
+            uintptr_t pawnFromPS = safeReadPtr(ps + m_off.PS_PawnPrivate);
+            if (ok(pawnFromPS)) {
+                getActorLocation(pawnFromPS, pos);
+                if (std::fabs(pos.x) > 1.0f || std::fabs(pos.y) > 1.0f) return pos;
+            }
+        }
+    }
+
+    // 方法2: 回退 - 遍历 PlayerArray, 找到与相机位置最近的玩家
     uintptr_t gworld = safeReadPtr(m_moduleBase + m_offGWorld);
     if (!ok(gworld)) return pos;
 
-    // 尝试从 GameState→PlayerArray 第一个元素获取
     uintptr_t gs = safeReadPtr(gworld + m_off.World_GameState);
-    if (ok(gs)) {
-        uintptr_t paPtr = safeReadPtr(gs + m_off.GS_PlayerArray);
-        if (ok(paPtr)) {
-            uintptr_t ps0 = safeReadPtr(paPtr);
-            if (ok(ps0)) {
-                uintptr_t pawn0 = safeReadPtr(ps0 + m_off.PS_PawnPrivate);
-                if (ok(pawn0)) getActorLocation(pawn0, pos);
+    if (!ok(gs)) return pos;
+
+    uintptr_t paPtr = safeReadPtr(gs + m_off.GS_PlayerArray);
+    int32_t paCount = safeReadS32(gs + m_off.GS_PlayerArray + offsetof(TArray<void*>, Num));
+    if (!ok(paPtr) || paCount <= 0) return pos;
+
+    // 尝试每个 PlayerState 的 PawnPrivate
+    for (int i = 0; i < std::min(paCount, 20); i++) {
+        uintptr_t ps = safeReadPtr(paPtr + static_cast<uintptr_t>(i) * 8);
+        if (!ok(ps)) continue;
+
+        // 检查这个 PlayerState 的 Owner 是否是 PlayerController (本地玩家的标志)
+        uintptr_t owner = safeReadPtr(ps + m_off.Actor_Owner);
+        if (ok(owner) && ok(pc) && owner == pc) {
+            uintptr_t pawn = safeReadPtr(ps + m_off.PS_PawnPrivate);
+            if (ok(pawn)) {
+                getActorLocation(pawn, pos);
+                if (std::fabs(pos.x) > 1.0f || std::fabs(pos.y) > 1.0f) {
+                    return pos;
+                }
             }
         }
+    }
+
+    // 方法3: 最终回退 - 用 PlayerArray[0]
+    uintptr_t ps0 = safeReadPtr(paPtr);
+    if (ok(ps0)) {
+        uintptr_t pawn0 = safeReadPtr(ps0 + m_off.PS_PawnPrivate);
+        if (ok(pawn0)) getActorLocation(pawn0, pos);
     }
     return pos;
 }
@@ -969,14 +1029,22 @@ bool DfmMatchMonitor::initOffsets() {
     TRY_RESOLVE("Actor", "Owner", m_off.Actor_Owner);
 
     // 相机系统 (反射可查)
-    TRY_RESOLVE("Controller", "ControlRotation", m_off.Ctrl_ControlRotation);
+    TRY_RESOLVE("Controller", "Pawn",              m_off.Ctrl_Pawn);
+    TRY_RESOLVE("Controller", "PlayerState",       m_off.Ctrl_PlayerState);
+    TRY_RESOLVE("Controller", "ControlRotation",   m_off.Ctrl_ControlRotation);
+    TRY_RESOLVE("PlayerController", "AcknowledgedPawn", m_off.PC_AcknowledgedPawn);
     TRY_RESOLVE("PlayerController", "PlayerCameraManager", m_off.PC_PlayerCameraManager);
     TRY_RESOLVE("PlayerCameraManager", "DefaultFOV", m_off.PCM_DefaultFOV);
+    TRY_RESOLVE("PlayerCameraManager", "CameraCache", m_off.PCM_CameraCache);
+    TRY_RESOLVE("PlayerCameraManager", "LastFrameCameraCache", m_off.PCM_LastFrameCache);
+    TRY_RESOLVE("PlayerCameraManager", "ViewTarget", m_off.PCM_ViewTarget);
     TRY_RESOLVE("PlayerCameraManager", "CameraCachePrivate", m_off.PCM_CameraCachePrivate);
+    TRY_RESOLVE("PlayerCameraManager", "LastFrameCameraCachePrivate", m_off.PCM_LastFrameCachePriv);
 
     // 本地 PlayerController 查找链
     TRY_RESOLVE("World", "OwningGameInstance", m_off.World_OwningGameInstance);
     TRY_RESOLVE("GameInstance", "LocalPlayers", m_off.GI_LocalPlayers);
+    TRY_RESOLVE("Player", "PlayerController", m_off.LP_PlayerController);
     TRY_RESOLVE("LocalPlayer", "PlayerController", m_off.LP_PlayerController);
 
     #undef TRY_RESOLVE
@@ -1181,6 +1249,25 @@ void DfmMatchMonitor::pollLoop() {
             persistentData.inMatch = true;
             persistentData.myPos = getMyPosition();
             fillCameraData(persistentData);
+
+            // 每 5 秒输出一次 myPos 诊断 (直接写 logcat, 不依赖 g_runtimeLogEnabled)
+            {
+                static auto lastMyPosLog = std::chrono::steady_clock::now();
+                auto nowLog = std::chrono::steady_clock::now();
+                if (std::chrono::duration_cast<std::chrono::seconds>(nowLog - lastMyPosLog).count() >= 5) {
+                    lastMyPosLog = nowLog;
+                    uintptr_t pc = findLocalPlayerController();
+                    uintptr_t ackPawn = ok(pc) ? safeReadPtr(pc + m_off.PC_AcknowledgedPawn) : 0;
+                    uintptr_t ctrlPawn = ok(pc) ? safeReadPtr(pc + m_off.Ctrl_Pawn) : 0;
+                    __android_log_print(ANDROID_LOG_INFO, "UE5-DFM",
+                        "myPos=(%.0f,%.0f,%.0f) cam=(%.0f,%.0f,%.0f) fov=%.0f yaw=%.1f team=%d "
+                        "PC=%p ackPawn=%p ctrlPawn=%p",
+                        persistentData.myPos.x, persistentData.myPos.y, persistentData.myPos.z,
+                        persistentData.camLocX, persistentData.camLocY, persistentData.camLocZ,
+                        persistentData.camFOV, persistentData.camYaw, persistentData.myTeamId,
+                        (void*)pc, (void*)ackPawn, (void*)ctrlPawn);
+                }
+            }
 
             SharedDfmData::getInstance().pushData(persistentData);
         }
