@@ -341,7 +341,7 @@ static void DfmGuiThread() {
         overlay.drawOverlay(gameData);
 
         imgui->EndFrame();
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        // 不额外 sleep, 由 TCP 传输和 GPU 自然限速实现最低延迟
     }
 }
 

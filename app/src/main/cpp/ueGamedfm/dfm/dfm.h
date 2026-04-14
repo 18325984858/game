@@ -96,7 +96,9 @@ struct ResolvedOffsets {
     int32_t PS_TeamID             = 0x660;   // GPPlayerState.TeamID
     int32_t PS_PlayerName2        = 0x470;   // GPPlayerState.PlayerNamePrivate (回退)
 
-    // PickupBase
+    // PickupBase (inherits InteractorBase)
+    // [修复] 新增: 读取物品本地化显示名 (SDK: InteractorBase.InteractorName FText@0x770)
+    int32_t Interactor_Name        = 0x770;   // InteractorBase.InteractorName (FText, Size=0x18)
     int32_t Pickup_InvIdName      = 0xF20;   // PickupBase.InventoryIdName (FName)
     int32_t Pickup_InvType        = 0xF28;   // PickupBase.InventoryType
     int32_t Pickup_StackCount     = 0xF30;   // PickupBase.StackCount
@@ -119,6 +121,8 @@ struct ResolvedOffsets {
     int32_t Cont_RepItemArray     = 0x1C38;  // InventoryPickup_Container.RepItemArray
     int32_t Cont_ItemsOffset      = 0x108;   // RepItemArray 内 TArray 偏移
     int32_t Cont_PickupBoxType    = 0x1C14;
+    // [修复] 新增: 容器首次打开标记 (SDK: ExtraContainerRepInfo.bFirstOpen@0x1C30)
+    int32_t Cont_ExtraRepInfo     = 0x1C30;  // InventoryPickup_Container.ExtraRepInfo (bFirstOpen)
     int32_t Cont_IsEmpty          = 0x2110;
 
     // SingleItemContainer
@@ -359,6 +363,7 @@ private:
 
     // ── FString 读取 ──
     static std::string readFString(uintptr_t addr);
+    std::string readFText(uintptr_t addr) const;
 
     // ── 坐标读取 ──
     bool getActorLocation(uintptr_t actorPtr, FVector3& outLoc) const;

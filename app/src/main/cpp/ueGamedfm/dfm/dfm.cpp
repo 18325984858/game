@@ -200,6 +200,30 @@ std::string DfmMatchMonitor::readFString(uintptr_t addr) {
     return result;
 }
 
+// [修复] 新增: FText 读取 — 从 InteractorBase.InteractorName 获取本地化物品名
+// FText 读取 (UE5 FText 内部: FTextData* → SourceString/DisplayString)
+// FText Size=0x18: 通常 +0x0 是 FTextData* (SharedReferenceCount 之后是 FString)
+// 简化策略: 直接将 FText 地址当 FString 尝试读取, 回退到 FTextData* → FString
+std::string DfmMatchMonitor::readFText(uintptr_t addr) const {
+    if (!ok(addr)) return "";
+
+    // 策略1: FText 内部可能直接包含 FString (某些 UE5 版本)
+    std::string direct = readFString(addr);
+    if (!direct.empty() && direct != "None" && direct.length() > 1) return direct;
+
+    // 策略2: FText → FTextData* (第一个指针) → 内部 FString
+    uintptr_t textData = safeReadPtr(addr);
+    if (ok(textData)) {
+        // FTextData 内部: 通常 +0x28 或 +0x30 位置有 DisplayString (FString)
+        static const uint32_t kStrCandidates[] = {0x28, 0x30, 0x38, 0x40, 0x48};
+        for (uint32_t off : kStrCandidates) {
+            std::string s = readFString(textData + off);
+            if (!s.empty() && s != "None" && s.length() > 1) return s;
+        }
+    }
+    return "";
+}
+
 // =====================================================================
 //  坐标读取 (来自 IDA K2_GetActorLocation 反编译)
 // =====================================================================
@@ -530,7 +554,14 @@ void DfmMatchMonitor::scanActors(const std::vector<uintptr_t>& actors, DrawDfmDa
             try { numId = std::stoi(rawId); } catch (...) {}
 
             LootItem item;
-            item.itemName = (numId > 0) ? getItemDisplayName(numId) : rawId;
+            // [修复] 优先读取 InteractorName (FText, 本地化物品名)
+            // 解决物品只显示数字 ID 的问题
+            std::string displayName = readFText(actor + m_off.Interactor_Name);
+            if (!displayName.empty()) {
+                item.itemName = displayName;
+            } else {
+                item.itemName = (numId > 0) ? getItemDisplayName(numId) : rawId;
+            }
             item.className = cn;
             item.itemId = numId;
             item.stackCount = safeReadS32(actor + m_off.Pickup_StackCount);
@@ -630,8 +661,13 @@ ContainerInfo DfmMatchMonitor::readContainerInfo(uintptr_t actorPtr, const std::
         ci.boxType = "尸体箱";
     } else {
         uint8_t boxType = safeReadU8(actorPtr + m_off.Cont_PickupBoxType);
-        ci.opened = (safeReadU8(actorPtr + m_off.Cont_IsEmpty) & 1) != 0;
-        ci.finished = ci.opened;
+        // [修复] 使用 ExtraRepInfo.bFirstOpen (0x1C30) 判断是否被打开过
+        // 原代码只用 bIsEmpty 判断, 拿完物资后仍显示"未打开"
+        ci.opened = (safeReadU8(actorPtr + m_off.Cont_ExtraRepInfo) & 1) != 0;
+        // bIsEmpty (0x2110) — 是否已被拿空 (独立于打开状态)
+        ci.finished = (safeReadU8(actorPtr + m_off.Cont_IsEmpty) & 1) != 0;
+        // 如果没有 bFirstOpen 但为空, 也标记为已打开
+        if (!ci.opened && ci.finished) ci.opened = true;
         static const char* boxTypes[] = {"默认","武器箱","护甲箱","杂物箱","据点箱"};
         ci.boxType = (boxType < 5) ? boxTypes[boxType] : "未知";
     }
@@ -685,7 +721,15 @@ std::vector<ContainerItem> DfmMatchMonitor::readContainerItems(uintptr_t actorPt
                 int32_t stackCount = safeReadS32(pickup + m_off.Pickup_StackCount);
 
                 ContainerItem ci;
-                ci.name = idName;
+                // [修复] 优先读取本地化名称, 解决箱内物品只显示数字 ID
+                std::string displayName = readFText(pickup + m_off.Interactor_Name);
+                if (!displayName.empty()) {
+                    ci.name = displayName;
+                } else {
+                    int32_t numId = 0;
+                    try { numId = std::stoi(idName); } catch (...) {}
+                    ci.name = (numId > 0) ? getItemDisplayName(numId) : idName;
+                }
                 ci.count = stackCount;
                 try { ci.itemId = std::stoi(idName); } catch (...) {}
                 items.push_back(std::move(ci));
@@ -1024,6 +1068,9 @@ bool DfmMatchMonitor::initOffsets() {
     TRY_RESOLVE("GPPlayerState", "TeamID", m_off.PS_TeamID);
     TRY_RESOLVE("GPCharacterBase", "GPHealthDataComponent", m_off.Char_HealthComp);
     TRY_RESOLVE("GPCharacterBase", "CacheCurWeapon", m_off.Char_CurWeapon);
+
+    // InteractorBase (物品/箱子显示名)
+    TRY_RESOLVE("InteractorBase", "InteractorName", m_off.Interactor_Name);
 
     // Actor (通用)
     TRY_RESOLVE("Actor", "Owner", m_off.Actor_Owner);

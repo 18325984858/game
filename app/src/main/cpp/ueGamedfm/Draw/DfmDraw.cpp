@@ -190,7 +190,8 @@ void DfmOverlay::drawMenu(const dfm::DrawDfmData& data) {
         ImGui::SliderFloat("物资距离(m)", &m_lootMaxDist, 20.0f, 300.0f, "%.0f");
     }
 
-    if (ImGui::Button(m_menuExpanded ? "收起 ▲" : "展开 ▼", ImVec2(-1, 0))) {
+    // [修复] ▲▼ 替换为 ASCII <</>>, 避免超出字体字形范围显示为 ?
+    if (ImGui::Button(m_menuExpanded ? "收起 <<" : "展开 >>", ImVec2(-1, 0))) {
         m_menuExpanded = !m_menuExpanded;
     }
 
@@ -232,8 +233,9 @@ int DfmOverlay::drawESP(const dfm::DrawDfmData& data, float screenW, float scree
     float myCy = screenH;
     int drawn = 0;
 
-    // UE5 角色半高 (capsule half-height, 单位: UU/cm)
-    constexpr float kCharacterHalfHeight = 90.0f;
+    // UE5 角色全高 (capsule full height, 单位: UU/cm)
+    // ComponentToWorld.Translation 返回角色脚底位置 (Capsule 底部)
+    constexpr float kCharacterHeight = 180.0f;
 
     for (const auto& p : data.players) {
         if (p.hp <= 0) continue;
@@ -249,11 +251,11 @@ int DfmOverlay::drawESP(const dfm::DrawDfmData& data, float screenW, float scree
         else if (p.teamId >= 0 && p.teamId == data.myTeamId) color = IM_COL32(0, 255, 0, 200);
         else color = IM_COL32(255, 50, 50, 230);
 
-        // 投影脚底和头顶 (pos 是角色中心, ±半高)
+        // pos.z 是脚底, +kCharacterHeight 是头顶
         float footSX, footSY, headSX, headSY;
-        bool footOk = worldToScreen(data, p.pos.x, p.pos.y, p.pos.z - kCharacterHalfHeight,
+        bool footOk = worldToScreen(data, p.pos.x, p.pos.y, p.pos.z,
                                      screenW, screenH, footSX, footSY);
-        bool headOk = worldToScreen(data, p.pos.x, p.pos.y, p.pos.z + kCharacterHalfHeight,
+        bool headOk = worldToScreen(data, p.pos.x, p.pos.y, p.pos.z + kCharacterHeight,
                                      screenW, screenH, headSX, headSY);
 
         if (footOk && headOk) {
