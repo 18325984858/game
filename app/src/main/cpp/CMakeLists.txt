@@ -128,6 +128,8 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
         "ueGamedfm/ilbUE5Struct/UE5DfmStruct.cpp"
         "ueGamedfm/ilbUE5Dumper/UE5DfmDumper.cpp"
         "ueGamedfm/interface/interface.cpp"
+        "ueGamedfm/dfm/dfm.cpp"
+        "ueGamedfm/Draw/DfmDraw.cpp"
         "soDumper/so_dumper.cpp"
         "soDumper/so_dumper_jni.cpp"
 )

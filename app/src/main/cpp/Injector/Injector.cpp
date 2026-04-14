@@ -631,34 +631,30 @@ int Injector::injectRemote(pid_t pid, const char* soPath, InjectMode mode) {
             uint64_t ue4Size = getRemoteModuleSize(pid, "libUE4.so");
             LOG(LOG_LEVEL_INFO, "[Injector] libUE4.so 基址: %llx 大小: 0x%llx", (unsigned long long)ue4Base, (unsigned long long)ue4Size);
 
-            // 计算 UE5 全局变量地址 (基址 + 偏移)
-            uint64_t pNamePool          = ue4Base + DFM_OFF_NAMEPOOL;            // NamePool 结构体地址
-            uint64_t pGUObjectArrayNum  = ue4Base + DFM_OFF_GUOBJECTARRAY_NUM;   // GUObjectArray.NumElements 地址
-            uint64_t pGUObjectArrayChunks = ue4Base + DFM_OFF_GUOBJECTARRAY_CHUNKS; // GUObjectArray.Chunks 地址
-            uint64_t pGWorld            = ptrace_peekptr(pid, ue4Base + DFM_OFF_GWORLD); // GWorld (需解引用)
+            // 直接传递偏移值 (不加 ue4Base, C++ 层使用 base + offset 计算)
+            uint64_t pNamePool          = DFM_OFF_NAMEPOOL;                  // NamePool 偏移
+            uint64_t pGUObjectArrayNum  = DFM_OFF_GUOBJECTARRAY_NUM;          // GUObjectArray.NumElements 偏移
+            uint64_t pGUObjectArrayChunks = DFM_OFF_GUOBJECTARRAY_CHUNKS;     // GUObjectArray.Chunks 偏移
+            uint64_t pGWorld            = DFM_OFF_GWORLD;                     // GWorld 偏移
 
-            LOG(LOG_LEVEL_INFO, "[Injector] DFM NamePool:          %llx", (unsigned long long)pNamePool);
-            LOG(LOG_LEVEL_INFO, "[Injector] DFM GUObjArray.Num:    %llx", (unsigned long long)pGUObjectArrayNum);
-            LOG(LOG_LEVEL_INFO, "[Injector] DFM GUObjArray.Chunks: %llx", (unsigned long long)pGUObjectArrayChunks);
-            LOG(LOG_LEVEL_INFO, "[Injector] DFM GWorld:            %llx", (unsigned long long)pGWorld);
+            LOG(LOG_LEVEL_INFO, "[Injector] DFM offsets: NP=0x%llx Num=0x%llx Chunks=0x%llx GW=0x%llx",
+                (unsigned long long)pNamePool, (unsigned long long)pGUObjectArrayNum,
+                (unsigned long long)pGUObjectArrayChunks, (unsigned long long)pGWorld);
 
-            if (ue4Size == 0 || pGWorld == 0) {
-                LOG(LOG_LEVEL_ERROR,
-                    "[Injector] DFM 全局指针未就绪 ue4Size=0x%llx GWorld=%llx",
-                    (unsigned long long)ue4Size,
-                    (unsigned long long)pGWorld);
+            if (ue4Size == 0) {
+                LOG(LOG_LEVEL_ERROR, "[Injector] DFM ue4Size=0");
                 goto cleanup;
             }
 
-            // 调用 MyStartPointDFM(libUE4Base, pNamePool, pGWorld, pGUObjArrayNum, pGUObjArrayChunks, moduleSize, NULL)
+            // 调用 MyStartPointDFM(libUE4Base, offNamePool, offGWorld, offGUObjArrayNum, offGUObjArrayChunks, moduleSize, NULL)
             uint64_t startParams[7] = {
                 ue4Base,                // X0: plibUE4ModeBase - libUE4.so 基址
-                pNamePool,              // X1: pGNames - NamePool 结构体地址
-                pGWorld,                // X2: pGWorld - GWorld 指针 (已解引用)
-                pGUObjectArrayNum,      // X3: pGUObjectArray - NumElements 地址
-                pGUObjectArrayChunks,   // X4: pGUObjectArrayChunks - Chunks 地址
-                ue4Size,                // X5: moduleSize - libUE4.so 模块大小
-                0                       // X6: pData - 预留 (nullptr)
+                pNamePool,              // X1: pGNames - NamePool 偏移
+                pGWorld,                // X2: pGWorld - GWorld 偏移
+                pGUObjectArrayNum,      // X3: pGUObjectArray - NumElements 偏移
+                pGUObjectArrayChunks,   // X4: pGUObjectArrayChunks - Chunks 偏移
+                ue4Size,                // X5: moduleSize
+                0                       // X6: pData - 预留
             };
             LOG(LOG_LEVEL_INFO, "[Injector] 调用 MyStartPointDFM...");
             uint64_t startRet = 0;
@@ -701,7 +697,7 @@ int Injector::injectRemote(pid_t pid, const char* soPath, InjectMode mode) {
             }
             LOG(LOG_LEVEL_INFO, "[Injector] MyStartPoint 地址: %llx", (unsigned long long)myStartPointAddr);
 
-            // ── 7. 获取 libil2cpp.so 基址并读取 IL2CPP 指针 ──
+            // ── 7. 获取 libil2cpp.so 基址 ──
             uint64_t il2cppBase = getRemoteModuleBase(pid, "libil2cpp.so");
             if (il2cppBase == 0) {
                 LOG(LOG_LEVEL_ERROR, "[Injector] 无法找到 libil2cpp.so 基址");
@@ -709,24 +705,17 @@ int Injector::injectRemote(pid_t pid, const char* soPath, InjectMode mode) {
             }
             LOG(LOG_LEVEL_INFO, "[Injector] libil2cpp.so 基址: %llx", (unsigned long long)il2cppBase);
 
-            // 读取 IL2CPP 元数据指针 (与 Frida JS 中的偏移一致)
-            uint64_t pCodeRegistration     = ptrace_peekptr(pid, il2cppBase + LOL_OFF_CODE_REG);
-            uint64_t pMetadataRegistration  = ptrace_peekptr(pid, il2cppBase + LOL_OFF_META_REG);
-            uint64_t pGlobalMetadataHeader  = ptrace_peekptr(pid, il2cppBase + LOL_OFF_GLOBAL_META);
-            uint64_t pMetadataImagesTable   = ptrace_peekptr(pid, il2cppBase + LOL_OFF_META_IMAGES);
+            // 直接传递偏移值 (不加 il2cppBase, C++ 层使用 base + offset 解引用)
+            uint64_t pCodeRegistration     = LOL_OFF_CODE_REG;
+            uint64_t pMetadataRegistration  = LOL_OFF_META_REG;
+            uint64_t pGlobalMetadataHeader  = LOL_OFF_GLOBAL_META;
+            uint64_t pMetadataImagesTable   = LOL_OFF_META_IMAGES;
 
-            LOG(LOG_LEVEL_INFO, "[Injector] pCodeRegistration:     %llx", (unsigned long long)pCodeRegistration);
-            LOG(LOG_LEVEL_INFO, "[Injector] pMetadataRegistration: %llx", (unsigned long long)pMetadataRegistration);
-            LOG(LOG_LEVEL_INFO, "[Injector] pGlobalMetadataHeader: %llx", (unsigned long long)pGlobalMetadataHeader);
-            LOG(LOG_LEVEL_INFO, "[Injector] pMetadataImagesTable:  %llx", (unsigned long long)pMetadataImagesTable);
+            LOG(LOG_LEVEL_INFO, "[Injector] LOL offsets: CodeReg=0x%llx MetaReg=0x%llx GlobalMeta=0x%llx MetaImages=0x%llx",
+                (unsigned long long)pCodeRegistration, (unsigned long long)pMetadataRegistration,
+                (unsigned long long)pGlobalMetadataHeader, (unsigned long long)pMetadataImagesTable);
 
-            if (pCodeRegistration == 0 || pMetadataRegistration == 0 ||
-                pGlobalMetadataHeader == 0 || pMetadataImagesTable == 0) {
-                LOG(LOG_LEVEL_ERROR, "[Injector] IL2CPP 指针读取失败, 某个值为 0");
-                goto cleanup;
-            }
-
-            // ── 8. 远程调用 MyStartPoint(il2cppBase, pCodeReg, pMetaReg, pGlobalMeta, pMetaImages) ──
+            // ── 8. 远程调用 MyStartPointLOL(il2cppBase, offCodeReg, offMetaReg, offGlobalMeta, offMetaImages) ──
             uint64_t startParams[5] = {
                 il2cppBase,
                 pCodeRegistration,

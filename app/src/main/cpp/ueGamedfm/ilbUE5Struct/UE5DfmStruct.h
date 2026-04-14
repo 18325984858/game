@@ -68,6 +68,81 @@ static_assert(sizeof(FString) == 0x10, "FString size mismatch");
 #endif
 
 // =====================================================================
+//  FRotator — 旋转角 (Pitch/Yaw/Roll, 3 × float = 12 bytes)
+//  UE5.4 Source: Runtime/Core/Public/Math/Rotator.h
+// =====================================================================
+struct FRotator {
+    float Pitch;        // +0x00
+    float Yaw;          // +0x04
+    float Roll;         // +0x08
+};
+#if __SIZEOF_POINTER__ == 8
+static_assert(sizeof(FRotator) == 0x0C, "FRotator size mismatch");
+#endif
+
+// =====================================================================
+//  FVector — 三维向量 (3 × float = 12 bytes, 非 LWC 版本)
+//  注: UE5 LargeWorldCoordinates 使用 double, 但 DFM 手游可能仍为 float
+// =====================================================================
+struct FVector {
+    float X;            // +0x00
+    float Y;            // +0x04
+    float Z;            // +0x08
+};
+#if __SIZEOF_POINTER__ == 8
+static_assert(sizeof(FVector) == 0x0C, "FVector size mismatch");
+#endif
+
+// =====================================================================
+//  FTransform — 变换 (Rotation + Translation + Scale)
+//  UE5.4 Source: Runtime/Core/Public/Math/TransformNonVectorized.h
+//  内存布局 (float 版):
+//    +0x00: FQuat Rotation (4 × float = 16 bytes)
+//    +0x10: FVector Translation (3 × float = 12 bytes)
+//    +0x1C: pad (4 bytes)
+//    +0x20: FVector Scale3D (3 × float = 12 bytes)
+//    +0x2C: pad (4 bytes)
+//  Total: 0x30 = 48 bytes
+// =====================================================================
+struct FTransform {
+    float RotationX, RotationY, RotationZ, RotationW; // +0x00 Quat
+    float TranslationX;  // +0x10
+    float TranslationY;  // +0x14
+    float TranslationZ;  // +0x18
+    float _Pad1C;        // +0x1C
+    float Scale3DX;      // +0x20
+    float Scale3DY;      // +0x24
+    float Scale3DZ;      // +0x28
+    float _Pad2C;        // +0x2C
+};
+#if __SIZEOF_POINTER__ == 8
+static_assert(sizeof(FTransform) == 0x30, "FTransform size mismatch");
+static_assert(offsetof(FTransform, TranslationX) == 0x10, "FTransform::TranslationX offset mismatch");
+#endif
+
+// =====================================================================
+//  InventoryItemInfo — 箱内物品信息 (Size: 0x690, SDK 确认)
+//  DFMCommonItemRow 内 ItemID/Count/Durability 字段
+// =====================================================================
+struct InventoryItemInfo {
+    uint8_t  _Pad00[0x10];       // +0x00
+    uint32_t ItemCategory;       // +0x10  ItemID.Category
+    uint32_t ItemSequence;       // +0x14  ItemID.Sequence
+    uint8_t  _Pad18[0x20];      // +0x18
+    int32_t  ItemCount;          // +0x38  数量
+    int32_t  ItemNumMax;         // +0x3C  最大数量
+    float    ItemDurability;     // +0x40  耐久
+    float    ItemDurabilityMax;  // +0x44  最大耐久
+    uint8_t  _Pad48[0x648];     // +0x48 ... 到 0x690
+};
+#if __SIZEOF_POINTER__ == 8
+static_assert(sizeof(InventoryItemInfo) == 0x690, "InventoryItemInfo size mismatch");
+static_assert(offsetof(InventoryItemInfo, ItemCategory) == 0x10, "InventoryItemInfo::ItemCategory offset mismatch");
+static_assert(offsetof(InventoryItemInfo, ItemCount) == 0x38, "InventoryItemInfo::ItemCount offset mismatch");
+static_assert(offsetof(InventoryItemInfo, ItemDurability) == 0x40, "InventoryItemInfo::ItemDurability offset mismatch");
+#endif
+
+// =====================================================================
 //  UObjectBase — UE5.4 所有 UObject 的基类 (0x28 = 40 bytes)
 //  腾讯定制版布局 (与 Epic 标准版略有不同):
 //    +0x00: VTablePtr (腾讯版保留)

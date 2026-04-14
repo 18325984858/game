@@ -1352,6 +1352,25 @@ bool MyStartPointLOL(void *pli2cppModeBase, void *pCodeRegistration, void *pMeta
             return false;
         }
 
+        // 参数现在是偏移值 (不是已解引用的指针), 需要 base + offset 解引用
+        uintptr_t base = reinterpret_cast<uintptr_t>(pli2cppModeBase);
+        uintptr_t offCodeReg    = reinterpret_cast<uintptr_t>(pCodeRegistration);
+        uintptr_t offMetaReg    = reinterpret_cast<uintptr_t>(pMetadataRegistration);
+        uintptr_t offGlobalMeta = reinterpret_cast<uintptr_t>(pGlobalMetadataHeader);
+        uintptr_t offMetaImages = reinterpret_cast<uintptr_t>(pMetadataImagesTable);
+
+        // 解引用: 从 base + offset 处读取实际指针值
+        pCodeRegistration     = *reinterpret_cast<void**>(base + offCodeReg);
+        pMetadataRegistration = *reinterpret_cast<void**>(base + offMetaReg);
+        pGlobalMetadataHeader = *reinterpret_cast<void**>(base + offGlobalMeta);
+        pMetadataImagesTable  = *reinterpret_cast<void**>(base + offMetaImages);
+
+        LOG(LOG_LEVEL_INFO, "[MyStartPointLOL] base=%p offsets: CR=0x%lX MR=0x%lX GM=0x%lX MI=0x%lX",
+            pli2cppModeBase, (unsigned long)offCodeReg, (unsigned long)offMetaReg,
+            (unsigned long)offGlobalMeta, (unsigned long)offMetaImages);
+        LOG(LOG_LEVEL_INFO, "[MyStartPointLOL] resolved: CR=%p MR=%p GM=%p MI=%p",
+            pCodeRegistration, pMetadataRegistration, pGlobalMetadataHeader, pMetadataImagesTable);
+
         LOG(LOG_LEVEL_INFO, "[MyStartPointLOL] 注入模式 — 启动数据采集 + eglSwapBuffers Hook 绘制");
         installCrashGuard();
 

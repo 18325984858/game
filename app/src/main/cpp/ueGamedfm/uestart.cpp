@@ -2,6 +2,10 @@
 #include "../Log/log.h"
 #include "UE5DfmDumper.h"
 #include "UE5DfmStruct.h"
+#include "dfm/dfm.h"
+#include "Draw/DfmDraw.h"
+#include "AImGui.h"
+#include "ANativeWindowCreator.h"
 #include <atomic>
 #include <thread>
 #include <chrono>
@@ -15,6 +19,7 @@
 #include <dlfcn.h>
 #include <jni.h>
 #include <sys/stat.h>
+#include <stdexcept>
 
 namespace {
 
@@ -179,25 +184,186 @@ namespace toast_util {
 } // namespace
 
 // =====================================================================
-//  DFM 全局变量偏移 (相对于 libUE4.so 基址)
-//  这些值由 Injector 在 ptrace 注入时确定, 此处硬编码用于引擎就绪探测
+//  注入偏移参数包 (从 MyStartPointDFM 计算并传递到工作线程)
 // =====================================================================
-static constexpr uint32_t kOffNamePool            = 0x1A343A00;
-static constexpr uint32_t kOffGUObjectArrayNum    = 0x1A36A75C;
-static constexpr uint32_t kOffGUObjectArrayChunks = 0x1A36A768;
-static constexpr uint32_t kOffGWorld              = 0x1A65ECC8;
+struct DfmInjectParams {
+    uintptr_t base;
+    uint64_t  moduleSize;
+    uint32_t  offNamePool;
+    uint32_t  offGUObjectArrayNum;
+    uint32_t  offGUObjectArrayChunks;
+    uint32_t  offGWorld;
+};
+
+// =====================================================================
+//  显示信息查询 (Java WindowManager / shell 回退)
+// =====================================================================
+namespace {
+
+struct DisplayInfo {
+    int width = 0, height = 0, rotateTheta = 0;
+};
+
+static DisplayInfo queryShellDisplayInfo() {
+    DisplayInfo info;
+    FILE* pipe = popen("/system/bin/wm size 2>/dev/null", "r");
+    if (pipe) {
+        char buf[256] = {};
+        while (fgets(buf, sizeof(buf), pipe)) {
+            int w = 0, h = 0;
+            if (sscanf(buf, "%*[^0-9]%dx%d", &w, &h) == 2 && w > 0 && h > 0) {
+                info.width = w; info.height = h;
+            }
+        }
+        pclose(pipe);
+    }
+    // 横屏归一化
+    if (info.width > 0 && info.height > 0 && info.width < info.height) {
+        int tmp = info.width; info.width = info.height; info.height = tmp;
+    }
+    if (info.width <= 0) { info.width = 2400; info.height = 1080; }
+    DLOG("queryShellDisplayInfo: %dx%d r%d", info.width, info.height, info.rotateTheta);
+    return info;
+}
+
+} // namespace
+
+// =====================================================================
+//  DFM GUI 线程 — AImGui RenderClient 绘制 (与 PUBG UE4GuiThread 相同模式)
+// =====================================================================
+
+static std::atomic<bool> g_dfmGuiThreadStarted{false};
+
+static void DfmGuiThread() {
+    struct GuiResetGuard {
+        ~GuiResetGuard() {
+            g_dfmGuiThreadStarted.store(false, std::memory_order_release);
+            DLOG("DFM GUI 线程已退出, 释放单例锁");
+        }
+    } resetGuard;
+
+    DLOG("DFM GUI 线程启动, 等待 10 秒...");
+    std::this_thread::sleep_for(std::chrono::seconds(10));
+
+    DisplayInfo displayInfo = queryShellDisplayInfo();
+    DLOG("AImGui RenderClient: %dx%d", displayInfo.width, displayInfo.height);
+
+    android::AImGui::Options opts{
+        .renderType = android::AImGui::RenderType::RenderClient,
+        .compressionFrameData = false,
+        .autoUpdateOrientation = false,
+        .exchangeFontData = true,
+        .tcpNoDelay = true,
+        .disableVsync = true,
+        .styleScale = 1.75f,
+        .fontSizePixels = 18.0f,
+        .screenWidth = displayInfo.width,
+        .screenHeight = displayInfo.height,
+        .rotateTheta = displayInfo.rotateTheta,
+        .clientConnectAddress = "127.0.0.1",
+    };
+
+    std::unique_ptr<android::AImGui> imgui;
+    for (int attempt = 1; attempt <= 20; ++attempt) {
+        try {
+            imgui = std::make_unique<android::AImGui>(opts);
+            DLOG("AImGui 构造完成: attempt=%d state=%d", attempt, *imgui ? 1 : 0);
+        } catch (const std::exception& ex) {
+            DERR("AImGui 构造异常: attempt=%d error=%s", attempt, ex.what());
+            imgui.reset();
+        } catch (...) {
+            DERR("AImGui 构造异常: attempt=%d error=unknown", attempt);
+            imgui.reset();
+        }
+        if (imgui && *imgui) break;
+        DLOG("等待公开 Overlay 服务: attempt=%d/20", attempt);
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+
+    if (!imgui || !(*imgui)) {
+        DERR("AImGui RenderClient 初始化失败: 无法连接公开 Overlay 服务");
+        return;
+    }
+
+    DLOG("AImGui RenderClient 初始化完成, 开始渲染循环");
+
+    // 输入线程 (ProcessInputEvent 阻塞读取, 不能放在渲染循环中)
+    std::atomic<bool> inputRunning{true};
+    std::thread inputThread([imguiPtr = imgui.get(), &inputRunning]() {
+        DLOG("RenderClient 输入线程启动");
+        while (inputRunning.load(std::memory_order_acquire)) {
+            imguiPtr->ProcessInputEvent();
+        }
+        DLOG("RenderClient 输入线程退出");
+    });
+
+    dfmdraw::DfmOverlay overlay;
+    dfm::DrawDfmData gameData;
+
+    // 检测游戏进程存活
+    auto isGameAlive = []() -> bool {
+        char cmdline[256] = {};
+        int fd = open("/proc/self/cmdline", O_RDONLY);
+        if (fd < 0) return false;
+        ssize_t n = read(fd, cmdline, sizeof(cmdline) - 1);
+        close(fd);
+        return n > 0 && strstr(cmdline, "tmgp.dfm") != nullptr;
+    };
+
+    auto lastAliveCheck = std::chrono::steady_clock::now();
+
+    // 渲染主循环
+    while (true) {
+        // 每 2 秒检查游戏进程存活
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastAliveCheck).count() > 2000) {
+            lastAliveCheck = now;
+            if (!isGameAlive()) {
+                DLOG("RenderClient: 游戏进程已退出");
+                inputRunning.store(false, std::memory_order_release);
+                for (int i = 0; i < 3; i++) {
+                    imgui->BeginFrame(); imgui->EndFrame();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(16));
+                }
+                break;
+            }
+        }
+
+        imgui->BeginFrame();
+
+        // 从 SharedDfmData 读取最新数据
+        dfm::SharedDfmData::getInstance().getData(gameData);
+
+        // 绘制 DFM overlay
+        overlay.drawOverlay(gameData);
+
+        imgui->EndFrame();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    inputRunning.store(false, std::memory_order_release);
+    if (inputThread.joinable()) inputThread.join();
+}
 
 // =====================================================================
 //  工作线程
 // =====================================================================
-static void DfmWorkerThread(void* plibUE5ModeBase, void* /*pGNames*/,
-                            void* pGWorld, void* pGUObjectArray,
-                            uint64_t moduleSize, void* /*pData*/) {
-    LOG(LOG_LEVEL_INFO, "[DfmWorker] 工作线程启动");
-    LOG(LOG_LEVEL_INFO, "[DfmWorker] libUE4Base=%p GWorld=%p GUObjectArray=%p moduleSize=0x%llX",
-        plibUE5ModeBase, pGWorld, pGUObjectArray, (unsigned long long)moduleSize);
+static void DfmWorkerThread(DfmInjectParams* params) {
+    // 取出参数并释放堆内存
+    DfmInjectParams p = *params;
+    delete params;
 
-    uintptr_t base = reinterpret_cast<uintptr_t>(plibUE5ModeBase);
+    uintptr_t base = p.base;
+    uint64_t moduleSize = p.moduleSize;
+
+    // 启用运行时日志 (LOG 宏依赖此开关)
+    g_runtimeLogEnabled = true;
+
+    LOG(LOG_LEVEL_INFO, "[DfmWorker] 工作线程启动");
+    DLOG("[DfmWorker] 工作线程启动 base=%p moduleSize=0x%llX", (void*)base, (unsigned long long)moduleSize);
+    LOG(LOG_LEVEL_INFO, "[DfmWorker] base=%p moduleSize=0x%llX offNP=0x%X offNum=0x%X offChunks=0x%X offGW=0x%X",
+        (void*)base, (unsigned long long)moduleSize,
+        p.offNamePool, p.offGUObjectArrayNum, p.offGUObjectArrayChunks, p.offGWorld);
 
     // 等待游戏引擎完成初始化
     LOG(LOG_LEVEL_INFO, "[DfmWorker] 等待游戏引擎就绪...");
@@ -208,7 +374,7 @@ static void DfmWorkerThread(void* plibUE5ModeBase, void* /*pGNames*/,
 
         for (int i = 0; i < kMaxWaitSeconds * 2; i++) {
             // 验证 NamePool 第一个块指针
-            uintptr_t poolBlockAddr = base + kOffNamePool + offsetof(ue5dfm::FNameEntryAllocator, Blocks);
+            uintptr_t poolBlockAddr = base + p.offNamePool + offsetof(ue5dfm::FNameEntryAllocator, Blocks);
             uintptr_t block0 = 0;
             bool namePoolOk = false;
             if (memFd >= 0 && poolBlockAddr >= 0x10000) {
@@ -220,7 +386,7 @@ static void DfmWorkerThread(void* plibUE5ModeBase, void* /*pGNames*/,
             // 验证 GUObjectArray numElements
             uint32_t numElements = 0;
             bool objArrayOk = false;
-            uintptr_t numAddr = base + kOffGUObjectArrayNum;
+            uintptr_t numAddr = base + p.offGUObjectArrayNum;
             if (memFd >= 0 && numAddr >= 0x10000) {
                 if (pread(memFd, &numElements, sizeof(numElements), static_cast<off_t>(numAddr)) == sizeof(numElements)) {
                     objArrayOk = (numElements > 100);
@@ -228,7 +394,7 @@ static void DfmWorkerThread(void* plibUE5ModeBase, void* /*pGNames*/,
             }
 
             // 验证 GWorld
-            uintptr_t gworldAddr = base + kOffGWorld;
+            uintptr_t gworldAddr = base + p.offGWorld;
             uintptr_t worldPtr = 0;
             bool worldOk = false;
             if (memFd >= 0 && gworldAddr >= 0x10000) {
@@ -240,6 +406,8 @@ static void DfmWorkerThread(void* plibUE5ModeBase, void* /*pGNames*/,
             if (namePoolOk && objArrayOk && worldOk) {
                 LOG(LOG_LEVEL_INFO, "[DfmWorker] 引擎就绪! block0=%p numElements=%u worldPtr=%p (等待了 %.1fs)",
                     (void*)block0, numElements, (void*)worldPtr, i * 0.5f);
+                DLOG("[DfmWorker] 引擎就绪! block0=%p numElements=%u worldPtr=%p (%.1fs)",
+                    (void*)block0, numElements, (void*)worldPtr, i * 0.5f);
                 ready = true;
                 break;
             }
@@ -248,6 +416,7 @@ static void DfmWorkerThread(void* plibUE5ModeBase, void* /*pGNames*/,
         if (memFd >= 0) close(memFd);
         if (!ready) {
             LOG(LOG_LEVEL_ERROR, "[DfmWorker] 引擎等待超时 (%ds), 放弃启动", kMaxWaitSeconds);
+            DERR("[DfmWorker] 引擎等待超时 (%ds), 放弃启动", kMaxWaitSeconds);
             return;
         }
     }
@@ -263,10 +432,10 @@ static void DfmWorkerThread(void* plibUE5ModeBase, void* /*pGNames*/,
         ue5dfm::UE5DfmDumper dumper(
             base,
             static_cast<uintptr_t>(moduleSize),
-            kOffNamePool,
-            kOffGUObjectArrayNum,
-            kOffGUObjectArrayChunks,
-            kOffGWorld,
+            p.offNamePool,
+            p.offGUObjectArrayNum,
+            p.offGUObjectArrayChunks,
+            p.offGWorld,
             "/data/data/com.tencent.tmgp.dfm/cache/ue5_dump/"
         );
 
@@ -286,6 +455,26 @@ static void DfmWorkerThread(void* plibUE5ModeBase, void* /*pGNames*/,
         }
     } else {
         LOG(LOG_LEVEL_INFO, "[DfmWorker] ue_dumper 未启用, 跳过 dump");
+    }
+
+    // ---- 对局监控 (物资/玩家/相机 采集 → SharedDfmData → GUI) ----
+    LOG(LOG_LEVEL_INFO, "[DfmWorker] 启动对局监控...");
+    DLOG("[DfmWorker] 启动对局监控...");
+    auto* monitor = new dfm::DfmMatchMonitor(
+        base,
+        static_cast<uintptr_t>(moduleSize),
+        p.offNamePool,
+        p.offGUObjectArrayNum,
+        p.offGUObjectArrayChunks,
+        p.offGWorld
+    );
+    if (!monitor->start()) {
+        LOG(LOG_LEVEL_ERROR, "[DfmWorker] DfmMatchMonitor 启动失败");
+        toast_util::showToast("DFM 对局监控启动失败");
+        delete monitor;
+    } else {
+        LOG(LOG_LEVEL_INFO, "[DfmWorker] DfmMatchMonitor 已启动");
+        toast_util::showToast("DFM 对局监控已启动");
     }
 
     LOG(LOG_LEVEL_INFO, "[DfmWorker] 工作线程退出");
@@ -320,8 +509,32 @@ bool MyStartPointDFM(void* plibUE5ModeBase, void* pGNames,
          plibUE5ModeBase, pGNames, pGWorld, pGUObjectArray, (unsigned long long)moduleSize);
     LOG(LOG_LEVEL_INFO, "[MyStartPointDFM] 启动 DFM 工作线程");
 
-    std::thread(DfmWorkerThread, plibUE5ModeBase, pGNames,
-                pGWorld, pGUObjectArray, moduleSize, pData).detach();
+    // 注入器直接传入偏移值 (不是绝对地址, 无需减基址)
+    uintptr_t base = reinterpret_cast<uintptr_t>(plibUE5ModeBase);
+    auto* params = new DfmInjectParams{
+        .base = base,
+        .moduleSize = moduleSize,
+        .offNamePool            = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pGNames)),
+        .offGUObjectArrayNum    = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pGUObjectArray)),
+        .offGUObjectArrayChunks = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pGUObjectArrayChunks)),
+        .offGWorld              = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pGWorld)),
+    };
+
+    LOG(LOG_LEVEL_INFO, "[MyStartPointDFM] 偏移: NP=0x%X Num=0x%X Chunks=0x%X GW=0x%X",
+        params->offNamePool, params->offGUObjectArrayNum,
+        params->offGUObjectArrayChunks, params->offGWorld);
+
+    // 启动 GUI 线程 (AImGui RenderClient, 连接公开 Overlay 服务)
+    bool guiExpected = false;
+    if (g_dfmGuiThreadStarted.compare_exchange_strong(guiExpected, true, std::memory_order_acq_rel)) {
+        DLOG("MyStartPointDFM: 启动 DFM GUI 线程");
+        LOG(LOG_LEVEL_INFO, "[MyStartPointDFM] 启动 DFM GUI 线程");
+        std::thread(DfmGuiThread).detach();
+    } else {
+        DLOG("MyStartPointDFM: DFM GUI 线程已存在, 跳过");
+    }
+
+    std::thread(DfmWorkerThread, params).detach();
 
     return true;
 }
