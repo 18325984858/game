@@ -8,6 +8,7 @@
 #include <mutex>
 #include <atomic>
 #include <thread>
+#include <chrono>
 #include <array>
 #include <cstring>
 #include "../ilbUE5Struct/UE5DfmStruct.h"
@@ -24,8 +25,8 @@ namespace ue5dfminf { class UE5DfmInterface; }
 //    GWorld(+0xF8)  → PersistentLevel
 //    GWorld(+0x140) → GameState
 //    Level(+0x98)   → TArray<Actor*> (Actors 数组)
-//    Actor(+0x180)  → RootComponent
-//    RootComponent(+0x220/224/228) → WorldPos X/Y/Z
+//    Actor(+0x268)  → RootComponent
+//    RootComponent(+ComponentToWorld+0x10/0x14/0x18) → WorldPos X/Y/Z
 //
 //  PickupBase (物品拾取):
 //    +0xF20 → InventoryIdName (FName)
@@ -60,11 +61,39 @@ namespace dfm {
 // =====================================================================
 struct ResolvedOffsets {
     // ── Actor (反射可查) ──
-    int32_t Actor_RootComponent   = 0x180;   // Actor.RootComponent
+    int32_t Actor_bReplicateMovement = 0xA0;   // Actor.bReplicateMovement
+    int32_t Actor_ReplicatedMovement = 0x170;  // Actor.ReplicatedMovement
+    int32_t Actor_RootComponent      = 0x268;  // Actor.RootComponent
 
     // ── SceneComponent (反射可查) ──
     int32_t Scene_RelativeLocation = 0x168;  // SceneComponent.RelativeLocation
     int32_t Scene_ComponentToWorld = 0x210;  // SceneComponent.ComponentToWorld (FTransform)
+
+    // ── 位置相关字段 ──
+    // IntCharacter.CosmeticData_Server_Character_OnFire (+0x810) 内的 CameraViewLoc (+0xE8)
+    // 绝对偏移: Actor + 0x810 + 0xE8 = Actor + 0x8F8
+    int32_t Char_CameraViewLoc     = 0x8F8;  // IntCharacter 内嵌 NetworkCosmeticData 的 CameraViewLoc (plain Vector)
+
+    // ── 骨骼系统 (SDK dump 确认) ──
+    // CHARACTER.Mesh → SkeletalMeshComponent (Pawn.Mesh at CHARACTER+0x3D0)
+    int32_t Char_Mesh              = 0x3D0;   // CHARACTER.Mesh (SkeletalMeshComponent*, SDK: 0x3D0)
+    int32_t Char_FPPMesh           = 0xA80;   // CharacterBase.FPPMesh (SkeletalMeshComponent*, SDK: 0xA80)
+    int32_t STBase_AvatarComponent = 0x3B98;  // STExtraBaseCharacter.AvatarComponent
+    int32_t STBase_FPPComp         = 0x4168;  // STExtraBaseCharacter.FPPComp
+    int32_t FPPComp_AvatarComp     = 0x380;   // BaseFPPComponent._AvatarComp
+    // SkeletalMeshComponent 内部字段
+    int32_t SkinnedMesh_SkeletalMesh = 0x7F0; // SkinnedMeshComponent.SkeletalMesh (mesh asset)
+    int32_t SkinnedMesh_MasterPoseComponent = 0x710; // SkinnedMeshComponent.MasterPoseComponent
+    int32_t Skel_CachedCompSpace   = 0x9D8;   // SkeletalMeshComponent.CachedComponentSpaceTransforms (TArray<FTransform>)
+    int32_t Skel_BoneSpaceTransforms = 0x9C8; // SkeletalMeshComponent.CachedBoneSpaceTransforms
+    int32_t Avatar_MasterBoneComponent = 0x300; // AvatarComponent.MasterBoneComponent
+    int32_t Avatar_MeshComponentList = 0x528;   // AvatarComponent.meshComponentList
+    int32_t Avatar_AvatarEntityList = 0x880;    // AvatarComponent.AvatarEntityList
+    int32_t Avatar_DefaultAvatarSubSystemList = 0xDD0; // AvatarComponent.DefaultAvatarSubSystemList
+    int32_t Avatar_LocalSubSystemList = 0xE30;  // AvatarComponent.LocalSubSystemList
+    int32_t Avatar_LocalActiveSubSystemList = 0xE40; // AvatarComponent.LocalActiveSubSystemList
+    int32_t Avatar_SkeletalMeshCompPool = 0xF10; // AvatarComponent.SkeletalMeshCompPool
+    int32_t AvatarFuncBranch_SkeletonMappingComp = 0x68; // AvatarFuncBranch_NewFPP.SkeletonMappingComp
 
     // ── Pawn (反射可查) ──
     int32_t Pawn_PlayerState      = 0x390;   // Pawn.PlayerState
@@ -269,6 +298,17 @@ struct PlayerInfo {
     std::string weapon;
     FVector3    pos;
     uintptr_t   characterPtr = 0;
+
+    // 骨骼位置 (世界坐标, 由 Worker 线程填充)
+    // 索引对应 UE5 标准人形骨骼:
+    //   0=Head, 1=Neck, 2=Spine3(chest), 3=Spine1(belly),
+    //   4=Pelvis(hip), 5=RShoulder, 6=RElbow, 7=RHand,
+    //   8=LShoulder, 9=LElbow, 10=LHand,
+    //   11=RThigh, 12=RKnee, 13=RFoot,
+    //   14=LThigh, 15=LKnee, 16=LFoot
+    static constexpr int BONE_COUNT = 17;
+    FVector3 bones[BONE_COUNT];
+    bool     bonesValid = false;
 };
 
 // =====================================================================
@@ -346,6 +386,13 @@ public:
     bool isRunning() const { return m_running.load(std::memory_order_acquire); }
 
 private:
+    struct ReplicatedMovementSnapshot {
+        FVector3 location{};
+        uint8_t encByte = 0;
+        bool movementEnabled = false;
+        bool hasUsablePlainLocation = false;
+    };
+
     // ── 安全内存读取 ──
     static uintptr_t safeReadPtr(uintptr_t addr);
     static int32_t   safeReadS32(uintptr_t addr);
@@ -367,6 +414,10 @@ private:
 
     // ── 坐标读取 ──
     bool getActorLocation(uintptr_t actorPtr, FVector3& outLoc) const;
+    ReplicatedMovementSnapshot sampleReplicatedMovement(uintptr_t actorPtr) const;
+    bool tryGetCachedActorLocation(uintptr_t actorPtr, FVector3& outLoc) const;
+    void rememberActorLocation(uintptr_t actorPtr, const FVector3& location) const;
+    bool shouldAcceptRootCompensation(uintptr_t actorPtr, float x, float y) const;
 
     // ── 对局状态 ──
     MatchState getMatchState() const;
@@ -405,6 +456,27 @@ private:
     // ── 玩家位置快速更新 ──
     void updatePlayerPositions(DrawDfmData& data) const;
 
+    // ── 骨骼系统 ──
+    bool fillPlayerBones(PlayerInfo& player) const;
+    uintptr_t resolveObjectField(uintptr_t fieldAddr) const;
+    uintptr_t followMasterPoseChain(uintptr_t meshComp) const;
+    uintptr_t getSkeletalMeshAsset(uintptr_t meshComp) const;
+    int32_t collectSparseMapValues(uintptr_t mapBase, std::vector<uintptr_t>& outValues,
+                                   int32_t maxEntries) const;
+    int32_t collectObjectArrayValues(uintptr_t arrayAddr, std::vector<uintptr_t>& outValues,
+                                     int32_t maxEntries) const;
+    uintptr_t scanObjectForMeshComponent(uintptr_t objectPtr, int scanBytes) const;
+    uintptr_t resolveBestBoneMeshComponent(uintptr_t characterPtr) const;
+    int32_t getCachedTransformCount(uintptr_t meshComp) const;
+    struct BoneAssetCacheEntry {
+        std::array<int32_t, PlayerInfo::BONE_COUNT> trackedBoneIndices{};
+        int matchedCount = 0;
+    };
+    bool resolveTrackedBoneIndices(uintptr_t skeletalMeshAssetPtr, BoneAssetCacheEntry& outEntry) const;
+    int matchBoneNamesFromFNameArray(uintptr_t dataPtr, int count, BoneAssetCacheEntry& entry) const;
+    int matchBoneNamesFromBoneInfoArray(uintptr_t dataPtr, int count, int stride,
+                                        BoneAssetCacheEntry& entry) const;
+
     // ── 击杀/变化检测 ──
     void detectChanges(const DrawDfmData& prev, DrawDfmData& curr);
 
@@ -423,6 +495,13 @@ private:
     uint32_t  m_offGUObjectArrayNum;
     uint32_t  m_offGUObjectArrayChunks;
     uint32_t  m_offGWorld;
+    mutable std::unordered_map<uintptr_t, BoneAssetCacheEntry> m_boneAssetCache;
+    struct RootCompensationOwner {
+        uintptr_t actorPtr = 0;
+        std::chrono::steady_clock::time_point seenAt{};
+    };
+    mutable std::unordered_map<uintptr_t, FVector3> m_lastKnownActorPositions;
+    mutable std::unordered_map<uint64_t, RootCompensationOwner> m_rootCompensationOwners;
 
     mutable uintptr_t m_cachedPC = 0;      // 缓存的本地 PlayerController
     std::atomic<bool> m_running{false};

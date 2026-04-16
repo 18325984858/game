@@ -18,6 +18,10 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
+constexpr float kMinEspDistanceMeters = 0.1f;
+constexpr float kRelaxedProjectionDistanceMeters = 8.0f;
+constexpr float kRelaxedProjectionMinDepth = 0.05f;
+
 bool shouldLogEvery(Clock::time_point& lastLogTime, std::chrono::milliseconds interval) {
     const auto now = Clock::now();
     if (lastLogTime.time_since_epoch().count() != 0 && now - lastLogTime < interval) return false;
@@ -33,6 +37,54 @@ bool hasValidPos(float x, float y, float z) {
 float distMeters(float x1, float y1, float z1, float x2, float y2, float z2) {
     float dx = x1 - x2, dy = y1 - y2, dz = z1 - z2;
     return std::sqrt(dx * dx + dy * dy + dz * dz) / 100.0f;
+}
+
+float estimateFallbackHalfHeight(float distMetersValue) {
+    return std::clamp(220.0f / std::max(distMetersValue, 0.5f), 24.0f, 120.0f);
+}
+
+bool projectToScreen(const dfm::DrawDfmData& cam,
+                     float wx, float wy, float wz,
+                     float screenW, float screenH,
+                     float minDepth,
+                     float& sx, float& sy,
+                     float* outDepth = nullptr,
+                     float* outFocal = nullptr) {
+    constexpr float DEG2RAD = 3.14159265358979f / 180.0f;
+
+    if (!std::isfinite(cam.camLocX) || !std::isfinite(cam.camYaw)) return false;
+    float fov = cam.camFOV;
+    if (fov < 30.0f || fov > 170.0f) fov = 90.0f;
+
+    float pitch = std::remainder(cam.camPitch, 360.0f) * DEG2RAD;
+    float yaw   = std::remainder(cam.camYaw, 360.0f) * DEG2RAD;
+    float roll  = std::remainder(cam.camRoll, 360.0f) * DEG2RAD;
+
+    float sp = std::sin(pitch), cp = std::cos(pitch);
+    float sy_ = std::sin(yaw),  cy = std::cos(yaw);
+    float sr = std::sin(roll),  cr = std::cos(roll);
+
+    float axX = cp * cy, axY = cp * sy_, axZ = sp;
+    float ayX = sr*sp*cy - cr*sy_, ayY = sr*sp*sy_ + cr*cy, ayZ = -sr*cp;
+    float azX = -(cr*sp*cy + sr*sy_), azY = cy*sr - cr*sp*sy_, azZ = cr*cp;
+
+    float dx = wx - cam.camLocX, dy = wy - cam.camLocY, dz = wz - cam.camLocZ;
+    float cX = dx*ayX + dy*ayY + dz*ayZ;
+    float cY = dx*azX + dy*azY + dz*azZ;
+    float cZ = dx*axX + dy*axY + dz*axZ;
+
+    if (outDepth) *outDepth = cZ;
+    if (cZ <= minDepth) return false;
+
+    constexpr float kRefAspect = 16.0f / 9.0f;
+    float tanHalfBase = std::tan(fov * 0.5f * DEG2RAD);
+    if (tanHalfBase < 0.01f) return false;
+    float focal = screenH * 0.5f * kRefAspect / tanHalfBase;
+    if (outFocal) *outFocal = focal;
+
+    sx = screenW * 0.5f + cX * focal / cZ;
+    sy = screenH * 0.5f - cY * focal / cZ;
+    return std::isfinite(sx) && std::isfinite(sy);
 }
 
 } // namespace
@@ -60,45 +112,7 @@ bool DfmOverlay::worldToScreen(const dfm::DrawDfmData& cam,
                                 float wx, float wy, float wz,
                                 float screenW, float screenH,
                                 float& sx, float& sy) {
-    constexpr float DEG2RAD = 3.14159265358979f / 180.0f;
-    constexpr float kNearDepth = 1.0f;
-
-    if (!std::isfinite(cam.camLocX) || !std::isfinite(cam.camYaw)) return false;
-    float fov = cam.camFOV;
-    if (fov < 30.0f || fov > 170.0f) fov = 90.0f;
-
-    float pitch = std::remainder(cam.camPitch, 360.0f) * DEG2RAD;
-    float yaw   = std::remainder(cam.camYaw, 360.0f) * DEG2RAD;
-    float roll  = std::remainder(cam.camRoll, 360.0f) * DEG2RAD;
-
-    float sp = std::sin(pitch), cp = std::cos(pitch);
-    float sy_ = std::sin(yaw),  cy = std::cos(yaw);
-    float sr = std::sin(roll),  cr = std::cos(roll);
-
-    float axX = cp * cy, axY = cp * sy_, axZ = sp;
-    float ayX = sr*sp*cy - cr*sy_, ayY = sr*sp*sy_ + cr*cy, ayZ = -sr*cp;
-    float azX = -(cr*sp*cy + sr*sy_), azY = cy*sr - cr*sp*sy_, azZ = cr*cp;
-
-    float dx = wx - cam.camLocX, dy = wy - cam.camLocY, dz = wz - cam.camLocZ;
-    float cX = dx*ayX + dy*ayY + dz*ayZ;
-    float cY = dx*azX + dy*azY + dz*azZ;
-    float cZ = dx*axX + dy*axY + dz*axZ;
-
-    if (cZ <= kNearDepth) return false;
-
-    // UE5 MaintainYFOV 模式:
-    //   FOV 存储为 16:9 参考宽高比下的水平 FOV (如 DefaultFOV=90)
-    //   先换算为垂直半角, 再算焦距 (焦距在任何宽高比下一致)
-    //   vFOV/2 = atan(tan(hFOV/2) / refAspect)
-    //   focal  = screenH/2 / tan(vFOV/2) = screenH/2 * refAspect / tan(hFOV/2)
-    constexpr float kRefAspect = 16.0f / 9.0f;
-    float tanHalfBase = std::tan(fov * 0.5f * DEG2RAD);
-    if (tanHalfBase < 0.01f) return false;
-    float focal = screenH * 0.5f * kRefAspect / tanHalfBase;
-
-    sx = screenW * 0.5f + cX * focal / cZ;
-    sy = screenH * 0.5f - cY * focal / cZ;
-    return std::isfinite(sx) && std::isfinite(sy);
+    return projectToScreen(cam, wx, wy, wz, screenW, screenH, 1.0f, sx, sy);
 }
 
 // =====================================================================
@@ -130,6 +144,7 @@ void DfmOverlay::drawOverlay(const dfm::DrawDfmData& data) {
     if (!data.inMatch) return;
 
     if (m_enableESP) drawESP(data, screenW, screenH);
+    if (m_enableBones) drawBones(data, screenW, screenH);
     if (m_enableLootESP) drawLootESP(data, screenW, screenH);
     if (m_enableMinimap) drawMinimap(data, screenW, screenH);
     if (m_enablePlayerList) drawPlayerList(data, screenW, screenH);
@@ -172,6 +187,7 @@ void DfmOverlay::drawMenu(const dfm::DrawDfmData& data) {
 
     if (m_menuExpanded) {
         ImGui::Checkbox("3D ESP", &m_enableESP);
+        ImGui::Checkbox("骨骼", &m_enableBones);
         ImGui::Checkbox("射线", &m_enableSnapline);
         ImGui::Checkbox("小地图", &m_enableMinimap);
         ImGui::Checkbox("玩家列表", &m_enablePlayerList);
@@ -185,6 +201,7 @@ void DfmOverlay::drawMenu(const dfm::DrawDfmData& data) {
         ImGui::Checkbox("护甲/头盔", &m_enableArmor);
         ImGui::Checkbox("过滤弹药", &m_filterAmmo);
         ImGui::Checkbox("过滤杂物", &m_filterJunk);
+        ImGui::Checkbox("日志输出", &g_runtimeLogEnabled);
         ImGui::SliderFloat("ESP距离(m)", &m_espMaxDist, 50.0f, 1000.0f, "%.0f");
         ImGui::SliderFloat("地图范围(m)", &m_minimapRange, 50.0f, 500.0f, "%.0f");
         ImGui::SliderFloat("物资距离(m)", &m_lootMaxDist, 20.0f, 300.0f, "%.0f");
@@ -233,9 +250,9 @@ int DfmOverlay::drawESP(const dfm::DrawDfmData& data, float screenW, float scree
     float myCy = screenH;
     int drawn = 0;
 
-    // UE5 角色全高 (capsule full height, 单位: UU/cm)
-    // ComponentToWorld.Translation 返回角色脚底位置 (Capsule 底部)
+    // 当前采集到的 p.pos 更接近角色脚底，按脚底 + 全高绘制方框更稳定。
     constexpr float kCharacterHeight = 180.0f;
+    constexpr float kCharacterHalfHeight = kCharacterHeight * 0.5f;
 
     for (const auto& p : data.players) {
         if (p.hp <= 0) continue;
@@ -244,26 +261,69 @@ int DfmOverlay::drawESP(const dfm::DrawDfmData& data, float screenW, float scree
 
         float dist = distMeters(p.pos.x, p.pos.y, p.pos.z,
                                 data.camLocX, data.camLocY, data.camLocZ);
-        if (dist > m_espMaxDist || dist < 1.0f) continue;
+        if (dist > m_espMaxDist || dist < kMinEspDistanceMeters) continue;
 
         ImU32 color;
         if (p.isAI) color = IM_COL32(255, 255, 0, 200);
         else if (p.teamId >= 0 && p.teamId == data.myTeamId) color = IM_COL32(0, 255, 0, 200);
         else color = IM_COL32(255, 50, 50, 230);
 
-        // pos.z 是脚底, +kCharacterHeight 是头顶
-        float footSX, footSY, headSX, headSY;
-        bool footOk = worldToScreen(data, p.pos.x, p.pos.y, p.pos.z,
-                                     screenW, screenH, footSX, footSY);
-        bool headOk = worldToScreen(data, p.pos.x, p.pos.y, p.pos.z + kCharacterHeight,
-                                     screenW, screenH, headSX, headSY);
+        float footWX = p.pos.x;
+        float footWY = p.pos.y;
+        float footWZ = p.pos.z;
+        float headWX = p.pos.x;
+        float headWY = p.pos.y;
+        float headWZ = p.pos.z + kCharacterHeight;
+        float centerWX = p.pos.x;
+        float centerWY = p.pos.y;
+        float centerWZ = p.pos.z + kCharacterHalfHeight;
+
+        float footSX = 0.0f, footSY = 0.0f, headSX = 0.0f, headSY = 0.0f;
+        float edgeMinDepth = dist <= kRelaxedProjectionDistanceMeters
+            ? kRelaxedProjectionMinDepth
+            : 1.0f;
+        bool footOk = projectToScreen(data, footWX, footWY, footWZ,
+                                      screenW, screenH, edgeMinDepth,
+                                      footSX, footSY);
+        bool headOk = projectToScreen(data, headWX, headWY, headWZ,
+                                      screenW, screenH, edgeMinDepth,
+                                      headSX, headSY);
+
+        float centerSX = 0.0f, centerSY = 0.0f, centerDepth = 0.0f, centerFocal = 0.0f;
+        bool centerOk = projectToScreen(data, centerWX, centerWY, centerWZ,
+                                        screenW, screenH,
+                                        kRelaxedProjectionMinDepth,
+                                        centerSX, centerSY,
+                                        &centerDepth, &centerFocal);
+
+        bool canDrawBox = false;
+        float cx = 0.0f, topY = 0.0f, botY = 0.0f;
 
         if (footOk && headOk) {
-            float boxH = std::fabs(footSY - headSY);
+            cx = (footSX + headSX) * 0.5f;
+            topY = std::min(footSY, headSY);
+            botY = std::max(footSY, headSY);
+            canDrawBox = true;
+        } else if (centerOk && dist <= kRelaxedProjectionDistanceMeters) {
+            float halfHeightPx = estimateFallbackHalfHeight(dist);
+            if (footOk) halfHeightPx = std::max(halfHeightPx, std::fabs(footSY - centerSY));
+            if (headOk) halfHeightPx = std::max(halfHeightPx, std::fabs(centerSY - headSY));
+            if (centerFocal > 0.0f && centerDepth > kRelaxedProjectionMinDepth) {
+                halfHeightPx = std::max(halfHeightPx, centerFocal * kCharacterHalfHeight / centerDepth);
+            }
+
+            halfHeightPx = std::clamp(halfHeightPx, 18.0f, 140.0f);
+            cx = centerSX;
+            topY = headOk ? headSY : (centerSY - halfHeightPx);
+            botY = footOk ? footSY : (centerSY + halfHeightPx);
+            if (topY > botY) std::swap(topY, botY);
+            canDrawBox = std::isfinite(cx) && std::isfinite(topY) && std::isfinite(botY)
+                && (botY - topY) >= 8.0f;
+        }
+
+        if (canDrawBox) {
+            float boxH = std::fabs(botY - topY);
             float boxW = boxH * 0.48f;
-            float cx = (footSX + headSX) * 0.5f;
-            float topY = std::min(footSY, headSY);
-            float botY = std::max(footSY, headSY);
 
             if (boxH > screenH * 0.9f) { /* 太大跳过 */ }
             else if (boxH < 8.0f) {
@@ -381,6 +441,123 @@ int DfmOverlay::drawESP(const dfm::DrawDfmData& data, float screenW, float scree
 
     ImGui::End();
     return drawn;
+}
+
+// =====================================================================
+//  骨骼绘制 — 用线段连接骨骼关节点形成人体骨架
+// =====================================================================
+//
+// 骨骼连接定义 (PlayerInfo.bones 索引):
+//   0=Head, 1=Neck, 2=Chest, 3=Belly, 4=Pelvis
+//   5=RShoulder, 6=RElbow, 7=RHand
+//   8=LShoulder, 9=LElbow, 10=LHand
+//   11=RThigh, 12=RKnee, 13=RFoot
+//   14=LThigh, 15=LKnee, 16=LFoot
+//
+// 连接方式: 躯干(Head→Neck→Chest→Belly→Pelvis)
+//           右臂(Chest→RShoulder→RElbow→RHand)
+//           左臂(Chest→LShoulder→LElbow→LHand)
+//           右腿(Pelvis→RThigh→RKnee→RFoot)
+//           左腿(Pelvis→LThigh→LKnee→LFoot)
+
+void DfmOverlay::drawBones(const dfm::DrawDfmData& data, float screenW, float screenH) {
+    bool camValid = std::isfinite(data.camLocX) && std::isfinite(data.camYaw)
+        && (std::fabs(data.camLocX) > 1.0f || std::fabs(data.camLocY) > 1.0f)
+        && data.camFOV >= 30.0f && data.camFOV <= 170.0f;
+    if (!camValid) return;
+
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+
+    // 骨骼连接对: {from, to}
+    static const int kBoneLinks[][2] = {
+        // 躯干
+        {0, 1},   // Head → Neck
+        {1, 2},   // Neck → Chest
+        {2, 3},   // Chest → Belly
+        {3, 4},   // Belly → Pelvis
+        // 右臂
+        {2, 5},   // Chest → RShoulder
+        {5, 6},   // RShoulder → RElbow
+        {6, 7},   // RElbow → RHand
+        // 左臂
+        {2, 8},   // Chest → LShoulder
+        {8, 9},   // LShoulder → LElbow
+        {9, 10},  // LElbow → LHand
+        // 右腿
+        {4, 11},  // Pelvis → RThigh
+        {11, 12}, // RThigh → RKnee
+        {12, 13}, // RKnee → RFoot
+        // 左腿
+        {4, 14},  // Pelvis → LThigh
+        {14, 15}, // LThigh → LKnee
+        {15, 16}, // LKnee → LFoot
+    };
+
+    for (const auto& p : data.players) {
+        if (p.hp <= 0 || !p.bonesValid) continue;
+        if (!m_enableTeammate && p.teamId >= 0 && p.teamId == data.myTeamId) continue;
+
+        float dist = distMeters(p.pos.x, p.pos.y, p.pos.z,
+                                data.camLocX, data.camLocY, data.camLocZ);
+        if (dist > m_espMaxDist || dist < kMinEspDistanceMeters) continue;
+
+        // 颜色: AI=橙黄, 队友=亮绿, 敌人=亮青
+        ImU32 boneColor;
+        if (p.isAI) boneColor = IM_COL32(255, 196, 64, 235);
+        else if (p.teamId >= 0 && p.teamId == data.myTeamId) boneColor = IM_COL32(64, 255, 128, 235);
+        else boneColor = IM_COL32(64, 220, 255, 245);
+        const ImU32 boneOutlineColor = IM_COL32(0, 0, 0, 210);
+
+        // 投影所有骨骼到屏幕坐标
+        float boneSX[dfm::PlayerInfo::BONE_COUNT];
+        float boneSY[dfm::PlayerInfo::BONE_COUNT];
+        bool  boneOk[dfm::PlayerInfo::BONE_COUNT];
+
+        int projectedBoneCount = 0;
+        for (int i = 0; i < dfm::PlayerInfo::BONE_COUNT; i++) {
+            boneOk[i] = worldToScreen(data, p.bones[i].x, p.bones[i].y, p.bones[i].z,
+                                       screenW, screenH, boneSX[i], boneSY[i]);
+            if (boneOk[i]) ++projectedBoneCount;
+        }
+
+        if (projectedBoneCount < 4) continue;
+
+        // 线宽随距离缩放 (近粗远细)
+        float thickness = std::clamp(3.6f - dist / 180.0f, 1.4f, 4.2f);
+        float outlineThickness = thickness + 1.6f;
+
+        // 绘制骨骼连线
+        for (const auto& link : kBoneLinks) {
+            int a = link[0], b = link[1];
+            if (boneOk[a] && boneOk[b]) {
+                dl->AddLine(ImVec2(boneSX[a], boneSY[a]),
+                            ImVec2(boneSX[b], boneSY[b]),
+                            boneOutlineColor, outlineThickness);
+                dl->AddLine(ImVec2(boneSX[a], boneSY[a]),
+                            ImVec2(boneSX[b], boneSY[b]),
+                            boneColor, thickness);
+            }
+        }
+
+        // 头部圆圈
+        if (boneOk[0]) {
+            // 头部大小根据距离缩放
+            float headR = std::clamp(800.0f / dist, 3.0f, 15.0f);
+            dl->AddCircle(ImVec2(boneSX[0], boneSY[0]), headR, boneOutlineColor, 12, outlineThickness);
+            dl->AddCircle(ImVec2(boneSX[0], boneSY[0]), headR, boneColor, 12, thickness);
+        }
+
+        // 关节点 (近距离显示)
+        if (dist < 120.0f) {
+            for (int i = 0; i < dfm::PlayerInfo::BONE_COUNT; i++) {
+                if (boneOk[i]) {
+                    dl->AddCircleFilled(ImVec2(boneSX[i], boneSY[i]), 3.0f, boneOutlineColor);
+                    dl->AddCircleFilled(ImVec2(boneSX[i], boneSY[i]), 2.0f,
+                                        boneColor);
+                }
+            }
+        }
+    }
 }
 
 // =====================================================================

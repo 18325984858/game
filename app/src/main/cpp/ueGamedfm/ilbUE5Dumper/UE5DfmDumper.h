@@ -125,6 +125,14 @@ private:
     std::vector<FieldInfo> collectFields(uintptr_t structPtr, const std::string& ownerName) const;
     std::vector<FuncInfo> collectFuncs(uintptr_t classPtr, const std::string& ownerName) const;
 
+    // ---- CDO (Class Default Object) 查找 ----
+    int32_t m_cdoOffset = -1;  // UClass 内 ClassDefaultObject 的偏移, -1=未探测
+    uintptr_t findCDO(uintptr_t classPtr);
+
+    // ---- NativeFunc 反查表 (地址→名称) ----
+    std::unordered_map<uintptr_t, std::string> m_nativeFuncMap;
+    void buildNativeFuncMap();
+
     // ---- 输出路径 ----
     std::string resolveOutputPath(const char* filename) const;
     FILE* openOutputFile(const char* filename) const;

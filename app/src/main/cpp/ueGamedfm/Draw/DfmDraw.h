@@ -21,6 +21,7 @@ private:
     // ── 菜单状态 ──
     bool m_menuExpanded    = true;
     bool m_enableESP       = true;     // 3D ESP 方框
+    bool m_enableBones     = false;    // 骨骼绘制
     bool m_enableSnapline  = true;     // 底部射线
     bool m_enableName      = true;     // 玩家名
     bool m_enableHP        = true;     // 血条
@@ -42,6 +43,7 @@ private:
     // ── 子绘制 ──
     void drawMenu(const dfm::DrawDfmData& data);
     int  drawESP(const dfm::DrawDfmData& data, float screenW, float screenH);
+    void drawBones(const dfm::DrawDfmData& data, float screenW, float screenH);
     void drawLootESP(const dfm::DrawDfmData& data, float screenW, float screenH);
     void drawMinimap(const dfm::DrawDfmData& data, float screenW, float screenH);
     void drawPlayerList(const dfm::DrawDfmData& data, float screenW, float screenH);

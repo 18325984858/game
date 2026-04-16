@@ -15,6 +15,11 @@
 
 #include <android/log.h>  // 包含 Android NDK 的 log.h 文件
 #include <stdarg.h>  // 用于支持可变参数宏
+#include <fcntl.h>
+#include <unistd.h>
+#include <cstdio>
+#include <cstring>
+#include <string>
 
 /** @name 日志级别定义 */
 ///@{
@@ -38,8 +43,78 @@
  */
 #if ENABLE_LOGGING
 
-/** @brief 运行时日志开关（默认关闭，可通过配置或代码开启） */
-inline bool g_runtimeLogEnabled = false;
+/** @brief 运行时日志开关（默认开启） */
+inline bool g_runtimeLogEnabled = true;
+
+namespace log_internal {
+
+inline std::string resolveTracePath() {
+    static std::string cachedPath;
+    const auto tryOpen = [](const std::string& path) -> int {
+        if (path.empty()) return -1;
+        return open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    };
+
+    if (!cachedPath.empty()) {
+        const int cachedFd = tryOpen(cachedPath);
+        if (cachedFd >= 0) {
+            close(cachedFd);
+            return cachedPath;
+        }
+        cachedPath.clear();
+    }
+
+    char processName[256] = {};
+    const int cmdlineFd = open("/proc/self/cmdline", O_RDONLY | O_CLOEXEC);
+    if (cmdlineFd >= 0) {
+        const ssize_t sz = read(cmdlineFd, processName, sizeof(processName) - 1);
+        close(cmdlineFd);
+        if (sz > 0) {
+            processName[sz] = '\0';
+            std::string packageName(processName);
+            const size_t sep = packageName.find(':');
+            if (sep != std::string::npos) packageName.resize(sep);
+            if (!packageName.empty()) {
+                const std::string cachePath = "/data/data/" + packageName + "/cache/dfm_trace.txt";
+                const int fd = tryOpen(cachePath);
+                if (fd >= 0) {
+                    close(fd);
+                    cachedPath = cachePath;
+                    return cachedPath;
+                }
+            }
+        }
+    }
+
+    cachedPath = "/data/data/com.tencent.tmgp.dfm/cache/dfm_trace.txt";
+    int fallbackFd = tryOpen(cachedPath);
+    if (fallbackFd >= 0) {
+        close(fallbackFd);
+        return cachedPath;
+    }
+
+    cachedPath = "/data/local/tmp/dfm_trace.txt";
+    return cachedPath;
+}
+
+inline void appendLogLineToFile(int priority, const char* renderedLine) {
+    const std::string tracePath = resolveTracePath();
+    const int fd = open(tracePath.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    if (fd < 0) return;
+
+    const char* level = priority >= ANDROID_LOG_ERROR ? "E"
+        : (priority >= ANDROID_LOG_WARN ? "W" : "I");
+    char line[1792] = {};
+    const int length = snprintf(line, sizeof(line), "[%s][pid=%d] %s\n", level, getpid(), renderedLine);
+    if (length > 0) {
+        const size_t bytesToWrite = static_cast<size_t>(
+            length < static_cast<int>(sizeof(line)) ? length : (sizeof(line) - 1));
+        write(fd, line, bytesToWrite);
+    }
+    close(fd);
+}
+
+} // namespace log_internal
 
 #define LOG(level, fmt, ...) \
         do { \
@@ -48,7 +123,10 @@ inline bool g_runtimeLogEnabled = false;
                 if (level == LOG_LEVEL_INFO) priority = ANDROID_LOG_INFO; \
                 else if (level == LOG_LEVEL_WARN) priority = ANDROID_LOG_WARN; \
                 else if (level == LOG_LEVEL_ERROR) priority = ANDROID_LOG_ERROR; \
-                __android_log_print(priority, "[SFK]", "%s:%d: " fmt, __FILE__, __LINE__, ##__VA_ARGS__); \
+                char renderedLine[1536] = {}; \
+                snprintf(renderedLine, sizeof(renderedLine), "%s:%d: " fmt, __FILE__, __LINE__, ##__VA_ARGS__); \
+                __android_log_print(priority, "[SFK]", "%s", renderedLine); \
+                log_internal::appendLogLineToFile(priority, renderedLine); \
             } \
         } while (0)
 

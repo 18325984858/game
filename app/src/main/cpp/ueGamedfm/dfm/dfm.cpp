@@ -18,6 +18,8 @@
 #include <cstdio>
 #include <cstddef>
 #include <cstring>
+#include <cctype>
+#include <cmath>
 #include <chrono>
 #include <algorithm>
 
@@ -26,6 +28,196 @@
 using namespace ue5dfm;
 
 namespace dfm {
+
+namespace {
+
+constexpr int kMinRenderableBoneCount = 21;
+constexpr int kMaxRenderableBoneCount = 256;
+constexpr int kMaxMasterPoseDepth = 4;
+constexpr int kMinTrackedBoneMatches = 4;
+constexpr uintptr_t kReplicatedMovementLocationOffset = 0x18;
+constexpr uintptr_t kEncHandlerEncryptedFlagOffset = 0x0E;
+
+using BoneAliasList = std::array<const char*, 8>;
+
+const std::array<BoneAliasList, PlayerInfo::BONE_COUNT> kTrackedBoneAliases = {{
+    BoneAliasList{"head", "head01", "head02", "bip001head", "bip01head", nullptr, nullptr, nullptr},
+    BoneAliasList{"neck01", "neck", "neck02", "bip001neck", "bip01neck", nullptr, nullptr, nullptr},
+    BoneAliasList{"spine03", "spine3", "spine02", "spine2", "chest", "spine03jnt", "bip001spine2", "bip01spine2"},
+    BoneAliasList{"spine01", "spine1", "spine", "bip001spine", "bip01spine", nullptr, nullptr, nullptr},
+    BoneAliasList{"pelvis", "root", "hips", "bip001pelvis", "bip01pelvis", nullptr, nullptr, nullptr},
+    BoneAliasList{"upperarmr", "rupperarm", "rightarm", "rightupperarm", "clavicler", "bip001rupperarm", "bip01rupperarm", nullptr},
+    BoneAliasList{"lowerarmr", "rlowerarm", "rightforearm", "rightlowerarm", "forearmr", "bip001rforearm", "bip01rforearm", nullptr},
+    BoneAliasList{"handr", "rhand", "righthand", "bip001rhand", "bip01rhand", nullptr, nullptr, nullptr},
+    BoneAliasList{"upperarml", "lupperarm", "leftarm", "leftupperarm", "claviclel", "bip001lupperarm", "bip01lupperarm", nullptr},
+    BoneAliasList{"lowerarml", "llowerarm", "leftforearm", "leftlowerarm", "forearml", "bip001lforearm", "bip01lforearm", nullptr},
+    BoneAliasList{"handl", "lhand", "lefthand", "bip001lhand", "bip01lhand", nullptr, nullptr, nullptr},
+    BoneAliasList{"thighr", "rthigh", "rightupleg", "rightthigh", "bip001rthigh", "bip01rthigh", nullptr, nullptr},
+    BoneAliasList{"calfr", "rcalf", "rightleg", "rightlowerleg", "bip001rcalf", "bip01rcalf", nullptr, nullptr},
+    BoneAliasList{"footr", "rfoot", "rightfoot", "bip001rfoot", "bip01rfoot", nullptr, nullptr, nullptr},
+    BoneAliasList{"thighl", "lthigh", "leftupleg", "leftthigh", "bip001lthigh", "bip01lthigh", nullptr, nullptr},
+    BoneAliasList{"calfl", "lcalf", "leftleg", "leftlowerleg", "bip001lcalf", "bip01lcalf", nullptr, nullptr},
+    BoneAliasList{"footl", "lfoot", "leftfoot", "bip001lfoot", "bip01lfoot", nullptr, nullptr, nullptr},
+}};
+
+struct RemoteWeakObjectPtr {
+    int32_t objectIndex = -1;
+    int32_t objectSerialNumber = 0;
+};
+static_assert(sizeof(RemoteWeakObjectPtr) == 0x8, "RemoteWeakObjectPtr size mismatch");
+
+template<typename T>
+bool isUsableRemoteArray(const TArray<T>& array, int maxNum) {
+    const uintptr_t dataPtr = reinterpret_cast<uintptr_t>(array.Data);
+    return dataPtr > 0x10000 && array.Num > 0 && array.Num <= maxNum && array.Max >= array.Num;
+}
+
+FVector3 crossProduct(const FVector3& lhs, const FVector3& rhs) {
+    return {
+        lhs.y * rhs.z - lhs.z * rhs.y,
+        lhs.z * rhs.x - lhs.x * rhs.z,
+        lhs.x * rhs.y - lhs.y * rhs.x,
+    };
+}
+
+FVector3 scaleVector(const FVector3& value, const FVector3& scale) {
+    return {value.x * scale.x, value.y * scale.y, value.z * scale.z};
+}
+
+FVector3 rotateVector(const FTransform& rotation, const FVector3& value) {
+    const FVector3 quatVector{rotation.RotationX, rotation.RotationY, rotation.RotationZ};
+    const FVector3 uv = crossProduct(quatVector, value);
+    const FVector3 uuv = crossProduct(quatVector, uv);
+    return {
+        value.x + ((uv.x * rotation.RotationW) + uuv.x) * 2.0f,
+        value.y + ((uv.y * rotation.RotationW) + uuv.y) * 2.0f,
+        value.z + ((uv.z * rotation.RotationW) + uuv.z) * 2.0f,
+    };
+}
+
+FVector3 transformPosition(const FTransform& transform, const FVector3& localPosition) {
+    FVector3 safeScale{transform.Scale3DX, transform.Scale3DY, transform.Scale3DZ};
+    if (!std::isfinite(safeScale.x) || std::fabs(safeScale.x) < 0.0001f) safeScale.x = 1.0f;
+    if (!std::isfinite(safeScale.y) || std::fabs(safeScale.y) < 0.0001f) safeScale.y = 1.0f;
+    if (!std::isfinite(safeScale.z) || std::fabs(safeScale.z) < 0.0001f) safeScale.z = 1.0f;
+
+    const FVector3 scaled = scaleVector(localPosition, safeScale);
+    const FVector3 rotated = rotateVector(transform, scaled);
+    return {
+        rotated.x + transform.TranslationX,
+        rotated.y + transform.TranslationY,
+        rotated.z + transform.TranslationZ,
+    };
+}
+
+bool hasUsableWorldPoint(const FVector3& value) {
+    return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z)
+        && std::fabs(value.x) < 1.0e8f && std::fabs(value.y) < 1.0e8f && std::fabs(value.z) < 1.0e8f;
+}
+
+bool hasUsableActorPoint(const FVector3& value) {
+    return hasUsableWorldPoint(value)
+        && (std::fabs(value.x) > 1.0f || std::fabs(value.y) > 1.0f || std::fabs(value.z) > 1.0f);
+}
+
+constexpr float kRootCompensationZBias = 958.0f;
+constexpr float kRootCompensationXYQuantize = 10.0f;
+constexpr size_t kMaxCachedActorLocations = 4096;
+constexpr size_t kMaxRootCompensationOwners = 2048;
+constexpr auto kRootCompensationHoldWindow = std::chrono::milliseconds(1500);
+
+uint64_t makeQuantizedXYKey(float x, float y) {
+    const int32_t qx = static_cast<int32_t>(std::lround(x / kRootCompensationXYQuantize));
+    const int32_t qy = static_cast<int32_t>(std::lround(y / kRootCompensationXYQuantize));
+    return (static_cast<uint64_t>(static_cast<uint32_t>(qx)) << 32)
+        | static_cast<uint32_t>(qy);
+}
+
+float distanceMeters(const FVector3& lhs, const FVector3& rhs) {
+    const double dx = static_cast<double>(lhs.x) - static_cast<double>(rhs.x);
+    const double dy = static_cast<double>(lhs.y) - static_cast<double>(rhs.y);
+    const double dz = static_cast<double>(lhs.z) - static_cast<double>(rhs.z);
+    return static_cast<float>(std::sqrt((dx * dx) + (dy * dy) + (dz * dz)) / 100.0);
+}
+
+bool deriveFootPositionFromBones(const PlayerInfo& player, FVector3& outPos) {
+    if (!player.bonesValid) return false;
+
+    const FVector3& pelvis = player.bones[4];
+    const FVector3& head = player.bones[0];
+    const FVector3& rFoot = player.bones[13];
+    const FVector3& lFoot = player.bones[16];
+
+    const bool pelvisValid = hasUsableActorPoint(pelvis);
+    const bool headValid = hasUsableActorPoint(head);
+    const bool rFootValid = hasUsableActorPoint(rFoot);
+    const bool lFootValid = hasUsableActorPoint(lFoot);
+
+    if (rFootValid && lFootValid) {
+        outPos.x = (rFoot.x + lFoot.x) * 0.5f;
+        outPos.y = (rFoot.y + lFoot.y) * 0.5f;
+        outPos.z = std::min(rFoot.z, lFoot.z);
+        return true;
+    }
+    if (rFootValid) {
+        outPos = rFoot;
+        return true;
+    }
+    if (lFootValid) {
+        outPos = lFoot;
+        return true;
+    }
+    if (pelvisValid) {
+        outPos.x = pelvis.x;
+        outPos.y = pelvis.y;
+        outPos.z = pelvis.z - 90.0f;
+        return true;
+    }
+    if (headValid) {
+        outPos.x = head.x;
+        outPos.y = head.y;
+        outPos.z = head.z - 160.0f;
+        return true;
+    }
+    return false;
+}
+
+bool isLikelyMeshComponentClass(const std::string& className) {
+    return className.find("SkeletalMeshComponent") != std::string::npos
+        || className.find("SkinnedMeshComponent") != std::string::npos
+        || className.find("MeshComponentBudgeted") != std::string::npos;
+}
+
+std::string normalizeBoneName(const std::string& value) {
+    std::string normalized;
+    normalized.reserve(value.size());
+    for (unsigned char ch : value) {
+        if (!std::isalnum(ch)) continue;
+        normalized.push_back(static_cast<char>(std::tolower(ch)));
+    }
+    return normalized;
+}
+
+bool endsWithText(const std::string& value, const char* suffix) {
+    if (suffix == nullptr) return false;
+    const size_t suffixLength = std::strlen(suffix);
+    return value.size() >= suffixLength
+        && value.compare(value.size() - suffixLength, suffixLength, suffix) == 0;
+}
+
+bool matchesTrackedBoneName(size_t slot, const std::string& normalizedName) {
+    for (const char* alias : kTrackedBoneAliases[slot]) {
+        if (alias == nullptr) break;
+        if (normalizedName == alias
+            || endsWithText(normalizedName, alias)
+            || (std::strlen(alias) >= 6 && normalizedName.find(alias) != std::string::npos)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+} // namespace
 
 // =====================================================================
 //  安全内存读取 (sigsetjmp/siglongjmp 防崩溃)
@@ -226,33 +418,179 @@ std::string DfmMatchMonitor::readFText(uintptr_t addr) const {
 
 // =====================================================================
 //  坐标读取 (来自 IDA K2_GetActorLocation 反编译)
+//  优先级: RootComponent.CTW → ReplicatedMovement.Location(plain) → CameraViewLoc → Root.CTW+958 → RelativeLocation
 // =====================================================================
 
-bool DfmMatchMonitor::getActorLocation(uintptr_t actorPtr, FVector3& outLoc) const {
-    uintptr_t root = safeReadPtr(actorPtr + m_off.Actor_RootComponent);
-    if (!ok(root)) return false;
-
-    float x = safeReadFloat(root + (m_off.Scene_ComponentToWorld + offsetof(FTransform, TranslationX)));
-    float y = safeReadFloat(root + (m_off.Scene_ComponentToWorld + offsetof(FTransform, TranslationY)));
-    float z = safeReadFloat(root + (m_off.Scene_ComponentToWorld + offsetof(FTransform, TranslationZ)));
-
-    // 有效性检查: 排除 NaN/Inf/极大值
-    if (std::isfinite(x) && std::isfinite(y) && std::isfinite(z)
-        && std::fabs(x) < 1e8f && std::fabs(y) < 1e8f && std::fabs(z) < 1e8f) {
-        outLoc.x = x; outLoc.y = y; outLoc.z = z;
-        if (x != 0.0f || y != 0.0f || z != 0.0f) return true;
+bool DfmMatchMonitor::tryGetCachedActorLocation(uintptr_t actorPtr, FVector3& outLoc) const {
+    const auto cached = m_lastKnownActorPositions.find(actorPtr);
+    if (cached == m_lastKnownActorPositions.end() || !hasUsableActorPoint(cached->second)) {
+        return false;
     }
-
-    // ComponentToWorld 无效时回退到 RelativeLocation (注意: EncVector 可能加密)
-    x = safeReadFloat(root + (m_off.Scene_RelativeLocation));
-    y = safeReadFloat(root + (m_off.Scene_RelativeLocation + offsetof(FVector, Y)));
-    z = safeReadFloat(root + (m_off.Scene_RelativeLocation + offsetof(FVector, Z)));
-
-    if (std::isfinite(x) && std::isfinite(y) && std::isfinite(z)
-        && std::fabs(x) < 1e8f && std::fabs(y) < 1e8f && std::fabs(z) < 1e8f) {
-        outLoc.x = x; outLoc.y = y; outLoc.z = z;
-    }
+    outLoc = cached->second;
     return true;
+}
+
+void DfmMatchMonitor::rememberActorLocation(uintptr_t actorPtr, const FVector3& location) const {
+    if (!ok(actorPtr) || !hasUsableActorPoint(location)) {
+        return;
+    }
+    if (m_lastKnownActorPositions.size() >= kMaxCachedActorLocations) {
+        m_lastKnownActorPositions.clear();
+    }
+    m_lastKnownActorPositions[actorPtr] = location;
+}
+
+DfmMatchMonitor::ReplicatedMovementSnapshot
+DfmMatchMonitor::sampleReplicatedMovement(uintptr_t actorPtr) const {
+    ReplicatedMovementSnapshot snapshot{};
+    if (!ok(actorPtr) || m_off.Actor_ReplicatedMovement <= 0) {
+        return snapshot;
+    }
+
+    snapshot.movementEnabled = m_off.Actor_bReplicateMovement <= 0
+        || safeReadU8(actorPtr + static_cast<uintptr_t>(m_off.Actor_bReplicateMovement)) != 0;
+
+    const uintptr_t repMoveBase = actorPtr + static_cast<uintptr_t>(m_off.Actor_ReplicatedMovement);
+    snapshot.location.x = safeReadFloat(repMoveBase + kReplicatedMovementLocationOffset + 0x00);
+    snapshot.location.y = safeReadFloat(repMoveBase + kReplicatedMovementLocationOffset + 0x04);
+    snapshot.location.z = safeReadFloat(repMoveBase + kReplicatedMovementLocationOffset + 0x08);
+    snapshot.encByte = safeReadU8(repMoveBase + kReplicatedMovementLocationOffset + kEncHandlerEncryptedFlagOffset);
+    snapshot.hasUsablePlainLocation = snapshot.movementEnabled
+        && snapshot.encByte == 0
+        && hasUsableActorPoint(snapshot.location);
+    return snapshot;
+}
+
+bool DfmMatchMonitor::shouldAcceptRootCompensation(uintptr_t actorPtr, float x, float y) const {
+    if (!ok(actorPtr) || !std::isfinite(x) || !std::isfinite(y)) {
+        return false;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    const uint64_t key = makeQuantizedXYKey(x, y);
+
+    auto slot = m_rootCompensationOwners.find(key);
+    if (slot != m_rootCompensationOwners.end()) {
+        if ((now - slot->second.seenAt) <= kRootCompensationHoldWindow
+            && slot->second.actorPtr != 0
+            && slot->second.actorPtr != actorPtr) {
+            return false;
+        }
+        slot->second.actorPtr = actorPtr;
+        slot->second.seenAt = now;
+        return true;
+    }
+
+    if (m_rootCompensationOwners.size() >= kMaxRootCompensationOwners) {
+        for (auto it = m_rootCompensationOwners.begin(); it != m_rootCompensationOwners.end();) {
+            if ((now - it->second.seenAt) > kRootCompensationHoldWindow) {
+                it = m_rootCompensationOwners.erase(it);
+                continue;
+            }
+            ++it;
+        }
+        if (m_rootCompensationOwners.size() >= kMaxRootCompensationOwners) {
+            m_rootCompensationOwners.clear();
+        }
+    }
+
+    m_rootCompensationOwners[key] = {actorPtr, now};
+    return true;
+}
+
+bool DfmMatchMonitor::getActorLocation(uintptr_t actorPtr, FVector3& outLoc) const {
+    const FVector3 previousLoc = outLoc;
+    outLoc = {};
+    uintptr_t root = safeReadPtr(actorPtr + m_off.Actor_RootComponent);
+    if (!ok(root)) {
+        if (tryGetCachedActorLocation(actorPtr, outLoc)) {
+            return true;
+        }
+        if (hasUsableActorPoint(previousLoc)) {
+            outLoc = previousLoc;
+            rememberActorLocation(actorPtr, outLoc);
+            return true;
+        }
+        return false;
+    }
+
+    auto isUsableLocation = [](float x, float y, float z) {
+        return std::isfinite(x) && std::isfinite(y) && std::isfinite(z)
+            && std::fabs(x) < 1e8f && std::fabs(y) < 1e8f && std::fabs(z) < 1e8f
+            && (std::fabs(x) > 1.0f || std::fabs(y) > 1.0f || std::fabs(z) > 1.0f);
+    };
+
+    // ── 方法 1: RootComponent.ComponentToWorld (有效四元数时直接使用) ──
+    uintptr_t ctwBase = root + m_off.Scene_ComponentToWorld;
+    float qx = safeReadFloat(ctwBase + 0x00);
+    float qy = safeReadFloat(ctwBase + 0x04);
+    float qz = safeReadFloat(ctwBase + 0x08);
+    float qw = safeReadFloat(ctwBase + 0x0C);
+    float tx = safeReadFloat(ctwBase + offsetof(FTransform, TranslationX));
+    float ty = safeReadFloat(ctwBase + offsetof(FTransform, TranslationY));
+    float tz = safeReadFloat(ctwBase + offsetof(FTransform, TranslationZ));
+
+    bool posValid = isUsableLocation(tx, ty, tz);
+    bool quatValid = !(std::fabs(qx) < 0.001f && std::fabs(qy) < 0.001f
+        && std::fabs(qz) < 0.001f && std::fabs(qw) < 0.001f);
+
+    if (posValid && quatValid) {
+        outLoc.x = tx; outLoc.y = ty; outLoc.z = tz;
+        rememberActorLocation(actorPtr, outLoc);
+        return true;
+    }
+
+    // ── 方法 2: Actor.ReplicatedMovement.Location (EncVector 未加密时优先使用) ──
+    const ReplicatedMovementSnapshot repMove = sampleReplicatedMovement(actorPtr);
+    if (repMove.hasUsablePlainLocation) {
+        outLoc = repMove.location;
+        rememberActorLocation(actorPtr, outLoc);
+        return true;
+    }
+
+    // ── 方法 3: CameraViewLoc (明文 Vector, 网络复制的视角位置) ──
+    if (m_off.Char_CameraViewLoc > 0) {
+        float cvx = safeReadFloat(actorPtr + static_cast<uintptr_t>(m_off.Char_CameraViewLoc));
+        float cvy = safeReadFloat(actorPtr + static_cast<uintptr_t>(m_off.Char_CameraViewLoc) + 4);
+        float cvz = safeReadFloat(actorPtr + static_cast<uintptr_t>(m_off.Char_CameraViewLoc) + 8);
+        if (isUsableLocation(cvx, cvy, cvz) && (std::fabs(cvx) > 1.0f || std::fabs(cvy) > 1.0f)) {
+            outLoc.x = cvx; outLoc.y = cvy; outLoc.z = cvz;
+            rememberActorLocation(actorPtr, outLoc);
+            return true;
+        }
+    }
+
+    // ── 方法 4: CTW (四元数无效) + Z 偏移补偿 ──
+    // 远程敌人的 CTW 四元数全零，XY 有效但 Z 低了固定偏移
+    // 实测: 队友 Z≈948 vs 敌人 raw Z≈-10, 差值≈958
+    if (posValid && shouldAcceptRootCompensation(actorPtr, tx, ty)) {
+        outLoc.x = tx; outLoc.y = ty;
+        outLoc.z = tz + kRootCompensationZBias;  // 补偿远程角色的 Z 偏移
+        rememberActorLocation(actorPtr, outLoc);
+        return true;
+    }
+
+    // ── 方法 5: RelativeLocation (EncVector 可能加密) ──
+    if (ok(root)) {
+        float x = safeReadFloat(root + m_off.Scene_RelativeLocation);
+        float y = safeReadFloat(root + m_off.Scene_RelativeLocation + offsetof(FVector, Y));
+        float z = safeReadFloat(root + m_off.Scene_RelativeLocation + offsetof(FVector, Z));
+        if (isUsableLocation(x, y, z)) {
+            outLoc.x = x; outLoc.y = y; outLoc.z = z;
+            rememberActorLocation(actorPtr, outLoc);
+            return true;
+        }
+    }
+
+    if (tryGetCachedActorLocation(actorPtr, outLoc)) {
+        return true;
+    }
+    if (hasUsableActorPoint(previousLoc)) {
+        outLoc = previousLoc;
+        rememberActorLocation(actorPtr, outLoc);
+        return true;
+    }
+    return false;
 }
 
 // =====================================================================
@@ -580,7 +918,7 @@ void DfmMatchMonitor::scanActors(const std::vector<uintptr_t>& actors, DrawDfmDa
             std::string playerName = getPlayerName(actor);
             if (!isAI && playerName.empty() && !ok(psPtr)) continue; // 幽灵/残影
 
-            PlayerInfo pi;
+            PlayerInfo pi{};
             pi.playerName = playerName.empty() ? (isAI ? "[AI]" : "(无名)") : playerName;
             pi.className = cn;
             pi.isAI = isAI;
@@ -593,6 +931,61 @@ void DfmMatchMonitor::scanActors(const std::vector<uintptr_t>& actors, DrawDfmDa
             pi.armor = hi.armor; pi.helmet = hi.helmet;
 
             getActorLocation(actor, pi.pos);
+            fillPlayerBones(pi);  // 读取骨骼世界坐标
+
+            // ── 真人敌人优先使用骨骼反推脚底位置，AI 保持原采集链 ──
+            {
+                FVector3 bonePos{};
+                const bool posUsable = hasUsableActorPoint(pi.pos);
+                if (((!pi.isAI) || !posUsable) && deriveFootPositionFromBones(pi, bonePos)) {
+                    pi.pos = bonePos;
+                    rememberActorLocation(actor, pi.pos);
+                    LOG(LOG_LEVEL_INFO,
+                        "[posFixBone] %s isAI=%d final=(%.0f,%.0f,%.0f)",
+                        pi.playerName.c_str(), pi.isAI ? 1 : 0,
+                        pi.pos.x, pi.pos.y, pi.pos.z);
+                }
+            }
+
+            // ── 坐标诊断 ──
+            {
+                static int diagCount = 0;
+                if (diagCount < 30) {
+                    uintptr_t root = safeReadPtr(actor + m_off.Actor_RootComponent);
+                    uintptr_t pawnPrivate = ok(psPtr) ? safeReadPtr(psPtr + m_off.PS_PawnPrivate) : 0;
+                    float ctw_x = 0, ctw_y = 0, ctw_z = 0;
+                    float mesh_x = 0, mesh_y = 0, mesh_z = 0;
+                    uint8_t encByte = 0;
+                    if (ok(root)) {
+                        ctw_x = safeReadFloat(root + m_off.Scene_ComponentToWorld + offsetof(FTransform, TranslationX));
+                        ctw_y = safeReadFloat(root + m_off.Scene_ComponentToWorld + offsetof(FTransform, TranslationY));
+                        ctw_z = safeReadFloat(root + m_off.Scene_ComponentToWorld + offsetof(FTransform, TranslationZ));
+                        encByte = safeReadU8(root + m_off.Scene_RelativeLocation + 0xE);
+                    }
+                    uintptr_t meshComp = m_off.Char_Mesh > 0
+                        ? resolveObjectField(actor + static_cast<uintptr_t>(m_off.Char_Mesh)) : 0;
+                    if (ok(meshComp)) {
+                        mesh_x = safeReadFloat(meshComp + m_off.Scene_ComponentToWorld + offsetof(FTransform, TranslationX));
+                        mesh_y = safeReadFloat(meshComp + m_off.Scene_ComponentToWorld + offsetof(FTransform, TranslationY));
+                        mesh_z = safeReadFloat(meshComp + m_off.Scene_ComponentToWorld + offsetof(FTransform, TranslationZ));
+                    }
+                    LOG(LOG_LEVEL_WARN,
+                        "[posDiag] %s isAI=%d actor=%p rootPtr=%p ps=%p pawnPrivate=%p rootCTW=(%.0f,%.0f,%.0f) meshCTW=(%.0f,%.0f,%.0f) enc=%d final=(%.0f,%.0f,%.0f) bones=%d name=%s",
+                        cn.c_str(), isAI?1:0,
+                        (void*)actor,
+                        (void*)root,
+                        (void*)psPtr,
+                        (void*)pawnPrivate,
+                        ctw_x, ctw_y, ctw_z,
+                        mesh_x, mesh_y, mesh_z,
+                        (int)encByte,
+                        pi.pos.x, pi.pos.y, pi.pos.z,
+                        pi.bonesValid?1:0,
+                        pi.playerName.c_str());
+                    diagCount++;
+                }
+            }
+
             outData.players.push_back(std::move(pi));
         }
 
@@ -626,7 +1019,7 @@ void DfmMatchMonitor::scanFromPlayerArray(DrawDfmData& outData) const {
         uintptr_t pawn = safeReadPtr(ps + m_off.PS_PawnPrivate);
         if (!ok(pawn)) continue;
 
-        PlayerInfo pi;
+        PlayerInfo pi{};
         pi.playerName = readFString(ps + m_off.PS_PlayerName);
         if (pi.playerName.empty()) pi.playerName = readFString(ps + m_off.PS_PlayerName2);
         if (pi.playerName.empty()) pi.playerName = "(无名)";
@@ -640,6 +1033,18 @@ void DfmMatchMonitor::scanFromPlayerArray(DrawDfmData& outData) const {
         pi.armor = hi.armor; pi.helmet = hi.helmet;
 
         getActorLocation(pawn, pi.pos);
+        fillPlayerBones(pi);
+
+        // 真人敌人优先使用骨骼反推脚底位置
+        {
+            FVector3 bonePos{};
+            const bool posUsable = hasUsableActorPoint(pi.pos);
+            if (((!pi.isAI) || !posUsable) && deriveFootPositionFromBones(pi, bonePos)) {
+                pi.pos = bonePos;
+                rememberActorLocation(pawn, pi.pos);
+            }
+        }
+
         outData.players.push_back(std::move(pi));
     }
 }
@@ -902,7 +1307,7 @@ void DfmMatchMonitor::fillCameraData(DrawDfmData& outData) const {
         float f3 = ok(diagPCM) ? safeReadFloat(diagPCM + m_off.PCM_ViewTarget + m_off.ViewTarget_FOV) : -1;
         float f4 = ok(diagPCM) ? safeReadFloat(diagPCM + m_off.PCM_CameraCachePrivate + m_off.CamCache_FOV) : -1;
         float f5 = ok(diagPCM) ? safeReadFloat(diagPCM + m_off.PCM_LastFrameCachePriv + m_off.CamCache_FOV) : -1;
-        __android_log_print(ANDROID_LOG_INFO, "UE5-DFM",
+        LOG(LOG_LEVEL_INFO,
             "[cam] loc=%d rot=%d fov=%d PCM=%p defFov=%.1f fovs=[%.1f,%.1f,%.1f,%.1f,%.1f]",
             gotLocation?1:0, gotRotation?1:0, gotFov?1:0,
             (void*)diagPCM, diagDefFov, f1, f2, f3, f4, f5);
@@ -1034,12 +1439,61 @@ bool DfmMatchMonitor::initOffsets() {
         } \
     } while(0)
 
+    #define TRY_RESOLVE_MULTI(field, target, ...) do { \
+        const char* classes[] = { __VA_ARGS__ }; \
+        std::string owner; \
+        for (const char* cls : classes) { \
+            const auto* info = m_interface->findFieldInHierarchy(cls, field, &owner); \
+            if (info) { \
+                target = info->offset; \
+                LOG(LOG_LEVEL_INFO, TAG " [offset] %s.%s = 0x%X (via %s)", cls, field, info->offset, owner.c_str()); \
+                break; \
+            } \
+        } \
+    } while(0)
+
     // Actor
+    TRY_RESOLVE("Actor", "bReplicateMovement", m_off.Actor_bReplicateMovement);
+    TRY_RESOLVE("Actor", "ReplicatedMovement", m_off.Actor_ReplicatedMovement);
     TRY_RESOLVE("Actor", "RootComponent", m_off.Actor_RootComponent);
 
     // SceneComponent
     TRY_RESOLVE("SceneComponent", "RelativeLocation", m_off.Scene_RelativeLocation);
     TRY_RESOLVE("SceneComponent", "ComponentToWorld", m_off.Scene_ComponentToWorld);
+
+    // 骨骼系统 (sdk_dump.cs + 既有 IDA 分析)
+    TRY_RESOLVE_MULTI("Mesh", m_off.Char_Mesh,
+        "Character", "CHARACTER", "CharacterBase", "GPCharacterBase", "GPCharacter");
+    TRY_RESOLVE_MULTI("FPPMesh", m_off.Char_FPPMesh,
+        "CharacterBase", "GPCharacter", "GPCharacterBase", "Character");
+    TRY_RESOLVE_MULTI("AvatarComponent", m_off.STBase_AvatarComponent,
+        "STExtraBaseCharacter", "STExtraCharacter", "CharacterBase", "Character");
+    TRY_RESOLVE_MULTI("FPPComp", m_off.STBase_FPPComp,
+        "STExtraBaseCharacter", "STExtraCharacter", "CharacterBase", "Character");
+    TRY_RESOLVE_MULTI("MasterBoneComponent", m_off.Avatar_MasterBoneComponent,
+        "AvatarComponent");
+    TRY_RESOLVE_MULTI("meshComponentList", m_off.Avatar_MeshComponentList,
+        "AvatarComponent");
+    TRY_RESOLVE_MULTI("AvatarEntityList", m_off.Avatar_AvatarEntityList,
+        "AvatarComponent");
+    TRY_RESOLVE_MULTI("DefaultAvatarSubSystemList", m_off.Avatar_DefaultAvatarSubSystemList,
+        "AvatarComponent");
+    TRY_RESOLVE_MULTI("LocalSubSystemList", m_off.Avatar_LocalSubSystemList,
+        "AvatarComponent");
+    TRY_RESOLVE_MULTI("LocalActiveSubSystemList", m_off.Avatar_LocalActiveSubSystemList,
+        "AvatarComponent");
+    TRY_RESOLVE_MULTI("SkeletalMeshCompPool", m_off.Avatar_SkeletalMeshCompPool,
+        "AvatarComponent");
+    TRY_RESOLVE_MULTI("SkeletonMappingComp", m_off.AvatarFuncBranch_SkeletonMappingComp,
+        "AvatarFuncBranch_NewFPP");
+    TRY_RESOLVE_MULTI("SkeletalMesh", m_off.SkinnedMesh_SkeletalMesh,
+        "SkinnedMeshComponent", "SkeletalMeshComponent");
+    TRY_RESOLVE_MULTI("MasterPoseComponent", m_off.SkinnedMesh_MasterPoseComponent,
+        "SkinnedMeshComponent", "SkeletalMeshComponent");
+    TRY_RESOLVE_MULTI("CachedComponentSpaceTransforms", m_off.Skel_CachedCompSpace,
+        "SkeletalMeshComponent", "SkinnedMeshComponent");
+    TRY_RESOLVE_MULTI("CachedBoneSpaceTransforms", m_off.Skel_BoneSpaceTransforms,
+        "SkeletalMeshComponent", "SkinnedMeshComponent");
 
     // Pawn
     TRY_RESOLVE("Pawn", "PlayerState", m_off.Pawn_PlayerState);
@@ -1094,10 +1548,11 @@ bool DfmMatchMonitor::initOffsets() {
     TRY_RESOLVE("Player", "PlayerController", m_off.LP_PlayerController);
     TRY_RESOLVE("LocalPlayer", "PlayerController", m_off.LP_PlayerController);
 
+    #undef TRY_RESOLVE_MULTI
     #undef TRY_RESOLVE
 
-    LOG(LOG_LEVEL_INFO, TAG " 偏移解析完成: RootComp=0x%X PS=0x%X GS_PA=0x%X PCM=0x%X CamCache=0x%X",
-        m_off.Actor_RootComponent, m_off.Pawn_PlayerState, m_off.GS_PlayerArray,
+    LOG(LOG_LEVEL_INFO, TAG " 偏移解析完成: RepMove=0x%X RootComp=0x%X PS=0x%X GS_PA=0x%X PCM=0x%X CamCache=0x%X",
+        m_off.Actor_ReplicatedMovement, m_off.Actor_RootComponent, m_off.Pawn_PlayerState, m_off.GS_PlayerArray,
         m_off.PC_PlayerCameraManager, m_off.PCM_CameraCachePrivate);
     return m_off.isValid();
 }
@@ -1124,13 +1579,624 @@ void DfmMatchMonitor::stop() {
 }
 
 // =====================================================================
-//  玩家位置快速更新 (只更新坐标/血量/武器, 不重新扫描 Actor)
+//  骨骼系统 — 基于 sdk_dump.cs / 既有 IDA 导出结果的读取链
 // =====================================================================
+//
+// 运行时候选链:
+//   Character.Mesh / CharacterBase.FPPMesh
+//       -> SkinnedMeshComponent.MasterPoseComponent
+//       -> SkeletalMeshComponent.CachedComponentSpaceTransforms
+//       -> SceneComponent.ComponentToWorld
+//
+// 说明:
+//   1. sdk_dump.cs 导出为 Character.Mesh=0x3D0, CharacterBase.FPPMesh=0xA80,
+//      SkinnedMeshComponent.MasterPoseComponent=0x710,
+//      SkeletalMeshComponent.CachedComponentSpaceTransforms=0x9D8。
+//   2. 实际运行中 MasterPose 字段有时表现为直接 UObject*，有时更像
+//      objectIndex+serial 的弱引用对，因此解析逻辑同时兼容两种存储。
+//   3. CachedComponentSpaceTransforms 里的 Translation 已经是组件空间骨骼原点，
+//      只需要再套一次 ComponentToWorld 的旋转/缩放/平移即可得到世界坐标。
+//
+// 固定索引只作为最后回退；正常路径优先从 SkeletalMesh+0x238 的
+// FReferenceSkeleton.RawRefBoneInfo 按骨骼名动态映射到 17 个绘制槽位。
+static const int kFallbackBoneMap[PlayerInfo::BONE_COUNT] = {
+    14,  // [0] Head
+    13,  // [1] Neck
+    4,   // [2] Chest (spine_03)
+    2,   // [3] Belly (spine_01)
+    1,   // [4] Pelvis
+    9,   // [5] R Shoulder (clavicle_r)
+    11,  // [6] R Elbow (lowerarm_r)
+    12,  // [7] R Hand
+    5,   // [8] L Shoulder (clavicle_l)
+    7,   // [9] L Elbow (lowerarm_l)
+    8,   // [10] L Hand
+    18,  // [11] R Thigh (thigh_r)
+    19,  // [12] R Knee (calf_r)
+    20,  // [13] R Foot (foot_r)
+    15,  // [14] L Thigh (thigh_l)
+    16,  // [15] L Knee (calf_l)
+    17,  // [16] L Foot (foot_l)
+};
+
+int DfmMatchMonitor::matchBoneNamesFromFNameArray(uintptr_t dataPtr,
+                                                  int count,
+                                                  BoneAssetCacheEntry& entry) const {
+    entry.trackedBoneIndices.fill(-1);
+    entry.matchedCount = 0;
+    if (dataPtr < 0x10000 || count <= 0 || count > kMaxRenderableBoneCount) return 0;
+
+    for (int index = 0; index < count; ++index) {
+        const std::string normalizedName = normalizeBoneName(
+            readFName(dataPtr + static_cast<uintptr_t>(index) * sizeof(FName)));
+        if (normalizedName.empty()) continue;
+
+        for (size_t slot = 0; slot < PlayerInfo::BONE_COUNT; ++slot) {
+            if (entry.trackedBoneIndices[slot] >= 0) continue;
+            if (matchesTrackedBoneName(slot, normalizedName)) {
+                entry.trackedBoneIndices[slot] = index;
+                entry.matchedCount++;
+                break;
+            }
+        }
+        if (entry.matchedCount == PlayerInfo::BONE_COUNT) break;
+    }
+    return entry.matchedCount;
+}
+
+int DfmMatchMonitor::matchBoneNamesFromBoneInfoArray(uintptr_t dataPtr,
+                                                     int count,
+                                                     int stride,
+                                                     BoneAssetCacheEntry& entry) const {
+    entry.trackedBoneIndices.fill(-1);
+    entry.matchedCount = 0;
+    if (dataPtr < 0x10000 || count <= 0 || count > kMaxRenderableBoneCount || stride < 8) {
+        return 0;
+    }
+
+    for (int index = 0; index < count; ++index) {
+        const std::string normalizedName = normalizeBoneName(
+            readFName(dataPtr + static_cast<uintptr_t>(index) * static_cast<uintptr_t>(stride)));
+        if (normalizedName.empty()) continue;
+
+        for (size_t slot = 0; slot < PlayerInfo::BONE_COUNT; ++slot) {
+            if (entry.trackedBoneIndices[slot] >= 0) continue;
+            if (matchesTrackedBoneName(slot, normalizedName)) {
+                entry.trackedBoneIndices[slot] = index;
+                entry.matchedCount++;
+                break;
+            }
+        }
+        if (entry.matchedCount == PlayerInfo::BONE_COUNT) break;
+    }
+    return entry.matchedCount;
+}
+
+uintptr_t DfmMatchMonitor::getSkeletalMeshAsset(uintptr_t meshComp) const {
+    if (!ok(meshComp) || m_off.SkinnedMesh_SkeletalMesh <= 0) return 0;
+    return resolveObjectField(meshComp + static_cast<uintptr_t>(m_off.SkinnedMesh_SkeletalMesh));
+}
+
+bool DfmMatchMonitor::resolveTrackedBoneIndices(uintptr_t skeletalMeshAssetPtr,
+                                                BoneAssetCacheEntry& outEntry) const {
+    outEntry.trackedBoneIndices.fill(-1);
+    outEntry.matchedCount = 0;
+    if (!ok(skeletalMeshAssetPtr)) return false;
+
+    const auto cached = m_boneAssetCache.find(skeletalMeshAssetPtr);
+    if (cached != m_boneAssetCache.end()) {
+        outEntry = cached->second;
+        return outEntry.matchedCount >= kMinTrackedBoneMatches;
+    }
+
+    if (m_boneAssetCache.size() > 256) {
+        m_boneAssetCache.clear();
+    }
+
+    BoneAssetCacheEntry entry;
+    entry.trackedBoneIndices.fill(-1);
+
+    constexpr uintptr_t kRefBoneInfoOffset = 0x238;
+    const uintptr_t boneInfoData = safeReadPtr(skeletalMeshAssetPtr + kRefBoneInfoOffset);
+    const int32_t boneInfoNum = safeReadS32(
+        skeletalMeshAssetPtr + kRefBoneInfoOffset + offsetof(TArray<FName>, Num));
+    if (boneInfoData >= 0x10000 && boneInfoNum > 0 && boneInfoNum <= kMaxRenderableBoneCount) {
+        matchBoneNamesFromBoneInfoArray(boneInfoData, boneInfoNum, 16, entry);
+        if (entry.matchedCount < kMinTrackedBoneMatches) {
+            BoneAssetCacheEntry trial;
+            if (matchBoneNamesFromFNameArray(boneInfoData, boneInfoNum, trial) > entry.matchedCount) {
+                entry = trial;
+            }
+        }
+    }
+
+    if (entry.matchedCount < kMinTrackedBoneMatches) {
+        constexpr uintptr_t kSkeletonOffset = 0x48;
+        constexpr uintptr_t kRefBoneNamesOffset = 0x280;
+        const uintptr_t skeletonPtr = resolveObjectField(skeletalMeshAssetPtr + kSkeletonOffset);
+        if (ok(skeletonPtr)) {
+            TArray<FName> refBoneNames{};
+            if (safeReadMemory(skeletonPtr + kRefBoneNamesOffset, &refBoneNames, sizeof(refBoneNames))
+                && isUsableRemoteArray(refBoneNames, kMaxRenderableBoneCount)) {
+                BoneAssetCacheEntry trial;
+                if (matchBoneNamesFromFNameArray(reinterpret_cast<uintptr_t>(refBoneNames.Data),
+                                                 refBoneNames.Num,
+                                                 trial) > entry.matchedCount) {
+                    entry = trial;
+                }
+            }
+        }
+    }
+
+    m_boneAssetCache[skeletalMeshAssetPtr] = entry;
+    outEntry = entry;
+    return entry.matchedCount >= kMinTrackedBoneMatches;
+}
+
+int32_t DfmMatchMonitor::getCachedTransformCount(uintptr_t meshComp) const {
+    if (!ok(meshComp) || m_off.Skel_CachedCompSpace <= 0) return 0;
+
+    TArray<FTransform> transforms{};
+    if (!safeReadMemory(meshComp + static_cast<uintptr_t>(m_off.Skel_CachedCompSpace),
+                        &transforms,
+                        sizeof(transforms))) {
+        return 0;
+    }
+    return isUsableRemoteArray(transforms, kMaxRenderableBoneCount) ? transforms.Num : 0;
+}
+
+int32_t DfmMatchMonitor::collectSparseMapValues(uintptr_t mapBase,
+                                               std::vector<uintptr_t>& outValues,
+                                               int32_t maxEntries) const {
+    if (!ok(mapBase) || maxEntries <= 0) return 0;
+
+    const uintptr_t entries = safeReadPtr(mapBase);
+    const int32_t maxIdx = safeReadS32(mapBase + 0x28);
+    if (!ok(entries) || maxIdx <= 0 || maxIdx > maxEntries) {
+        return 0;
+    }
+
+    const uintptr_t secFlags = safeReadPtr(mapBase + 0x20);
+    int32_t activeCount = 0;
+    for (int32_t wordIndex = 0; wordIndex < (maxIdx + 31) / 32; ++wordIndex) {
+        uint32_t flags = 0;
+        if (wordIndex < 4) {
+            safeReadMemory(mapBase + 0x10 + wordIndex * 4, &flags, sizeof(flags));
+        } else if (ok(secFlags)) {
+            safeReadMemory(secFlags + wordIndex * 4, &flags, sizeof(flags));
+        }
+
+        for (int bit = 0; bit < 32 && flags; ++bit, flags >>= 1) {
+            if ((flags & 1u) == 0) continue;
+            const int32_t idx = wordIndex * 32 + bit;
+            if (idx >= maxIdx) break;
+
+            ++activeCount;
+            const uintptr_t valueAddr = entries + static_cast<uintptr_t>(idx) * 24 + 8;
+            const uintptr_t value = resolveObjectField(valueAddr);
+            if (ok(value)) {
+                outValues.push_back(value);
+            }
+        }
+    }
+    return activeCount;
+}
+
+int32_t DfmMatchMonitor::collectObjectArrayValues(uintptr_t arrayAddr,
+                                                  std::vector<uintptr_t>& outValues,
+                                                  int32_t maxEntries) const {
+    if (!ok(arrayAddr) || maxEntries <= 0) return 0;
+
+    TArray<uintptr_t> array{};
+    if (!safeReadMemory(arrayAddr, &array, sizeof(array))
+        || !isUsableRemoteArray(array, maxEntries)) {
+        return 0;
+    }
+
+    const uintptr_t data = reinterpret_cast<uintptr_t>(array.Data);
+    int32_t activeCount = 0;
+    for (int32_t i = 0; i < array.Num; ++i) {
+        ++activeCount;
+        const uintptr_t value = resolveObjectField(data + static_cast<uintptr_t>(i) * sizeof(uintptr_t));
+        if (ok(value)) {
+            outValues.push_back(value);
+        }
+    }
+    return activeCount;
+}
+
+uintptr_t DfmMatchMonitor::scanObjectForMeshComponent(uintptr_t objectPtr, int scanBytes) const {
+    if (!ok(objectPtr) || scanBytes < 8) return 0;
+
+    uintptr_t bestComp = 0;
+    int32_t bestCount = 0;
+    auto considerMesh = [&](uintptr_t meshComp) {
+        if (!ok(meshComp)) return;
+        const std::string className = readClassName(meshComp);
+        if (!isLikelyMeshComponentClass(className)) return;
+
+        int32_t transformCount = getCachedTransformCount(meshComp);
+        if (transformCount > bestCount) {
+            bestComp = meshComp;
+            bestCount = transformCount;
+        }
+
+        const uintptr_t masterComp = followMasterPoseChain(meshComp);
+        const int32_t masterCount = getCachedTransformCount(masterComp);
+        if (masterCount > bestCount) {
+            bestComp = masterComp;
+            bestCount = masterCount;
+        }
+    };
+
+    for (int offset = 0; offset <= scanBytes - 8; offset += 8) {
+        const uintptr_t candidate = resolveObjectField(objectPtr + static_cast<uintptr_t>(offset));
+        if (!ok(candidate) || candidate == objectPtr) continue;
+
+        const std::string className = readClassName(candidate);
+        if (isLikelyMeshComponentClass(className)) {
+            considerMesh(candidate);
+            continue;
+        }
+
+        if (m_off.AvatarFuncBranch_SkeletonMappingComp > 0
+            && className.find("AvatarFuncBranch") != std::string::npos) {
+            const uintptr_t skeletonMappingComp = resolveObjectField(
+                candidate + static_cast<uintptr_t>(m_off.AvatarFuncBranch_SkeletonMappingComp));
+            considerMesh(skeletonMappingComp);
+        }
+    }
+
+    return bestComp;
+}
+
+uintptr_t DfmMatchMonitor::resolveObjectField(uintptr_t fieldAddr) const {
+    auto looksLikeUObject = [&](uintptr_t objPtr) -> bool {
+        if (!ok(objPtr)) return false;
+        uintptr_t classPtr = safeReadPtr(objPtr + offsetof(UObjectBase, ClassPrivate));
+        return ok(classPtr);
+    };
+
+    uintptr_t directPtr = safeReadPtr(fieldAddr);
+    if (looksLikeUObject(directPtr)) {
+        return directPtr;
+    }
+
+    RemoteWeakObjectPtr weakPtr{};
+    if (!safeReadMemory(fieldAddr, &weakPtr, sizeof(weakPtr))
+        || weakPtr.objectIndex < 0
+        || weakPtr.objectSerialNumber <= 0) {
+        return 0;
+    }
+
+    const uint32_t totalObjects = safeReadU32(m_moduleBase + m_offGUObjectArrayNum);
+    const uintptr_t chunkTable = safeReadPtr(m_moduleBase + m_offGUObjectArrayChunks);
+    if (!ok(chunkTable) || weakPtr.objectIndex >= static_cast<int32_t>(totalObjects)) {
+        return 0;
+    }
+
+    const uint32_t objectIndex = static_cast<uint32_t>(weakPtr.objectIndex);
+    const uintptr_t chunkBase = safeReadPtr(
+        chunkTable + static_cast<uintptr_t>(objectIndex >> 16) * sizeof(uintptr_t));
+    if (!ok(chunkBase)) {
+        return 0;
+    }
+
+    FUObjectItem item{};
+    const uintptr_t itemAddr = chunkBase
+        + static_cast<uintptr_t>(objectIndex & 0xFFFF) * sizeof(FUObjectItem);
+    if (!safeReadMemory(itemAddr, &item, sizeof(item))
+        || item.SerialNumber != weakPtr.objectSerialNumber) {
+        return 0;
+    }
+
+    const uintptr_t resolved = reinterpret_cast<uintptr_t>(item.Object);
+    return looksLikeUObject(resolved) ? resolved : 0;
+}
+
+uintptr_t DfmMatchMonitor::followMasterPoseChain(uintptr_t meshComp) const {
+    if (!ok(meshComp) || m_off.SkinnedMesh_MasterPoseComponent <= 0) {
+        return meshComp;
+    }
+
+    uintptr_t bestComp = meshComp;
+    int32_t bestCount = getCachedTransformCount(meshComp);
+    uintptr_t current = meshComp;
+    for (int depth = 0; depth < kMaxMasterPoseDepth; ++depth) {
+        uintptr_t next = resolveObjectField(
+            current + static_cast<uintptr_t>(m_off.SkinnedMesh_MasterPoseComponent));
+        if (!ok(next) || next == current) {
+            break;
+        }
+
+        int32_t nextCount = getCachedTransformCount(next);
+        if (nextCount > bestCount) {
+            bestComp = next;
+            bestCount = nextCount;
+        }
+        current = next;
+    }
+    return bestComp;
+}
+
+uintptr_t DfmMatchMonitor::resolveBestBoneMeshComponent(uintptr_t characterPtr) const {
+    struct Candidate {
+        uintptr_t meshComp = 0;
+        int32_t transformCount = 0;
+    };
+
+    std::vector<Candidate> candidates;
+    candidates.reserve(16);
+
+    Candidate best{};
+    auto consider = [&](uintptr_t meshComp) {
+        if (!ok(meshComp)) return;
+        for (const auto& existing : candidates) {
+            if (existing.meshComp == meshComp) return;
+        }
+        int32_t transformCount = getCachedTransformCount(meshComp);
+        candidates.push_back({meshComp, transformCount});
+        if (transformCount > best.transformCount) {
+            best.meshComp = meshComp;
+            best.transformCount = transformCount;
+        }
+    };
+
+    auto readMeshField = [&](int32_t offset) -> uintptr_t {
+        return (offset > 0)
+            ? resolveObjectField(characterPtr + static_cast<uintptr_t>(offset))
+            : 0;
+    };
+
+    const uintptr_t mesh3p = readMeshField(m_off.Char_Mesh);
+    consider(mesh3p);
+    consider(followMasterPoseChain(mesh3p));
+
+    const uintptr_t meshFpp = readMeshField(m_off.Char_FPPMesh);
+    consider(meshFpp);
+    consider(followMasterPoseChain(meshFpp));
+
+    auto scanAvatarComponent = [&](uintptr_t avatarComp) {
+        if (!ok(avatarComp)) return;
+
+        const uintptr_t masterBone = resolveObjectField(
+            avatarComp + static_cast<uintptr_t>(m_off.Avatar_MasterBoneComponent));
+        consider(masterBone);
+        consider(followMasterPoseChain(masterBone));
+
+        std::vector<uintptr_t> meshListValues;
+        meshListValues.reserve(16);
+        collectSparseMapValues(
+            avatarComp + static_cast<uintptr_t>(m_off.Avatar_MeshComponentList),
+            meshListValues,
+            256);
+        for (uintptr_t meshComp : meshListValues) {
+            consider(meshComp);
+            consider(followMasterPoseChain(meshComp));
+        }
+
+        TArray<uintptr_t> pool{};
+        if (safeReadMemory(avatarComp + static_cast<uintptr_t>(m_off.Avatar_SkeletalMeshCompPool),
+                           &pool,
+                           sizeof(pool))
+            && isUsableRemoteArray(pool, 64)) {
+            const uintptr_t poolData = reinterpret_cast<uintptr_t>(pool.Data);
+            for (int i = 0; i < pool.Num; ++i) {
+                uintptr_t meshComp = resolveObjectField(
+                    poolData + static_cast<uintptr_t>(i) * sizeof(uintptr_t));
+                consider(meshComp);
+                consider(followMasterPoseChain(meshComp));
+            }
+        }
+
+        if (best.transformCount < kMinRenderableBoneCount && m_off.Avatar_AvatarEntityList > 0) {
+            std::vector<uintptr_t> entityValues;
+            entityValues.reserve(16);
+            collectSparseMapValues(
+                avatarComp + static_cast<uintptr_t>(m_off.Avatar_AvatarEntityList),
+                entityValues,
+                128);
+            for (uintptr_t entity : entityValues) {
+                consider(scanObjectForMeshComponent(entity, 0x200));
+            }
+        }
+
+        if (best.transformCount < kMinRenderableBoneCount) {
+            std::vector<uintptr_t> subsystemValues;
+            subsystemValues.reserve(24);
+            collectObjectArrayValues(
+                avatarComp + static_cast<uintptr_t>(m_off.Avatar_DefaultAvatarSubSystemList),
+                subsystemValues,
+                64);
+            collectObjectArrayValues(
+                avatarComp + static_cast<uintptr_t>(m_off.Avatar_LocalSubSystemList),
+                subsystemValues,
+                64);
+            collectObjectArrayValues(
+                avatarComp + static_cast<uintptr_t>(m_off.Avatar_LocalActiveSubSystemList),
+                subsystemValues,
+                64);
+            for (uintptr_t subsystem : subsystemValues) {
+                consider(scanObjectForMeshComponent(subsystem, 0x200));
+            }
+        }
+
+        if (best.transformCount < kMinRenderableBoneCount) {
+            consider(scanObjectForMeshComponent(avatarComp, 0x1000));
+        }
+    };
+
+    const uintptr_t avatarComp = readMeshField(m_off.STBase_AvatarComponent);
+    scanAvatarComponent(avatarComp);
+
+    const uintptr_t fppComp = readMeshField(m_off.STBase_FPPComp);
+    if (ok(fppComp)) {
+        int32_t avatarFieldOffset = m_off.FPPComp_AvatarComp;
+        if (m_interface) {
+            const std::string fppClass = readClassName(fppComp);
+            if (!fppClass.empty() && fppClass[0] != '<') {
+                for (const char* fieldName : {"_AvatarComp", "AvatarComp", "AvatarComponent"}) {
+                    std::string owner;
+                    const auto* info = m_interface->findFieldInHierarchy(fppClass, fieldName, &owner);
+                    if (info) {
+                        avatarFieldOffset = info->offset;
+                        break;
+                    }
+                }
+            }
+        }
+
+        const uintptr_t fppAvatar = resolveObjectField(
+            fppComp + static_cast<uintptr_t>(avatarFieldOffset));
+        if (ok(fppAvatar) && fppAvatar != avatarComp) {
+            scanAvatarComponent(fppAvatar);
+        }
+
+        if (best.transformCount < kMinRenderableBoneCount) {
+            consider(scanObjectForMeshComponent(fppComp, 0x400));
+            if (ok(fppAvatar)) {
+                consider(scanObjectForMeshComponent(fppAvatar, 0x1000));
+            }
+        }
+    }
+
+    return best.transformCount >= kMinRenderableBoneCount ? best.meshComp : 0;
+}
+
+bool DfmMatchMonitor::fillPlayerBones(PlayerInfo& player) const {
+    for (auto& bone : player.bones) bone = {};
+    player.bonesValid = false;
+    if (!ok(player.characterPtr)) return false;
+
+    const uintptr_t meshComp = resolveBestBoneMeshComponent(player.characterPtr);
+    if (!ok(meshComp)) return false;
+
+    TArray<FTransform> boneArray{};
+    if (!safeReadMemory(meshComp + static_cast<uintptr_t>(m_off.Skel_CachedCompSpace),
+                        &boneArray,
+                        sizeof(boneArray))
+        || !isUsableRemoteArray(boneArray, kMaxRenderableBoneCount)
+        || boneArray.Num < kMinRenderableBoneCount) {
+        return false;
+    }
+
+    FTransform componentToWorld{};
+    if (!safeReadMemory(meshComp + static_cast<uintptr_t>(m_off.Scene_ComponentToWorld),
+                        &componentToWorld,
+                        sizeof(componentToWorld))) {
+        return false;
+    }
+
+    std::array<FTransform, kMaxRenderableBoneCount> localTransforms{};
+    const uintptr_t boneData = reinterpret_cast<uintptr_t>(boneArray.Data);
+    if (!safeReadMemory(boneData,
+                        localTransforms.data(),
+                        static_cast<size_t>(boneArray.Num) * sizeof(FTransform))) {
+        return false;
+    }
+
+    BoneAssetCacheEntry boneEntry;
+    const uintptr_t skeletalMeshAsset = getSkeletalMeshAsset(meshComp);
+    const bool haveTrackedBoneMap = resolveTrackedBoneIndices(skeletalMeshAsset, boneEntry);
+
+    const bool haveRootPos = hasUsableActorPoint(player.pos)
+        && (std::fabs(player.pos.x) > 100.0f || std::fabs(player.pos.y) > 100.0f);
+    const float maxAllowedDelta = player.isAI ? 500.0f : 1600.0f;
+    bool anyValid = false;
+    int validBoneCount = 0;
+    for (int slot = 0; slot < PlayerInfo::BONE_COUNT; ++slot) {
+        const int boneIndex = haveTrackedBoneMap
+            ? boneEntry.trackedBoneIndices[slot]
+            : kFallbackBoneMap[slot];
+        if (boneIndex < 0 || boneIndex >= boneArray.Num) continue;
+
+        const FTransform& boneTransform = localTransforms[boneIndex];
+        const FVector3 localPos{
+            boneTransform.TranslationX,
+            boneTransform.TranslationY,
+            boneTransform.TranslationZ,
+        };
+        const FVector3 worldPos = transformPosition(componentToWorld, localPos);
+        if (!hasUsableWorldPoint(worldPos)) continue;
+
+        if (haveRootPos) {
+            const float dx = worldPos.x - player.pos.x;
+            const float dy = worldPos.y - player.pos.y;
+            const float dz = worldPos.z - player.pos.z;
+            if (dx * dx + dy * dy + dz * dz > maxAllowedDelta * maxAllowedDelta) continue;
+        }
+
+        player.bones[slot] = worldPos;
+        anyValid = true;
+        validBoneCount++;
+    }
+
+    player.bonesValid = anyValid && validBoneCount >= kMinTrackedBoneMatches;
+    return player.bonesValid;
+}
+
+// =====================================================================
+//  玩家位置快速更新
 
 void DfmMatchMonitor::updatePlayerPositions(DrawDfmData& data) const {
+    // 周期性位置诊断 (每 10 秒)
+    static auto lastPosDiag = std::chrono::steady_clock::now();
+    auto nowDiag = std::chrono::steady_clock::now();
+    bool doDiag = std::chrono::duration_cast<std::chrono::seconds>(nowDiag - lastPosDiag).count() >= 10;
+    if (doDiag) lastPosDiag = nowDiag;
+
     for (auto& p : data.players) {
         if (p.characterPtr == 0) continue;
         getActorLocation(p.characterPtr, p.pos);
+
+        // 诊断: 每 10 秒采样最多 3 个玩家的详细坐标
+        if (doDiag && p.hp > 0) {
+            uintptr_t psPtr = safeReadPtr(p.characterPtr + m_off.Pawn_PlayerState);
+            uintptr_t root = safeReadPtr(p.characterPtr + m_off.Actor_RootComponent);
+            if (ok(root)) {
+                uintptr_t pawnPrivate = ok(psPtr) ? safeReadPtr(psPtr + m_off.PS_PawnPrivate) : 0;
+                const ReplicatedMovementSnapshot repMove = sampleReplicatedMovement(p.characterPtr);
+                uintptr_t ctwBase = root + m_off.Scene_ComponentToWorld;
+                // 完整 FTransform: quat(XYZW) + translation(XYZ)
+                float qx = safeReadFloat(ctwBase + 0x00);
+                float qy = safeReadFloat(ctwBase + 0x04);
+                float qz = safeReadFloat(ctwBase + 0x08);
+                float qw = safeReadFloat(ctwBase + 0x0C);
+                float tx = safeReadFloat(ctwBase + 0x10);
+                float ty = safeReadFloat(ctwBase + 0x14);
+                float tz = safeReadFloat(ctwBase + 0x18);
+
+                // RootComponent 类名诊断
+                std::string rootClassName = readClassName(root);
+
+                // CameraViewLoc + ReplicatedMovement.Location 诊断
+                float cvx = safeReadFloat(p.characterPtr + static_cast<uintptr_t>(m_off.Char_CameraViewLoc));
+                float cvy = safeReadFloat(p.characterPtr + static_cast<uintptr_t>(m_off.Char_CameraViewLoc) + 4);
+                float cvz = safeReadFloat(p.characterPtr + static_cast<uintptr_t>(m_off.Char_CameraViewLoc) + 8);
+
+                // Actor.ReplicatedMovement 内的 Location
+                // RepMovement 结构体: LinearVelocity(0xC) + AngularVelocity(0xC) + EncVector Location(0x10)
+                // EncVector: {float X +0x00, float Y +0x04, float Z +0x08, EncHandler +0x0C}
+                LOG(LOG_LEVEL_WARN,
+                    "[posUpdate] %s isAI=%d actor=%p rootPtr=%p ps=%p pawnPrivate=%p rootClass=%s quat=(%.3f,%.3f,%.3f,%.3f) rootT=(%.0f,%.0f,%.0f) "
+                    "repMovLoc=(%.0f,%.0f,%.0f) rep=%d enc=%u camView=(%.0f,%.0f,%.0f) final=(%.0f,%.0f,%.0f)",
+                    p.playerName.c_str(), p.isAI?1:0,
+                    (void*)p.characterPtr,
+                    (void*)root,
+                    (void*)psPtr,
+                    (void*)pawnPrivate,
+                    rootClassName.c_str(),
+                    qx, qy, qz, qw,
+                    tx, ty, tz,
+                    repMove.location.x, repMove.location.y, repMove.location.z,
+                    repMove.movementEnabled ? 1 : 0,
+                    static_cast<unsigned>(repMove.encByte),
+                    cvx, cvy, cvz,
+                    p.pos.x, p.pos.y, p.pos.z);
+            }
+            static int diagSamples = 0;
+            if (++diagSamples >= 3) { doDiag = false; diagSamples = 0; }
+        }
 
         // 更新血量
         HealthInfo hi = getCharacterHealth(p.characterPtr);
@@ -1139,6 +2205,19 @@ void DfmMatchMonitor::updatePlayerPositions(DrawDfmData& data) const {
 
         // 更新武器
         p.weapon = getWeaponName(p.characterPtr);
+
+        // 更新骨骼
+        fillPlayerBones(p);
+
+        // ── 真人敌人优先使用骨骼反推脚底位置 ──
+        {
+            FVector3 bonePos{};
+            const bool posUsable = hasUsableActorPoint(p.pos);
+            if (((!p.isAI) || !posUsable) && deriveFootPositionFromBones(p, bonePos)) {
+                p.pos = bonePos;
+                rememberActorLocation(p.characterPtr, p.pos);
+            }
+        }
     }
 
     // 重新统计存活
@@ -1215,10 +2294,14 @@ void DfmMatchMonitor::pollLoop() {
             LOG(LOG_LEVEL_INFO, TAG " 检测到对局开始: %s (%s)", ms.state.c_str(), ms.worldName.c_str());
             persistentData = DrawDfmData{};
             prevData = DrawDfmData{};
+            m_lastKnownActorPositions.clear();
+            m_rootCompensationOwners.clear();
         } else if (!ms.inMatch && wasInMatch) {
             LOG(LOG_LEVEL_INFO, TAG " 对局结束");
             persistentData = DrawDfmData{};
             prevData = DrawDfmData{};
+            m_lastKnownActorPositions.clear();
+            m_rootCompensationOwners.clear();
             SharedDfmData::getInstance().pushData(persistentData);
         }
         wasInMatch = ms.inMatch;
@@ -1297,7 +2380,7 @@ void DfmMatchMonitor::pollLoop() {
             persistentData.myPos = getMyPosition();
             fillCameraData(persistentData);
 
-            // 每 5 秒输出一次 myPos 诊断 (直接写 logcat, 不依赖 g_runtimeLogEnabled)
+            // 每 5 秒输出一次 myPos 诊断
             {
                 static auto lastMyPosLog = std::chrono::steady_clock::now();
                 auto nowLog = std::chrono::steady_clock::now();
@@ -1306,13 +2389,264 @@ void DfmMatchMonitor::pollLoop() {
                     uintptr_t pc = findLocalPlayerController();
                     uintptr_t ackPawn = ok(pc) ? safeReadPtr(pc + m_off.PC_AcknowledgedPawn) : 0;
                     uintptr_t ctrlPawn = ok(pc) ? safeReadPtr(pc + m_off.Ctrl_Pawn) : 0;
-                    __android_log_print(ANDROID_LOG_INFO, "UE5-DFM",
+                    LOG(LOG_LEVEL_INFO,
                         "myPos=(%.0f,%.0f,%.0f) cam=(%.0f,%.0f,%.0f) fov=%.0f yaw=%.1f team=%d "
                         "PC=%p ackPawn=%p ctrlPawn=%p",
                         persistentData.myPos.x, persistentData.myPos.y, persistentData.myPos.z,
                         persistentData.camLocX, persistentData.camLocY, persistentData.camLocZ,
                         persistentData.camFOV, persistentData.camYaw, persistentData.myTeamId,
                         (void*)pc, (void*)ackPawn, (void*)ctrlPawn);
+
+                    struct TrackLogEntry {
+                        const PlayerInfo* player = nullptr;
+                        float distMeters = -1.0f;
+                    };
+
+                    std::vector<TrackLogEntry> selfEntries;
+                    std::vector<TrackLogEntry> enemyEntries;
+                    std::vector<TrackLogEntry> aiEntries;
+                    selfEntries.reserve(2);
+                    enemyEntries.reserve(persistentData.players.size());
+                    aiEntries.reserve(persistentData.players.size());
+
+                    for (const auto& p : persistentData.players) {
+                        if (p.hp <= 0.0f || p.characterPtr == 0) continue;
+
+                        const float distMeters = (hasUsableActorPoint(persistentData.myPos) && hasUsableActorPoint(p.pos))
+                            ? distanceMeters(persistentData.myPos, p.pos)
+                            : -1.0f;
+                        const bool sameTeam = persistentData.myTeamId >= 0
+                            && p.teamId >= 0
+                            && p.teamId == persistentData.myTeamId;
+                        const bool isLocalPawn = p.characterPtr == ackPawn || p.characterPtr == ctrlPawn;
+
+                        if (isLocalPawn || (sameTeam && distMeters >= 0.0f && distMeters < 5.0f)) {
+                            selfEntries.push_back({&p, distMeters});
+                            continue;
+                        }
+                        if (p.isAI) {
+                            aiEntries.push_back({&p, distMeters});
+                            continue;
+                        }
+                        if (!sameTeam || persistentData.myTeamId < 0) {
+                            enemyEntries.push_back({&p, distMeters});
+                        }
+                    }
+
+                    const auto sortEntries = [](std::vector<TrackLogEntry>& entries) {
+                        std::sort(entries.begin(), entries.end(), [](const TrackLogEntry& lhs, const TrackLogEntry& rhs) {
+                            const float lhsDist = lhs.distMeters >= 0.0f ? lhs.distMeters : 1.0e9f;
+                            const float rhsDist = rhs.distMeters >= 0.0f ? rhs.distMeters : 1.0e9f;
+                            return lhsDist < rhsDist;
+                        });
+                    };
+                    sortEntries(selfEntries);
+                    sortEntries(enemyEntries);
+                    sortEntries(aiEntries);
+
+                    LOG(LOG_LEVEL_INFO,
+                        "[track][summary] players=%zu self=%zu enemy=%zu ai=%zu myTeam=%d myPos=(%.0f,%.0f,%.0f) cam=(%.0f,%.0f,%.0f)",
+                        persistentData.players.size(),
+                        selfEntries.size(),
+                        enemyEntries.size(),
+                        aiEntries.size(),
+                        persistentData.myTeamId,
+                        persistentData.myPos.x, persistentData.myPos.y, persistentData.myPos.z,
+                        persistentData.camLocX, persistentData.camLocY, persistentData.camLocZ);
+
+                    const auto dumpTrackEntry = [&](const char* category, const TrackLogEntry& entry) {
+                        const PlayerInfo& p = *entry.player;
+                        uintptr_t psPtr = safeReadPtr(p.characterPtr + m_off.Pawn_PlayerState);
+                        uintptr_t pawnPrivate = ok(psPtr) ? safeReadPtr(psPtr + m_off.PS_PawnPrivate) : 0;
+                        uintptr_t root = safeReadPtr(p.characterPtr + m_off.Actor_RootComponent);
+                        float rootX = 0.0f;
+                        float rootY = 0.0f;
+                        float rootZ = 0.0f;
+                        if (ok(root)) {
+                            rootX = safeReadFloat(root + m_off.Scene_ComponentToWorld + 0x10);
+                            rootY = safeReadFloat(root + m_off.Scene_ComponentToWorld + 0x14);
+                            rootZ = safeReadFloat(root + m_off.Scene_ComponentToWorld + 0x18);
+                        }
+
+                        const float cvx = safeReadFloat(p.characterPtr + static_cast<uintptr_t>(m_off.Char_CameraViewLoc));
+                        const float cvy = safeReadFloat(p.characterPtr + static_cast<uintptr_t>(m_off.Char_CameraViewLoc) + 4);
+                        const float cvz = safeReadFloat(p.characterPtr + static_cast<uintptr_t>(m_off.Char_CameraViewLoc) + 8);
+                        const ReplicatedMovementSnapshot repMove = sampleReplicatedMovement(p.characterPtr);
+
+                        FVector3 boneFoot{};
+                        const bool boneFootValid = deriveFootPositionFromBones(p, boneFoot);
+                        const int sameTeamFlag = (persistentData.myTeamId >= 0 && p.teamId >= 0)
+                            ? (p.teamId == persistentData.myTeamId ? 1 : 0)
+                            : -1;
+
+                        LOG(LOG_LEVEL_INFO,
+                            "[track][%s] name='%s' class='%s' isAI=%d team=%d sameTeam=%d hp=%.0f/%.0f armor=%.0f helmet=%.0f dist=%.1f pos=(%.0f,%.0f,%.0f) root=(%.0f,%.0f,%.0f) repMov=(%.0f,%.0f,%.0f) rep=%d enc=%u camView=(%.0f,%.0f,%.0f) boneFootValid=%d boneFoot=(%.0f,%.0f,%.0f) bones=%d weapon='%s' actor=%p rootPtr=%p ps=%p pawnPrivate=%p",
+                            category,
+                            p.playerName.c_str(),
+                            p.className.c_str(),
+                            p.isAI ? 1 : 0,
+                            p.teamId,
+                            sameTeamFlag,
+                            p.hp,
+                            p.maxHp,
+                            p.armor,
+                            p.helmet,
+                            entry.distMeters,
+                            p.pos.x,
+                            p.pos.y,
+                            p.pos.z,
+                            rootX,
+                            rootY,
+                            rootZ,
+                            repMove.location.x,
+                            repMove.location.y,
+                            repMove.location.z,
+                            repMove.movementEnabled ? 1 : 0,
+                            static_cast<unsigned>(repMove.encByte),
+                            cvx,
+                            cvy,
+                            cvz,
+                            boneFootValid ? 1 : 0,
+                            boneFoot.x,
+                            boneFoot.y,
+                            boneFoot.z,
+                            p.bonesValid ? 1 : 0,
+                            p.weapon.c_str(),
+                                (void*)p.characterPtr,
+                                (void*)root,
+                                (void*)psPtr,
+                                (void*)pawnPrivate);
+                    };
+
+                    if (!selfEntries.empty()) {
+                        dumpTrackEntry("selfPawn", selfEntries.front());
+                    }
+                    const size_t kMaxEnemyLogs = 6;
+                    for (size_t i = 0; i < std::min(enemyEntries.size(), kMaxEnemyLogs); ++i) {
+                        dumpTrackEntry("enemy", enemyEntries[i]);
+                    }
+                    const size_t kMaxAiLogs = 6;
+                    for (size_t i = 0; i < std::min(aiEntries.size(), kMaxAiLogs); ++i) {
+                        dumpTrackEntry("ai", aiEntries[i]);
+                    }
+
+                    // 骨骼诊断: 打印第一个有效玩家的第三人称/FPP/MasterPose 候选状态
+                    for (const auto& p : persistentData.players) {
+                        if (p.hp <= 0 || p.characterPtr == 0) continue;
+                        uintptr_t mesh3p = resolveObjectField(
+                            p.characterPtr + static_cast<uintptr_t>(m_off.Char_Mesh));
+                        int32_t bc3p = getCachedTransformCount(mesh3p);
+                        uintptr_t meshFpp = resolveObjectField(
+                            p.characterPtr + static_cast<uintptr_t>(m_off.Char_FPPMesh));
+                        int32_t bcFpp = getCachedTransformCount(meshFpp);
+                        uintptr_t fppComp = resolveObjectField(
+                            p.characterPtr + static_cast<uintptr_t>(m_off.STBase_FPPComp));
+                        uintptr_t avatarComp = resolveObjectField(
+                            p.characterPtr + static_cast<uintptr_t>(m_off.STBase_AvatarComponent));
+                        uintptr_t fppAvatar = ok(fppComp) && m_off.FPPComp_AvatarComp > 0
+                            ? resolveObjectField(
+                                fppComp + static_cast<uintptr_t>(m_off.FPPComp_AvatarComp))
+                            : 0;
+                        uintptr_t masterBone = ok(avatarComp)
+                            ? resolveObjectField(
+                                avatarComp + static_cast<uintptr_t>(m_off.Avatar_MasterBoneComponent))
+                            : 0;
+                        int32_t bcMasterBone = getCachedTransformCount(masterBone);
+                        uintptr_t master3p = ok(mesh3p) ? followMasterPoseChain(mesh3p) : 0;
+                        int32_t bcMaster = getCachedTransformCount(master3p);
+                        uintptr_t avatarDeep = ok(avatarComp) ? scanObjectForMeshComponent(avatarComp, 0x1000) : 0;
+                        int32_t bcAvatarDeep = getCachedTransformCount(avatarDeep);
+                        std::vector<uintptr_t> meshListValues;
+                        std::vector<uintptr_t> entityListValues;
+                        int32_t meshListActive = 0;
+                        int32_t entityListActive = 0;
+                        int32_t defaultSubActive = 0;
+                        int32_t localSubActive = 0;
+                        int32_t activeSubActive = 0;
+                        int32_t meshListBest = 0;
+                        int32_t entityListBest = 0;
+                        int32_t subsystemBest = 0;
+                        if (ok(avatarComp)) {
+                            meshListValues.reserve(16);
+                            entityListValues.reserve(16);
+                            std::vector<uintptr_t> subsystemValues;
+                            subsystemValues.reserve(24);
+                            meshListActive = collectSparseMapValues(
+                                avatarComp + static_cast<uintptr_t>(m_off.Avatar_MeshComponentList),
+                                meshListValues,
+                                256);
+                            entityListActive = collectSparseMapValues(
+                                avatarComp + static_cast<uintptr_t>(m_off.Avatar_AvatarEntityList),
+                                entityListValues,
+                                128);
+                            for (uintptr_t meshComp : meshListValues) {
+                                meshListBest = std::max(meshListBest, getCachedTransformCount(meshComp));
+                                meshListBest = std::max(meshListBest,
+                                    getCachedTransformCount(followMasterPoseChain(meshComp)));
+                            }
+                            for (uintptr_t entity : entityListValues) {
+                                const uintptr_t entityMesh = scanObjectForMeshComponent(entity, 0x200);
+                                entityListBest = std::max(entityListBest,
+                                    getCachedTransformCount(entityMesh));
+                            }
+                            defaultSubActive = collectObjectArrayValues(
+                                avatarComp + static_cast<uintptr_t>(m_off.Avatar_DefaultAvatarSubSystemList),
+                                subsystemValues,
+                                64);
+                            localSubActive = collectObjectArrayValues(
+                                avatarComp + static_cast<uintptr_t>(m_off.Avatar_LocalSubSystemList),
+                                subsystemValues,
+                                64);
+                            activeSubActive = collectObjectArrayValues(
+                                avatarComp + static_cast<uintptr_t>(m_off.Avatar_LocalActiveSubSystemList),
+                                subsystemValues,
+                                64);
+                            for (uintptr_t subsystem : subsystemValues) {
+                                const uintptr_t subsystemMesh = scanObjectForMeshComponent(subsystem, 0x200);
+                                subsystemBest = std::max(subsystemBest,
+                                    getCachedTransformCount(subsystemMesh));
+                            }
+                        }
+                        TArray<uintptr_t> pool{};
+                        int32_t poolNum = 0;
+                        if (ok(avatarComp)
+                            && safeReadMemory(avatarComp + static_cast<uintptr_t>(m_off.Avatar_SkeletalMeshCompPool),
+                                              &pool,
+                                              sizeof(pool))
+                            && isUsableRemoteArray(pool, 64)) {
+                            poolNum = pool.Num;
+                        }
+                        uintptr_t fppBranch = ok(fppComp) ? scanObjectForMeshComponent(fppComp, 0x400) : 0;
+                        int32_t bcFppBranch = getCachedTransformCount(fppBranch);
+                        uintptr_t bestMesh = resolveBestBoneMeshComponent(p.characterPtr);
+                        int32_t bcBest = getCachedTransformCount(bestMesh);
+                        const uintptr_t bestAsset = getSkeletalMeshAsset(bestMesh);
+                        BoneAssetCacheEntry bestEntry;
+                        const int boneMatched = resolveTrackedBoneIndices(bestAsset, bestEntry)
+                            ? bestEntry.matchedCount
+                            : 0;
+                        if (bcBest <= 0 && boneMatched <= 0 && !p.bonesValid) {
+                            continue;
+                        }
+
+                        LOG(LOG_LEVEL_INFO,
+                            "[bone] '%s' mesh3p=%p(bc=%d) fpp=%p(bc=%d) fppComp=%p fppAvatar=%p fppBranch=%p(bc=%d) avatar=%p avatarDeep=%p(bc=%d) masterBone=%p(bc=%d) master=%p(bc=%d) meshList=%d/%zu(best=%d) entityList=%d/%zu(best=%d) subSys=%d/%d/%d(best=%d) pool=%d best=%p(bc=%d asset=%p matched=%d) valid=%d",
+                            p.playerName.c_str(), (void*)mesh3p, bc3p,
+                            (void*)meshFpp, bcFpp,
+                            (void*)fppComp, (void*)fppAvatar,
+                            (void*)fppBranch, bcFppBranch,
+                            (void*)avatarComp,
+                            (void*)avatarDeep, bcAvatarDeep,
+                            (void*)masterBone, bcMasterBone,
+                            (void*)master3p, bcMaster,
+                            meshListActive, meshListValues.size(), meshListBest,
+                            entityListActive, entityListValues.size(), entityListBest,
+                            defaultSubActive, localSubActive, activeSubActive, subsystemBest,
+                            poolNum,
+                            (void*)bestMesh, bcBest, (void*)bestAsset, boneMatched,
+                            p.bonesValid ? 1 : 0);
+                        break;  // 只打印第一个
+                    }
                 }
             }
 

@@ -356,9 +356,6 @@ static void DfmWorkerThread(DfmInjectParams* params) {
     uintptr_t base = p.base;
     uint64_t moduleSize = p.moduleSize;
 
-    // 启用运行时日志 (LOG 宏依赖此开关)
-    g_runtimeLogEnabled = true;
-
     LOG(LOG_LEVEL_INFO, "[DfmWorker] 工作线程启动");
     DLOG("[DfmWorker] 工作线程启动 base=%p moduleSize=0x%llX", (void*)base, (unsigned long long)moduleSize);
     LOG(LOG_LEVEL_INFO, "[DfmWorker] base=%p moduleSize=0x%llX offNP=0x%X offNum=0x%X offChunks=0x%X offGW=0x%X",

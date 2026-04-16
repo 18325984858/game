@@ -385,6 +385,59 @@ std::vector<UE5DfmDumper::FuncInfo> UE5DfmDumper::collectFuncs(uintptr_t classPt
     return funcs;
 }
 
+// ===================== CDO (Class Default Object) 查找 ===============
+
+uintptr_t UE5DfmDumper::findCDO(uintptr_t classPtr) {
+    if (!ok(classPtr)) return 0;
+
+    // 已知偏移直接读取
+    if (m_cdoOffset >= 0) {
+        uintptr_t cdo = rp(classPtr + static_cast<uintptr_t>(m_cdoOffset));
+        return ok(cdo) ? cdo : 0;
+    }
+
+    // 扫描 UClass 内存找 CDO: CDO.ClassPrivate (+0x08) 应指回 classPtr
+    for (int off = 0xC0; off <= 0x260; off += 8) {
+        uintptr_t candidate = rp(classPtr + static_cast<uintptr_t>(off));
+        if (!ok(candidate)) continue;
+        uintptr_t candidateClass = rp(candidate + offsetof(UObjectBase, ClassPrivate));
+        if (candidateClass != classPtr) continue;
+        // 验证: CDO 名字应包含 "Default__"
+        std::string cdoName = oname(candidate);
+        if (cdoName.find("Default__") == 0) {
+            m_cdoOffset = off;
+            LOG(LOG_LEVEL_INFO, "[DfmDumper] CDO found at UClass+0x%X", off);
+            return candidate;
+        }
+    }
+    return 0;
+}
+
+// ===================== NativeFunc 反查表 ==============================
+
+void UE5DfmDumper::buildNativeFuncMap() {
+    m_nativeFuncMap.clear();
+    uint32_t maxObj = r32(m_moduleBase + m_offGUObjectArrayNum);
+
+    for (uint32_t i = 0; i < maxObj; i++) {
+        uintptr_t obj = getobj(static_cast<int>(i));
+        if (!ok(obj)) continue;
+        uintptr_t cls = rp(obj + offsetof(UObjectBase, ClassPrivate));
+        if (!ok(cls)) continue;
+        std::string clsName = oname(cls);
+        if (clsName != "Function" && clsName != "DelegateFunction") continue;
+
+        uintptr_t nfPtr = rp(obj + offsetof(UFunction, Func));
+        if (!ok(nfPtr)) continue;
+
+        uintptr_t ownerClass = rp(obj + offsetof(UObjectBase, OuterPrivate));
+        std::string ownerName = ok(ownerClass) ? oname(ownerClass) : "?";
+        m_nativeFuncMap[nfPtr] = ownerName + "::" + oname(obj);
+    }
+    LOG(LOG_LEVEL_INFO, "[DfmDumper] NativeFunc map: %zu entries",
+        m_nativeFuncMap.size());
+}
+
 // ===================== 输出路径 ======================================
 
 std::string UE5DfmDumper::resolveOutputPath(const char* filename) const {
@@ -461,6 +514,10 @@ bool UE5DfmDumper::dumpSDK(const char* filePath) {
     LOG(LOG_LEVEL_INFO, "[DfmDumper] [SDK] Starting...");
     fprintf(fp, "// UE SDK Dump (C++ native)\n// Target: com.tencent.tmgp.dfm\n// Base: 0x%lX\n\n",
             static_cast<unsigned long>(m_moduleBase));
+
+    // 设置较大的 I/O 缓冲区减少系统调用
+    static char ioBuf[1 << 16]; // 64KB
+    setvbuf(fp, ioBuf, _IOFBF, sizeof(ioBuf));
     fflush(fp);
 
     uint32_t maxObj = r32(m_moduleBase + m_offGUObjectArrayNum);
@@ -469,6 +526,9 @@ bool UE5DfmDumper::dumpSDK(const char* filePath) {
     // 缓存: 避免重复收集同一个 UStruct 的字段/函数
     std::unordered_map<uintptr_t, std::vector<FieldInfo>> fieldCache;
     std::unordered_map<uintptr_t, std::vector<FuncInfo>> funcCache;
+
+    // Phase 0: 预扫描所有 UFunction, 构建 NativeFunc 地址→名称 反查表
+    buildNativeFuncMap();
 
     for (uint32_t idx = 0; idx < maxObj; idx++) {
         uintptr_t p = getobj(static_cast<int>(idx));
@@ -557,32 +617,63 @@ bool UE5DfmDumper::dumpSDK(const char* filePath) {
             }
         }
 
-        // ---- VTable diff (仅 Class) ----
+        // ---- VTable via CDO (仅 Class) ----
         if (kind == 1) {
-            uintptr_t vtbl = rp(p);
-            uintptr_t pVtbl = ok(superP) ? rp(superP) : 0;
+            uintptr_t cdo = findCDO(p);
+            uintptr_t vtbl = ok(cdo) ? rp(cdo) : 0;
+            uintptr_t pCdo = ok(superP) ? findCDO(superP) : 0;
+            uintptr_t pVtbl = ok(pCdo) ? rp(pCdo) : 0;
+
             if (ok(vtbl)) {
-                fprintf(fp, "\n\t// C++ VTable (diff vs parent%s%s)\n",
-                        superName.empty() ? "" : " ", superName.c_str());
+                // 计算虚表总槽数
+                int vtblTotal = 0;
+                for (int vc = 0; vc < 1024; vc++) {
+                    uintptr_t ve = rp(vtbl + static_cast<uintptr_t>(vc) * 8);
+                    if (!ok(ve)) break;
+                    if (m_moduleSize > 0 && (ve < m_moduleBase || ve >= m_moduleBase + m_moduleSize)) break;
+                    vtblTotal++;
+                }
+                // 父类虚表槽数
+                int pVtblTotal = 0;
                 if (ok(pVtbl)) {
-                    for (int vi = 0; vi < 400; vi++) {
-                        uintptr_t ve = rp(vtbl + static_cast<uintptr_t>(vi) * 8);
-                        if (!ok(ve)) break;
-                        // 检查地址是否在模块范围内
-                        if (m_moduleSize > 0 && (ve < m_moduleBase || ve >= m_moduleBase + m_moduleSize)) break;
+                    for (int pvc = 0; pvc < 1024; pvc++) {
+                        uintptr_t pvce = rp(pVtbl + static_cast<uintptr_t>(pvc) * 8);
+                        if (!ok(pvce)) break;
+                        if (m_moduleSize > 0 && (pvce < m_moduleBase || pvce >= m_moduleBase + m_moduleSize)) break;
+                        pVtblTotal++;
+                    }
+                }
+
+                fprintf(fp, "\n\t// C++ VTable: %d slots%s\n",
+                        vtblTotal,
+                        ok(pVtbl)
+                            ? (std::string(" (parent ") + superName + ": " + std::to_string(pVtblTotal) + " slots)").c_str()
+                            : "");
+
+                for (int vi = 0; vi < vtblTotal; vi++) {
+                    uintptr_t ve = rp(vtbl + static_cast<uintptr_t>(vi) * 8);
+                    uintptr_t rva = ve - m_moduleBase;
+
+                    // inherited / override / new
+                    const char* tag = "";
+                    if (ok(pVtbl) && vi < pVtblTotal) {
                         uintptr_t pe = rp(pVtbl + static_cast<uintptr_t>(vi) * 8);
-                        if (ve == pe) continue;
-                        fprintf(fp, "\tvirtual void sub_%s_0x%lX(); // [Slot: 0x%X] [override]\n",
-                                nm.c_str(), static_cast<unsigned long>(ve - m_moduleBase), vi * 8);
+                        tag = (ve == pe) ? " (inherited)" : " (override)";
+                    } else if (vi >= pVtblTotal) {
+                        tag = " (new)";
                     }
-                } else {
-                    for (int vi = 0; vi < 80; vi++) {
-                        uintptr_t ve = rp(vtbl + static_cast<uintptr_t>(vi) * 8);
-                        if (!ok(ve)) break;
-                        if (m_moduleSize > 0 && (ve < m_moduleBase || ve >= m_moduleBase + m_moduleSize)) break;
-                        fprintf(fp, "\tvirtual void sub_%s_0x%lX(); // [Slot: 0x%X]\n",
-                                nm.c_str(), static_cast<unsigned long>(ve - m_moduleBase), vi * 8);
+
+                    // NativeFunc 反查
+                    std::string sym;
+                    auto it = m_nativeFuncMap.find(ve);
+                    if (it != m_nativeFuncMap.end()) {
+                        sym = " " + it->second;
                     }
+
+                    fprintf(fp, "\t// [%d] +0x%X -> 0x%lX%s%s\n",
+                            vi, vi * 8,
+                            static_cast<unsigned long>(rva),
+                            tag, sym.c_str());
                 }
             }
         }
