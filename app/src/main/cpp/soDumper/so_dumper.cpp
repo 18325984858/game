@@ -23,6 +23,32 @@
 
 #define DTAG "[SoDumper]"
 
+// ELF 常量 (部分 NDK 版本可能缺失)
+#ifndef DT_GNU_HASH
+#define DT_GNU_HASH      0x6ffffef5
+#endif
+#ifndef DT_VERSYM
+#define DT_VERSYM        0x6ffffff0
+#endif
+#ifndef DT_VERNEED
+#define DT_VERNEED       0x6ffffffe
+#endif
+#ifndef DT_VERNEEDNUM
+#define DT_VERNEEDNUM    0x6fffffff
+#endif
+#ifndef DT_VERDEF
+#define DT_VERDEF        0x6ffffffc
+#endif
+#ifndef SHT_GNU_HASH
+#define SHT_GNU_HASH     0x6ffffff6
+#endif
+#ifndef SHT_GNU_VERSYM
+#define SHT_GNU_VERSYM   0x6fffffff
+#endif
+#ifndef SHT_GNU_verneed
+#define SHT_GNU_verneed  0x6ffffffe
+#endif
+
 namespace SoDumper {
 
 // ─── 工具函数 ───────────────────────────────────────────────────────
@@ -132,8 +158,12 @@ std::vector<ModuleInfo> listModules(int pid) {
         return result;
     }
 
-    // 收集所有 .so 映射, 按路径合并
-    std::map<std::string, ModuleInfo> moduleMap;
+    // 收集所有 .so 映射, 按路径合并; 同时累计实际映射字节数
+    struct ModuleAcc {
+        ModuleInfo info;
+        size_t mappedBytes; // 实际映射字节 (各区域之和)
+    };
+    std::map<std::string, ModuleAcc> moduleMap;
 
     char line[1024];
     while (fgets(line, sizeof(line), fp)) {
@@ -155,26 +185,28 @@ std::vector<ModuleInfo> listModules(int pid) {
         if (pathStr[0] != '/') continue;
 
         if (moduleMap.find(pathStr) == moduleMap.end()) {
-            ModuleInfo mod;
-            mod.path = pathStr;
-            // 提取文件名
+            ModuleAcc acc;
+            acc.info.path = pathStr;
             size_t slashPos = pathStr.rfind('/');
-            mod.name = (slashPos != std::string::npos) ? pathStr.substr(slashPos + 1) : pathStr;
-            mod.baseAddr = start;
-            mod.endAddr = end;
-            mod.size = end - start;
-            moduleMap[pathStr] = mod;
+            acc.info.name = (slashPos != std::string::npos) ? pathStr.substr(slashPos + 1) : pathStr;
+            acc.info.baseAddr = start;
+            acc.info.endAddr = end;
+            acc.mappedBytes = end - start;
+            moduleMap[pathStr] = acc;
         } else {
-            auto& mod = moduleMap[pathStr];
-            if (start < mod.baseAddr) mod.baseAddr = start;
-            if (end > mod.endAddr) mod.endAddr = end;
-            mod.size = mod.endAddr - mod.baseAddr;
+            auto& acc = moduleMap[pathStr];
+            if (start < acc.info.baseAddr) acc.info.baseAddr = start;
+            if (end > acc.info.endAddr) acc.info.endAddr = end;
+            acc.mappedBytes += (end - start);
         }
     }
     pclose(fp);
 
     for (auto& kv : moduleMap) {
-        result.push_back(kv.second);
+        auto& acc = kv.second;
+        // size 报告实际映射字节, 而非虚拟地址跨度
+        acc.info.size = acc.mappedBytes;
+        result.push_back(acc.info);
     }
 
     // 按名称排序
@@ -187,202 +219,842 @@ std::vector<ModuleInfo> listModules(int pid) {
     return result;
 }
 
-// ─── ELF 修复 ───────────────────────────────────────────────────────
+// ─── 进程内存读取 (通过 su + dd) ────────────────────────────────────
 
 /**
- * 修复 ELF 头部:
- * 1. 修复 section header (运行时通常被清除, 直接置零)
- * 2. 修复 program header 偏移
- * 3. 修复 PT_LOAD 段的文件偏移与大小使之与内存布局一致
+ * 从目标进程内存读取指定地址的数据到缓冲区
+ * @return 实际读取的字节数, 0 表示失败
  */
-static bool fixElf64(uint8_t* data, size_t dataSize) {
-    if (dataSize < sizeof(Elf64_Ehdr)) return false;
+static size_t readProcessMemory(int pid, uintptr_t addr, size_t size, uint8_t* buf) {
+    const size_t PAGE_SIZE = 4096;
+    uintptr_t pageStart = addr & ~(PAGE_SIZE - 1);
+    size_t pageOffset = addr - pageStart;
+    size_t pageCount = (pageOffset + size + PAGE_SIZE - 1) / PAGE_SIZE;
 
-    auto* ehdr = reinterpret_cast<Elf64_Ehdr*>(data);
+    const char* tmpPath = "/data/local/tmp/so_dump/_pmem_tmp";
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+        "su -c 'dd if=/proc/%d/mem of=%s bs=%zu skip=%zu count=%zu "
+        "conv=noerror,sync 2>/dev/null && chmod 666 %s'",
+        pid, tmpPath, PAGE_SIZE, pageStart / PAGE_SIZE, pageCount, tmpPath);
 
-    // 验证 ELF magic
-    if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0) {
-        __android_log_print(ANDROID_LOG_ERROR, DTAG, "不是有效的 ELF 文件");
-        return false;
+    system(cmd);
+
+    FILE* fp = fopen(tmpPath, "rb");
+    if (!fp) {
+        __android_log_print(ANDROID_LOG_ERROR, DTAG, "readProcessMemory: 无法打开 tmp 文件");
+        return 0;
     }
 
-    // section header 在内存 dump 中通常无效, 清零
-    ehdr->e_shoff = 0;
-    ehdr->e_shnum = 0;
-    ehdr->e_shstrndx = 0;
-    // e_shentsize 保留
+    fseek(fp, (long)pageOffset, SEEK_SET);
+    size_t got = fread(buf, 1, size, fp);
+    fclose(fp);
 
-    // 修复 program headers
-    if (ehdr->e_phoff == 0 || ehdr->e_phnum == 0) {
-        __android_log_print(ANDROID_LOG_WARN, DTAG, "ELF 无 program header, 跳过修复");
-        return true;
-    }
-
-    if (ehdr->e_phoff + ehdr->e_phnum * ehdr->e_phentsize > dataSize) {
-        __android_log_print(ANDROID_LOG_WARN, DTAG, "program header 越界, 跳过修复");
-        return true;
-    }
-
-    // 修复 PT_LOAD 段: 使 p_offset 与 p_vaddr 对齐
-    for (int i = 0; i < ehdr->e_phnum; i++) {
-        auto* phdr = reinterpret_cast<Elf64_Phdr*>(data + ehdr->e_phoff + i * ehdr->e_phentsize);
-
-        if (phdr->p_type == PT_LOAD) {
-            // 内存 dump 中 p_offset 应该等于 p_vaddr (相对于基址)
-            phdr->p_offset = phdr->p_vaddr;
-            // p_filesz 设为与 p_memsz 相同 (dump 后数据已在文件中)
-            phdr->p_filesz = phdr->p_memsz;
-        }
-    }
-
-    __android_log_print(ANDROID_LOG_INFO, DTAG, "ELF64 修复完成");
-    return true;
+    // 清理临时文件
+    system("su -c 'rm -f /data/local/tmp/so_dump/_pmem_tmp'");
+    return got;
 }
 
-static bool fixElf32(uint8_t* data, size_t dataSize) {
-    if (dataSize < sizeof(Elf32_Ehdr)) return false;
+/**
+ * 从目标进程内存读取大块数据, 直接 dd 到文件
+ * @return 实际文件大小, 0 表示失败
+ */
+static size_t readProcessMemoryToFile(int pid, uintptr_t addr, size_t size,
+                                       const std::string& outTmpPath) {
+    const size_t PAGE_SIZE = 4096;
+    uintptr_t pageStart = addr & ~(PAGE_SIZE - 1);
+    size_t pageOffset = addr - pageStart;
+    size_t pageCount = (pageOffset + size + PAGE_SIZE - 1) / PAGE_SIZE;
 
-    auto* ehdr = reinterpret_cast<Elf32_Ehdr*>(data);
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+        "su -c 'dd if=/proc/%d/mem of=%s bs=%zu skip=%zu count=%zu "
+        "conv=noerror,sync 2>/dev/null && chmod 666 %s'",
+        pid, outTmpPath.c_str(), PAGE_SIZE, pageStart / PAGE_SIZE, pageCount,
+        outTmpPath.c_str());
 
-    if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0) {
-        __android_log_print(ANDROID_LOG_ERROR, DTAG, "不是有效的 ELF 文件");
-        return false;
-    }
+    system(cmd);
 
-    ehdr->e_shoff = 0;
-    ehdr->e_shnum = 0;
-    ehdr->e_shstrndx = 0;
-
-    if (ehdr->e_phoff == 0 || ehdr->e_phnum == 0) {
-        return true;
-    }
-
-    if (ehdr->e_phoff + ehdr->e_phnum * ehdr->e_phentsize > dataSize) {
-        return true;
-    }
-
-    for (int i = 0; i < ehdr->e_phnum; i++) {
-        auto* phdr = reinterpret_cast<Elf32_Phdr*>(data + ehdr->e_phoff + i * ehdr->e_phentsize);
-        if (phdr->p_type == PT_LOAD) {
-            phdr->p_offset = phdr->p_vaddr;
-            phdr->p_filesz = phdr->p_memsz;
-        }
-    }
-
-    __android_log_print(ANDROID_LOG_INFO, DTAG, "ELF32 修复完成");
-    return true;
+    FILE* fp = fopen(outTmpPath.c_str(), "rb");
+    if (!fp) return 0;
+    fseek(fp, 0, SEEK_END);
+    size_t fileSize = (size_t)ftell(fp);
+    fclose(fp);
+    return fileSize;
 }
 
-// ─── Dump + 修复 ────────────────────────────────────────────────────
+// ─── Dump + 修复 (PT_LOAD 段感知) ──────────────────────────────────
 
 int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath) {
     __android_log_print(ANDROID_LOG_INFO, DTAG,
-                        "开始 dump: pid=%d, module=%s, base=0x%lx, size=%zu",
-                        pid, module.name.c_str(), (unsigned long)module.baseAddr, module.size);
+                        "开始 dump: pid=%d, module=%s, base=0x%lx, end=0x%lx, size=%zu",
+                        pid, module.name.c_str(),
+                        (unsigned long)module.baseAddr, (unsigned long)module.endAddr,
+                        module.size);
 
-    size_t totalSize = module.size;
-    if (totalSize == 0 || totalSize > 512 * 1024 * 1024) {
-        __android_log_print(ANDROID_LOG_ERROR, DTAG, "模块大小异常: %zu", totalSize);
+    uintptr_t baseAddr = module.baseAddr;
+    if (baseAddr == 0) {
+        __android_log_print(ANDROID_LOG_ERROR, DTAG, "baseAddr 为 0");
         return -2;
     }
 
-    // SO 模块基地址一定是页对齐的 (mmap)
+    // 创建临时目录
+    system("su -c 'mkdir -p /data/local/tmp/so_dump && chmod 777 /data/local/tmp/so_dump'");
+
+    // ── Step 1: 读取首页, 获取 ELF 头 ──
     const size_t PAGE_SIZE = 4096;
-    size_t skipPages = module.baseAddr / PAGE_SIZE;
-    size_t countPages = (totalSize + PAGE_SIZE - 1) / PAGE_SIZE;
+    const size_t HEADER_PAGES = 4;  // 读 4 页 (16KB) 确保覆盖 phdr 表
+    size_t headerReadSize = PAGE_SIZE * HEADER_PAGES;
+    uint8_t* headerBuf = new(std::nothrow) uint8_t[headerReadSize];
+    if (!headerBuf) return -3;
+    memset(headerBuf, 0, headerReadSize);
 
-    std::string rawPath = outPath + ".raw";
-
-    // 使用 su + dd 从 /proc/pid/mem 读取内存
-    // conv=noerror,sync: 遇到不可读页继续读取, 并用 0 填充
-    char cmd[2048];
-    snprintf(cmd, sizeof(cmd),
-        "su -c 'mkdir -p /data/local/tmp/so_dump && "
-        "chmod 777 /data/local/tmp/so_dump && "
-        "dd if=/proc/%d/mem of=%s bs=4096 skip=%zu count=%zu conv=noerror,sync 2>/dev/null && "
-        "chmod 666 %s'",
-        pid, rawPath.c_str(), skipPages, countPages, rawPath.c_str());
-
-    __android_log_print(ANDROID_LOG_INFO, DTAG, "执行: %s", cmd);
-    int sysRet = system(cmd);
-    if (sysRet != 0) {
-        __android_log_print(ANDROID_LOG_WARN, DTAG, "dd 返回 %d, 尝试继续...", sysRet);
-    }
-
-    // 读取 dd 输出的 raw 文件
-    FILE* rawFp = fopen(rawPath.c_str(), "rb");
-    if (!rawFp) {
-        __android_log_print(ANDROID_LOG_ERROR, DTAG, "无法打开 raw 文件: %s", rawPath.c_str());
+    size_t headerGot = readProcessMemory(pid, baseAddr, headerReadSize, headerBuf);
+    if (headerGot < sizeof(Elf64_Ehdr)) {
+        __android_log_print(ANDROID_LOG_ERROR, DTAG, "读取 ELF 头失败, got=%zu", headerGot);
+        delete[] headerBuf;
         return -4;
     }
 
-    fseek(rawFp, 0, SEEK_END);
-    size_t fileSize = (size_t)ftell(rawFp);
-    fseek(rawFp, 0, SEEK_SET);
-
-    // 取实际模块大小 (dd 可能多读了一页)
-    size_t actualSize = std::min(fileSize, totalSize);
-    if (actualSize == 0) {
-        __android_log_print(ANDROID_LOG_ERROR, DTAG, "raw 文件为空");
-        fclose(rawFp);
-        return -4;
+    // 验证 ELF magic
+    if (memcmp(headerBuf, ELFMAG, SELFMAG) != 0) {
+        __android_log_print(ANDROID_LOG_ERROR, DTAG, "无效 ELF magic");
+        delete[] headerBuf;
+        return -2;
     }
 
-    uint8_t* buffer = new(std::nothrow) uint8_t[actualSize];
-    if (!buffer) {
-        __android_log_print(ANDROID_LOG_ERROR, DTAG, "内存分配失败: %zu bytes", actualSize);
-        fclose(rawFp);
-        return -3;
-    }
+    bool is64 = (headerBuf[EI_CLASS] == ELFCLASS64);
+    __android_log_print(ANDROID_LOG_INFO, DTAG, "ELF class: %s", is64 ? "64-bit" : "32-bit");
 
-    size_t bytesRead = fread(buffer, 1, actualSize, rawFp);
-    fclose(rawFp);
+    // ── Step 2: 解析 PT_LOAD 段 ──
+    struct LoadSeg {
+        uintptr_t vaddr;   // p_vaddr (相对于 ELF 基址 0)
+        size_t offset;     // p_offset (原始文件偏移)
+        size_t memsz;      // p_memsz
+    };
+    std::vector<LoadSeg> loadSegs;
+    size_t outFileSize = 0;
 
-    __android_log_print(ANDROID_LOG_INFO, DTAG, "读取 raw 文件: %zu / %zu bytes", bytesRead, actualSize);
+    if (is64) {
+        auto* ehdr = reinterpret_cast<Elf64_Ehdr*>(headerBuf);
+        size_t phdrEnd = ehdr->e_phoff + (size_t)ehdr->e_phnum * ehdr->e_phentsize;
+        if (phdrEnd > headerGot) {
+            // phdr 表超出已读范围, 需要额外读取
+            __android_log_print(ANDROID_LOG_WARN, DTAG,
+                "phdr 表偏移 %zu 超出首次读取范围 %zu, 扩展读取",
+                phdrEnd, headerGot);
+            uint8_t* newBuf = new(std::nothrow) uint8_t[phdrEnd];
+            if (!newBuf) { delete[] headerBuf; return -3; }
+            memcpy(newBuf, headerBuf, headerGot);
+            delete[] headerBuf;
+            headerBuf = newBuf;
+            headerReadSize = phdrEnd;
+            // 读取剩余部分
+            if (phdrEnd > headerGot) {
+                readProcessMemory(pid, baseAddr + headerGot, phdrEnd - headerGot,
+                                  headerBuf + headerGot);
+            }
+            ehdr = reinterpret_cast<Elf64_Ehdr*>(headerBuf);
+        }
 
-    if (bytesRead == 0) {
-        __android_log_print(ANDROID_LOG_ERROR, DTAG, "未读取到任何数据");
-        delete[] buffer;
-        return -4;
-    }
+        for (int i = 0; i < ehdr->e_phnum; i++) {
+            auto* phdr = reinterpret_cast<Elf64_Phdr*>(
+                headerBuf + ehdr->e_phoff + i * ehdr->e_phentsize);
+            if (phdr->p_type == PT_LOAD) {
+                LoadSeg seg;
+                seg.vaddr = phdr->p_vaddr;
+                seg.offset = phdr->p_offset;
+                seg.memsz = phdr->p_memsz;
+                loadSegs.push_back(seg);
+                size_t segEnd = seg.offset + seg.memsz;
+                if (segEnd > outFileSize) outFileSize = segEnd;
+                __android_log_print(ANDROID_LOG_INFO, DTAG,
+                    "PT_LOAD[%d]: vaddr=0x%lx offset=0x%lx memsz=0x%lx",
+                    i, (unsigned long)seg.vaddr, (unsigned long)seg.offset,
+                    (unsigned long)seg.memsz);
+            }
+        }
+    } else {
+        auto* ehdr = reinterpret_cast<Elf32_Ehdr*>(headerBuf);
+        size_t phdrEnd = ehdr->e_phoff + (size_t)ehdr->e_phnum * ehdr->e_phentsize;
+        if (phdrEnd > headerGot) {
+            uint8_t* newBuf = new(std::nothrow) uint8_t[phdrEnd];
+            if (!newBuf) { delete[] headerBuf; return -3; }
+            memcpy(newBuf, headerBuf, headerGot);
+            delete[] headerBuf;
+            headerBuf = newBuf;
+            headerReadSize = phdrEnd;
+            if (phdrEnd > headerGot) {
+                readProcessMemory(pid, baseAddr + headerGot, phdrEnd - headerGot,
+                                  headerBuf + headerGot);
+            }
+            ehdr = reinterpret_cast<Elf32_Ehdr*>(headerBuf);
+        }
 
-    // 修复 ELF
-    if (actualSize >= EI_NIDENT) {
-        uint8_t elfClass = buffer[EI_CLASS];
-        if (elfClass == ELFCLASS64) {
-            fixElf64(buffer, actualSize);
-        } else if (elfClass == ELFCLASS32) {
-            fixElf32(buffer, actualSize);
-        } else {
-            __android_log_print(ANDROID_LOG_WARN, DTAG, "未知 ELF class: %d, 不进行修复", elfClass);
+        for (int i = 0; i < ehdr->e_phnum; i++) {
+            auto* phdr = reinterpret_cast<Elf32_Phdr*>(
+                headerBuf + ehdr->e_phoff + i * ehdr->e_phentsize);
+            if (phdr->p_type == PT_LOAD) {
+                LoadSeg seg;
+                seg.vaddr = phdr->p_vaddr;
+                seg.offset = phdr->p_offset;
+                seg.memsz = phdr->p_memsz;
+                loadSegs.push_back(seg);
+                size_t segEnd = seg.offset + seg.memsz;
+                if (segEnd > outFileSize) outFileSize = segEnd;
+            }
         }
     }
 
-    // 写入修复后的文件
+    if (loadSegs.empty()) {
+        __android_log_print(ANDROID_LOG_ERROR, DTAG, "未找到 PT_LOAD 段");
+        delete[] headerBuf;
+        return -2;
+    }
+
+    __android_log_print(ANDROID_LOG_INFO, DTAG,
+        "找到 %zu 个 PT_LOAD 段, 输出文件大小: %zu bytes (%.2f MB)",
+        loadSegs.size(), outFileSize, outFileSize / (1024.0 * 1024.0));
+
+    // 输出文件大小检查 (基于原始 p_offset 布局, 通常与磁盘 SO 大小接近)
+    if (outFileSize == 0 || outFileSize > (size_t)2 * 1024 * 1024 * 1024) {
+        __android_log_print(ANDROID_LOG_ERROR, DTAG, "输出文件大小异常: %zu", outFileSize);
+        delete[] headerBuf;
+        return -2;
+    }
+
+    // ── Step 3: 分配输出缓冲区 (零初始化) ──
+    uint8_t* outBuf = new(std::nothrow) uint8_t[outFileSize]();
+    if (!outBuf) {
+        __android_log_print(ANDROID_LOG_ERROR, DTAG, "分配 %zu 字节失败", outFileSize);
+        delete[] headerBuf;
+        return -3;
+    }
+
+    // 先把 header 页写入 (含 ELF 头 + program headers)
+    size_t hdrCopy = std::min(headerReadSize, outFileSize);
+    memcpy(outBuf, headerBuf, hdrCopy);
+    delete[] headerBuf;
+    headerBuf = nullptr;
+
+    // ── Step 4: 逐段 dump PT_LOAD 数据 ──
+    std::string segTmpPath = "/data/local/tmp/so_dump/_seg_tmp";
+
+    for (size_t si = 0; si < loadSegs.size(); si++) {
+        auto& seg = loadSegs[si];
+        uintptr_t memAddr = baseAddr + seg.vaddr;
+        size_t readSize = seg.memsz;
+
+        if (seg.offset + readSize > outFileSize) {
+            readSize = outFileSize - seg.offset;
+        }
+        if (readSize == 0) continue;
+
+        __android_log_print(ANDROID_LOG_INFO, DTAG,
+            "Dump PT_LOAD[%zu]: mem=0x%lx -> file_off=0x%lx, size=%zu",
+            si, (unsigned long)memAddr, (unsigned long)seg.offset, readSize);
+
+        // 对于小段 (< 64KB), 直接读到内存
+        if (readSize <= 64 * 1024) {
+            readProcessMemory(pid, memAddr, readSize, outBuf + seg.offset);
+        } else {
+            // 大段: dd 到文件, 再分块读入
+            size_t tmpFileSize = readProcessMemoryToFile(pid, memAddr, readSize, segTmpPath);
+            if (tmpFileSize == 0) {
+                __android_log_print(ANDROID_LOG_WARN, DTAG,
+                    "PT_LOAD[%zu] dd 失败, 跳过", si);
+                continue;
+            }
+
+            FILE* segFp = fopen(segTmpPath.c_str(), "rb");
+            if (segFp) {
+                // 处理页对齐偏移
+                size_t pageOffset = memAddr & (PAGE_SIZE - 1);
+                fseek(segFp, (long)pageOffset, SEEK_SET);
+                size_t got = fread(outBuf + seg.offset, 1, readSize, segFp);
+                fclose(segFp);
+                __android_log_print(ANDROID_LOG_INFO, DTAG,
+                    "PT_LOAD[%zu]: 读取 %zu / %zu bytes", si, got, readSize);
+            }
+
+            // 清理段临时文件
+            char rmCmd[512];
+            snprintf(rmCmd, sizeof(rmCmd), "su -c 'rm -f %s'", segTmpPath.c_str());
+            system(rmCmd);
+        }
+    }
+
+    // ── Step 5: IDA 兼容 ELF 修复 (重建 section headers) ──
+    //
+    // IDA 依赖 section headers 来定位 .dynsym / .dynstr / .plt 等表。
+    // 内存 dump 后 section headers 已丢失, 这里从 PT_DYNAMIC 重建。
+
+    // --- 5a: 修复 PT_LOAD 的 p_filesz ---
+    if (is64) {
+        auto* ehdr = reinterpret_cast<Elf64_Ehdr*>(outBuf);
+        for (int i = 0; i < ehdr->e_phnum; i++) {
+            auto* phdr = reinterpret_cast<Elf64_Phdr*>(
+                outBuf + ehdr->e_phoff + i * ehdr->e_phentsize);
+            if (phdr->p_type == PT_LOAD)
+                phdr->p_filesz = phdr->p_memsz;
+        }
+    } else {
+        auto* ehdr = reinterpret_cast<Elf32_Ehdr*>(outBuf);
+        for (int i = 0; i < ehdr->e_phnum; i++) {
+            auto* phdr = reinterpret_cast<Elf32_Phdr*>(
+                outBuf + ehdr->e_phoff + i * ehdr->e_phentsize);
+            if (phdr->p_type == PT_LOAD)
+                phdr->p_filesz = phdr->p_memsz;
+        }
+    }
+
+    // --- 5b: 查找 PT_DYNAMIC 的文件偏移和大小 ---
+    size_t dynOff = 0, dynSize = 0;
+    if (is64) {
+        auto* ehdr = reinterpret_cast<Elf64_Ehdr*>(outBuf);
+        for (int i = 0; i < ehdr->e_phnum; i++) {
+            auto* ph = reinterpret_cast<Elf64_Phdr*>(
+                outBuf + ehdr->e_phoff + i * ehdr->e_phentsize);
+            if (ph->p_type == PT_DYNAMIC) {
+                dynOff = ph->p_vaddr;   // 使用 vaddr (内存布局 = 文件偏移)
+                dynSize = ph->p_memsz;
+                break;
+            }
+        }
+    } else {
+        auto* ehdr = reinterpret_cast<Elf32_Ehdr*>(outBuf);
+        for (int i = 0; i < ehdr->e_phnum; i++) {
+            auto* ph = reinterpret_cast<Elf32_Phdr*>(
+                outBuf + ehdr->e_phoff + i * ehdr->e_phentsize);
+            if (ph->p_type == PT_DYNAMIC) {
+                dynOff = ph->p_vaddr;
+                dynSize = ph->p_memsz;
+                break;
+            }
+        }
+    }
+
+    if (dynOff == 0 || dynOff + dynSize > outFileSize) {
+        __android_log_print(ANDROID_LOG_WARN, DTAG,
+            "PT_DYNAMIC 未找到或越界 (off=0x%lx sz=0x%lx), 跳过 section 重建",
+            (unsigned long)dynOff, (unsigned long)dynSize);
+        // 直接清零 section header 并跳过
+        if (is64) {
+            auto* e = reinterpret_cast<Elf64_Ehdr*>(outBuf);
+            e->e_shoff = 0; e->e_shnum = 0; e->e_shstrndx = 0;
+        } else {
+            auto* e = reinterpret_cast<Elf32_Ehdr*>(outBuf);
+            e->e_shoff = 0; e->e_shnum = 0; e->e_shstrndx = 0;
+        }
+        goto write_output;
+    }
+
+    {
+        // --- 5c: 解析 dynamic entries, 收集各表地址和大小 ---
+        // 所有 d_ptr 值在内存 dump 中可能是绝对地址 (baseAddr + vaddr),
+        // 需要检测并减去 baseAddr 得到文件偏移。
+        struct DynInfo {
+            size_t dt_strtab    = 0;  // DT_STRTAB   -> .dynstr
+            size_t dt_strsz     = 0;  // DT_STRSZ
+            size_t dt_symtab    = 0;  // DT_SYMTAB   -> .dynsym
+            size_t dt_syment    = 0;  // DT_SYMENT   (16 or 24)
+            size_t dt_hash      = 0;  // DT_HASH     -> .hash
+            size_t dt_gnu_hash  = 0;  // DT_GNU_HASH -> .gnu.hash
+            size_t dt_rela      = 0;  // DT_RELA     -> .rela.dyn
+            size_t dt_relasz    = 0;
+            size_t dt_relaent   = 0;
+            size_t dt_rel       = 0;  // DT_REL      -> .rel.dyn (32-bit)
+            size_t dt_relsz     = 0;
+            size_t dt_relent    = 0;
+            size_t dt_jmprel    = 0;  // DT_JMPREL   -> .rela.plt / .rel.plt
+            size_t dt_pltrelsz  = 0;
+            size_t dt_pltrel    = 0;  // DT_PLTREL (DT_RELA=7 or DT_REL=17)
+            size_t dt_pltgot    = 0;  // DT_PLTGOT   -> .got.plt
+            size_t dt_init_arr  = 0;  // DT_INIT_ARRAY
+            size_t dt_init_arrsz= 0;
+            size_t dt_fini_arr  = 0;  // DT_FINI_ARRAY
+            size_t dt_fini_arrsz= 0;
+            size_t dt_versym    = 0;  // DT_VERSYM
+            size_t dt_verneed   = 0;  // DT_VERNEED
+        };
+        DynInfo di;
+
+        // 检测 linker 是否将 d_ptr 转换为绝对地址
+        // 策略: 如果 DT_STRTAB 的值 >= baseAddr 且 baseAddr > 0, 则判定为绝对地址
+        bool absoluteAddrs = false;
+
+        auto normAddr = [&](size_t val) -> size_t {
+            if (absoluteAddrs && val >= baseAddr) return val - baseAddr;
+            return val;
+        };
+
+        // 第一遍: 先读 DT_STRTAB 判断是否绝对地址
+        if (is64) {
+            auto* dyn = reinterpret_cast<Elf64_Dyn*>(outBuf + dynOff);
+            size_t count = dynSize / sizeof(Elf64_Dyn);
+            for (size_t i = 0; i < count && dyn[i].d_tag != DT_NULL; i++) {
+                if (dyn[i].d_tag == DT_STRTAB) {
+                    if (baseAddr > 0 && (size_t)dyn[i].d_un.d_ptr >= baseAddr)
+                        absoluteAddrs = true;
+                    break;
+                }
+            }
+        } else {
+            auto* dyn = reinterpret_cast<Elf32_Dyn*>(outBuf + dynOff);
+            size_t count = dynSize / sizeof(Elf32_Dyn);
+            for (size_t i = 0; i < count && dyn[i].d_tag != DT_NULL; i++) {
+                if (dyn[i].d_tag == DT_STRTAB) {
+                    if (baseAddr > 0 && (size_t)dyn[i].d_un.d_ptr >= baseAddr)
+                        absoluteAddrs = true;
+                    break;
+                }
+            }
+        }
+
+        __android_log_print(ANDROID_LOG_INFO, DTAG,
+            "Dynamic entries 地址模式: %s", absoluteAddrs ? "绝对地址" : "相对地址");
+
+        // 第二遍: 完整解析
+        if (is64) {
+            auto* dyn = reinterpret_cast<Elf64_Dyn*>(outBuf + dynOff);
+            size_t count = dynSize / sizeof(Elf64_Dyn);
+            for (size_t i = 0; i < count && dyn[i].d_tag != DT_NULL; i++) {
+                size_t v = (size_t)dyn[i].d_un.d_val;
+                switch (dyn[i].d_tag) {
+                    case DT_STRTAB:     di.dt_strtab    = normAddr(v); break;
+                    case DT_STRSZ:      di.dt_strsz     = v; break;
+                    case DT_SYMTAB:     di.dt_symtab    = normAddr(v); break;
+                    case DT_SYMENT:     di.dt_syment    = v; break;
+                    case DT_HASH:       di.dt_hash      = normAddr(v); break;
+                    case DT_GNU_HASH:   di.dt_gnu_hash  = normAddr(v); break;
+                    case DT_RELA:       di.dt_rela      = normAddr(v); break;
+                    case DT_RELASZ:     di.dt_relasz    = v; break;
+                    case DT_RELAENT:    di.dt_relaent   = v; break;
+                    case DT_REL:        di.dt_rel       = normAddr(v); break;
+                    case DT_RELSZ:      di.dt_relsz     = v; break;
+                    case DT_RELENT:     di.dt_relent    = v; break;
+                    case DT_JMPREL:     di.dt_jmprel    = normAddr(v); break;
+                    case DT_PLTRELSZ:   di.dt_pltrelsz  = v; break;
+                    case DT_PLTREL:     di.dt_pltrel    = v; break;
+                    case DT_PLTGOT:     di.dt_pltgot    = normAddr(v); break;
+                    case DT_INIT_ARRAY: di.dt_init_arr  = normAddr(v); break;
+                    case DT_INIT_ARRAYSZ: di.dt_init_arrsz = v; break;
+                    case DT_FINI_ARRAY: di.dt_fini_arr  = normAddr(v); break;
+                    case DT_FINI_ARRAYSZ: di.dt_fini_arrsz = v; break;
+                    case DT_VERSYM:     di.dt_versym    = normAddr(v); break;
+                    case DT_VERNEED:    di.dt_verneed   = normAddr(v); break;
+                }
+            }
+        } else {
+            auto* dyn = reinterpret_cast<Elf32_Dyn*>(outBuf + dynOff);
+            size_t count = dynSize / sizeof(Elf32_Dyn);
+            for (size_t i = 0; i < count && dyn[i].d_tag != DT_NULL; i++) {
+                size_t v = (size_t)dyn[i].d_un.d_val;
+                switch (dyn[i].d_tag) {
+                    case DT_STRTAB:     di.dt_strtab    = normAddr(v); break;
+                    case DT_STRSZ:      di.dt_strsz     = v; break;
+                    case DT_SYMTAB:     di.dt_symtab    = normAddr(v); break;
+                    case DT_SYMENT:     di.dt_syment    = v; break;
+                    case DT_HASH:       di.dt_hash      = normAddr(v); break;
+                    case DT_GNU_HASH:   di.dt_gnu_hash  = normAddr(v); break;
+                    case DT_RELA:       di.dt_rela      = normAddr(v); break;
+                    case DT_RELASZ:     di.dt_relasz    = v; break;
+                    case DT_RELAENT:    di.dt_relaent   = v; break;
+                    case DT_REL:        di.dt_rel       = normAddr(v); break;
+                    case DT_RELSZ:      di.dt_relsz     = v; break;
+                    case DT_RELENT:     di.dt_relent    = v; break;
+                    case DT_JMPREL:     di.dt_jmprel    = normAddr(v); break;
+                    case DT_PLTRELSZ:   di.dt_pltrelsz  = v; break;
+                    case DT_PLTREL:     di.dt_pltrel    = v; break;
+                    case DT_PLTGOT:     di.dt_pltgot    = normAddr(v); break;
+                    case DT_INIT_ARRAY: di.dt_init_arr  = normAddr(v); break;
+                    case DT_INIT_ARRAYSZ: di.dt_init_arrsz = v; break;
+                    case DT_FINI_ARRAY: di.dt_fini_arr  = normAddr(v); break;
+                    case DT_FINI_ARRAYSZ: di.dt_fini_arrsz = v; break;
+                    case DT_VERSYM:     di.dt_versym    = normAddr(v); break;
+                    case DT_VERNEED:    di.dt_verneed   = normAddr(v); break;
+                }
+            }
+        }
+
+        __android_log_print(ANDROID_LOG_INFO, DTAG,
+            "Dynamic: strtab=0x%lx(%zu) symtab=0x%lx hash=0x%lx gnu_hash=0x%lx",
+            (unsigned long)di.dt_strtab, di.dt_strsz,
+            (unsigned long)di.dt_symtab,
+            (unsigned long)di.dt_hash, (unsigned long)di.dt_gnu_hash);
+
+        // --- 5d: 推算 .dynsym 大小 ---
+        // 方法: 从 DT_HASH 的 nchain 字段, 或从 DT_GNU_HASH 推算
+        size_t dynsymCount = 0;
+        size_t symEntSize = is64 ? sizeof(Elf64_Sym) : sizeof(Elf32_Sym);
+        if (di.dt_syment > 0) symEntSize = di.dt_syment;
+
+        if (di.dt_hash && di.dt_hash + 8 <= outFileSize) {
+            // DT_HASH: uint32_t nbucket, uint32_t nchain; nchain = symbol count
+            uint32_t nchain = *reinterpret_cast<uint32_t*>(outBuf + di.dt_hash + 4);
+            dynsymCount = nchain;
+        } else if (di.dt_gnu_hash && di.dt_gnu_hash + 16 <= outFileSize) {
+            // GNU hash: nbuckets, symoffset, bloom_size, bloom_shift
+            // 然后 bloom[bloom_size], buckets[nbuckets], chains...
+            // 需要找 bucket 中最大值, 然后从 chain 往后扫到 bit0==1
+            uint32_t nbuckets   = *reinterpret_cast<uint32_t*>(outBuf + di.dt_gnu_hash + 0);
+            uint32_t symoffset  = *reinterpret_cast<uint32_t*>(outBuf + di.dt_gnu_hash + 4);
+            uint32_t bloom_size = *reinterpret_cast<uint32_t*>(outBuf + di.dt_gnu_hash + 8);
+
+            size_t bloomBytes = bloom_size * (is64 ? 8 : 4);
+            size_t bucketsOff = di.dt_gnu_hash + 16 + bloomBytes;
+            size_t chainsOff  = bucketsOff + nbuckets * 4;
+
+            if (bucketsOff + nbuckets * 4 <= outFileSize) {
+                uint32_t* buckets = reinterpret_cast<uint32_t*>(outBuf + bucketsOff);
+                uint32_t maxBucket = 0;
+                for (uint32_t b = 0; b < nbuckets; b++) {
+                    if (buckets[b] > maxBucket) maxBucket = buckets[b];
+                }
+                if (maxBucket >= symoffset) {
+                    // 从 maxBucket 对应 chain 开始扫描到 bit0==1
+                    size_t chainIdx = maxBucket - symoffset;
+                    size_t chainOff = chainsOff + chainIdx * 4;
+                    while (chainOff + 4 <= outFileSize) {
+                        uint32_t entry = *reinterpret_cast<uint32_t*>(outBuf + chainOff);
+                        chainIdx++;
+                        chainOff += 4;
+                        if (entry & 1) break; // last entry in chain
+                    }
+                    dynsymCount = symoffset + chainIdx;
+                }
+            }
+        }
+
+        if (dynsymCount == 0) {
+            // 兜底: 从 symtab 到 strtab 估算
+            if (di.dt_symtab && di.dt_strtab > di.dt_symtab && symEntSize > 0) {
+                dynsymCount = (di.dt_strtab - di.dt_symtab) / symEntSize;
+            }
+        }
+        size_t dynsymSize = dynsymCount * symEntSize;
+
+        __android_log_print(ANDROID_LOG_INFO, DTAG,
+            "dynsym: count=%zu, entsize=%zu, total=%zu",
+            dynsymCount, symEntSize, dynsymSize);
+
+        // --- 5e: 计算 .hash 大小 ---
+        size_t hashSize = 0;
+        if (di.dt_hash && di.dt_hash + 8 <= outFileSize) {
+            uint32_t nbucket = *reinterpret_cast<uint32_t*>(outBuf + di.dt_hash);
+            uint32_t nchain  = *reinterpret_cast<uint32_t*>(outBuf + di.dt_hash + 4);
+            hashSize = 8 + (nbucket + nchain) * 4;
+        }
+
+        // --- 5f: 计算 .gnu.hash 大小 ---
+        size_t gnuHashSize = 0;
+        if (di.dt_gnu_hash && di.dt_gnu_hash + 16 <= outFileSize) {
+            uint32_t nbuckets   = *reinterpret_cast<uint32_t*>(outBuf + di.dt_gnu_hash + 0);
+            uint32_t symoffset  = *reinterpret_cast<uint32_t*>(outBuf + di.dt_gnu_hash + 4);
+            uint32_t bloom_size = *reinterpret_cast<uint32_t*>(outBuf + di.dt_gnu_hash + 8);
+            size_t bloomBytes = bloom_size * (is64 ? 8 : 4);
+            size_t chainsStart = 16 + bloomBytes + nbuckets * 4;
+            // chain count = dynsymCount - symoffset
+            size_t chainCount = (dynsymCount > symoffset) ? (dynsymCount - symoffset) : 0;
+            gnuHashSize = chainsStart + chainCount * 4;
+        }
+
+        // --- 5g: 构建 .shstrtab 字符串表 ---
+        // 格式: \0name1\0name2\0...
+        struct SecDef {
+            const char* name;
+            uint32_t type;
+            uint64_t flags;
+            size_t   addr;      // 文件偏移 (= vaddr for dump)
+            size_t   size;
+            uint32_t link;
+            uint32_t info;
+            size_t   addralign;
+            size_t   entsize;
+        };
+
+        std::vector<SecDef> sections;
+        // Section 0 is always NULL
+
+        // Helper lambda to add section
+        auto addSec = [&](const char* name, uint32_t type, uint64_t flags,
+                          size_t addr, size_t sz, uint32_t link, uint32_t info,
+                          size_t align, size_t entsz) {
+            if (addr == 0 && sz == 0 && type != SHT_NULL) return; // skip empty
+            sections.push_back({name, type, flags, addr, sz, link, info, align, entsz});
+        };
+
+        // 按地址排序后生成 section, 先收集所有有效段
+        // .dynsym
+        uint32_t dynsymIdx = 0, dynstrIdx = 0;
+
+        if (di.dt_symtab && dynsymSize) {
+            dynsymIdx = (uint32_t)sections.size() + 1; // +1 because NULL sec at [0]
+        }
+        addSec(".dynsym", SHT_DYNSYM, SHF_ALLOC,
+               di.dt_symtab, dynsymSize,
+               0 /* link=dynstr, 稍后修复 */, 1 /* info=first global */,
+               is64 ? 8 : 4, symEntSize);
+
+        if (di.dt_strtab && di.dt_strsz) {
+            dynstrIdx = (uint32_t)sections.size() + 1;
+        }
+        addSec(".dynstr", SHT_STRTAB, SHF_ALLOC,
+               di.dt_strtab, di.dt_strsz, 0, 0, 1, 0);
+
+        addSec(".hash", SHT_HASH, SHF_ALLOC,
+               di.dt_hash, hashSize, 0, 0, is64 ? 8 : 4, 4);
+
+        addSec(".gnu.hash", SHT_GNU_HASH, SHF_ALLOC,
+               di.dt_gnu_hash, gnuHashSize, 0, 0, is64 ? 8 : 4, 0);
+
+        // .rela.dyn / .rel.dyn
+        if (is64 || di.dt_rela) {
+            addSec(".rela.dyn", SHT_RELA, SHF_ALLOC,
+                   di.dt_rela, di.dt_relasz, 0, 0, 8,
+                   di.dt_relaent ? di.dt_relaent : (is64 ? 24 : 12));
+        }
+        if (!is64 && di.dt_rel) {
+            addSec(".rel.dyn", SHT_REL, SHF_ALLOC,
+                   di.dt_rel, di.dt_relsz, 0, 0, 4,
+                   di.dt_relent ? di.dt_relent : 8);
+        }
+
+        // .rela.plt / .rel.plt
+        if (di.dt_jmprel && di.dt_pltrelsz) {
+            bool isPltRela = (di.dt_pltrel == DT_RELA) || is64;
+            addSec(isPltRela ? ".rela.plt" : ".rel.plt",
+                   isPltRela ? SHT_RELA : SHT_REL, SHF_ALLOC | SHF_INFO_LINK,
+                   di.dt_jmprel, di.dt_pltrelsz, 0, 0, 8,
+                   isPltRela ? (is64 ? 24 : 12) : (is64 ? 16 : 8));
+        }
+
+        // .dynamic
+        addSec(".dynamic", SHT_DYNAMIC, SHF_ALLOC | SHF_WRITE,
+               dynOff, dynSize, 0, 0, is64 ? 8 : 4,
+               is64 ? sizeof(Elf64_Dyn) : sizeof(Elf32_Dyn));
+
+        // .init_array
+        addSec(".init_array", SHT_INIT_ARRAY, SHF_ALLOC | SHF_WRITE,
+               di.dt_init_arr, di.dt_init_arrsz, 0, 0, is64 ? 8 : 4, is64 ? 8 : 4);
+
+        // .fini_array
+        addSec(".fini_array", SHT_FINI_ARRAY, SHF_ALLOC | SHF_WRITE,
+               di.dt_fini_arr, di.dt_fini_arrsz, 0, 0, is64 ? 8 : 4, is64 ? 8 : 4);
+
+        // .got.plt (大小未知, 尝试从 pltgot 到下一已知段的间隙估算)
+        if (di.dt_pltgot) {
+            // 粗略估算: GOT 至少包含 3 个保留条目 + PLT reloc count 个条目
+            size_t ptrSize = is64 ? 8 : 4;
+            size_t pltRelocCount = 0;
+            if (di.dt_pltrelsz && di.dt_pltrel) {
+                size_t relaEnt = (di.dt_pltrel == DT_RELA) ? (is64 ? 24 : 12) : (is64 ? 16 : 8);
+                if (relaEnt > 0) pltRelocCount = di.dt_pltrelsz / relaEnt;
+            }
+            size_t gotPltSize = (3 + pltRelocCount) * ptrSize;
+            addSec(".got.plt", SHT_PROGBITS, SHF_ALLOC | SHF_WRITE,
+                   di.dt_pltgot, gotPltSize, 0, 0, ptrSize, ptrSize);
+        }
+
+        // .gnu.version (DT_VERSYM)
+        if (di.dt_versym && dynsymCount) {
+            addSec(".gnu.version", SHT_GNU_VERSYM, SHF_ALLOC,
+                   di.dt_versym, dynsymCount * 2, 0, 0, 2, 2);
+        }
+
+        // .gnu.version_r (DT_VERNEED) - 大小不确定, 给最小估算
+        if (di.dt_verneed) {
+            addSec(".gnu.version_r", SHT_GNU_verneed, SHF_ALLOC,
+                   di.dt_verneed, 64 /* 最小估算 */, 0, 0, is64 ? 8 : 4, 0);
+        }
+
+        // 过滤掉 addr=0 && size=0 的无效 section (已在 addSec 中跳过)
+        // 过滤掉越界的 section
+        std::vector<SecDef> validSections;
+        for (auto& s : sections) {
+            if (s.addr + s.size <= outFileSize) {
+                validSections.push_back(s);
+            } else {
+                __android_log_print(ANDROID_LOG_WARN, DTAG,
+                    "Section '%s' 越界 (off=0x%lx, sz=0x%lx), 跳过",
+                    s.name, (unsigned long)s.addr, (unsigned long)s.size);
+            }
+        }
+        sections = std::move(validSections);
+
+        __android_log_print(ANDROID_LOG_INFO, DTAG,
+            "重建 %zu 个 section headers", sections.size());
+
+        // 构建 .shstrtab
+        std::vector<uint8_t> shstrtab;
+        shstrtab.push_back(0); // 首字节 = \0
+        std::vector<uint32_t> nameOffsets;
+        for (auto& s : sections) {
+            nameOffsets.push_back((uint32_t)shstrtab.size());
+            shstrtab.insert(shstrtab.end(), s.name, s.name + strlen(s.name) + 1);
+        }
+        // .shstrtab 自身的名字
+        uint32_t shstrtabNameOff = (uint32_t)shstrtab.size();
+        const char* shstrtabName = ".shstrtab";
+        shstrtab.insert(shstrtab.end(), shstrtabName, shstrtabName + strlen(shstrtabName) + 1);
+
+        // --- 5h: 修正 link 字段 ---
+        // 重新找 dynsymIdx 和 dynstrIdx 在最终数组中的位置 (+1 因为 NULL section 在 [0])
+        dynsymIdx = 0;
+        dynstrIdx = 0;
+        for (size_t i = 0; i < sections.size(); i++) {
+            if (strcmp(sections[i].name, ".dynsym") == 0) dynsymIdx = (uint32_t)(i + 1);
+            if (strcmp(sections[i].name, ".dynstr") == 0) dynstrIdx = (uint32_t)(i + 1);
+        }
+        // 设置 link: .dynsym -> .dynstr, .hash/.gnu.hash -> .dynsym,
+        // .rela.* -> .dynsym, .dynamic -> .dynstr
+        for (auto& s : sections) {
+            if (s.type == SHT_DYNSYM)       s.link = dynstrIdx;
+            if (s.type == SHT_HASH)         s.link = dynsymIdx;
+            if (s.type == SHT_GNU_HASH)     s.link = dynsymIdx;
+            if (s.type == SHT_RELA)         s.link = dynsymIdx;
+            if (s.type == SHT_REL)          s.link = dynsymIdx;
+            if (s.type == SHT_DYNAMIC)      s.link = dynstrIdx;
+            if (s.type == SHT_GNU_VERSYM)   s.link = dynsymIdx;
+            if (s.type == SHT_GNU_verneed)  s.link = dynstrIdx;
+        }
+
+        // --- 5i: 追加 .shstrtab 数据 + section headers 到输出缓冲区 ---
+        // 总 section 数 = 1 (NULL) + sections.size() + 1 (.shstrtab)
+        size_t totalSections = 1 + sections.size() + 1;
+        size_t shstrtabIdx = totalSections - 1; // .shstrtab 是最后一个
+        size_t shentSize = is64 ? sizeof(Elf64_Shdr) : sizeof(Elf32_Shdr);
+
+        // 对齐到 8 字节
+        size_t shstrtabOff = (outFileSize + 7) & ~(size_t)7;
+        size_t shtOff = (shstrtabOff + shstrtab.size() + 7) & ~(size_t)7;
+        size_t totalAppend = (shtOff - outFileSize) + totalSections * shentSize;
+        size_t newFileSize = shtOff + totalSections * shentSize;
+
+        // 重新分配输出缓冲区
+        uint8_t* newBuf = new(std::nothrow) uint8_t[newFileSize]();
+        if (!newBuf) {
+            __android_log_print(ANDROID_LOG_ERROR, DTAG,
+                "追加 section header 内存分配失败");
+            goto write_output;
+        }
+        memcpy(newBuf, outBuf, outFileSize);
+        delete[] outBuf;
+        outBuf = newBuf;
+
+        // 写入 .shstrtab 数据
+        memcpy(outBuf + shstrtabOff, shstrtab.data(), shstrtab.size());
+
+        // 写入 section headers
+        if (is64) {
+            auto* shdrs = reinterpret_cast<Elf64_Shdr*>(outBuf + shtOff);
+            // [0] NULL section
+            memset(&shdrs[0], 0, sizeof(Elf64_Shdr));
+
+            // [1..N] 重建的 sections
+            for (size_t i = 0; i < sections.size(); i++) {
+                auto& s = sections[i];
+                auto& sh = shdrs[i + 1];
+                memset(&sh, 0, sizeof(Elf64_Shdr));
+                sh.sh_name      = nameOffsets[i];
+                sh.sh_type      = s.type;
+                sh.sh_flags     = s.flags;
+                sh.sh_addr      = s.addr;     // vaddr = file offset for dump
+                sh.sh_offset    = s.addr;     // file offset
+                sh.sh_size      = s.size;
+                sh.sh_link      = s.link;
+                sh.sh_info      = s.info;
+                sh.sh_addralign = s.addralign;
+                sh.sh_entsize   = s.entsize;
+            }
+
+            // 最后一个 = .shstrtab
+            auto& shstrSh = shdrs[totalSections - 1];
+            memset(&shstrSh, 0, sizeof(Elf64_Shdr));
+            shstrSh.sh_name      = shstrtabNameOff;
+            shstrSh.sh_type      = SHT_STRTAB;
+            shstrSh.sh_flags     = 0;
+            shstrSh.sh_addr      = 0;
+            shstrSh.sh_offset    = shstrtabOff;
+            shstrSh.sh_size      = shstrtab.size();
+            shstrSh.sh_addralign = 1;
+
+            // 更新 ELF header
+            auto* ehdr = reinterpret_cast<Elf64_Ehdr*>(outBuf);
+            ehdr->e_shoff     = shtOff;
+            ehdr->e_shnum     = (uint16_t)totalSections;
+            ehdr->e_shentsize = sizeof(Elf64_Shdr);
+            ehdr->e_shstrndx  = (uint16_t)shstrtabIdx;
+        } else {
+            auto* shdrs = reinterpret_cast<Elf32_Shdr*>(outBuf + shtOff);
+            memset(&shdrs[0], 0, sizeof(Elf32_Shdr));
+
+            for (size_t i = 0; i < sections.size(); i++) {
+                auto& s = sections[i];
+                auto& sh = shdrs[i + 1];
+                memset(&sh, 0, sizeof(Elf32_Shdr));
+                sh.sh_name      = nameOffsets[i];
+                sh.sh_type      = s.type;
+                sh.sh_flags     = (uint32_t)s.flags;
+                sh.sh_addr      = (uint32_t)s.addr;
+                sh.sh_offset    = (uint32_t)s.addr;
+                sh.sh_size      = (uint32_t)s.size;
+                sh.sh_link      = s.link;
+                sh.sh_info      = s.info;
+                sh.sh_addralign = (uint32_t)s.addralign;
+                sh.sh_entsize   = (uint32_t)s.entsize;
+            }
+
+            auto& shstrSh = shdrs[totalSections - 1];
+            memset(&shstrSh, 0, sizeof(Elf32_Shdr));
+            shstrSh.sh_name      = shstrtabNameOff;
+            shstrSh.sh_type      = SHT_STRTAB;
+            shstrSh.sh_offset    = (uint32_t)shstrtabOff;
+            shstrSh.sh_size      = (uint32_t)shstrtab.size();
+            shstrSh.sh_addralign = 1;
+
+            auto* ehdr = reinterpret_cast<Elf32_Ehdr*>(outBuf);
+            ehdr->e_shoff     = (uint32_t)shtOff;
+            ehdr->e_shnum     = (uint16_t)totalSections;
+            ehdr->e_shentsize = sizeof(Elf32_Shdr);
+            ehdr->e_shstrndx  = (uint16_t)shstrtabIdx;
+        }
+
+        outFileSize = newFileSize;
+        __android_log_print(ANDROID_LOG_INFO, DTAG,
+            "Section headers 重建完成: %zu sections, 文件大小 %zu -> %zu",
+            totalSections, outFileSize - totalAppend, outFileSize);
+    }
+
+    write_output:
+
+    // ── Step 6: 写入输出文件 ──
     FILE* outFp = fopen(outPath.c_str(), "wb");
     if (!outFp) {
         __android_log_print(ANDROID_LOG_ERROR, DTAG, "无法创建输出文件: %s", outPath.c_str());
-        delete[] buffer;
+        delete[] outBuf;
         return -5;
     }
 
-    size_t written = fwrite(buffer, 1, actualSize, outFp);
+    size_t written = fwrite(outBuf, 1, outFileSize, outFp);
     fclose(outFp);
-    delete[] buffer;
+    delete[] outBuf;
 
-    // 清理 raw 临时文件, 修复输出文件权限
-    snprintf(cmd, sizeof(cmd),
-        "su -c 'rm -f %s && chmod 644 %s && chmod 755 /data/local/tmp/so_dump'",
-        rawPath.c_str(), outPath.c_str());
-    system(cmd);
+    // 修复权限
+    char chmodCmd[512];
+    snprintf(chmodCmd, sizeof(chmodCmd), "su -c 'chmod 644 %s'", outPath.c_str());
+    system(chmodCmd);
 
-    if (written != actualSize) {
-        __android_log_print(ANDROID_LOG_ERROR, DTAG, "写入不完整: %zu / %zu", written, actualSize);
+    if (written != outFileSize) {
+        __android_log_print(ANDROID_LOG_ERROR, DTAG,
+            "写入不完整: %zu / %zu", written, outFileSize);
         return -6;
     }
 
     __android_log_print(ANDROID_LOG_INFO, DTAG,
-                        "Dump 成功: %s -> %s (%zu bytes)", module.name.c_str(), outPath.c_str(), actualSize);
+                        "Dump 成功: %s -> %s (%zu bytes, %.2f MB)",
+                        module.name.c_str(), outPath.c_str(),
+                        outFileSize, outFileSize / (1024.0 * 1024.0));
     return 0;
 }
 
