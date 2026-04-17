@@ -48,6 +48,14 @@ namespace MemReader {
                                          const std::vector<uint8_t>& mask,
                                          size_t maxHits);
 
+    /**
+     * 向目标进程写入一段内存 (通过 root + base64 + dd)
+     * 会自动 untag 地址.
+     * @return 实际写入字节数；<=0 表示失败
+     */
+    ssize_t writeMemory(int pid, uintptr_t address,
+                        const std::vector<uint8_t>& data);
+
 } // namespace MemReader
 
 #endif // MEM_READER_H

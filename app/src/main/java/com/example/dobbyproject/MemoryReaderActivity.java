@@ -35,6 +35,7 @@ public class MemoryReaderActivity extends AppCompatActivity {
     private native String[] nativeListModules(int pid);
     private native String[] nativeListAllRegions(int pid);
     private native byte[]   nativeReadMemory(int pid, long address, int size);
+    private native int      nativeWriteMemory(int pid, long address, byte[] data);
     private native String   nativeFindRegion(int pid, long address);
     private native long[]   nativeSearchPattern(int pid, long rangeStart, long rangeEnd,
                                                  byte[] pattern, byte[] mask, int maxHits);
@@ -91,7 +92,7 @@ public class MemoryReaderActivity extends AppCompatActivity {
     private Spinner  spApps, spModules, spViewMode, spEndian;
     private CheckBox cbSigned, cbAllRegions;
     private Button   btnRefresh, btnRead, btnUseModuleBase;
-    private Button   btnDeref, btnPrev, btnNext, btnSearch;
+    private Button   btnDeref, btnPrev, btnNext, btnSearch, btnWrite;
     private TextView tvOutput, tvStatus;
     private ProgressBar pbLoading;
 
@@ -126,6 +127,7 @@ public class MemoryReaderActivity extends AppCompatActivity {
         btnPrev          = findViewById(R.id.mem_btn_prev);
         btnNext          = findViewById(R.id.mem_btn_next);
         btnSearch        = findViewById(R.id.mem_btn_search);
+        btnWrite         = findViewById(R.id.mem_btn_write);
         tvOutput         = findViewById(R.id.mem_tv_output);
         tvStatus         = findViewById(R.id.mem_tv_status);
         pbLoading        = findViewById(R.id.mem_progress);
@@ -183,6 +185,7 @@ public class MemoryReaderActivity extends AppCompatActivity {
         btnPrev.setOnClickListener(v -> shiftAddress(-1));
         btnNext.setOnClickListener(v -> shiftAddress(+1));
         btnSearch.setOnClickListener(v -> showSearchDialog());
+        btnWrite.setOnClickListener(v -> showWriteDialog());
 
         refreshApps();
     }
@@ -615,6 +618,186 @@ public class MemoryReaderActivity extends AppCompatActivity {
             asc.append((b >= 0x20 && b < 0x7F) ? (char) b : '.');
         }
         return hex.toString().trim() + "   " + asc.toString();
+    }
+
+    // ─── 写入内存 ─────────────────────────────────────────────
+    private static final String[] WRITE_TYPES = {
+            "字节 (十六进制 48 8B ...)",
+            "字符串 (UTF-8)",
+            "宽字符串 (UTF-16LE)",
+            "整数 1 字节",
+            "整数 2 字节",
+            "整数 4 字节",
+            "整数 8 字节",
+            "float 32-bit",
+            "double 64-bit",
+    };
+
+    private void showWriteDialog() {
+        if (selectedPid <= 0) { Toast.makeText(this, "请先选择进程", Toast.LENGTH_SHORT).show(); return; }
+
+        android.widget.LinearLayout root = new android.widget.LinearLayout(this);
+        root.setOrientation(android.widget.LinearLayout.VERTICAL);
+        int pad = (int) (12 * getResources().getDisplayMetrics().density);
+        root.setPadding(pad, pad, pad, pad);
+
+        TextView tvAddr = new TextView(this);
+        tvAddr.setText("目标地址: " + etAddress.getText().toString().trim() + "   PID: " + selectedPid);
+        root.addView(tvAddr);
+
+        final Spinner spType = new Spinner(this);
+        ArrayAdapter<String> typeAdapter = new ArrayAdapter<>(this,
+                android.R.layout.simple_spinner_item, WRITE_TYPES);
+        typeAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        spType.setAdapter(typeAdapter);
+        root.addView(spType);
+
+        final Spinner spEnd = new Spinner(this);
+        ArrayAdapter<String> endAdapter = new ArrayAdapter<>(this,
+                android.R.layout.simple_spinner_item, ENDIANS);
+        endAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        spEnd.setAdapter(endAdapter);
+        root.addView(spEnd);
+
+        final EditText etValue = new EditText(this);
+        etValue.setHint("待写入的值");
+        etValue.setSingleLine(false);
+        etValue.setMinLines(2);
+        root.addView(etValue);
+
+        final CheckBox cbConfirm = new CheckBox(this);
+        cbConfirm.setText("我已确认要修改目标进程内存 (不可撤销)");
+        root.addView(cbConfirm);
+
+        new androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("写入内存 (PID " + selectedPid + ")")
+            .setView(root)
+            .setPositiveButton("写入", (d, w) -> {
+                if (!cbConfirm.isChecked()) {
+                    Toast.makeText(this, "请先勾选确认", Toast.LENGTH_SHORT).show();
+                    return;
+                }
+                long addr;
+                try { addr = parseAddressExpr(etAddress.getText().toString().trim()); }
+                catch (Exception ex) { Toast.makeText(this, "地址错误", Toast.LENGTH_SHORT).show(); return; }
+
+                byte[] payload;
+                try {
+                    payload = buildWritePayload(
+                            spType.getSelectedItemPosition(),
+                            etValue.getText().toString(),
+                            spEnd.getSelectedItemPosition() == 1);
+                } catch (Exception ex) {
+                    Toast.makeText(this, "值解析失败: " + ex.getMessage(), Toast.LENGTH_LONG).show();
+                    return;
+                }
+                if (payload == null || payload.length == 0) {
+                    Toast.makeText(this, "空 payload", Toast.LENGTH_SHORT).show(); return;
+                }
+
+                runWrite(addr, payload);
+            })
+            .setNegativeButton("取消", null)
+            .show();
+    }
+
+    /**
+     * 根据类型构造要写入的字节序列
+     * @param bigEndian 是否大端 (字符串/字节类型忽略)
+     */
+    private static byte[] buildWritePayload(int typeIdx, String input, boolean bigEndian) {
+        String s = input == null ? "" : input.trim();
+        switch (typeIdx) {
+            case 0: { // hex 字节
+                String[] toks = s.split("\\s+");
+                byte[] b = new byte[toks.length];
+                for (int i = 0; i < toks.length; i++) {
+                    if (toks[i].length() != 2) throw new IllegalArgumentException("token: " + toks[i]);
+                    b[i] = (byte) Integer.parseInt(toks[i], 16);
+                }
+                return b;
+            }
+            case 1: return input.getBytes(StandardCharsets.UTF_8);
+            case 2: return input.getBytes(StandardCharsets.UTF_16LE);
+            case 3: case 4: case 5: case 6: {
+                int width = (typeIdx == 3) ? 1 : (typeIdx == 4) ? 2 : (typeIdx == 5) ? 4 : 8;
+                // 支持 0x 前缀和负数
+                long v;
+                if (s.startsWith("0x") || s.startsWith("0X")) {
+                    v = new BigInteger(s.substring(2), 16).longValue();
+                } else if (s.startsWith("-0x") || s.startsWith("-0X")) {
+                    v = -new BigInteger(s.substring(3), 16).longValue();
+                } else {
+                    v = new BigInteger(s).longValue();
+                }
+                byte[] b = new byte[width];
+                for (int i = 0; i < width; i++) {
+                    int shift = bigEndian ? (width - 1 - i) * 8 : i * 8;
+                    b[i] = (byte) ((v >> shift) & 0xFF);
+                }
+                return b;
+            }
+            case 7: { // float
+                int bits = Float.floatToRawIntBits(Float.parseFloat(s));
+                byte[] b = new byte[4];
+                for (int i = 0; i < 4; i++) {
+                    int shift = bigEndian ? (3 - i) * 8 : i * 8;
+                    b[i] = (byte) ((bits >> shift) & 0xFF);
+                }
+                return b;
+            }
+            case 8: { // double
+                long bits = Double.doubleToRawLongBits(Double.parseDouble(s));
+                byte[] b = new byte[8];
+                for (int i = 0; i < 8; i++) {
+                    int shift = bigEndian ? (7 - i) * 8 : i * 8;
+                    b[i] = (byte) ((bits >> shift) & 0xFF);
+                }
+                return b;
+            }
+            default: throw new IllegalArgumentException("未知类型 " + typeIdx);
+        }
+    }
+
+    private void runWrite(long addr, byte[] payload) {
+        tvStatus.setText(String.format("写入中: 0x%X 共 %d 字节 ...", addr, payload.length));
+        pbLoading.setVisibility(View.VISIBLE);
+        final long a = addr;
+        final byte[] p = payload;
+        new Thread(() -> {
+            int result;
+            try { result = nativeWriteMemory(selectedPid, a, p); }
+            catch (Throwable t) { result = -99; }
+            // 写后立即回读校验
+            byte[] verify;
+            try { verify = nativeReadMemory(selectedPid, a, p.length); }
+            catch (Throwable t) { verify = new byte[0]; }
+            final int r = result;
+            final byte[] vf = verify;
+            runOnUiThread(() -> {
+                pbLoading.setVisibility(View.GONE);
+                StringBuilder sb = new StringBuilder();
+                sb.append(String.format("[写入内存]  地址=0x%X  长度=%d  返回=%d\n", a, p.length, r));
+                sb.append("─────────────────────────────────\n");
+                sb.append("待写入: ").append(formatPreview(p, p.length)).append('\n');
+                sb.append("回  读: ").append(formatPreview(vf, p.length)).append('\n');
+                boolean match = vf != null && vf.length >= p.length;
+                if (match) {
+                    for (int i = 0; i < p.length; i++) {
+                        if (p[i] != vf[i]) { match = false; break; }
+                    }
+                }
+                sb.append("校  验: ").append(match ? "✓ 一致" : "✗ 不一致").append('\n');
+                tvOutput.setText(sb.toString());
+                if (r > 0 && match) {
+                    tvStatus.setText("写入成功 (" + r + " 字节, 回读一致)");
+                } else if (r > 0) {
+                    tvStatus.setText("写入 " + r + " 字节但回读不一致, 可能被目标进程覆盖或只读页");
+                } else {
+                    tvStatus.setText("写入失败 code=" + r);
+                }
+            });
+        }).start();
     }
 
     /** 解析形如 "48 8B ?? ?? 89 C2" 的 pattern, 返回 {pattern, mask} */

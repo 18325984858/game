@@ -249,6 +249,13 @@
             android:text="🔎 搜索字节 / 字符串"
             android:layout_marginBottom="8dp" />
 
+        <Button
+            android:id="@+id/mem_btn_write"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="✏️ 写入内存"
+            android:layout_marginBottom="8dp" />
+
         <ProgressBar
             android:id="@+id/mem_progress"
             style="?android:attr/progressBarStyleHorizontal"

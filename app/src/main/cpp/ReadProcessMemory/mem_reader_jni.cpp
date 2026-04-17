@@ -149,6 +149,28 @@ Java_com_example_dobbyproject_MemoryReaderActivity_nativeReadMemory(
 }
 
 /**
+ * 写入指定进程内存
+ * @return 实际写入字节数; <=0 表示失败
+ */
+JNIEXPORT jint JNICALL
+Java_com_example_dobbyproject_MemoryReaderActivity_nativeWriteMemory(
+        JNIEnv* env, jobject,
+        jint pid, jlong address, jbyteArray dataBytes) {
+
+    if (pid <= 0 || dataBytes == nullptr) return -1;
+    jsize n = env->GetArrayLength(dataBytes);
+    if (n <= 0) return -1;
+
+    std::vector<uint8_t> buf((size_t)n);
+    env->GetByteArrayRegion(dataBytes, 0, n, reinterpret_cast<jbyte*>(buf.data()));
+
+    ssize_t w = MemReader::writeMemory((int)pid,
+                                       (uintptr_t)(uint64_t)address,
+                                       buf);
+    return (jint)w;
+}
+
+/**
  * 查找地址所在的 maps 区间
  * 返回 "baseHex:endHex:name:path:perms", 找不到返回 ""
  */

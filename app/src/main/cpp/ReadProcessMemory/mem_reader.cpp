@@ -387,4 +387,112 @@ std::vector<uintptr_t> searchPattern(int pid,
     return hits;
 }
 
+// ── base64 编码 (标准字母表, 不换行) ──
+static std::string b64_encode(const uint8_t* data, size_t len) {
+    static const char tbl[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve(((len + 2) / 3) * 4);
+    size_t i = 0;
+    while (i + 3 <= len) {
+        uint32_t v = (uint32_t)data[i] << 16 | (uint32_t)data[i+1] << 8 | data[i+2];
+        out += tbl[(v >> 18) & 0x3F];
+        out += tbl[(v >> 12) & 0x3F];
+        out += tbl[(v >> 6)  & 0x3F];
+        out += tbl[ v        & 0x3F];
+        i += 3;
+    }
+    if (i < len) {
+        uint32_t v = (uint32_t)data[i] << 16;
+        if (i + 1 < len) v |= (uint32_t)data[i+1] << 8;
+        out += tbl[(v >> 18) & 0x3F];
+        out += tbl[(v >> 12) & 0x3F];
+        out += (i + 1 < len) ? tbl[(v >> 6) & 0x3F] : '=';
+        out += '=';
+    }
+    return out;
+}
+
+ssize_t writeMemory(int pid, uintptr_t address,
+                    const std::vector<uint8_t>& data) {
+    if (pid <= 0 || data.empty()) return -1;
+
+    // 写入字节数上限 (单条 shell 命令载荷) — 更大时分段
+    // 单条命令的 b64 文本约 4/3 * raw + 开销, 这里 1MB 足够应付绝大多数场景
+    const size_t MAX_ONCE = 1 * 1024 * 1024;
+    size_t total = data.size();
+    uintptr_t realAddr = untag(address);
+    if (realAddr != address) {
+        __android_log_print(ANDROID_LOG_INFO, RTAG,
+            "写入去 tag: 0x%zx -> 0x%zx", (size_t)address, (size_t)realAddr);
+    }
+
+    // 准备 tmp 目录
+    static std::once_flag s_mkdir;
+    std::call_once(s_mkdir, []{
+        RootShell::I().exec(
+            std::string("mkdir -p ") + TMP_DIR + " && chmod 777 " + TMP_DIR);
+    });
+
+    const char* TMP_WRITE = "/data/local/tmp/so_dump/_memwrite_tmp";
+
+    size_t written = 0;
+    while (written < total) {
+        size_t chunk = std::min(total - written, MAX_ONCE);
+        std::string b64 = b64_encode(data.data() + written, chunk);
+
+        // 构造命令:
+        //   1. 用 base64 -d 还原二进制到 TMP_WRITE
+        //   2. dd bs=1 seek=ADDR count=SIZE conv=notrunc 到 /proc/PID/mem
+        //      bs=1 慢但可按字节精确定位, 对一般修改 (<1KB) 可接受
+        //      大块时分段但每段仍按 bs=1 — 若需再提速可按页写, 先读再改再写回
+        std::string cmd;
+        cmd.reserve(b64.size() + 256);
+        cmd += "echo -n '";
+        cmd += b64;
+        cmd += "' | base64 -d > ";
+        cmd += TMP_WRITE;
+        cmd += " && chmod 666 ";
+        cmd += TMP_WRITE;
+        cmd += " && dd if=";
+        cmd += TMP_WRITE;
+        cmd += " of=/proc/";
+        char ibuf[64];
+        snprintf(ibuf, sizeof(ibuf), "%d", pid);
+        cmd += ibuf;
+        cmd += "/mem bs=1 seek=";
+        snprintf(ibuf, sizeof(ibuf), "%zu", (size_t)(realAddr + written));
+        cmd += ibuf;
+        cmd += " count=";
+        snprintf(ibuf, sizeof(ibuf), "%zu", chunk);
+        cmd += ibuf;
+        // 关键: 一定要 conv=notrunc, 否则 dd 会截断 /proc/PID/mem (在某些 kernel 会拒绝)
+        cmd += " conv=notrunc 2>/data/local/tmp/so_dump/_memwrite_err && ";
+        // 成功时打印一个占位, 不成功则由外层 marker 感知不到错误码, 但 dd 的 err 可后续取
+        cmd += "echo __WRITE_OK__";
+
+        bool ok = RootShell::I().exec(cmd);
+        if (!ok) {
+            __android_log_print(ANDROID_LOG_ERROR, RTAG,
+                "写入 shell 失败 pid=%d addr=0x%zx size=%zu written=%zu",
+                pid, (size_t)realAddr, chunk, written);
+            break;
+        }
+
+        written += chunk;
+    }
+
+    if (written == 0) {
+        __android_log_print(ANDROID_LOG_WARN, RTAG,
+            "写入 0 字节: pid=%d addr=0x%zx size=%zu",
+            pid, (size_t)realAddr, total);
+        return -2;
+    }
+
+    __android_log_print(ANDROID_LOG_INFO, RTAG,
+        "写入 pid=%d addr=0x%zx->0x%zx 请求=%zu 实际=%zu",
+        pid, (size_t)address, (size_t)realAddr, total, written);
+    return (ssize_t)written;
+}
+
 } // namespace MemReader
