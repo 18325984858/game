@@ -36,6 +36,11 @@
             android:exported="false"
             android:label="SO Dumper" />
 
+        <activity
+            android:name=".MemoryReaderActivity"
+            android:exported="false"
+            android:label="Memory Reader" />
+
         <service
             android:name=".Ue4OverlayService"
             android:enabled="true"

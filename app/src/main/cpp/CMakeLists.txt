@@ -132,6 +132,8 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
         "ueGamedfm/Draw/DfmDraw.cpp"
         "soDumper/so_dumper.cpp"
         "soDumper/so_dumper_jni.cpp"
+        "ReadProcessMemory/mem_reader.cpp"
+        "ReadProcessMemory/mem_reader_jni.cpp"
 )
 
 # Specifies libraries CMake should link to your target library. You

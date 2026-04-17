@@ -182,6 +182,13 @@ public class MainActivity extends AppCompatActivity {
             startActivity(soDumperIntent);
         });
 
+        // ── Memory Reader 入口 ──
+        Button btnMemReader = findViewById(R.id.btn_mem_reader);
+        btnMemReader.setOnClickListener(v -> {
+            Intent memIntent = new Intent(this, MemoryReaderActivity.class);
+            startActivity(memIntent);
+        });
+
         // ── 和平精英启动按钮 ──
         btnPubgLaunch.setOnClickListener(v -> {
             if (!selinuxDone) {

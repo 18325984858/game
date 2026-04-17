@@ -1,0 +1,289 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    tools:context=".MemoryReaderActivity">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="16dp">
+
+        <!-- 进程搜索 -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="① 搜索 / 选择目标进程"
+            android:textSize="14sp"
+            android:textStyle="bold"
+            android:layout_marginBottom="4dp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginBottom="6dp">
+
+            <EditText
+                android:id="@+id/mem_et_search"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:hint="包名关键词..."
+                android:singleLine="true"
+                android:inputType="text" />
+
+            <Button
+                android:id="@+id/mem_btn_refresh"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="刷新" />
+        </LinearLayout>
+
+        <Spinner
+            android:id="@+id/mem_spinner_apps"
+            android:layout_width="match_parent"
+            android:layout_height="48dp"
+            android:background="@android:drawable/btn_dropdown"
+            android:layout_marginBottom="12dp" />
+
+        <!-- 模块选择 (可选, 用于取 base 地址) -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="② 内存映射 (模块 / heap / stack / 匿名段)"
+            android:textSize="13sp"
+            android:textColor="#888888"
+            android:layout_marginBottom="4dp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginBottom="4dp">
+
+            <EditText
+                android:id="@+id/mem_et_module_filter"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:hint="名称关键词 (libUE4 / heap / anon ...)"
+                android:singleLine="true"
+                android:inputType="text" />
+
+            <CheckBox
+                android:id="@+id/mem_cb_all_regions"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="全部映射"
+                android:layout_gravity="center_vertical"
+                android:layout_marginStart="6dp" />
+        </LinearLayout>
+        <Spinner
+            android:id="@+id/mem_spinner_modules"
+            android:layout_width="match_parent"
+            android:layout_height="48dp"
+            android:background="@android:drawable/btn_dropdown"
+            android:layout_marginBottom="4dp" />
+
+        <Button
+            android:id="@+id/mem_btn_use_module_base"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="使用该模块 base 作为地址"
+            android:layout_marginBottom="12dp" />
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:background="#CCCCCC"
+            android:layout_marginBottom="12dp" />
+
+        <!-- 地址 + 长度 -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="③ 地址 / 长度"
+            android:textSize="14sp"
+            android:textStyle="bold"
+            android:layout_marginBottom="4dp" />
+
+        <EditText
+            android:id="@+id/mem_et_address"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="十六进制 (支持 0x 前缀 / base+offset), 例: 0x7abc0000 或 0x7abc0000+0x100"
+            android:singleLine="true"
+            android:inputType="text"
+            android:fontFamily="monospace"
+            android:layout_marginBottom="6dp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginBottom="6dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="长度(字节):"
+                android:textSize="13sp"
+                android:layout_gravity="center_vertical"
+                android:layout_marginEnd="6dp" />
+
+            <EditText
+                android:id="@+id/mem_et_length"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="256"
+                android:singleLine="true"
+                android:inputType="number" />
+        </LinearLayout>
+
+        <!-- 显示模式 -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="④ 显示格式"
+            android:textSize="14sp"
+            android:textStyle="bold"
+            android:layout_marginBottom="4dp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginBottom="6dp">
+
+            <Spinner
+                android:id="@+id/mem_spinner_viewmode"
+                android:layout_width="0dp"
+                android:layout_weight="2"
+                android:layout_height="48dp"
+                android:background="@android:drawable/btn_dropdown" />
+
+            <Spinner
+                android:id="@+id/mem_spinner_endian"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="48dp"
+                android:background="@android:drawable/btn_dropdown"
+                android:layout_marginStart="6dp" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginBottom="6dp">
+
+            <CheckBox
+                android:id="@+id/mem_cb_signed"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="有符号" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="自定义字宽:"
+                android:textSize="13sp"
+                android:layout_gravity="center_vertical"
+                android:layout_marginStart="12dp"
+                android:layout_marginEnd="4dp" />
+
+            <EditText
+                android:id="@+id/mem_et_custom_width"
+                android:layout_width="60dp"
+                android:layout_height="wrap_content"
+                android:hint="16"
+                android:singleLine="true"
+                android:inputType="number" />
+        </LinearLayout>
+
+        <Button
+            android:id="@+id/mem_btn_read"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="📖 读取并显示"
+            android:layout_marginBottom="4dp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginBottom="8dp">
+
+            <Button
+                android:id="@+id/mem_btn_deref"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:text="→ 指针跟随"
+                android:layout_marginEnd="4dp" />
+
+            <Button
+                android:id="@+id/mem_btn_prev"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:text="◀ 前 N"
+                android:layout_marginEnd="4dp" />
+
+            <Button
+                android:id="@+id/mem_btn_next"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:text="后 N ▶" />
+        </LinearLayout>
+
+        <Button
+            android:id="@+id/mem_btn_search"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="🔎 搜索字节 / 字符串"
+            android:layout_marginBottom="8dp" />
+
+        <ProgressBar
+            android:id="@+id/mem_progress"
+            style="?android:attr/progressBarStyleHorizontal"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:indeterminate="true"
+            android:visibility="gone"
+            android:layout_marginBottom="8dp" />
+
+        <TextView
+            android:id="@+id/mem_tv_status"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text=""
+            android:textSize="12sp"
+            android:textColor="#888888"
+            android:layout_marginBottom="6dp" />
+
+        <!-- 输出框 -->
+        <HorizontalScrollView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:background="#111111"
+            android:padding="8dp">
+
+            <TextView
+                android:id="@+id/mem_tv_output"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textColor="#CCE9FF"
+                android:textSize="12sp"
+                android:fontFamily="monospace"
+                android:textIsSelectable="true"
+                android:text="" />
+        </HorizontalScrollView>
+
+    </LinearLayout>
+</ScrollView>
