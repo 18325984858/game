@@ -1031,7 +1031,9 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath) 
     // ── Step 6: 写入输出文件 ──
     FILE* outFp = fopen(outPath.c_str(), "wb");
     if (!outFp) {
-        __android_log_print(ANDROID_LOG_ERROR, DTAG, "无法创建输出文件: %s", outPath.c_str());
+        __android_log_print(ANDROID_LOG_ERROR, DTAG,
+            "无法创建输出文件: %s (errno=%d, %s)",
+            outPath.c_str(), errno, strerror(errno));
         delete[] outBuf;
         return -5;
     }

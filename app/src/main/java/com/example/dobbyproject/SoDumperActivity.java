@@ -69,8 +69,8 @@ public class SoDumperActivity extends AppCompatActivity {
     private int selectedPid = -1;          // 当前选中的目标进程 PID
     private String selectedPackage = "";    // 当前选中的目标包名
 
-    /** Dump 输出目录 (设备上) */
-    private static final String DUMP_DIR = "/data/local/tmp/so_dump";
+    /** Dump 输出目录 (设备上) - 运行时初始化为应用私有外部目录, 应用进程可直接读写 */
+    private String DUMP_DIR = "/data/local/tmp/so_dump";
 
     static {
         System.loadLibrary("dobbyproject");
@@ -407,9 +407,15 @@ public class SoDumperActivity extends AppCompatActivity {
 
     // ─── 工具方法 ───────────────────────────────────────────────────
 
-    /** 确保设备上的 dump 输出目录存在 */
+    /** 确保设备上的 dump 输出目录存在
+     *  使用应用自己的外部私有目录 (getExternalFilesDir), 应用进程有写权限, 无需 root, 且空间在 /sdcard 上.
+     *  /data/local/tmp 仅 shell 用户可写, 普通应用 fopen 会 EACCES 返回 -5. */
     private void ensureDumpDir() {
-        execSuCommand("mkdir -p " + DUMP_DIR + " && chmod 755 " + DUMP_DIR);
+        java.io.File base = getExternalFilesDir(null);
+        if (base == null) base = getFilesDir();
+        java.io.File dir = new java.io.File(base, "so_dump");
+        if (!dir.exists()) dir.mkdirs();
+        DUMP_DIR = dir.getAbsolutePath();
     }
 
     /** 通过 su 执行一条 shell 命令 */
