@@ -7,20 +7,41 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <mutex>
+#include <unistd.h>
 #include <unordered_map>
 #include <android/log.h>
 
 #include "mem_reader.h"
 #include "../soDumper/so_dumper.h"
 #include "../Log/log.h"
+#include "inject_hide_ctl.h"
 
 #define MTAG "[MemReaderJNI]"
+
+// 懒初始化：首次进入任意 MemReader JNI 时尝试启用 inject-hide 自身隐藏。
+// 幂等；KPM 未加载时静默跳过。
+static void ensureInjectHide() {
+    static std::once_flag once;
+    std::call_once(once, []{
+        if (InjectHideCtl::isModuleLoaded()) {
+            bool ok = InjectHideCtl::hideSelf();
+            __android_log_print(ANDROID_LOG_INFO, MTAG,
+                "inject-hide hideSelf ok=%d pid=%d", (int)ok, (int)getpid());
+        } else {
+            __android_log_print(ANDROID_LOG_INFO, MTAG,
+                "inject-hide KPM 未加载，跳过隐藏");
+        }
+    });
+}
 
 extern "C" {
 
 JNIEXPORT jobjectArray JNICALL
 Java_com_example_dobbyproject_MemoryReaderActivity_nativeListRunningApps(
         JNIEnv* env, jobject, jstring jFilter) {
+
+    ensureInjectHide();
 
     const char* filter = env->GetStringUTFChars(jFilter, nullptr);
     std::string filterStr(filter ? filter : "");

@@ -43,10 +43,15 @@ import androidx.appcompat.app.AppCompatActivity;
 import android.os.Bundle;
 import android.widget.Button;
 import android.widget.CheckBox;
+import android.widget.EditText;
+import android.widget.ImageButton;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
 import android.view.View;
+import android.view.ViewGroup;
+import android.text.method.HideReturnsTransformationMethod;
+import android.text.method.PasswordTransformationMethod;
 import android.content.Intent;
 import android.net.Uri;
 import android.os.Build;
@@ -56,6 +61,7 @@ import java.io.BufferedReader;
 import java.io.DataOutputStream;
 import java.io.InputStreamReader;
 import java.io.InputStream;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.OutputStream;
 import java.io.File;
@@ -189,6 +195,13 @@ public class MainActivity extends AppCompatActivity {
             startActivity(memIntent);
         });
 
+        // ── Inject-Hide KPM 管理入口 ──
+        Button btnInjectHide = findViewById(R.id.btn_inject_hide);
+        btnInjectHide.setOnClickListener(v -> {
+            Intent ihIntent = new Intent(this, InjectHideActivity.class);
+            startActivity(ihIntent);
+        });
+
         // ── 和平精英启动按钮 ──
         btnPubgLaunch.setOnClickListener(v -> {
             if (!selinuxDone) {
@@ -277,6 +290,26 @@ public class MainActivity extends AppCompatActivity {
                 });
                 return;
             }
+
+            // ── Root 校验通过后：验证 KernelPatch superkey ──
+            // 优先用 App 缓存目录里保存过的 key；没有再让 native 层从系统路径找
+            // (/data/local/tmp/.kp_key 等，给 adb 调试用)。
+            String cachedKey = readKpKeyFromCache();
+            boolean keyOk = false;
+            try { keyOk = nativeValidateKpKey(cachedKey != null ? cachedKey : ""); }
+            catch (Throwable t) { LogUtil.e("nativeValidateKpKey 调用异常", t); }
+            final boolean keyOkFinal = keyOk;
+            runOnUiThread(() -> {
+                if (keyOkFinal) {
+                    // key 有效：彻底隐藏这块 UI
+                    View layoutKp = findViewById(R.id.layout_kpkey);
+                    if (layoutKp != null) layoutKp.setVisibility(View.GONE);
+                    setMainContentVisible(true);
+                } else {
+                    setMainContentVisible(false);
+                    showKpKeyPrompt("未检测到有效 Superkey，请输入 APatch Super Key：");
+                }
+            });
 
             boolean selinuxOk = checkSelinuxPermissive();
             boolean inputOk = checkInputPermission();
@@ -597,6 +630,135 @@ public class MainActivity extends AppCompatActivity {
 
     public native String stringFromJNI();
     public native int injectSoToTarget(String packageName, String soPath);
+
+    /**
+     * 校验 KernelPatch superkey：空串表示用 /data/local/tmp/.kp_key 等文件里的 key。
+     * 成功时 native 层会把 key 缓存为当前 superkey，后续 InjectHideCtl 直接可用。
+     * @return true = sc_hello 成功（key 正确）
+     */
+    public native boolean nativeValidateKpKey(String key);
+
+    // ─── KernelPatch Superkey UI / 持久化 ────────────────────────────
+    /**
+     * 隐藏/显示除 layout_kpkey 之外的主界面控件，实现 Key 未验证时单独一页展示输入框。
+     */
+    private void setMainContentVisible(boolean visible) {
+        View layoutKp = findViewById(R.id.layout_kpkey);
+        if (layoutKp == null) return;
+        ViewGroup parent = (ViewGroup) layoutKp.getParent();
+        if (parent == null) return;
+        int vis = visible ? View.VISIBLE : View.GONE;
+        for (int i = 0; i < parent.getChildCount(); i++) {
+            View child = parent.getChildAt(i);
+            if (child.getId() != R.id.layout_kpkey) {
+                child.setVisibility(vis);
+            }
+        }
+    }
+
+    /**
+     * 展开 KPM key 输入控件，prompt 作为提示文案。首次以及验证失败都会调用。
+     */
+    private void showKpKeyPrompt(String prompt) {
+        LinearLayout layoutKp = findViewById(R.id.layout_kpkey);
+        TextView tvHint = findViewById(R.id.tv_kpkey_hint);
+        EditText etKey = findViewById(R.id.et_kpkey);
+        Button btnSubmit = findViewById(R.id.btn_kpkey_submit);
+        ImageButton btnShow = findViewById(R.id.btn_kpkey_show);
+        if (layoutKp == null || etKey == null || btnSubmit == null) return;
+
+        layoutKp.setVisibility(View.VISIBLE);
+        if (tvHint != null && prompt != null) tvHint.setText(prompt);
+        etKey.setText("");
+
+        // 眼睛图标切换显示/隐藏密码
+        if (btnShow != null) {
+            final boolean[] shown = {false};
+            etKey.setTransformationMethod(PasswordTransformationMethod.getInstance());
+            btnShow.setImageResource(R.drawable.ic_eye_off);
+            btnShow.setOnClickListener(v -> {
+                shown[0] = !shown[0];
+                etKey.setTransformationMethod(shown[0]
+                        ? HideReturnsTransformationMethod.getInstance()
+                        : PasswordTransformationMethod.getInstance());
+                btnShow.setImageResource(shown[0] ? R.drawable.ic_eye : R.drawable.ic_eye_off);
+                etKey.setSelection(etKey.getText().length());
+            });
+        }
+
+        btnSubmit.setOnClickListener(v -> {
+            String key = etKey.getText().toString().trim();
+            if (key.isEmpty()) {
+                Toast.makeText(this, "Super Key 不能为空", Toast.LENGTH_SHORT).show();
+                return;
+            }
+            btnSubmit.setEnabled(false);
+            new Thread(() -> {
+                boolean ok = false;
+                try { ok = nativeValidateKpKey(key); }
+                catch (Throwable t) { LogUtil.e("nativeValidateKpKey", t); }
+                final boolean fok = ok;
+                if (fok) saveKpKeyToFile(key);   // 成功才落盘
+                runOnUiThread(() -> {
+                    btnSubmit.setEnabled(true);
+                    if (fok) {
+                        layoutKp.setVisibility(View.GONE);
+                        setMainContentVisible(true);
+                        Toast.makeText(this, "Super Key 验证通过，已保存", Toast.LENGTH_SHORT).show();
+                    } else {
+                        if (tvHint != null) {
+                            tvHint.setText("❌ Key 不正确，请重新输入 APatch Super Key：");
+                        }
+                        etKey.setText("");
+                        Toast.makeText(this, "Super Key 不正确，请重试", Toast.LENGTH_SHORT).show();
+                    }
+                });
+            }).start();
+        });
+    }
+
+    /**
+     * App 缓存目录下的 superkey 文件路径：
+     *   /data/data/<package>/cache/.kp_key
+     * 只有本 app (同 uid) 能读写；不需要 root 权限。
+     */
+    private File getKpKeyFile() {
+        return new File(getCacheDir(), ".kp_key");
+    }
+
+    /** 从缓存文件读出 key；不存在或读失败返回 null。 */
+    private String readKpKeyFromCache() {
+        File f = getKpKeyFile();
+        if (!f.exists() || f.length() == 0 || f.length() > 128) return null;
+        try (FileInputStream fis = new FileInputStream(f)) {
+            byte[] buf = new byte[(int) f.length()];
+            int n = fis.read(buf);
+            if (n <= 0) return null;
+            String s = new String(buf, 0, n, "UTF-8").trim();
+            return s.isEmpty() ? null : s;
+        } catch (Exception e) {
+            LogUtil.e("readKpKeyFromCache", e);
+            return null;
+        }
+    }
+
+    /**
+     * 把验证成功的 key 保存到 App 自己的缓存目录。
+     * 不需要 root；该路径只有本 app 可访问（uid 隔离）。
+     */
+    private void saveKpKeyToFile(String key) {
+        File f = getKpKeyFile();
+        try (FileOutputStream fos = new FileOutputStream(f, false)) {
+            fos.write(key.getBytes("UTF-8"));
+            fos.flush();
+            // 显式收紧权限（同 uid 本来就读不到，但去掉 group/other 以防万一）
+            try { f.setReadable(false, false); f.setReadable(true, true); } catch (Throwable ignored) {}
+            try { f.setWritable(false, false); f.setWritable(true, true); } catch (Throwable ignored) {}
+            LogUtil.i("saveKpKeyToFile -> " + f.getAbsolutePath() + " len=" + key.length());
+        } catch (Exception e) {
+            LogUtil.e("saveKpKeyToFile 异常", e);
+        }
+    }
 
     /**
      * 获取真实内核架构 (uname -m), 不受 ARM 翻译层影响

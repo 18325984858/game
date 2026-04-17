@@ -3,13 +3,14 @@
     xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
+    android:fillViewport="true"
     tools:context=".MainActivity">
 
 <LinearLayout
     android:layout_width="match_parent"
-    android:layout_height="wrap_content"
+    android:layout_height="match_parent"
     android:orientation="vertical"
-    android:gravity="center_horizontal"
+    android:gravity="center_horizontal|center_vertical"
     android:padding="24dp">
 
     <TextView
@@ -20,6 +21,65 @@
         android:textSize="20sp"
         android:textStyle="bold"
         android:layout_marginBottom="24dp" />
+
+    <!-- ───────── KernelPatch Superkey 状态 ─────────
+         打开 App 时：如果 /data/local/tmp/.kp_key 里的 key 能通过 sc_hello，
+         整块隐藏；否则显示输入框让用户填入 key。-->
+    <LinearLayout
+        android:id="@+id/layout_kpkey"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:background="#33FF9800"
+        android:padding="12dp"
+        android:visibility="gone"
+        android:layout_marginBottom="16dp">
+
+        <TextView
+            android:id="@+id/tv_kpkey_hint"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="⚠ 需要 KernelPatch Superkey\n请在下方输入 APatch 的 Super Key，用于激活 inject-hide 隐身功能。"
+            android:textSize="13sp"
+            android:textColor="#FFFFFF"
+            android:layout_marginBottom="8dp" />
+
+        <EditText
+            android:id="@+id/et_kpkey"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="请输入 Super Key"
+            android:inputType="textPassword"
+            android:maxLength="64"
+            android:textColor="#FFFFFF"
+            android:textColorHint="#AAFFFFFF"
+            android:paddingEnd="44dp"
+            android:layout_marginBottom="8dp" />
+
+        <ImageButton
+            android:id="@+id/btn_kpkey_show"
+            android:layout_width="36dp"
+            android:layout_height="36dp"
+            android:layout_gravity="end"
+            android:layout_marginTop="-48dp"
+            android:layout_marginEnd="4dp"
+            android:layout_marginBottom="12dp"
+            android:background="@android:color/transparent"
+            android:src="@drawable/ic_eye_off"
+            android:contentDescription="show/hide" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal">
+
+            <Button
+                android:id="@+id/btn_kpkey_submit"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="验证并保存" />
+        </LinearLayout>
+    </LinearLayout>
 
     <!-- 设置宽容模式 -->
     <Button
@@ -252,6 +312,14 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:text="🔍 内存读取器 (任意进程)"
+        android:layout_marginBottom="8dp" />
+
+    <!-- Inject-Hide 管理入口 -->
+    <Button
+        android:id="@+id/btn_inject_hide"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="🛡️ Inject-Hide 管理 (KPM)"
         android:layout_marginBottom="16dp" />
 
     <!-- 状态显示 -->

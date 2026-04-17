@@ -202,8 +202,8 @@ public class MemoryReaderActivity extends AppCompatActivity {
             catch (Throwable t) { arr = new String[0]; }
             final String[] items = arr;
 
-            appList.clear();
-            List<String> labels = new ArrayList<>();
+            final List<AppItem> collected = new ArrayList<>();
+            final List<String> labels = new ArrayList<>();
             if (items != null) {
                 for (String s : items) {
                     int colon = s.indexOf(':');
@@ -212,12 +212,14 @@ public class MemoryReaderActivity extends AppCompatActivity {
                         int pid = Integer.parseInt(s.substring(0, colon));
                         String name = s.substring(colon + 1);
                         AppItem it = new AppItem(pid, name);
-                        appList.add(it);
+                        collected.add(it);
                         labels.add(it.toString());
                     } catch (NumberFormatException ignored) {}
                 }
             }
             runOnUiThread(() -> {
+                appList.clear();
+                appList.addAll(collected);
                 appAdapter.clear();
                 appAdapter.addAll(labels);
                 appAdapter.notifyDataSetChanged();
@@ -244,7 +246,7 @@ public class MemoryReaderActivity extends AppCompatActivity {
             } catch (Throwable t) { arr = new String[0]; }
             final String[] items = arr;
 
-            allModules.clear();
+            final List<ModuleItem> collected = new ArrayList<>();
             if (items != null) {
                 for (String s : items) {
                     String[] parts = s.split(":", allRegions ? 6 : 5);
@@ -257,11 +259,13 @@ public class MemoryReaderActivity extends AppCompatActivity {
                         m.name     = parts[3];
                         m.path     = parts[4];
                         m.perms    = allRegions ? parts[5] : "";
-                        allModules.add(m);
+                        collected.add(m);
                     } catch (Exception ignored) {}
                 }
             }
             runOnUiThread(() -> {
+                allModules.clear();
+                allModules.addAll(collected);
                 applyModuleFilter();
                 tvStatus.setText("共 " + allModules.size() + (allRegions ? " 个映射" : " 个模块"));
             });

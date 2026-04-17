@@ -5,6 +5,7 @@
 #include "../Log/log.h"
 #include "unitystart.h"
 #include "../Injector/Injector.h"
+#include "../ReadProcessMemory/inject_hide_ctl.h"
 
 struct CommandResult {
     int exitCode;
@@ -68,6 +69,23 @@ Java_com_example_dobbyproject_MainActivity_injectSoToTarget(
     env->ReleaseStringUTFChars(packageName, pkg);
     env->ReleaseStringUTFChars(soPath, so);
     return ret;
+}
+
+// ─── KernelPatch superkey 校验 / 保存 ──────────────────────────────
+// 由 MainActivity 在 Root 校验通过后调用：
+//   nativeValidateKpKey("")          → 用文件里的 key（/data/local/tmp/.kp_key 等）试
+//   nativeValidateKpKey("xxxx")      → 用用户输入的 key 试
+// 返回 JNI_TRUE 表示 sc_hello 成功（key 正确）。
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_example_dobbyproject_MainActivity_nativeValidateKpKey(
+        JNIEnv* env, jobject /*thiz*/, jstring jKey) {
+    std::string key;
+    if (jKey) {
+        const char* p = env->GetStringUTFChars(jKey, nullptr);
+        if (p) { key = p; env->ReleaseStringUTFChars(jKey, p); }
+    }
+    bool ok = InjectHideCtl::verifyKey(key);
+    return ok ? JNI_TRUE : JNI_FALSE;
 }
 
 #ifdef OBFU_ATTRS_END

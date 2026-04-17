@@ -1,0 +1,328 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.core.widget.NestedScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fillViewport="true"
+    tools:context=".InjectHideActivity">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="16dp">
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Inject-Hide KPM 管理"
+            android:textSize="18sp"
+            android:textStyle="bold"
+            android:layout_marginBottom="4dp" />
+
+        <TextView
+            android:id="@+id/ih_tv_status"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="模块状态检测中..."
+            android:textColor="#888888"
+            android:textSize="12sp"
+            android:layout_marginBottom="12dp" />
+
+        <!-- 全局开关：单按钮自适应当前状态 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginBottom="8dp">
+            <Button
+                android:id="@+id/ih_btn_toggle_proc"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:text="PID隐藏：未知" />
+            <Button
+                android:id="@+id/ih_btn_toggle_file"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:text="文件隐藏：未知" />
+            <Button
+                android:id="@+id/ih_btn_toggle_comm"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:text="线程名隐藏：未知" />
+        </LinearLayout>
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:background="#CCCCCC"
+            android:layout_marginBottom="12dp" />
+
+        <!-- SO 关键字管理 -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="隐藏 SO 关键字列表 (最多 32) - 来自 inject-hide.kpm 实时数组"
+            android:textStyle="bold"
+            android:layout_marginBottom="4dp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginBottom="4dp">
+            <EditText
+                android:id="@+id/ih_et_so"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:hint="如: libdobbyproject.so"
+                android:singleLine="true" />
+            <Button
+                android:id="@+id/ih_btn_add_so"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="添加" />
+        </LinearLayout>
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginBottom="8dp">
+            <Button
+                android:id="@+id/ih_btn_list_so"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:text="刷新列表" />
+            <Button
+                android:id="@+id/ih_btn_clear_so"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:text="清空" />
+        </LinearLayout>
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="点击条目删除 ↓"
+            android:textSize="11sp"
+            android:textColor="#888888" />
+
+        <ListView
+            android:id="@+id/ih_lv_so_list"
+            android:layout_width="match_parent"
+            android:layout_height="160dp"
+            android:background="#22000000"
+            android:padding="4dp"
+            android:nestedScrollingEnabled="true"
+            android:layout_marginBottom="16dp" />
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:background="#CCCCCC"
+            android:layout_marginBottom="12dp" />
+
+        <!-- 监控的包名列表 (hide_pkg) -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="监控的应用包名 (命中则自动隐藏其 PID)"
+            android:textStyle="bold"
+            android:layout_marginBottom="4dp" />
+
+        <!-- 进程选择器：搜索关键字 + 下拉枚举所有进程 (cmdline)，选择后自动填充包名 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginBottom="4dp">
+            <EditText
+                android:id="@+id/ih_et_proc_search"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:hint="在已抓取的进程中过滤 (模糊匹配)"
+                android:singleLine="true" />
+            <Button
+                android:id="@+id/ih_btn_proc_refresh"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="抓取/刷新" />
+        </LinearLayout>
+
+        <Spinner
+            android:id="@+id/ih_sp_proc_match"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="4dp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginBottom="4dp">
+            <EditText
+                android:id="@+id/ih_et_pkg"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:hint="包名 (可手动输入或从上方下拉选择)"
+                android:singleLine="true" />
+            <Button
+                android:id="@+id/ih_btn_add_pkg"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="添加" />
+        </LinearLayout>
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginBottom="8dp">
+            <Button
+                android:id="@+id/ih_btn_list_pkg"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:text="刷新列表" />
+            <Button
+                android:id="@+id/ih_btn_clear_pkg"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:text="清空" />
+        </LinearLayout>
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="点击条目删除 ↓"
+            android:textSize="11sp"
+            android:textColor="#888888" />
+
+        <ListView
+            android:id="@+id/ih_lv_pkg_list"
+            android:layout_width="match_parent"
+            android:layout_height="140dp"
+            android:background="#22000000"
+            android:padding="4dp"
+            android:nestedScrollingEnabled="true"
+            android:layout_marginBottom="16dp" />
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:background="#CCCCCC"
+            android:layout_marginBottom="12dp" />
+
+        <!-- 线程名隐藏列表 (hide_comm) -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="隐藏的线程名关键字 (最多 32) - 命中则 comm 被擦空"
+            android:textStyle="bold"
+            android:layout_marginBottom="4dp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginBottom="4dp">
+            <EditText
+                android:id="@+id/ih_et_comm"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:hint="如: gmain / gum-js-loop"
+                android:singleLine="true" />
+            <Button
+                android:id="@+id/ih_btn_add_comm"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="添加" />
+        </LinearLayout>
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginBottom="8dp">
+            <Button
+                android:id="@+id/ih_btn_list_comm"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:text="刷新列表" />
+            <Button
+                android:id="@+id/ih_btn_clear_comm"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:text="清空" />
+        </LinearLayout>
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="点击条目删除 ↓"
+            android:textSize="11sp"
+            android:textColor="#888888" />
+
+        <ListView
+            android:id="@+id/ih_lv_comm_list"
+            android:layout_width="match_parent"
+            android:layout_height="140dp"
+            android:background="#22000000"
+            android:padding="4dp"
+            android:nestedScrollingEnabled="true"
+            android:layout_marginBottom="16dp" />
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:background="#CCCCCC"
+            android:layout_marginBottom="12dp" />
+
+        <!-- 原始命令 -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="原始命令 (调试)"
+            android:textStyle="bold"
+            android:layout_marginBottom="4dp" />
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginBottom="4dp">
+            <EditText
+                android:id="@+id/ih_et_raw"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:hint="例如: add_hide_pid:1234"
+                android:singleLine="true" />
+            <Button
+                android:id="@+id/ih_btn_raw"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="发送" />
+        </LinearLayout>
+        <TextView
+            android:id="@+id/ih_tv_raw_resp"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text=""
+            android:textSize="12sp"
+            android:fontFamily="monospace"
+            android:padding="8dp"
+            android:background="#22000000"
+            android:textColor="#00FF88"
+            android:layout_marginBottom="8dp" />
+    </LinearLayout>
+</androidx.core.widget.NestedScrollView>
