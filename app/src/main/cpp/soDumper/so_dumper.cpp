@@ -1,10 +1,14 @@
 /**
  * @file    so_dumper.cpp
  * @brief   从运行中进程 dump SO 文件并修复 ELF 头
- *          需要 root 权限 (所有 /proc 操作通过 su 执行)
+ *          - 需要 root 权限
+ *          - 所有 /proc/<pid>/mem 与 /proc/<pid>/maps 读取统一经 MemReader
+ *            (持久化 root shell + dd), 不再自己 popen("su -c dd ...");
+ *          - listRunningApps 仍用 popen("su -c ps") 做一次性进程枚举.
  */
 #include "so_dumper.h"
 #include "../Log/log.h"
+#include "../ReadProcessMemory/mem_reader.h"
 
 #include <cstdio>
 #include <cstring>
@@ -144,17 +148,22 @@ std::vector<ProcessInfo> listRunningApps(const std::string& filter) {
     return result;
 }
 
-// ─── 模块枚举 (通过 su 读取目标进程 maps) ───────────────────────────
-
+// ─── 模块枚举 (通过 MemReader 读取目标进程 /proc/<pid>/maps) ─────────
+//
+// 统计规则:
+//   - 只收录路径以 '/' 开头、且包含 ".so" 的映射 (排除 [vdso] 等匿名段)
+//   - 同一 .so 可能被拆成 r-x / r-- / rw- 等多段; 这里按 path 归并,
+//     baseAddr = 最小 start, endAddr = 最大 end, size = 各段字节之和
+//     (不是 end-base 的虚拟跨度, 跨度里可能含 gap)
 std::vector<ModuleInfo> listModules(int pid) {
     std::vector<ModuleInfo> result;
 
-    // 使用 su 读取其他进程的 maps (非 root 无权限)
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "su -c 'cat /proc/%d/maps 2>/dev/null'", pid);
-    FILE* fp = popen(cmd, "r");
-    if (!fp) {
-        __android_log_print(ANDROID_LOG_ERROR, DTAG, "popen(su cat maps) 失败, pid=%d", pid);
+    // 通过 MemReader 的持久 root shell 读取 /proc/<pid>/maps,
+    // 避免每次 popen(su) 的昂贵开销, 也与 mem_reader 共用一条 root 通道.
+    std::string mapsText;
+    if (!MemReader::readMaps(pid, mapsText)) {
+        __android_log_print(ANDROID_LOG_ERROR, DTAG,
+            "MemReader::readMaps 失败, pid=%d", pid);
         return result;
     }
 
@@ -165,15 +174,22 @@ std::vector<ModuleInfo> listModules(int pid) {
     };
     std::map<std::string, ModuleAcc> moduleMap;
 
-    char line[1024];
-    while (fgets(line, sizeof(line), fp)) {
+    // 按行扫描 mapsText
+    size_t linePos = 0;
+    while (linePos < mapsText.size()) {
+        size_t nl = mapsText.find('\n', linePos);
+        std::string line = mapsText.substr(linePos,
+            (nl == std::string::npos ? mapsText.size() : nl) - linePos);
+        linePos = (nl == std::string::npos) ? mapsText.size() : nl + 1;
+        if (line.empty()) continue;
+
         // 格式: 7a1000-7a2000 r-xp 00000000 fd:00 12345  /path/to/lib.so
         uintptr_t start, end;
         char perms[8], path[512];
         unsigned long offset, dev1, dev2, inode;
         path[0] = '\0';
 
-        int matched = sscanf(line, "%lx-%lx %4s %lx %lx:%lx %lu %511s",
+        int matched = sscanf(line.c_str(), "%lx-%lx %4s %lx %lx:%lx %lu %511s",
                              &start, &end, perms, &offset, &dev1, &dev2, &inode, path);
         if (matched < 7) continue;
         if (path[0] == '\0') continue;
@@ -200,7 +216,6 @@ std::vector<ModuleInfo> listModules(int pid) {
             acc.mappedBytes += (end - start);
         }
     }
-    pclose(fp);
 
     for (auto& kv : moduleMap) {
         auto& acc = kv.second;
@@ -219,68 +234,22 @@ std::vector<ModuleInfo> listModules(int pid) {
     return result;
 }
 
-// ─── 进程内存读取 (通过 su + dd) ────────────────────────────────────
+// ─── 进程内存读取 (统一走 MemReader, 与 mem_reader 共用持久 root shell) ──
 
 /**
- * 从目标进程内存读取指定地址的数据到缓冲区
+ * 从目标进程内存读取指定地址的数据到 buf.
+ * 底层是 MemReader::readMemory (持久 RootShell + dd + /proc/PID/mem),
+ * 自动处理 aarch64 MTE/TBI tag、页对齐和大块分段.
  * @return 实际读取的字节数, 0 表示失败
  */
 static size_t readProcessMemory(int pid, uintptr_t addr, size_t size, uint8_t* buf) {
-    const size_t PAGE_SIZE = 4096;
-    uintptr_t pageStart = addr & ~(PAGE_SIZE - 1);
-    size_t pageOffset = addr - pageStart;
-    size_t pageCount = (pageOffset + size + PAGE_SIZE - 1) / PAGE_SIZE;
-
-    const char* tmpPath = "/data/local/tmp/so_dump/_pmem_tmp";
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd),
-        "su -c 'dd if=/proc/%d/mem of=%s bs=%zu skip=%zu count=%zu "
-        "conv=noerror,sync 2>/dev/null && chmod 666 %s'",
-        pid, tmpPath, PAGE_SIZE, pageStart / PAGE_SIZE, pageCount, tmpPath);
-
-    system(cmd);
-
-    FILE* fp = fopen(tmpPath, "rb");
-    if (!fp) {
-        __android_log_print(ANDROID_LOG_ERROR, DTAG, "readProcessMemory: 无法打开 tmp 文件");
-        return 0;
-    }
-
-    fseek(fp, (long)pageOffset, SEEK_SET);
-    size_t got = fread(buf, 1, size, fp);
-    fclose(fp);
-
-    // 清理临时文件
-    system("su -c 'rm -f /data/local/tmp/so_dump/_pmem_tmp'");
-    return got;
-}
-
-/**
- * 从目标进程内存读取大块数据, 直接 dd 到文件
- * @return 实际文件大小, 0 表示失败
- */
-static size_t readProcessMemoryToFile(int pid, uintptr_t addr, size_t size,
-                                       const std::string& outTmpPath) {
-    const size_t PAGE_SIZE = 4096;
-    uintptr_t pageStart = addr & ~(PAGE_SIZE - 1);
-    size_t pageOffset = addr - pageStart;
-    size_t pageCount = (pageOffset + size + PAGE_SIZE - 1) / PAGE_SIZE;
-
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd),
-        "su -c 'dd if=/proc/%d/mem of=%s bs=%zu skip=%zu count=%zu "
-        "conv=noerror,sync 2>/dev/null && chmod 666 %s'",
-        pid, outTmpPath.c_str(), PAGE_SIZE, pageStart / PAGE_SIZE, pageCount,
-        outTmpPath.c_str());
-
-    system(cmd);
-
-    FILE* fp = fopen(outTmpPath.c_str(), "rb");
-    if (!fp) return 0;
-    fseek(fp, 0, SEEK_END);
-    size_t fileSize = (size_t)ftell(fp);
-    fclose(fp);
-    return fileSize;
+    if (!buf || size == 0) return 0;
+    std::vector<uint8_t> tmp;
+    ssize_t got = MemReader::readMemory(pid, addr, size, tmp);
+    if (got <= 0) return 0;
+    size_t copy = std::min<size_t>((size_t)got, size);
+    memcpy(buf, tmp.data(), copy);
+    return copy;
 }
 
 // ─── Dump + 修复 (PT_LOAD 段感知) ──────────────────────────────────
@@ -298,8 +267,7 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath) 
         return -2;
     }
 
-    // 创建临时目录
-    system("su -c 'mkdir -p /data/local/tmp/so_dump && chmod 777 /data/local/tmp/so_dump'");
+    // 临时目录由 MemReader 初始化时保证 (/data/local/tmp/so_dump)
 
     // ── Step 1: 读取首页, 获取 ELF 头 ──
     const size_t PAGE_SIZE = 4096;
@@ -437,9 +405,7 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath) 
     delete[] headerBuf;
     headerBuf = nullptr;
 
-    // ── Step 4: 逐段 dump PT_LOAD 数据 ──
-    std::string segTmpPath = "/data/local/tmp/so_dump/_seg_tmp";
-
+    // ── Step 4: 逐段 dump PT_LOAD 数据 (统一走 MemReader, 内部会按 1MB 分段) ──
     for (size_t si = 0; si < loadSegs.size(); si++) {
         auto& seg = loadSegs[si];
         uintptr_t memAddr = baseAddr + seg.vaddr;
@@ -454,34 +420,9 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath) 
             "Dump PT_LOAD[%zu]: mem=0x%lx -> file_off=0x%lx, size=%zu",
             si, (unsigned long)memAddr, (unsigned long)seg.offset, readSize);
 
-        // 对于小段 (< 64KB), 直接读到内存
-        if (readSize <= 64 * 1024) {
-            readProcessMemory(pid, memAddr, readSize, outBuf + seg.offset);
-        } else {
-            // 大段: dd 到文件, 再分块读入
-            size_t tmpFileSize = readProcessMemoryToFile(pid, memAddr, readSize, segTmpPath);
-            if (tmpFileSize == 0) {
-                __android_log_print(ANDROID_LOG_WARN, DTAG,
-                    "PT_LOAD[%zu] dd 失败, 跳过", si);
-                continue;
-            }
-
-            FILE* segFp = fopen(segTmpPath.c_str(), "rb");
-            if (segFp) {
-                // 处理页对齐偏移
-                size_t pageOffset = memAddr & (PAGE_SIZE - 1);
-                fseek(segFp, (long)pageOffset, SEEK_SET);
-                size_t got = fread(outBuf + seg.offset, 1, readSize, segFp);
-                fclose(segFp);
-                __android_log_print(ANDROID_LOG_INFO, DTAG,
-                    "PT_LOAD[%zu]: 读取 %zu / %zu bytes", si, got, readSize);
-            }
-
-            // 清理段临时文件
-            char rmCmd[512];
-            snprintf(rmCmd, sizeof(rmCmd), "su -c 'rm -f %s'", segTmpPath.c_str());
-            system(rmCmd);
-        }
+        size_t got = readProcessMemory(pid, memAddr, readSize, outBuf + seg.offset);
+        __android_log_print(ANDROID_LOG_INFO, DTAG,
+            "PT_LOAD[%zu]: 读取 %zu / %zu bytes", si, got, readSize);
     }
 
     // ── Step 5: IDA 兼容 ELF 修复 (重建 section headers) ──

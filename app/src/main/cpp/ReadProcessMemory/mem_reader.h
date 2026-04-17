@@ -36,6 +36,12 @@ namespace MemReader {
     bool findRegion(int pid, uintptr_t address, RegionInfo& info);
 
     /**
+     * 读取 /proc/PID/maps 的完整文本 (通过持久 root shell, 无需每次 popen).
+     * @return true 表示成功；out 里会是原始的 maps 内容 (包含末尾换行)
+     */
+    bool readMaps(int pid, std::string& out);
+
+    /**
      * 在指定地址范围内搜索字节模式
      * @param pattern 模式字节
      * @param mask    与 pattern 同长度的掩码 (0xFF 精确 / 0x00 通配)

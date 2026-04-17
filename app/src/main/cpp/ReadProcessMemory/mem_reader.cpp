@@ -273,6 +273,48 @@ ssize_t readMemory(int pid, uintptr_t address, size_t size,
     return (ssize_t)totalGot;
 }
 
+bool readMaps(int pid, std::string& out) {
+    out.clear();
+    if (pid <= 0) return false;
+
+    // 首次准备 tmp 目录
+    static std::once_flag s_mkdir_maps;
+    std::call_once(s_mkdir_maps, []{
+        RootShell::I().exec(
+            std::string("mkdir -p ") + TMP_DIR + " && chmod 777 " + TMP_DIR);
+    });
+
+    const char* mapsTmp = "/data/local/tmp/so_dump/_maps_tmp";
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd),
+        "cat /proc/%d/maps 2>/dev/null > %s; chmod 666 %s 2>/dev/null",
+        pid, mapsTmp, mapsTmp);
+    if (!RootShell::I().exec(cmd)) {
+        __android_log_print(ANDROID_LOG_WARN, RTAG,
+            "readMaps: RootShell exec 失败 pid=%d", pid);
+        return false;
+    }
+
+    FILE* fp = fopen(mapsTmp, "r");
+    if (!fp) {
+        __android_log_print(ANDROID_LOG_WARN, RTAG,
+            "readMaps: fopen tmp 失败 pid=%d errno=%d", pid, errno);
+        return false;
+    }
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
+        out.append(buf, n);
+    }
+    fclose(fp);
+    if (out.empty()) {
+        __android_log_print(ANDROID_LOG_WARN, RTAG,
+            "readMaps: maps 为空 pid=%d (进程可能已退出或无权限)", pid);
+        return false;
+    }
+    return true;
+}
+
 bool findRegion(int pid, uintptr_t address, RegionInfo& info) {
     uintptr_t realAddr = untag(address);
     char mapsPath[64];
@@ -287,8 +329,7 @@ bool findRegion(int pid, uintptr_t address, RegionInfo& info) {
     if (!RootShell::I().exec(cmd)) return false;
 
     FILE* fp = fopen(mapsTmp, "r");
-    if (!fp) return false;
-    char line[1024];
+    if (!fp) return false;    char line[1024];
     bool found = false;
     while (fgets(line, sizeof(line), fp)) {
         uintptr_t s, e;
