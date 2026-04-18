@@ -76,27 +76,37 @@ void overlayThreadMain(ANativeWindow* window, int width, int height, int rotateT
         // 否则 ImGui::IO 的 InputEventsQueue 会多线程竞争导致 ImVector 越界崩溃
 
         Clock::time_point lastHeartbeatLog;
-        bool clientWasConnected = false;  // 追踪 RenderClient 是否曾连接过
-        int clientDisconnectFrames = 0;   // Client 断开后的帧计数
+        bool clientWasConnected = false;          // 追踪 RenderClient 是否曾连接过
+        Clock::time_point lastClientSeenTime;     // 最后一次见到 client 连接的时刻
+        const auto kClientLostTimeout = std::chrono::seconds(2);   // client 失联超时
+        const auto kNoClientStartTimeout = std::chrono::seconds(0); // 启动后从未连接的超时(0=禁用)
+        const auto startTime = Clock::now();
+        bool exitDueToClientLost = false;
         while (!g_overlayStopRequested.load(std::memory_order_acquire)) {
             imgui->ProcessInputEvent();
             imgui->BeginFrame();
             imgui->EndFrame();
 
-            // 检测 RenderClient 断线: 游戏进程退出时 TCP 连接断开
+            const auto now = Clock::now();
             const bool clientNow = imgui->IsClientConnected();
             if (clientNow) {
                 clientWasConnected = true;
-                clientDisconnectFrames = 0;
+                lastClientSeenTime = now;
             } else if (clientWasConnected) {
-                clientDisconnectFrames++;
-                // Client 曾连接但已断开超过 60 帧 (~1秒): 清屏并退出
-                if (clientDisconnectFrames > 60) {
-                    OLOG(LOG_LEVEL_INFO, "公开 Overlay: RenderClient 断线, 清除画面并退出");
-                    imgui->BeginFrame();
-                    imgui->EndFrame();
+                // 曾连接过, 如果失联超时, 主动退出并清屏
+                if (lastClientSeenTime.time_since_epoch().count() != 0 &&
+                    now - lastClientSeenTime > kClientLostTimeout) {
+                    OLOG(LOG_LEVEL_INFO, "公开 Overlay: RenderClient 失联 %lldms, 清除画面并退出",
+                         (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                             now - lastClientSeenTime).count());
+                    exitDueToClientLost = true;
                     break;
                 }
+            } else if (kNoClientStartTimeout.count() > 0 &&
+                       now - startTime > kNoClientStartTimeout) {
+                // 启动后一直没有 client 连接, 超时退出 (默认禁用)
+                OLOG(LOG_LEVEL_INFO, "公开 Overlay: 启动后无 client 连接超时, 退出");
+                break;
             }
 
             if (shouldLogEvery(lastHeartbeatLog, std::chrono::milliseconds(3000))) {
@@ -107,10 +117,15 @@ void overlayThreadMain(ANativeWindow* window, int width, int height, int rotateT
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
 
-        // 渲染一帧空帧清除 Surface 上的残留内容
-        imgui->BeginFrame();
-        imgui->EndFrame();
-        OLOG(LOG_LEVEL_INFO, "公开 Overlay 已渲染空帧清除画面");
+        // 渲染多帧空帧, 确保 Surface 上之前 RenderClient 残留的内容被清除
+        // (单帧可能因双缓冲/三缓冲未真正提交到屏幕)
+        const int kClearFrames = exitDueToClientLost ? 5 : 2;
+        for (int i = 0; i < kClearFrames; ++i) {
+            imgui->BeginFrame();
+            imgui->EndFrame();
+            std::this_thread::sleep_for(std::chrono::milliseconds(16));
+        }
+        OLOG(LOG_LEVEL_INFO, "公开 Overlay 已渲染 %d 帧空帧清除画面", kClearFrames);
 
         OLOG(LOG_LEVEL_INFO, "公开 Overlay 渲染线程退出");
     } catch (const std::exception& exception) {

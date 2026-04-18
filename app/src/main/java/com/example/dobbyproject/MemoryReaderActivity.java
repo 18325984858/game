@@ -22,6 +22,7 @@ import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 
 /**
  * 任意进程内存读取器
@@ -176,7 +177,11 @@ public class MemoryReaderActivity extends AppCompatActivity {
                 Toast.makeText(this, "请先选择模块", Toast.LENGTH_SHORT).show();
                 return;
             }
-            etAddress.setText(String.format("0x%X", filteredModules.get(idx).baseAddr));
+            ModuleItem selected = filteredModules.get(idx);
+            long realBase = resolveModuleStartBase(selected);
+            etAddress.setText(String.format("0x%X", realBase));
+            tvStatus.setText(String.format(Locale.ROOT,
+                    "已使用 %s 的起始 BASE: 0x%X", selected.name, realBase));
         });
 
         btnRead.setOnClickListener(v -> doRead());
@@ -285,6 +290,33 @@ public class MemoryReaderActivity extends AppCompatActivity {
         moduleAdapter.clear();
         moduleAdapter.addAll(labels);
         moduleAdapter.notifyDataSetChanged();
+    }
+
+    private static String normalizedModuleKey(ModuleItem item) {
+        if (item == null) return "";
+        String path = item.path == null ? "" : item.path.trim().toLowerCase(Locale.ROOT);
+        if (!path.isEmpty() && path.startsWith("/")) {
+            return path;
+        }
+        return item.name == null ? "" : item.name.trim().toLowerCase(Locale.ROOT);
+    }
+
+    private long resolveModuleStartBase(ModuleItem selected) {
+        if (selected == null) return 0L;
+        long minBase = selected.baseAddr;
+        String selectedKey = normalizedModuleKey(selected);
+        String selectedName = selected.name == null ? "" : selected.name.trim().toLowerCase(Locale.ROOT);
+
+        for (ModuleItem m : allModules) {
+            String key = normalizedModuleKey(m);
+            String name = m.name == null ? "" : m.name.trim().toLowerCase(Locale.ROOT);
+            boolean sameModule = (!selectedKey.isEmpty() && selectedKey.equals(key))
+                    || (!selectedName.isEmpty() && selectedName.equals(name));
+            if (sameModule && m.baseAddr < minBase) {
+                minBase = m.baseAddr;
+            }
+        }
+        return minBase;
     }
 
     // ─── 读内存 + 显示 ───────────────────────────────────────────────

@@ -17,7 +17,10 @@ import android.widget.Toast;
 import android.widget.EditText;
 import java.io.BufferedReader;
 import java.io.DataOutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
 import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
 import java.text.DecimalFormat;
 import java.util.ArrayList;
 import java.util.List;
@@ -94,25 +97,40 @@ public class SoDumperActivity extends AppCompatActivity {
         }
     }
 
-    /** SO 模块信息 (来自 /proc/pid/maps) */
+    /** 内存映射信息 (来自 /proc/pid/maps) */
     private static class ModuleItem {
         long baseAddr;
         long endAddr;
         long size;
+        long fileOffset;
+        String perms;
         String name;
         String path;
 
-        ModuleItem(long baseAddr, long endAddr, long size, String name, String path) {
+        ModuleItem(long baseAddr, long endAddr, long size, long fileOffset, String perms, String name, String path) {
             this.baseAddr = baseAddr;
             this.endAddr = endAddr;
             this.size = size;
+            this.fileOffset = fileOffset;
+            this.perms = perms;
             this.name = name;
             this.path = path;
         }
 
         @Override
         public String toString() {
-            return name + " (" + formatSize(size) + ")";
+            String extra = "";
+            if (path != null && !path.isEmpty() && !path.equals(name)) {
+                extra = " - " + path;
+            }
+            return String.format(Locale.ROOT, "%s [%s off=0x%x] 0x%x-0x%x%s (%s)",
+                    name,
+                    perms == null ? "----" : perms,
+                    fileOffset,
+                    baseAddr,
+                    endAddr,
+                    extra,
+                    formatSize(size));
         }
 
         /** 格式化字节大小为人类可读字符串 (B / KB / MB) */
@@ -292,24 +310,28 @@ public class SoDumperActivity extends AppCompatActivity {
                 List<ModuleItem> newList = new ArrayList<>();
 
                 for (String raw : rawList) {
-                    // 格式: "0xBase:0xEnd:size:name:path"
-                    String[] parts = raw.split(":", 5);
-                    if (parts.length >= 5) {
+                    // 格式: "0xBase:0xEnd:size:0xOffset:perms:name:path"
+                    String[] parts = raw.split(":", 7);
+                    if (parts.length >= 7) {
                         long base = parseHexLong(parts[0]);
                         long end = parseHexLong(parts[1]);
                         long size = Long.parseLong(parts[2]);
-                        String name = parts[3];
-                        String path = parts[4];
-                        newList.add(new ModuleItem(base, end, size, name, path));
+                        long fileOffset = parseHexLong(parts[3]);
+                        String perms = parts[4];
+                        String name = parts[5];
+                        String path = parts[6];
+                        newList.add(new ModuleItem(base, end, size, fileOffset, perms, name, path));
                     }
                 }
 
+                final String exportPath = dumpModuleListToFile(newList);
                 runOnUiThread(() -> {
                     allModuleList.clear();
                     allModuleList.addAll(newList);
                     // 应用当前搜索过滤
                     filterModules(etModuleSearch.getText().toString().trim());
-                    tvStatus.setText(selectedPackage + " 加载了 " + allModuleList.size() + " 个 SO 模块");
+                    String suffix = (exportPath == null || exportPath.isEmpty()) ? "" : "，已导出模块清单";
+                    tvStatus.setText(selectedPackage + " 加载了 " + allModuleList.size() + " 个模块候选" + suffix);
                 });
             } catch (Exception e) {
                 runOnUiThread(() -> {
@@ -324,10 +346,23 @@ public class SoDumperActivity extends AppCompatActivity {
         filteredModuleList.clear();
         String lower = keyword.toLowerCase(Locale.ROOT);
         for (ModuleItem item : allModuleList) {
-            if (keyword.isEmpty() || item.name.toLowerCase(Locale.ROOT).contains(lower)
-                    || item.path.toLowerCase(Locale.ROOT).contains(lower)) {
+            String haystack = ((item.name == null ? "" : item.name) + " " +
+                    (item.path == null ? "" : item.path)).toLowerCase(Locale.ROOT);
+            boolean matched = keyword.isEmpty() || haystack.contains(lower);
+            if (!matched && lower.contains("ue4")) {
+                matched = haystack.contains("unreal");
+            }
+            if (!matched && lower.contains("unreal")) {
+                matched = haystack.contains("ue4");
+            }
+            if (matched) {
                 filteredModuleList.add(item);
             }
+        }
+
+        // 搜索无结果时, 回退显示全部候选模块, 方便用户手动翻找。
+        if (!keyword.isEmpty() && filteredModuleList.isEmpty()) {
+            filteredModuleList.addAll(allModuleList);
         }
         updateModuleSpinner();
     }
@@ -342,6 +377,33 @@ public class SoDumperActivity extends AppCompatActivity {
         moduleAdapter.addAll(labels);
         moduleAdapter.notifyDataSetChanged();
         btnDump.setEnabled(!filteredModuleList.isEmpty());
+    }
+
+    /** 把当前进程的模块候选完整导出到文本文件, 便于人工检索。 */
+    private String dumpModuleListToFile(List<ModuleItem> modules) {
+        try {
+            File dir = new File(getFilesDir(), "module_lists");
+            if (!dir.exists() && !dir.mkdirs()) {
+                return null;
+            }
+            File out = new File(dir, selectedPackage.replace(':', '_') + "_" + selectedPid + "_modules.txt");
+            StringBuilder sb = new StringBuilder();
+            sb.append("PID=").append(selectedPid).append('\n');
+            sb.append("PACKAGE=").append(selectedPackage).append('\n');
+            sb.append("COUNT=").append(modules.size()).append("\n\n");
+            for (ModuleItem item : modules) {
+                sb.append(String.format(Locale.ROOT, "0x%x-0x%x %d %s | %s\n",
+                        item.baseAddr, item.endAddr, item.size,
+                        item.name == null ? "" : item.name,
+                        item.path == null ? "" : item.path));
+            }
+            try (FileOutputStream fos = new FileOutputStream(out, false)) {
+                fos.write(sb.toString().getBytes(StandardCharsets.UTF_8));
+            }
+            return out.getAbsolutePath();
+        } catch (Throwable ignored) {
+            return null;
+        }
     }
 
     // ─── 执行 Dump ─────────────────────────────────────────────────
@@ -383,7 +445,9 @@ public class SoDumperActivity extends AppCompatActivity {
                 if (ret == 0) {
                     resultMsg = "Dump 成功!\n" + outFile + "\n大小: " + ModuleItem.formatSize(mod.size);
                 } else {
-                    resultMsg = "Dump 失败 (错误码: " + ret + ")\n模块: " + mod.name;
+                    resultMsg = "Dump 失败 (错误码: " + ret + ")\n模块: " + mod.name +
+                            "\n映射: " + String.format(Locale.ROOT, "0x%x-0x%x %s off=0x%x",
+                            mod.baseAddr, mod.endAddr, mod.perms, mod.fileOffset);
                 }
 
                 runOnUiThread(() -> {

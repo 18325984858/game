@@ -598,15 +598,15 @@ int Injector::injectRemote(pid_t pid, const char* soPath, InjectMode mode) {
             // ═══ DFM (UE5.4 三角洲) 注入路径 ═══
             //
             // 全局偏移 (相对于 libUE4.so 基址):
-            //   NamePool:          +0x1A343A00
-            //   GUObjectArray.Num: +0x1A36A75C
-            //   GUObjectArray.Chunks: +0x1A36A768
-            //   GWorld:            +0x1A65ECC8
+            //   NamePool:          +0x1B88EA00
+            //   GUObjectArray.Num: +0x1B8B579C
+            //   GUObjectArray.Chunks: +0x1B8B57A8
+            //   GWorld:            +0x1BBAA930
             //
-            static constexpr uint32_t DFM_OFF_NAMEPOOL          = 0x1A343A00;
-            static constexpr uint32_t DFM_OFF_GUOBJECTARRAY_NUM = 0x1A36A75C;
-            static constexpr uint32_t DFM_OFF_GUOBJECTARRAY_CHUNKS = 0x1A36A768;
-            static constexpr uint32_t DFM_OFF_GWORLD            = 0x1A65ECC8;
+            static constexpr uint32_t DFM_OFF_NAMEPOOL          = 0x1B88EA00;
+            static constexpr uint32_t DFM_OFF_GUOBJECTARRAY_NUM = 0x1B8B579C;
+            static constexpr uint32_t DFM_OFF_GUOBJECTARRAY_CHUNKS = 0x1B8B57A8;
+            static constexpr uint32_t DFM_OFF_GWORLD            = 0x1BBAA930;
 
             const char* funcName = "MyStartPointDFM";
             if (ptrace_writedata(pid, remoteMem, funcName, strlen(funcName) + 1) < 0) {

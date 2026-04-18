@@ -135,6 +135,21 @@ public class MainActivity extends AppCompatActivity {
         cbDfmDumper = findViewById(R.id.cb_dfm_dumper);
         cbDfmHeader = findViewById(R.id.cb_dfm_header);
 
+        // ── 日志开关: 启动时从 C++ 端读取默认值, 改动时主动同步到 C++ ──
+        try {
+            cbLog.setChecked(nativeIsLogEnabled());
+        } catch (Throwable t) {
+            LogUtil.e("nativeIsLogEnabled 调用失败", t);
+        }
+        cbLog.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            try {
+                nativeSetLogEnabled(isChecked);
+            } catch (Throwable t) {
+                LogUtil.e("nativeSetLogEnabled 调用失败", t);
+            }
+            LogUtil.i("[LogSwitch] UI -> C++ g_runtimeLogEnabled=" + isChecked);
+        });
+
         // ── 折叠区域: lol手游 ──
         TextView tvSectionHeader = findViewById(R.id.tv_section_lol_header);
         LinearLayout layoutLolContent = findViewById(R.id.layout_lol_content);
@@ -637,6 +652,12 @@ public class MainActivity extends AppCompatActivity {
      * @return true = sc_hello 成功（key 正确）
      */
     public native boolean nativeValidateKpKey(String key);
+
+    // ─── 日志运行时开关 (Java <-> C++ 双向同步) ──────────────────────
+    /** 读取 C++ 端 g_runtimeLogEnabled 当前值 (用于初始化 UI) */
+    public static native boolean nativeIsLogEnabled();
+    /** 把 UI 状态同步到 C++ 端 g_runtimeLogEnabled */
+    public static native void nativeSetLogEnabled(boolean enabled);
 
     // ─── KernelPatch Superkey UI / 持久化 ────────────────────────────
     /**

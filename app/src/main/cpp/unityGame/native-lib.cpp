@@ -88,6 +88,31 @@ Java_com_example_dobbyproject_MainActivity_nativeValidateKpKey(
     return ok ? JNI_TRUE : JNI_FALSE;
 }
 
+// ─── 日志运行时开关 (Java <-> C++ 双向同步) ────────────────────────
+// Java UI 上的 CheckBox 与 C++ 的 g_runtimeLogEnabled 共享同一状态:
+//   - Java 改动 → 调用 nativeSetLogEnabled() 同步到 C++
+//   - 启动时   → Java 调 nativeIsLogEnabled() 读取 C++ 默认值, 用其初始化 UI
+//   - C++ 改动 → 通过 nativeIsLogEnabled() 暴露给 Java 主动轮询/查询
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_example_dobbyproject_MainActivity_nativeIsLogEnabled(
+        JNIEnv* /*env*/, jclass /*clazz*/) {
+    return g_runtimeLogEnabled ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_dobbyproject_MainActivity_nativeSetLogEnabled(
+        JNIEnv* /*env*/, jclass /*clazz*/, jboolean enabled) {
+    const bool newValue = (enabled == JNI_TRUE);
+    if (g_runtimeLogEnabled != newValue) {
+        g_runtimeLogEnabled = newValue;
+        // 强制写一行(暂时打开输出, 以便能看到关闭/开启事件本身)
+        const bool prev = g_runtimeLogEnabled;
+        g_runtimeLogEnabled = true;
+        LOG(LOG_LEVEL_INFO, "[LogSwitch] g_runtimeLogEnabled -> %d (Java)", newValue ? 1 : 0);
+        g_runtimeLogEnabled = prev;
+    }
+}
+
 #ifdef OBFU_ATTRS_END
 OBFU_ATTRS_END
 #endif

@@ -10,8 +10,6 @@
 #include <algorithm>
 #include <chrono>
 
-#define DLOG(level, fmt, ...) LOG(level, fmt, ##__VA_ARGS__)
-
 namespace dfmdraw {
 
 namespace {

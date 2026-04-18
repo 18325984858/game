@@ -18,11 +18,13 @@ namespace SoDumper {
      * SO 模块信息 (来自 /proc/pid/maps)
      */
     struct ModuleInfo {
-        std::string name;       // so 文件名
-        std::string path;       // 完整路径
-        uintptr_t baseAddr;     // 内存起始地址
-        uintptr_t endAddr;      // 内存结束地址
-        size_t size;            // 映射总大小 (合并所有段)
+        std::string name;       // 显示名
+        std::string path;       // 完整路径或映射来源
+        std::string perms;      // maps 权限, 如 r-xp
+        uintptr_t baseAddr;     // 当前映射起始地址
+        uintptr_t endAddr;      // 当前映射结束地址
+        uintptr_t fileOffset;   // 对应 maps 的文件偏移
+        size_t size;            // 当前映射大小
     };
 
     /**

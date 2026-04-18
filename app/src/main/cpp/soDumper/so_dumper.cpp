@@ -120,20 +120,22 @@ std::vector<ProcessInfo> listRunningApps(const std::string& filter) {
         std::string cmdline(name);
         if (!isAppProcess(cmdline)) continue;
 
-        // 去掉子进程后缀 (com.example.app:service → com.example.app)
+        // 同包名可能存在多个子进程, 不能简单折叠成 baseName, 否则容易选错 PID。
         std::string baseName = cmdline;
         size_t colonPos = baseName.find(':');
         if (colonPos != std::string::npos) {
             baseName = baseName.substr(0, colonPos);
         }
 
-        if (!fuzzyMatch(baseName, filter)) continue;
-        if (seen.count(baseName)) continue;
-        seen.insert(baseName);
+        if (!fuzzyMatch(cmdline, filter) && !fuzzyMatch(baseName, filter)) continue;
+
+        std::string uniqueKey = std::to_string(pid) + ":" + cmdline;
+        if (seen.count(uniqueKey)) continue;
+        seen.insert(uniqueKey);
 
         ProcessInfo info;
         info.pid = pid;
-        info.packageName = baseName;
+        info.packageName = cmdline;
         result.push_back(info);
     }
     pclose(fp);
@@ -167,7 +169,9 @@ std::vector<ModuleInfo> listModules(int pid) {
         return result;
     }
 
-    // 收集所有 .so 映射, 按路径合并; 同时累计实际映射字节数
+    // 收集所有候选原生模块映射。
+    // 注意: 新版应用可能把多个原生库直接从 base.apk 映射出来, 如果仅按 path 合并,
+    // 会把不同库错误折叠成一个条目, 导致用户根本搜不到真实目标。
     struct ModuleAcc {
         ModuleInfo info;
         size_t mappedBytes; // 实际映射字节 (各区域之和)
@@ -195,22 +199,53 @@ std::vector<ModuleInfo> listModules(int pid) {
         if (path[0] == '\0') continue;
 
         std::string pathStr(path);
-        // 只保留 .so 文件
-        if (pathStr.find(".so") == std::string::npos) continue;
-        // 过滤掉 [vdso] 等特殊映射
-        if (pathStr[0] != '/') continue;
 
-        if (moduleMap.find(pathStr) == moduleMap.end()) {
+        // 新版游戏可能把主库放到 APK / memfd / anon / ashmem 里, 不能只认传统 .so 路径。
+        const bool isExec = strchr(perms, 'x') != nullptr;
+        const bool looksLikeSo = pathStr.find(".so") != std::string::npos;
+        const bool looksLikeApk = pathStr.find(".apk") != std::string::npos;
+        const bool looksLikeHiddenLib =
+                pathStr.find("memfd:") != std::string::npos ||
+                pathStr.find("[anon:") != std::string::npos ||
+                pathStr.find("/dev/ashmem") != std::string::npos;
+        const bool looksLikeUeLib =
+                pathStr.find("UE4") != std::string::npos ||
+                pathStr.find("Unreal") != std::string::npos ||
+                pathStr.find("libUE4") != std::string::npos ||
+                pathStr.find("libUnreal") != std::string::npos;
+        const bool fileBackedExec = !pathStr.empty() && pathStr[0] == '/' && isExec;
+
+        if (!(looksLikeSo || looksLikeApk || looksLikeHiddenLib || looksLikeUeLib || fileBackedExec)) continue;
+
+        char offBuf[32];
+        snprintf(offBuf, sizeof(offBuf), "@0x%lx", offset);
+
+        std::string displayName;
+        size_t slashPos = pathStr.rfind('/');
+        displayName = (slashPos != std::string::npos) ? pathStr.substr(slashPos + 1) : pathStr;
+        if (displayName.empty()) displayName = pathStr;
+        if (!looksLikeSo) {
+            displayName += offBuf;
+        }
+        if (looksLikeHiddenLib && displayName.find("[hidden]") == std::string::npos) {
+            displayName = std::string("[hidden] ") + displayName;
+        }
+
+        // 不再只按 path 合并, 否则同一个 base.apk 里的多个原生库会被错误折叠。
+        std::string moduleKey = pathStr + "|" + perms + "|" + std::to_string(offset);
+
+        if (moduleMap.find(moduleKey) == moduleMap.end()) {
             ModuleAcc acc;
             acc.info.path = pathStr;
-            size_t slashPos = pathStr.rfind('/');
-            acc.info.name = (slashPos != std::string::npos) ? pathStr.substr(slashPos + 1) : pathStr;
+            acc.info.name = displayName;
+            acc.info.perms = perms;
             acc.info.baseAddr = start;
             acc.info.endAddr = end;
+            acc.info.fileOffset = offset;
             acc.mappedBytes = end - start;
-            moduleMap[pathStr] = acc;
+            moduleMap[moduleKey] = acc;
         } else {
-            auto& acc = moduleMap[pathStr];
+            auto& acc = moduleMap[moduleKey];
             if (start < acc.info.baseAddr) acc.info.baseAddr = start;
             if (end > acc.info.endAddr) acc.info.endAddr = end;
             acc.mappedBytes += (end - start);
@@ -252,20 +287,96 @@ static size_t readProcessMemory(int pid, uintptr_t addr, size_t size, uint8_t* b
     return copy;
 }
 
+static bool hasElfMagicAt(int pid, uintptr_t addr) {
+    uint8_t magic[SELFMAG] = {0};
+    size_t got = readProcessMemory(pid, addr, sizeof(magic), magic);
+    return got == sizeof(magic) && memcmp(magic, ELFMAG, SELFMAG) == 0;
+}
+
+static uintptr_t resolveElfBaseFromMaps(int pid, const ModuleInfo& module) {
+    std::vector<uintptr_t> candidates;
+    auto addCandidate = [&](uintptr_t addr) {
+        if (addr == 0) return;
+        for (uintptr_t existing : candidates) {
+            if (existing == addr) return;
+        }
+        candidates.push_back(addr);
+    };
+
+    // 优先尝试当前选中映射及其由 offset 回推的地址。
+    addCandidate(module.baseAddr);
+    if (module.fileOffset <= module.baseAddr) {
+        addCandidate(module.baseAddr - module.fileOffset);
+    }
+
+    std::string mapsText;
+    if (MemReader::readMaps(pid, mapsText)) {
+        size_t linePos = 0;
+        while (linePos < mapsText.size()) {
+            size_t nl = mapsText.find('\n', linePos);
+            std::string line = mapsText.substr(linePos,
+                (nl == std::string::npos ? mapsText.size() : nl) - linePos);
+            linePos = (nl == std::string::npos) ? mapsText.size() : nl + 1;
+            if (line.empty()) continue;
+
+            uintptr_t start = 0, end = 0;
+            char perms[8] = {0}, path[512] = {0};
+            unsigned long offset = 0, dev1 = 0, dev2 = 0, inode = 0;
+            int matched = sscanf(line.c_str(), "%lx-%lx %4s %lx %lx:%lx %lu %511s",
+                                 &start, &end, perms, &offset, &dev1, &dev2, &inode, path);
+            if (matched < 7) continue;
+
+            std::string pathStr(path);
+            bool sameModule = (!module.path.empty() && pathStr == module.path) ||
+                              (!module.name.empty() && pathStr.find(module.name) != std::string::npos);
+            if (!sameModule) continue;
+
+            // 对应同一库的兄弟映射: 直接起始地址和 start-offset 两种都试。
+            addCandidate(start);
+            if (offset <= start) {
+                addCandidate(start - offset);
+            }
+        }
+    }
+
+    for (uintptr_t candidate : candidates) {
+        if (hasElfMagicAt(pid, candidate)) {
+            __android_log_print(ANDROID_LOG_INFO, DTAG,
+                                "ELF 头定位成功: 0x%lx", (unsigned long)candidate);
+            return candidate;
+        }
+    }
+
+    __android_log_print(ANDROID_LOG_WARN, DTAG,
+                        "无法从 maps/offset 自动定位 ELF 头, candidates=%zu",
+                        candidates.size());
+    return 0;
+}
+
 // ─── Dump + 修复 (PT_LOAD 段感知) ──────────────────────────────────
 
 int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath) {
     __android_log_print(ANDROID_LOG_INFO, DTAG,
-                        "开始 dump: pid=%d, module=%s, base=0x%lx, end=0x%lx, size=%zu",
+                        "开始 dump: pid=%d, module=%s, map_base=0x%lx, end=0x%lx, off=0x%lx, perms=%s, size=%zu",
                         pid, module.name.c_str(),
                         (unsigned long)module.baseAddr, (unsigned long)module.endAddr,
+                        (unsigned long)module.fileOffset,
+                        module.perms.c_str(),
                         module.size);
 
-    uintptr_t baseAddr = module.baseAddr;
+    uintptr_t baseAddr = resolveElfBaseFromMaps(pid, module);
     if (baseAddr == 0) {
-        __android_log_print(ANDROID_LOG_ERROR, DTAG, "baseAddr 为 0");
+        __android_log_print(ANDROID_LOG_ERROR, DTAG,
+                            "无法定位有效 ELF 基址: map_base=0x%lx off=0x%lx path=%s",
+                            (unsigned long)module.baseAddr,
+                            (unsigned long)module.fileOffset,
+                            module.path.c_str());
         return -2;
     }
+
+    __android_log_print(ANDROID_LOG_INFO, DTAG,
+                        "最终使用 ELF 基址: 0x%lx",
+                        (unsigned long)baseAddr);
 
     // 临时目录由 MemReader 初始化时保证 (/data/local/tmp/so_dump)
 

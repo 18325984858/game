@@ -37,8 +37,8 @@ Java_com_example_dobbyproject_SoDumperActivity_nativeListRunningApps(
 }
 
 /**
- * 获取指定进程加载的 SO 模块列表
- * 返回 String[] : ["baseAddr:endAddr:size:name:path", ...]
+ * 获取指定进程加载的内存映射模块列表
+ * 返回 String[] : ["baseAddr:endAddr:size:fileOffset:perms:name:path", ...]
  */
 JNIEXPORT jobjectArray JNICALL
 Java_com_example_dobbyproject_SoDumperActivity_nativeListModules(
@@ -50,11 +50,13 @@ Java_com_example_dobbyproject_SoDumperActivity_nativeListModules(
     jobjectArray arr = env->NewObjectArray((jsize)modules.size(), stringClass, nullptr);
 
     for (int i = 0; i < (int)modules.size(); i++) {
-        char buf[64];
-        snprintf(buf, sizeof(buf), "0x%lx:0x%lx:%zu:",
+        char buf[128];
+        snprintf(buf, sizeof(buf), "0x%lx:0x%lx:%zu:0x%lx:%s:",
                  (unsigned long)modules[i].baseAddr,
                  (unsigned long)modules[i].endAddr,
-                 modules[i].size);
+                 modules[i].size,
+                 (unsigned long)modules[i].fileOffset,
+                 modules[i].perms.c_str());
         std::string item = std::string(buf) + modules[i].name + ":" + modules[i].path;
         env->SetObjectArrayElement(arr, i, env->NewStringUTF(item.c_str()));
     }
@@ -83,6 +85,8 @@ Java_com_example_dobbyproject_SoDumperActivity_nativeDumpSo(
     mod.path = "";
     mod.baseAddr = (uintptr_t)baseAddr;
     mod.endAddr = (uintptr_t)endAddr;
+    mod.fileOffset = 0;
+    mod.perms = "";
     mod.size = mod.endAddr - mod.baseAddr;
 
     std::string outPathStr(outPath ? outPath : "");
