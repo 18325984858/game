@@ -2,6 +2,7 @@
 #include "../Log/log.h"
 #include "UE5DfmDumper.h"
 #include "UE5DfmStruct.h"
+#include "libUE5Header/UE5Header.h"
 #include "dfm/dfm.h"
 #include "Draw/DfmDraw.h"
 #include "AImGui.h"
@@ -9,6 +10,7 @@
 #include <atomic>
 #include <thread>
 #include <chrono>
+#include <memory>
 #include <cstddef>
 #include <fcntl.h>
 #include <unistd.h>
@@ -37,6 +39,7 @@ static bool readConfigFlag(const char* key) {
 }
 
 static bool readDumperEnabled() { return readConfigFlag("ue_dumper=1"); }
+static bool readHeaderEnabled() { return readConfigFlag("ue_header=1"); }
 static bool readLogEnabled()    { return readConfigFlag("log=1"); }
 
 // =====================================================================
@@ -239,6 +242,12 @@ static void DfmGuiThread() {
 
     auto lastAliveCheck = std::chrono::steady_clock::now();
 
+    // 数据陈旧/游戏退出阈值 (毫秒)
+    //  - kStaleSkipDrawMs : 超过此时间未收到新数据 → 停止绘制 UI, 仅送空帧 (清屏)
+    //  - kStaleExitMs     : 超过此时间未收到新数据 → 主动退出 GUI 线程, 断开 RenderClient
+    constexpr int64_t kStaleSkipDrawMs = 3000;
+    constexpr int64_t kStaleExitMs     = 10000;
+
     // 渲染主循环
     while (true) {
         // 每 2 秒检查游戏进程存活
@@ -247,12 +256,23 @@ static void DfmGuiThread() {
             lastAliveCheck = now;
             if (!isGameAlive()) {
                 LOG(LOG_LEVEL_INFO, "RenderClient: 游戏进程已退出");
-                for (int i = 0; i < 3; i++) {
+                for (int i = 0; i < 5; i++) {
                     imgui->BeginFrame(); imgui->EndFrame();
                     std::this_thread::sleep_for(std::chrono::milliseconds(16));
                 }
                 break;
             }
+        }
+
+        // 检查 DfmMatchMonitor 是否还在推送数据 (游戏假死/对局监控停止时停止绘制)
+        int64_t staleMs = dfm::SharedDfmData::getInstance().getMsSinceLastPush();
+        if (staleMs >= 0 && staleMs > kStaleExitMs) {
+            LOG(LOG_LEVEL_INFO, "RenderClient: 数据已陈旧 %lldms, 清屏并退出", (long long)staleMs);
+            for (int i = 0; i < 5; i++) {
+                imgui->BeginFrame(); imgui->EndFrame();
+                std::this_thread::sleep_for(std::chrono::milliseconds(16));
+            }
+            break;
         }
 
         // 非阻塞地处理所有待处理输入事件 (同线程, 避免竞态)
@@ -262,11 +282,14 @@ static void DfmGuiThread() {
 
         imgui->BeginFrame();
 
-        // 从 SharedDfmData 读取最新数据
-        dfm::SharedDfmData::getInstance().getData(gameData);
+        // 数据较新 → 正常绘制 overlay; 数据陈旧 → 送空帧让服务端清屏
+        if (staleMs < 0 || staleMs <= kStaleSkipDrawMs) {
+            // 从 SharedDfmData 读取最新数据
+            dfm::SharedDfmData::getInstance().getData(gameData);
 
-        // 绘制 DFM overlay
-        overlay.drawOverlay(gameData);
+            // 绘制 DFM overlay
+            overlay.drawOverlay(gameData);
+        }
 
         imgui->EndFrame();
         // 不额外 sleep, 由 TCP 传输和 GPU 自然限速实现最低延迟
@@ -345,11 +368,14 @@ static void DfmWorkerThread(DfmInjectParams* params) {
     // 额外等待 5 秒让引擎完全稳定
     std::this_thread::sleep_for(std::chrono::seconds(5));
 
-    // ---- SDK Dump ----
-    if (readDumperEnabled()) {
-        LOG(LOG_LEVEL_INFO, "[DfmWorker] ue_dumper 已启用, 开始 dump");
+    const bool wantDumper = readDumperEnabled();
+    const bool wantHeader = readHeaderEnabled();
+    LOG(LOG_LEVEL_INFO, "[DfmWorker] 配置: ue_dumper=%d ue_header=%d", wantDumper, wantHeader);
 
-        ue5dfm::UE5DfmDumper dumper(
+    // 若启用 dumper 或 header, 构造一个共享的 UE5DfmDumper (避免重复 init)
+    std::unique_ptr<ue5dfm::UE5DfmDumper> sharedDumper;
+    if (wantDumper || wantHeader) {
+        sharedDumper = std::make_unique<ue5dfm::UE5DfmDumper>(
             base,
             static_cast<uintptr_t>(moduleSize),
             p.offNamePool,
@@ -358,13 +384,37 @@ static void DfmWorkerThread(DfmInjectParams* params) {
             p.offGWorld,
             "/data/data/com.tencent.tmgp.dfm/cache/ue5_dump/"
         );
-
-        if (!dumper.init()) {
-            LOG(LOG_LEVEL_ERROR, "[DfmWorker] UE5DfmDumper 初始化失败");
+        if (!sharedDumper->init()) {
+            LOG(LOG_LEVEL_ERROR, "[DfmWorker] UE5DfmDumper 初始化失败, 跳过 dump/header");
             toast_util::showToast("DFM Dumper 初始化失败");
+            sharedDumper.reset();
         } else {
             LOG(LOG_LEVEL_INFO, "[DfmWorker] UE5DfmDumper 初始化成功");
-            if (dumper.dumpAll()) {
+        }
+    }
+
+    // ---- UE5 IDA 头文件 / script.json 生成 (优先执行, SDK dump 慢) ----
+    if (wantHeader) {
+        if (!sharedDumper) {
+            LOG(LOG_LEVEL_ERROR, "[DfmWorker] ue_header 已启用但 Dumper 不可用, 跳过");
+        } else {
+            LOG(LOG_LEVEL_INFO, "[DfmWorker] ue_header 已启用, 开始生成 IDA 头文件/script.json");
+            ue5dfm::UE5Header header(*sharedDumper, "/data/data/com.tencent.tmgp.dfm/cache/ue5_dump/");
+            header.start();
+            toast_util::showToast("UE5 Header 生成完成");
+            LOG(LOG_LEVEL_INFO, "[DfmWorker] ue_header 生成完成");
+        }
+    } else {
+        LOG(LOG_LEVEL_INFO, "[DfmWorker] ue_header 未启用, 跳过头文件生成");
+    }
+
+    // ---- SDK Dump ----
+    if (wantDumper) {
+        if (!sharedDumper) {
+            LOG(LOG_LEVEL_ERROR, "[DfmWorker] ue_dumper 已启用但 Dumper 不可用, 跳过");
+        } else {
+            LOG(LOG_LEVEL_INFO, "[DfmWorker] ue_dumper 已启用, 开始 dump");
+            if (sharedDumper->dumpAll()) {
                 LOG(LOG_LEVEL_INFO, "[DfmWorker] dump 全部完成");
                 toast_util::showToast("DFM SDK Dump 完成");
             } else {
@@ -375,6 +425,9 @@ static void DfmWorkerThread(DfmInjectParams* params) {
     } else {
         LOG(LOG_LEVEL_INFO, "[DfmWorker] ue_dumper 未启用, 跳过 dump");
     }
+
+    // 释放共享 dumper (后续对局监控用自己的)
+    sharedDumper.reset();
 
     // ---- 对局监控 (物资/玩家/相机 采集 → SharedDfmData → GUI) ----
     LOG(LOG_LEVEL_INFO, "[DfmWorker] 启动对局监控...");

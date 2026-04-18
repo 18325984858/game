@@ -282,8 +282,8 @@ public class MainActivity extends AppCompatActivity {
             launchAndInjectDfm(enableUeDumper, enableUeHeader, enableLog);
 
             String options2 = "";
-            if (enableUeDumper) options2 += " [UE4 Dumper]";
-            if (enableUeHeader) options2 += " [UE4 Header]";
+            if (enableUeDumper) options2 += " [UE5 Dumper]";
+            if (enableUeHeader) options2 += " [UE5 Header]";
             btnDfmLaunch.setText("✅ 游戏已启动" + options2);
             updateStatus(UE4_OVERLAY_STATUS + " | 三角洲启动中..." + options2);
             Toast.makeText(this, "正在启动三角洲并注入..." + options2, Toast.LENGTH_SHORT).show();

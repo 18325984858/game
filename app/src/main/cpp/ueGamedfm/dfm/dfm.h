@@ -60,10 +60,11 @@ namespace dfm {
 //  所有值在 DfmMatchMonitor::initOffsets() 中填充
 // =====================================================================
 struct ResolvedOffsets {
-    // ── Actor (反射可查) ──
-    int32_t Actor_bReplicateMovement = 0xA0;   // Actor.bReplicateMovement
-    int32_t Actor_ReplicatedMovement = 0x170;  // Actor.ReplicatedMovement
-    int32_t Actor_RootComponent      = 0x268;  // Actor.RootComponent
+    // ── Actor (反射可查; 默认值与 sdk_dump 对齐) ──
+    // sdk_dump.txt: bReplicateMovement@0x90 (位字段, bit5), ReplicatedMovement@0x9C, RootComponent@0x180
+    int32_t Actor_bReplicateMovement = 0x90;   // Actor.bReplicateMovement (位字段)
+    int32_t Actor_ReplicatedMovement = 0x9C;   // Actor.ReplicatedMovement (RepMovement, Size=0x38)
+    int32_t Actor_RootComponent      = 0x180;  // Actor.RootComponent (SceneComponent*)
 
     // ── SceneComponent (反射可查) ──
     int32_t Scene_RelativeLocation = 0x168;  // SceneComponent.RelativeLocation
@@ -121,24 +122,23 @@ struct ResolvedOffsets {
     int32_t Actor_Owner           = 0x120;   // Actor.Owner (AActor*)
 
     // ── DFM 游戏自定义 (IDA-only, 无法反射) ──
-    // GPPlayerState
-    int32_t PS_TeamID             = 0x660;   // GPPlayerState.TeamID
+    // GPPlayerState (sdk_dump 验证)
+    int32_t PS_TeamID             = 0x658;   // GPPlayerState.TeamID — sdk_dump: 0x658
     int32_t PS_PlayerName2        = 0x470;   // GPPlayerState.PlayerNamePrivate (回退)
 
-    // PickupBase (inherits InteractorBase)
-    // [修复] 新增: 读取物品本地化显示名 (SDK: InteractorBase.InteractorName FText@0x770)
-    int32_t Interactor_Name        = 0x770;   // InteractorBase.InteractorName (FText, Size=0x18)
-    int32_t Pickup_InvIdName      = 0xF20;   // PickupBase.InventoryIdName (FName)
-    int32_t Pickup_InvType        = 0xF28;   // PickupBase.InventoryType
-    int32_t Pickup_StackCount     = 0xF30;   // PickupBase.StackCount
+    // PickupBase (inherits InteractorBase) — sdk_dump 验证
+    int32_t Interactor_Name        = 0x790;   // InteractorBase.InteractorName (FText, Size=0x18) — sdk_dump: 0x790
+    int32_t Pickup_InvIdName      = 0xF78;   // PickupBase.InventoryIdName (FName) — sdk_dump: 0xF78
+    int32_t Pickup_InvType        = 0xF80;   // PickupBase.InventoryType (TSubclassOf<Class>) — sdk_dump: 0xF80
+    int32_t Pickup_StackCount     = 0xF88;   // PickupBase.StackCount (int32) — sdk_dump: 0xF88
 
-    // GPCharacterBase
-    int32_t Char_HealthComp       = 0x1088;  // GPCharacterBase.GPHealthDataComponent*
-    int32_t Char_CurWeapon        = 0x1718;  // GPCharacterBase.CacheCurWeapon
+    // GPCharacterBase (sdk_dump 验证)
+    int32_t Char_HealthComp       = 0x1068;  // GPCharacterBase.HealthComp (GPHealthDataComponent*) — sdk_dump: 0x1068
+    int32_t Char_CurWeapon        = 0x1708;  // GPCharacterBase.CacheCurWeapon — sdk_dump: 0x1708
 
-    // GPHealthDataComponent
-    int32_t HC_HealthMax          = 0x248;   // GPHealthDataComponent.HealthMAX
-    int32_t HC_HealthSet          = 0x270;   // GPHealthDataComponent.HealthSet*
+    // GPHealthDataComponent (sdk_dump 验证)
+    int32_t HC_HealthMax          = 0x258;   // GPHealthDataComponent.HealthMAX — sdk_dump: 0x258
+    int32_t HC_HealthSet          = 0x280;   // GPHealthDataComponent.HealthSet* — sdk_dump: 0x280
 
     // GPAttributeSetHealth
     int32_t HS_HealthCur          = 0x3C;    // HealthSet.Health.CurrentValue
@@ -146,19 +146,18 @@ struct ResolvedOffsets {
     int32_t HS_ArmorCur           = 0x74;    // HealthSet.ArmorHealth.CurrentValue
     int32_t HS_HelmetCur          = 0x9C;    // HealthSet.HelmetArmorHealth.CurrentValue
 
-    // Container (物资箱)
-    int32_t Cont_RepItemArray     = 0x1C38;  // InventoryPickup_Container.RepItemArray
-    int32_t Cont_ItemsOffset      = 0x108;   // RepItemArray 内 TArray 偏移
-    int32_t Cont_PickupBoxType    = 0x1C14;
-    // [修复] 新增: 容器首次打开标记 (SDK: ExtraContainerRepInfo.bFirstOpen@0x1C30)
-    int32_t Cont_ExtraRepInfo     = 0x1C30;  // InventoryPickup_Container.ExtraRepInfo (bFirstOpen)
-    int32_t Cont_IsEmpty          = 0x2110;
+    // Container (物资箱) — sdk_dump 验证
+    int32_t Cont_RepItemArray     = 0x1DE0;  // InventoryPickup_Container.RepItemArray (ItemArray, Size=0x120) — sdk_dump: 0x1DE0
+    int32_t Cont_ItemsOffset      = 0x108;   // RepItemArray 内 TArray 偏移 (内部布局, dump 不直接给出)
+    int32_t Cont_PickupBoxType    = 0x1DBC;  // InventoryPickup_Container.PickupBoxType (EPickupBoxType) — sdk_dump: 0x1DBC
+    int32_t Cont_ExtraRepInfo     = 0x1DD8;  // InventoryPickup_Container.ExtraRepInfo (bFirstOpen) — sdk_dump: 0x1DD8
+    int32_t Cont_IsEmpty          = 0x22D0;  // InventoryPickup_Container.bIsEmpty — sdk_dump: 0x22D0
 
-    // SingleItemContainer
-    int32_t SIC_CachedPickups     = 0x1058;
-    int32_t SIC_BoxId             = 0xFF8;
-    int32_t SIC_FirstOpened       = 0x1018;
-    int32_t SIC_Finished          = 0x10E0;
+    // SingleItemContainer (Interactor_SingleItemContainer) — sdk_dump 验证
+    int32_t SIC_CachedPickups     = 0x10B0;  // Interactor_SingleItemContainer.CachedPickups — sdk_dump: 0x10B0
+    int32_t SIC_BoxId             = 0x1050;  // Interactor_SingleItemContainer.boxId — sdk_dump: 0x1050
+    int32_t SIC_FirstOpened       = 0x1070;  // 估算: 旧偏移 0x1018 + 父类增长量 0x58
+    int32_t SIC_Finished          = 0x1138;  // 估算: 旧偏移 0x10E0 + 父类增长量 0x58
 
     // LevelStreaming
     int32_t Streaming_LoadedLevel = 0x128;
@@ -360,12 +359,17 @@ public:
     void getData(DrawDfmData& outData);
     bool isInMatch() const { return m_inMatch.load(std::memory_order_acquire); }
 
+    // 自最后一次 pushData 起经过的毫秒数 (用于检测游戏退出/数据停止)
+    // 若从未 push 过, 返回 -1
+    int64_t getMsSinceLastPush() const;
+
 private:
     SharedDfmData() = default;
     std::mutex m_mutex;
     DrawDfmData m_buffers[2];
     int m_frontIdx = 0;
     std::atomic<bool> m_inMatch{false};
+    std::atomic<int64_t> m_lastPushMs{-1};  // steady_clock 毫秒, -1 = 从未推送
 };
 
 // =====================================================================

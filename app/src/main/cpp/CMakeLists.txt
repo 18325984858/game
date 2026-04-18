@@ -127,6 +127,7 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
         "ueGamedfm/uestart.cpp"
         "ueGamedfm/ilbUE5Struct/UE5DfmStruct.cpp"
         "ueGamedfm/ilbUE5Dumper/UE5DfmDumper.cpp"
+        "ueGamedfm/libUE5Header/UE5Header.cpp"
         "ueGamedfm/interface/interface.cpp"
         "ueGamedfm/dfm/dfm.cpp"
         "ueGamedfm/Draw/DfmDraw.cpp"
@@ -161,6 +162,7 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
         ueGamedfm
         ueGamedfm/ilbUE5Struct
         ueGamedfm/ilbUE5Dumper
+        ueGamedfm/libUE5Header
 )
 
 target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE

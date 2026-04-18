@@ -675,18 +675,19 @@ namespace android
             {
             case RenderState::ReadData:
             {
-                // 断连后保持最后一帧显示, 超过宽限期再清屏, 防止瞬断闪烁
-                if (m_renderFrameCount > 0 && !m_clientConnected.load(std::memory_order_acquire)) {
+                // 客户端断连后持续清屏 + 交换, 确保所有 EGL 后备缓冲区里的旧画面都被擦掉
+                // (单次 swap 只清掉一个 back buffer, Android 通常有 2-3 个缓冲, 必须连续清多帧)
+                if (!m_clientConnected.load(std::memory_order_acquire)) {
                     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now() - m_clientDisconnectTime).count();
-                    if (elapsed >= 3000) {
+                    if (elapsed >= 800) {  // 短宽限期, 防止瞬断闪烁
                         glClear(GL_COLOR_BUFFER_BIT);
                         eglSwapBuffers(m_defaultDisplay, m_eglSurface);
-                        {
+                        if (m_renderFrameCount != 0) {
                             std::lock_guard<std::mutex> lock(m_renderDataMutex);
                             m_serverRenderData.clear();
+                            m_renderFrameCount = 0;
                         }
-                        m_renderFrameCount = 0;
                     }
                 }
                 break;

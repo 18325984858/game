@@ -1396,11 +1396,22 @@ void SharedDfmData::pushData(const DrawDfmData& data) {
     m_buffers[backIdx] = data;
     m_frontIdx = backIdx;
     m_inMatch.store(data.inMatch, std::memory_order_release);
+    auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    m_lastPushMs.store(nowMs, std::memory_order_release);
 }
 
 void SharedDfmData::getData(DrawDfmData& outData) {
     std::lock_guard<std::mutex> lock(m_mutex);
     outData = m_buffers[m_frontIdx];
+}
+
+int64_t SharedDfmData::getMsSinceLastPush() const {
+    int64_t last = m_lastPushMs.load(std::memory_order_acquire);
+    if (last < 0) return -1;
+    auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    return nowMs - last;
 }
 
 // =====================================================================
@@ -1520,8 +1531,26 @@ bool DfmMatchMonitor::initOffsets() {
 
     // DFM 游戏自定义类 (如果也在反射中)
     TRY_RESOLVE("GPPlayerState", "TeamID", m_off.PS_TeamID);
-    TRY_RESOLVE("GPCharacterBase", "GPHealthDataComponent", m_off.Char_HealthComp);
+    // sdk_dump: GPCharacterBase.HealthComp (字段名不是 GPHealthDataComponent)
+    TRY_RESOLVE("GPCharacterBase", "HealthComp", m_off.Char_HealthComp);
     TRY_RESOLVE("GPCharacterBase", "CacheCurWeapon", m_off.Char_CurWeapon);
+
+    // GPHealthDataComponent (sdk_dump 验证)
+    TRY_RESOLVE("GPHealthDataComponent", "HealthMAX", m_off.HC_HealthMax);
+    TRY_RESOLVE("GPHealthDataComponent", "HealthSet", m_off.HC_HealthSet);
+
+    // PickupBase / Container (sdk_dump 验证)
+    TRY_RESOLVE("PickupBase", "InventoryIdName", m_off.Pickup_InvIdName);
+    TRY_RESOLVE("PickupBase", "InventoryType",   m_off.Pickup_InvType);
+    TRY_RESOLVE("PickupBase", "StackCount",      m_off.Pickup_StackCount);
+    TRY_RESOLVE("InventoryPickup_Container", "PickupBoxType", m_off.Cont_PickupBoxType);
+    TRY_RESOLVE("InventoryPickup_Container", "ExtraRepInfo",  m_off.Cont_ExtraRepInfo);
+    TRY_RESOLVE("InventoryPickup_Container", "RepItemArray",  m_off.Cont_RepItemArray);
+    TRY_RESOLVE("InventoryPickup_Container", "bIsEmpty",      m_off.Cont_IsEmpty);
+
+    // Interactor_SingleItemContainer (sdk_dump 验证)
+    TRY_RESOLVE("Interactor_SingleItemContainer", "boxId",         m_off.SIC_BoxId);
+    TRY_RESOLVE("Interactor_SingleItemContainer", "CachedPickups", m_off.SIC_CachedPickups);
 
     // InteractorBase (物品/箱子显示名)
     TRY_RESOLVE("InteractorBase", "InteractorName", m_off.Interactor_Name);
