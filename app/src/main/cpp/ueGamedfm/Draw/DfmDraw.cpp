@@ -6,6 +6,7 @@
 #include "DfmDraw.h"
 #include "../../Log/log.h"
 #include <imgui/imgui_internal.h>
+#include <android/log.h>
 #include <cmath>
 #include <algorithm>
 #include <chrono>
@@ -346,12 +347,39 @@ int DfmOverlay::drawESP(const dfm::DrawDfmData& data, float screenW, float scree
         bool canDrawBox = false;
         float cx = 0.0f, topY = 0.0f, botY = 0.0f;
 
-        if (footOk && headOk) {
+        // ---- 优先策略: 用所有 17 骨骼的屏幕投影包围盒, 确保 ESP 框与骨骼绘制 1:1 一致
+        //      (避免 head/foot 单点投影偶发失败导致 box 与 bones 大小不一致 "一大一小")
+        if (p.bonesValid) {
+            float minX = 0, maxX = 0, minY = 0, maxY = 0;
+            int n = 0;
+            for (int i = 0; i < dfm::PlayerInfo::BONE_COUNT; ++i) {
+                const auto& b = p.bones[i];
+                if (!std::isfinite(b.x)) continue;
+                if (std::fabs(b.x) <= 1.0f && std::fabs(b.y) <= 1.0f) continue;
+                float bsx = 0, bsy = 0;
+                if (!projectToScreen(data, b.x, b.y, b.z, screenW, screenH,
+                                     edgeMinDepth, bsx, bsy)) continue;
+                if (n == 0) { minX = maxX = bsx; minY = maxY = bsy; }
+                else {
+                    if (bsx < minX) minX = bsx; else if (bsx > maxX) maxX = bsx;
+                    if (bsy < minY) minY = bsy; else if (bsy > maxY) maxY = bsy;
+                }
+                ++n;
+            }
+            if (n >= 6) {
+                cx = (minX + maxX) * 0.5f;
+                topY = minY;
+                botY = maxY;
+                canDrawBox = true;
+            }
+        }
+
+        if (!canDrawBox && footOk && headOk) {
             cx = (footSX + headSX) * 0.5f;
             topY = std::min(footSY, headSY);
             botY = std::max(footSY, headSY);
             canDrawBox = true;
-        } else if (centerOk && dist <= kRelaxedProjectionDistanceMeters) {
+        } else if (!canDrawBox && centerOk && dist <= kRelaxedProjectionDistanceMeters) {
             float halfHeightPx = estimateFallbackHalfHeight(dist);
             if (footOk) halfHeightPx = std::max(halfHeightPx, std::fabs(footSY - centerSY));
             if (headOk) halfHeightPx = std::max(halfHeightPx, std::fabs(centerSY - headSY));
@@ -602,6 +630,26 @@ void DfmOverlay::drawBones(const dfm::DrawDfmData& data, float screenW, float sc
 
         if (projectedBoneCount < 4) continue;
 
+        // 诊断: 周期性打印 head/foot 屏幕坐标 + 世界坐标, 看是否颠倒
+        {
+            static auto s_lastBoneDiag = std::chrono::steady_clock::time_point{};
+            auto now = std::chrono::steady_clock::now();
+            if (now - s_lastBoneDiag > std::chrono::seconds(3)) {
+                s_lastBoneDiag = now;
+                __android_log_print(ANDROID_LOG_WARN, "DFM",
+                    "[draw-bones] %s dist=%.1fm "
+                    "headW=(%.0f,%.0f,%.0f) S=(%.0f,%.0f,ok=%d) "
+                    "pelvW=(%.0f,%.0f,%.0f) S=(%.0f,%.0f,ok=%d) "
+                    "rfootW=(%.0f,%.0f,%.0f) S=(%.0f,%.0f,ok=%d) "
+                    "screenH=%.0f",
+                    p.playerName.c_str(), dist,
+                    p.bones[0].x, p.bones[0].y, p.bones[0].z, boneSX[0], boneSY[0], boneOk[0]?1:0,
+                    p.bones[4].x, p.bones[4].y, p.bones[4].z, boneSX[4], boneSY[4], boneOk[4]?1:0,
+                    p.bones[13].x, p.bones[13].y, p.bones[13].z, boneSX[13], boneSY[13], boneOk[13]?1:0,
+                    screenH);
+            }
+        }
+
         // 线宽随距离缩放 (近粗远细)
         float thickness = std::clamp(3.6f - dist / 180.0f, 1.4f, 4.2f);
         float outlineThickness = thickness + 1.6f;
@@ -621,8 +669,17 @@ void DfmOverlay::drawBones(const dfm::DrawDfmData& data, float screenW, float sc
 
         // 头部圆圈
         if (boneOk[0]) {
-            // 头部大小根据距离缩放
-            float headR = std::clamp(800.0f / dist, 3.0f, 15.0f);
+            // 头圆半径必须 < 人物投影身高的一定比例, 否则圆会从头一直盖到脚,
+            // 视觉上等同于 "head 圆挪到了脚的位置". 用 head→pelvis 投影距离估算头大小.
+            float headR;
+            if (boneOk[4]) {
+                // pelvis 在屏幕上, 用 (pelvis - head) 像素距离作为参考身高
+                float dy = std::fabs(boneSY[4] - boneSY[0]);
+                // 头部约占头-胯距离的 25% (颅顶到下颚)
+                headR = std::clamp(dy * 0.25f, 2.5f, 15.0f);
+            } else {
+                headR = std::clamp(800.0f / dist, 2.5f, 8.0f);
+            }
             dl->AddCircle(ImVec2(boneSX[0], boneSY[0]), headR, boneOutlineColor, 12, outlineThickness);
             dl->AddCircle(ImVec2(boneSX[0], boneSY[0]), headR, boneColor, 12, thickness);
         }

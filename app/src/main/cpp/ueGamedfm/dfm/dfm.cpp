@@ -72,7 +72,8 @@ const std::array<BoneAliasList, PlayerInfo::BONE_COUNT> kTrackedBoneAliases = {{
     BoneAliasList{"neck01", "neck", "neck02", "bip001neck", "bip01neck", nullptr, nullptr, nullptr},
     BoneAliasList{"spine03", "spine3", "spine02", "spine2", "chest", "spine03jnt", "bip001spine2", "bip01spine2"},
     BoneAliasList{"spine01", "spine1", "spine", "bip001spine", "bip01spine", nullptr, nullptr, nullptr},
-    BoneAliasList{"pelvis", "root", "hips", "bip001pelvis", "bip01pelvis", nullptr, nullptr, nullptr},
+    // pelvis: Mixamo "Hips" 才是真正的骨盆; "root" 是世界原点(在脚下), 必须排除
+    BoneAliasList{"pelvis", "hips", "bip001pelvis", "bip01pelvis", "hip", nullptr, nullptr, nullptr},
     BoneAliasList{"upperarmr", "rupperarm", "rightarm", "rightupperarm", "clavicler", "bip001rupperarm", "bip01rupperarm", nullptr},
     BoneAliasList{"lowerarmr", "rlowerarm", "rightforearm", "rightlowerarm", "forearmr", "bip001rforearm", "bip01rforearm", nullptr},
     BoneAliasList{"handr", "rhand", "righthand", "bip001rhand", "bip01rhand", nullptr, nullptr, nullptr},
@@ -1674,13 +1675,18 @@ bool DfmMatchMonitor::initOffsets() {
     #define TRY_RESOLVE_MULTI(field, target, ...) do { \
         const char* classes[] = { __VA_ARGS__ }; \
         std::string owner; \
+        bool _resolved = false; \
         for (const char* cls : classes) { \
             const auto* info = m_interface->findFieldInHierarchy(cls, field, &owner); \
             if (info) { \
                 target = info->offset; \
                 LOG(LOG_LEVEL_INFO, TAG " [offset] %s.%s = 0x%X (via %s)", cls, field, info->offset, owner.c_str()); \
+                _resolved = true; \
                 break; \
             } \
+        } \
+        if (!_resolved) { \
+            LOG(LOG_LEVEL_WARN, TAG " [offset] reflect MISS '%s' — keep default 0x%X", field, target); \
         } \
     } while(0)
 
@@ -1967,18 +1973,76 @@ bool DfmMatchMonitor::resolveTrackedBoneIndices(uintptr_t skeletalMeshAssetPtr,
     BoneAssetCacheEntry entry;
     entry.trackedBoneIndices.fill(-1);
 
-    constexpr uintptr_t kRefBoneInfoOffset = 0x238;
-    const uintptr_t boneInfoData = safeReadPtr(skeletalMeshAssetPtr + kRefBoneInfoOffset);
-    const int32_t boneInfoNum = safeReadS32(
-        skeletalMeshAssetPtr + kRefBoneInfoOffset + offsetof(TArray<FName>, Num));
-    if (boneInfoData >= 0x10000 && boneInfoNum > 0 && boneInfoNum <= kMaxRenderableBoneCount) {
-        matchBoneNamesFromBoneInfoArray(boneInfoData, boneInfoNum, 16, entry);
-        if (entry.matchedCount < kMinTrackedBoneMatches) {
-            BoneAssetCacheEntry trial;
-            if (matchBoneNamesFromFNameArray(boneInfoData, boneInfoNum, trial) > entry.matchedCount) {
-                entry = trial;
+    // FReferenceSkeleton 在 USkeletalMesh 内嵌, 但不是 UPROPERTY (sdk dump 不导出).
+    // IDA 已确认: sizeof(FReferenceSkeleton)=0x108, sizeof(FMeshBoneInfo)=12 (FName+int32 ParentIndex).
+    // RefSkeleton 第一个字段就是 TArray<FMeshBoneInfo> RawRefBoneInfo.
+    // 这里扫描 asset[0x60..0x400] 找一个 TArray header (Data ptr + Num + Max),
+    // 其 Data 指向的前几条记录用 stride=12 解析能匹配到至少 5 个已知骨骼名.
+    uintptr_t bestData = 0;
+    int32_t   bestNum  = 0;
+    int       bestStride = 12;
+    int       bestMatched = 0;
+    BoneAssetCacheEntry bestEntry;
+    {
+        std::string dumpScan;
+        for (uintptr_t off = 0x60; off <= 0x400; off += 8) {
+            const uintptr_t dataPtr = safeReadPtr(skeletalMeshAssetPtr + off);
+            const int32_t   num     = safeReadS32(skeletalMeshAssetPtr + off + 8);
+            const int32_t   maxv    = safeReadS32(skeletalMeshAssetPtr + off + 12);
+            if (dataPtr < 0x10000 || num < 8 || num > kMaxRenderableBoneCount) continue;
+            if (maxv < num || maxv > num * 4) continue;
+            // try strides 12, 16, 8
+            for (int trialStride : {12, 16, 8}) {
+                BoneAssetCacheEntry trial;
+                int matched = matchBoneNamesFromBoneInfoArray(dataPtr, num, trialStride, trial);
+                if (matched > bestMatched) {
+                    bestMatched = matched;
+                    bestData    = dataPtr;
+                    bestNum     = num;
+                    bestStride  = trialStride;
+                    bestEntry   = trial;
+                }
+            }
+            if (bestMatched >= 5) {
+                // 同时 dump 命中的偏移
+                dumpScan += "@0x" + [&]{ char b[8]; snprintf(b,sizeof(b),"%lx",(unsigned long)off); return std::string(b);}()
+                         + " num=" + std::to_string(num)
+                         + " stride=" + std::to_string(bestStride)
+                         + " matched=" + std::to_string(bestMatched) + " ";
             }
         }
+        // 一次性诊断: 输出扫描胜出的偏移 + 前 16 根骨名
+        std::string names;
+        if (bestData >= 0x10000 && bestNum > 0) {
+            for (int i = 0; i < std::min<int32_t>(bestNum, 16); ++i) {
+                std::string n = readFName(bestData + static_cast<uintptr_t>(i) * static_cast<uintptr_t>(bestStride));
+                names += "[" + std::to_string(i) + "]='" + n + "' ";
+            }
+        }
+        LOG(LOG_LEVEL_WARN, TAG " [bones-scan] mesh=%p winner=%p num=%d stride=%d matched=%d hits=[%s] names=%s",
+            (void*)skeletalMeshAssetPtr, (void*)bestData, bestNum, bestStride, bestMatched,
+            dumpScan.c_str(), names.c_str());
+
+        // 二次诊断: 17 个 slot 各自命中的 bone idx + 名字, 用于核实 head 别名是否走对
+        if (bestMatched > 0 && bestData >= 0x10000) {
+            std::string slotMap;
+            static const char* kSlotLabels[PlayerInfo::BONE_COUNT] = {
+                "head","neck","chest","spine","pelvis",
+                "Rshld","Rfarm","Rhand","Lshld","Lfarm","Lhand",
+                "Rthigh","Rcalf","Rfoot","Lthigh","Lcalf","Lfoot"
+            };
+            for (int slot = 0; slot < PlayerInfo::BONE_COUNT; ++slot) {
+                int idx = bestEntry.trackedBoneIndices[slot];
+                std::string bn = (idx >= 0 && idx < bestNum)
+                    ? readFName(bestData + static_cast<uintptr_t>(idx) * static_cast<uintptr_t>(bestStride))
+                    : std::string("-");
+                slotMap += std::string(kSlotLabels[slot]) + "[" + std::to_string(slot) + "]=" + std::to_string(idx) + ":" + bn + " ";
+            }
+            LOG(LOG_LEVEL_WARN, TAG " [bones-slotmap] mesh=%p %s", (void*)skeletalMeshAssetPtr, slotMap.c_str());
+        }
+    }
+    if (bestMatched > 0) {
+        entry = bestEntry;
     }
 
     if (entry.matchedCount < kMinTrackedBoneMatches) {
@@ -2467,13 +2531,100 @@ bool DfmMatchMonitor::fillPlayerBones(PlayerInfo& player) const {
     const uintptr_t meshComp = resolveBestBoneMeshComponent(player.characterPtr);
     if (!ok(meshComp)) return false;
 
+    // 反作弊会随版本搬动 CachedComponentSpaceTransforms 偏移, 而误读到旁边的
+    // CachedBoneSpaceTransforms (父空间局部 transform) 会让所有骨骼坍缩到一条线;
+    // 误读到无效区域则会得到天文数字 Z spread 反而骗过宽松筛选。
+    // 自动探测: 在 0x9C8 ~ 0xA08 区间内, 选满足以下三条的最优偏移
+    //   ① Z 轴展开在 60 ~ 500 cm (合理人形/含挂件)
+    //   ② 大多数四元数模长 ∈ [0.5, 1.5] (有效 FQuat 都是单位四元数)
+    //   ③ Translation 全部有限且 |xyz| < 5e3 cm
+    // 命中后按 meshComp 缓存, 避免每帧重新枚举。
+    static const int32_t kCandidateOffsets[] = { 0x9E8, 0x9F8, 0xA08, 0x9D8, 0x9C8 };
+    constexpr float kMinHumanHeightCm = 60.f;   // 蹲伏/儿童 mesh 下限
+    constexpr float kMaxHumanHeightCm = 500.f;  // 含巨型 mesh / 挂件
+    constexpr float kMaxTranslationCm = 5000.f; // 单根骨骼 Translation 绝对值上限
+
+    auto tryReadArray = [&](int32_t off, TArray<FTransform>& out) -> bool {
+        if (!safeReadMemory(meshComp + static_cast<uintptr_t>(off),
+                            &out, sizeof(out))) return false;
+        return isUsableRemoteArray(out, kMaxRenderableBoneCount)
+            && out.Num >= kMinRenderableBoneCount;
+    };
+
+    auto evaluateSpread = [&](const TArray<FTransform>& arr) -> float {
+        // 采样最多 32 根骨骼, 校验四元数 + 平移合理性, 再算 Z 极差。
+        const int sample = std::min<int>(arr.Num, 32);
+        std::array<FTransform, 32> buf{};
+        if (!safeReadMemory(reinterpret_cast<uintptr_t>(arr.Data),
+                            buf.data(), sizeof(FTransform) * sample)) return -1.f;
+        float zMin = 1e30f, zMax = -1e30f;
+        int valid = 0;
+        for (int i = 0; i < sample; ++i) {
+            const FTransform& t = buf[i];
+            // ① 平移分量必须有限且在合理量级
+            if (!std::isfinite(t.TranslationX) || !std::isfinite(t.TranslationY)
+                || !std::isfinite(t.TranslationZ)) return -1.f;
+            if (std::fabs(t.TranslationX) > kMaxTranslationCm
+                || std::fabs(t.TranslationY) > kMaxTranslationCm
+                || std::fabs(t.TranslationZ) > kMaxTranslationCm) return -1.f;
+            // ② 四元数模长应 ≈ 1 (允许 ±0.5 容忍 SIMD 精度)
+            float qLen2 = t.RotationX*t.RotationX + t.RotationY*t.RotationY
+                        + t.RotationZ*t.RotationZ + t.RotationW*t.RotationW;
+            if (!std::isfinite(qLen2) || qLen2 < 0.25f || qLen2 > 2.25f) return -1.f;
+            zMin = std::min(zMin, t.TranslationZ);
+            zMax = std::max(zMax, t.TranslationZ);
+            ++valid;
+        }
+        if (valid < 12) return -1.f;
+        const float spread = zMax - zMin;
+        if (spread < kMinHumanHeightCm || spread > kMaxHumanHeightCm) return -1.f;
+        return spread;
+    };
+
     TArray<FTransform> boneArray{};
-    if (!safeReadMemory(meshComp + static_cast<uintptr_t>(m_off.Skel_CachedCompSpace),
-                        &boneArray,
-                        sizeof(boneArray))
-        || !isUsableRemoteArray(boneArray, kMaxRenderableBoneCount)
-        || boneArray.Num < kMinRenderableBoneCount) {
-        return false;
+    int32_t chosenOffset = 0;
+    float bestSpread = -1.f;
+
+    // 按 meshComp 缓存上次有效偏移 (不同玩家不同 mesh 互不干扰)
+    {
+        std::lock_guard<std::mutex> lk(m_compSpaceOffsetMu);
+        auto it = m_compSpaceOffsetCache.find(meshComp);
+        if (it != m_compSpaceOffsetCache.end()) {
+            TArray<FTransform> tmp{};
+            if (tryReadArray(it->second, tmp)) {
+                float sp = evaluateSpread(tmp);
+                if (sp > 0.f) {
+                    boneArray = tmp;
+                    chosenOffset = it->second;
+                    bestSpread = sp;
+                }
+            }
+        }
+    }
+
+    if (chosenOffset == 0) {
+        for (int32_t off : kCandidateOffsets) {
+            TArray<FTransform> tmp{};
+            if (!tryReadArray(off, tmp)) continue;
+            float sp = evaluateSpread(tmp);
+            if (sp > bestSpread) { bestSpread = sp; boneArray = tmp; chosenOffset = off; }
+        }
+        if (chosenOffset == 0) {
+            // 所有候选要么读失败要么校验不过 (BoneSpace 局部偏移 / 垃圾内存)
+            static auto lastWarn = std::chrono::steady_clock::time_point{};
+            auto now = std::chrono::steady_clock::now();
+            if (now - lastWarn > std::chrono::seconds(5)) {
+                lastWarn = now;
+                LOG(LOG_LEVEL_WARN, TAG " [bones] no valid CompSpace offset for mesh %p", (void*)meshComp);
+            }
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> lk(m_compSpaceOffsetMu);
+            m_compSpaceOffsetCache[meshComp] = chosenOffset;
+        }
+        LOG(LOG_LEVEL_INFO, TAG " [bones] mesh %p picked CompSpace offset 0x%X (Z spread %.1f cm, %d bones)",
+            (void*)meshComp, chosenOffset, bestSpread, boneArray.Num);
     }
 
     // SkeletalMeshComponent.ComponentToWorld 与 SceneComponent.ComponentToWorld
@@ -2482,11 +2633,91 @@ bool DfmMatchMonitor::fillPlayerBones(PlayerInfo& player) const {
     // 这就是 ESP 框 "目标一动就跟不上" 的真正物理来源。先尝试通过解密 trampoline
     // 拿到当前帧的明文 CTW; 失败才退回直接内存读。
     FTransform componentToWorld{};
-    if (!decryptSceneComponentToWorld(meshComp, componentToWorld)) {
+    bool ctwDecrypted = decryptSceneComponentToWorld(meshComp, componentToWorld);
+    if (!ctwDecrypted) {
         if (!safeReadMemory(meshComp + static_cast<uintptr_t>(m_off.Scene_ComponentToWorld),
                             &componentToWorld,
                             sizeof(componentToWorld))) {
             return false;
+        }
+    }
+
+    // ── 关键修复: 始终用 root.CTW.Translation 锚定 mesh 的平移 ──
+    //   UE Character 默认 SkeletalMeshComponent.RelativeLocation = (0,0,-CapsuleHalfHeight),
+    //   所以正常情况下 mesh.T 本就 = root.T - (0,0,88cm). 我们直接用这个公式,
+    //   彻底消除 mesh.CTW 滞后 / LOD 冻结 / 视锥外不更新带来的整副骨架平移到错位
+    //   位置 (典型现象: bone-derived foot 跑到 actor 几十米外的旧 mesh 位置)。
+    //   保留 mesh 自己的 Rotation/Scale (动画/朝向仍由 mesh 提供)。
+    //   只有当 root 解密失败 / Translation 无效 / 与 mesh 同步差 < 5cm 时, 不动 mesh.T。
+    {
+        const uintptr_t rootComp = safeReadPtr(player.characterPtr + m_off.Actor_RootComponent);
+        FTransform rootCtw{};
+        const bool rootDec = ok(rootComp) && decryptSceneComponentToWorld(rootComp, rootCtw);
+        const bool rootTValid = rootDec
+            && std::isfinite(rootCtw.TranslationX) && std::isfinite(rootCtw.TranslationY) && std::isfinite(rootCtw.TranslationZ)
+            && (std::fabs(rootCtw.TranslationX) > 1.f || std::fabs(rootCtw.TranslationY) > 1.f || std::fabs(rootCtw.TranslationZ) > 1.f)
+            && std::fabs(rootCtw.TranslationX) < 1e7f && std::fabs(rootCtw.TranslationY) < 1e7f && std::fabs(rootCtw.TranslationZ) < 1e7f;
+        if (rootTValid) {
+            const float dx = componentToWorld.TranslationX - rootCtw.TranslationX;
+            const float dy = componentToWorld.TranslationY - rootCtw.TranslationY;
+            const float dz = componentToWorld.TranslationZ - (rootCtw.TranslationZ - 88.f);
+            const float drift2 = dx*dx + dy*dy + dz*dz;
+            componentToWorld.TranslationX = rootCtw.TranslationX;
+            componentToWorld.TranslationY = rootCtw.TranslationY;
+            componentToWorld.TranslationZ = rootCtw.TranslationZ - 88.f;
+            // 节流诊断: 仅当锚定位移 > 50cm (即修正了一个真实的滞后) 才打印
+            if (drift2 > 50.f * 50.f) {
+                static auto s_lastAnchorLog = std::chrono::steady_clock::time_point{};
+                auto now = std::chrono::steady_clock::now();
+                if (now - s_lastAnchorLog > std::chrono::seconds(2)) {
+                    s_lastAnchorLog = now;
+                    LOG(LOG_LEVEL_WARN, TAG " [bones-anchor] %s drift=%.0fcm meshT_old=(%.0f,%.0f,%.0f) -> rootT-88=(%.0f,%.0f,%.0f)",
+                        player.playerName.c_str(), std::sqrt(drift2),
+                        componentToWorld.TranslationX + dx,
+                        componentToWorld.TranslationY + dy,
+                        componentToWorld.TranslationZ + dz,
+                        componentToWorld.TranslationX,
+                        componentToWorld.TranslationY,
+                        componentToWorld.TranslationZ);
+                }
+            }
+        } else {
+            // root 解密失败诊断 (节流, 仅警告级)
+            static auto s_lastNoRootLog = std::chrono::steady_clock::time_point{};
+            auto now = std::chrono::steady_clock::now();
+            if (now - s_lastNoRootLog > std::chrono::seconds(5)) {
+                s_lastNoRootLog = now;
+                LOG(LOG_LEVEL_WARN, TAG " [bones-anchor] %s rootDecFail rootComp=%p -> 保留 mesh.T=(%.0f,%.0f,%.0f)",
+                    player.playerName.c_str(), (void*)rootComp,
+                    componentToWorld.TranslationX, componentToWorld.TranslationY, componentToWorld.TranslationZ);
+            }
+        }
+    }
+
+    // 诊断: 周期性比较 mesh.CTW 与 root.CTW (capsule), 看是否旋转一致
+    {
+        static auto s_lastCtwLog = std::chrono::steady_clock::time_point{};
+        auto now = std::chrono::steady_clock::now();
+        if (now - s_lastCtwLog > std::chrono::seconds(3)) {
+            s_lastCtwLog = now;
+            FTransform rootCtw{};
+            uintptr_t root = safeReadPtr(player.characterPtr + m_off.Actor_RootComponent);
+            bool rootDec = ok(root) && decryptSceneComponentToWorld(root, rootCtw);
+            float qLen = std::sqrt(componentToWorld.RotationX*componentToWorld.RotationX
+                + componentToWorld.RotationY*componentToWorld.RotationY
+                + componentToWorld.RotationZ*componentToWorld.RotationZ
+                + componentToWorld.RotationW*componentToWorld.RotationW);
+            LOG(LOG_LEVEL_WARN, TAG " [bones-ctw] %s mesh=%p meshDec=%d "
+                "meshQ=(%.3f,%.3f,%.3f,%.3f)|%.3f meshT=(%.0f,%.0f,%.0f) "
+                "rootDec=%d rootQ=(%.3f,%.3f,%.3f,%.3f) rootT=(%.0f,%.0f,%.0f)",
+                player.playerName.c_str(), (void*)meshComp, ctwDecrypted?1:0,
+                componentToWorld.RotationX, componentToWorld.RotationY,
+                componentToWorld.RotationZ, componentToWorld.RotationW, qLen,
+                componentToWorld.TranslationX, componentToWorld.TranslationY,
+                componentToWorld.TranslationZ,
+                rootDec?1:0,
+                rootCtw.RotationX, rootCtw.RotationY, rootCtw.RotationZ, rootCtw.RotationW,
+                rootCtw.TranslationX, rootCtw.TranslationY, rootCtw.TranslationZ);
         }
     }
 
@@ -2535,6 +2766,41 @@ bool DfmMatchMonitor::fillPlayerBones(PlayerInfo& player) const {
     }
 
     player.bonesValid = anyValid && validBoneCount >= kMinTrackedBoneMatches;
+
+    // 诊断: 周期性打印 17 个 slot 的世界坐标 spread + 是否走 fallback 映射
+    {
+        static auto s_lastDiag = std::chrono::steady_clock::time_point{};
+        auto now = std::chrono::steady_clock::now();
+        if (now - s_lastDiag > std::chrono::seconds(3) && player.bonesValid) {
+            s_lastDiag = now;
+            float xMin=1e30f,xMax=-1e30f,yMin=1e30f,yMax=-1e30f,zMin=1e30f,zMax=-1e30f;
+            for (int i = 0; i < PlayerInfo::BONE_COUNT; ++i) {
+                const auto& b = player.bones[i];
+                if (!hasUsableWorldPoint(b) || (b.x==0&&b.y==0&&b.z==0)) continue;
+                xMin=std::min(xMin,b.x);xMax=std::max(xMax,b.x);
+                yMin=std::min(yMin,b.y);yMax=std::max(yMax,b.y);
+                zMin=std::min(zMin,b.z);zMax=std::max(zMax,b.z);
+            }
+            // 也打印 head/pelvis/foot 三个关键 slot 的 trackedBoneIndex
+            int idxHead = haveTrackedBoneMap ? boneEntry.trackedBoneIndices[0]  : kFallbackBoneMap[0];
+            int idxPelv = haveTrackedBoneMap ? boneEntry.trackedBoneIndices[4]  : kFallbackBoneMap[4];
+            int idxRFoot= haveTrackedBoneMap ? boneEntry.trackedBoneIndices[13] : kFallbackBoneMap[13];
+            const auto& bH = player.bones[0];
+            const auto& bP = player.bones[4];
+            const auto& bRF = player.bones[13];
+            const auto& bLF = player.bones[16];
+            LOG(LOG_LEVEL_WARN, TAG " [bones-world] %s validBones=%d "
+                "Xspread=%.0f Yspread=%.0f Zspread=%.0f trackedMap=%d "
+                "head[0]=%d pelvis[4]=%d rfoot[13]=%d arr=%d "
+                "headZ=%.0f pelvZ=%.0f rfootZ=%.0f lfootZ=%.0f meshT=(%.0f,%.0f,%.0f)",
+                player.playerName.c_str(), validBoneCount,
+                xMax-xMin, yMax-yMin, zMax-zMin,
+                haveTrackedBoneMap?1:0, idxHead, idxPelv, idxRFoot, boneArray.Num,
+                bH.z, bP.z, bRF.z, bLF.z,
+                componentToWorld.TranslationX, componentToWorld.TranslationY, componentToWorld.TranslationZ);
+        }
+    }
+
     return player.bonesValid;
 }
 

@@ -83,11 +83,16 @@ struct ResolvedOffsets {
     int32_t STBase_AvatarComponent = 0x3B98;  // STExtraBaseCharacter.AvatarComponent
     int32_t STBase_FPPComp         = 0x4168;  // STExtraBaseCharacter.FPPComp
     int32_t FPPComp_AvatarComp     = 0x380;   // BaseFPPComponent._AvatarComp
-    // SkeletalMeshComponent 内部字段
-    int32_t SkinnedMesh_SkeletalMesh = 0x7F0; // SkinnedMeshComponent.SkeletalMesh (mesh asset)
-    int32_t SkinnedMesh_MasterPoseComponent = 0x710; // SkinnedMeshComponent.MasterPoseComponent
-    int32_t Skel_CachedCompSpace   = 0x9D8;   // SkeletalMeshComponent.CachedComponentSpaceTransforms (TArray<FTransform>)
-    int32_t Skel_BoneSpaceTransforms = 0x9C8; // SkeletalMeshComponent.CachedBoneSpaceTransforms
+    // SkeletalMeshComponent 内部字段 (sdk_dump 验证, 当前 DFM 版本)
+    // 旧版默认 (0x7F0/0x710/0x9D8/0x9C8) 与当前 SDK 错位 0x10 ~ 0x108;
+    // 关键: Skel_CachedCompSpace 旧值 0x9D8 实际指向 CachedBoneSpaceTransforms
+    // (父空间局部 transform), 把局部坐标乘以 ComponentToWorld 后所有骨骼坍缩到
+    // mesh 组件原点 → 屏幕上骨架画成一个点。反作弊会剥离这些字段名,
+    // TRY_RESOLVE_MULTI 反射查不到时静默保留默认值, 必须把默认值改对。
+    int32_t SkinnedMesh_SkeletalMesh = 0x6E8; // SkinnedMeshComponent.SkeletalMesh (sdk_dump: 0x6E8)
+    int32_t SkinnedMesh_MasterPoseComponent = 0x714; // SkinnedMeshComponent.MasterPoseComponent (sdk_dump: 0x714)
+    int32_t Skel_CachedCompSpace   = 0x9E8;   // SkeletalMeshComponent.CachedComponentSpaceTransforms (sdk_dump: 0x9E8)
+    int32_t Skel_BoneSpaceTransforms = 0x9D8; // SkeletalMeshComponent.CachedBoneSpaceTransforms (sdk_dump: 0x9D8)
     int32_t Avatar_MasterBoneComponent = 0x300; // AvatarComponent.MasterBoneComponent
     int32_t Avatar_MeshComponentList = 0x528;   // AvatarComponent.meshComponentList
     int32_t Avatar_AvatarEntityList = 0x880;    // AvatarComponent.AvatarEntityList
@@ -520,6 +525,9 @@ private:
     uint32_t  m_offGUObjectArrayChunks;
     uint32_t  m_offGWorld;
     mutable std::unordered_map<uintptr_t, BoneAssetCacheEntry> m_boneAssetCache;
+    // 探测出的 SkeletalMeshComponent.CachedComponentSpaceTransforms 偏移按 mesh 缓存
+    mutable std::mutex m_compSpaceOffsetMu;
+    mutable std::unordered_map<uintptr_t, int32_t> m_compSpaceOffsetCache;
     struct RootCompensationOwner {
         uintptr_t actorPtr = 0;
         std::chrono::steady_clock::time_point seenAt{};

@@ -12,8 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cerrno>
-#include <cstdint>
-#include <unistd.h>
+#include <cstdint>                                            
 #include <sys/syscall.h>
 #include <android/log.h>
 #include <string>
