@@ -249,9 +249,16 @@ int DfmOverlay::drawESP(const dfm::DrawDfmData& data, float screenW, float scree
     float myCy = screenH;
     int drawn = 0;
 
-    // 当前采集到的 p.pos 更接近角色脚底，按脚底 + 全高绘制方框更稳定。
-    constexpr float kCharacterHeight = 180.0f;
+    // p.pos 取自 RootComponent / ReplicatedMovement, 经测试更接近角色 "脚底"。
+    // DFM 使用的腾讯定制 UE5 骨架, 实际站立全高 (脚底 → 头顶) 约 200~210cm,
+    // 这个 200 已经包含 "head 骨骼 → 头顶" 的 ~20cm 间距。
+    //  - 远距离骨骼读取失败时使用此 fallback;
+    //  - 任何情况下顶部还会再加 kHeadCrownExtra 以确保框顶卡在头顶 (而非脖子)。
+    constexpr float kCharacterHeight    = 200.0f;
     constexpr float kCharacterHalfHeight = kCharacterHeight * 0.5f;
+    // UE Skeleton "head" 骨骼原点位于颅骨底 (≈ 脖子顶端),
+    // 距头顶冠点约 22~25cm。用于把方框上沿抬到真正的头顶。
+    constexpr float kHeadCrownExtra     = 25.0f;
 
     for (const auto& p : data.players) {
         if (p.hp <= 0) continue;
@@ -267,15 +274,56 @@ int DfmOverlay::drawESP(const dfm::DrawDfmData& data, float screenW, float scree
         else if (p.teamId >= 0 && p.teamId == data.myTeamId) color = IM_COL32(0, 255, 0, 200);
         else color = IM_COL32(255, 50, 50, 230);
 
+        // ---- 头/脚世界坐标: 优先用真实骨骼(已通过解密的 ComponentToWorld 投到世界空间),
+        //      否则退回 pos + 估算身高。骨骼 0=Head, 13=RFoot, 16=LFoot, 4=Pelvis。 ----
         float footWX = p.pos.x;
         float footWY = p.pos.y;
         float footWZ = p.pos.z;
         float headWX = p.pos.x;
         float headWY = p.pos.y;
-        float headWZ = p.pos.z + kCharacterHeight;
+        // 注意: 这里给 fallback 也加上了 kHeadCrownExtra, 避免远距离 fallback 时框顶卡在脖子
+        float headWZ = p.pos.z + kCharacterHeight + kHeadCrownExtra;
         float centerWX = p.pos.x;
         float centerWY = p.pos.y;
         float centerWZ = p.pos.z + kCharacterHalfHeight;
+
+        if (p.bonesValid) {
+            const auto& head   = p.bones[0];   // Head 骨 (颅底)
+            const auto& pelvis = p.bones[4];   // Pelvis
+            const auto& rFoot  = p.bones[13];
+            const auto& lFoot  = p.bones[16];
+            const bool headOkBone = std::isfinite(head.x) &&
+                (std::fabs(head.x) > 1.0f || std::fabs(head.y) > 1.0f);
+            const bool rFootOk = std::isfinite(rFoot.x) &&
+                (std::fabs(rFoot.x) > 1.0f || std::fabs(rFoot.y) > 1.0f);
+            const bool lFootOk = std::isfinite(lFoot.x) &&
+                (std::fabs(lFoot.x) > 1.0f || std::fabs(lFoot.y) > 1.0f);
+
+            if (headOkBone) {
+                // 用 head 骨水平位置, Z 加上 25cm 让框顶到头顶冠
+                headWX = head.x;
+                headWY = head.y;
+                headWZ = head.z + kHeadCrownExtra;
+            }
+            if (rFootOk && lFootOk) {
+                footWX = (rFoot.x + lFoot.x) * 0.5f;
+                footWY = (rFoot.y + lFoot.y) * 0.5f;
+                footWZ = std::min(rFoot.z, lFoot.z);
+            } else if (rFootOk) {
+                footWX = rFoot.x; footWY = rFoot.y; footWZ = rFoot.z;
+            } else if (lFootOk) {
+                footWX = lFoot.x; footWY = lFoot.y; footWZ = lFoot.z;
+            }
+            // 中心点: 用 pelvis 更稳, 否则取头脚中点
+            if (std::isfinite(pelvis.x) &&
+                (std::fabs(pelvis.x) > 1.0f || std::fabs(pelvis.y) > 1.0f)) {
+                centerWX = pelvis.x; centerWY = pelvis.y; centerWZ = pelvis.z;
+            } else {
+                centerWX = (headWX + footWX) * 0.5f;
+                centerWY = (headWY + footWY) * 0.5f;
+                centerWZ = (headWZ + footWZ) * 0.5f;
+            }
+        }
 
         float footSX = 0.0f, footSY = 0.0f, headSX = 0.0f, headSY = 0.0f;
         float edgeMinDepth = dist <= kRelaxedProjectionDistanceMeters
