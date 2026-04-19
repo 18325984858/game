@@ -1,8 +1,8 @@
 /**
  * @file    kpm_inject_hide_jni.cpp
  * @brief   InjectHideActivity 的 JNI 桥接层。
- *          通过 InjectHideCtl (ReadProcessMemory/inject_hide_ctl.cpp) 把
- *          KernelPatch/kpms/inject-hide 的 control0 命令映射为 JNI 方法：
+ *          通过 KpCtl (ReadProcessMemory/kp_ctl.cpp) 把
+ *          KernelPatch/kpms 模块的 control0 命令映射为 JNI 方法：
  *            - nativeEnable/Disable ProcHide / FileHide / CommHide : 三个总开关
  *            - nativeAdd/Remove/Clear/List HidePid / HideSo / HidePkg / HideComm
  *            - nativeListRunningApps : 复用 SoDumper root ps -A 枚举进程
@@ -23,7 +23,7 @@
 #include <cstdio>
 #include <android/log.h>
 
-#include "../ReadProcessMemory/inject_hide_ctl.h"
+#include "../ReadProcessMemory/kp_ctl.h"
 #include "../soDumper/so_dumper.h"
 
 #define KTAG "[KpmInjectHideJNI]"
@@ -38,7 +38,7 @@ std::string jstr(JNIEnv* env, jstring s) {
     return out;
 }
 
-// 读 /proc/<pid>/cmdline，若为空退回到 /proc/<pid>/comm
+// �?/proc/<pid>/cmdline，若为空退回到 /proc/<pid>/comm
 std::string proc_name_of(int pid) {
     if (pid <= 0) return "?";
     char path[64];
@@ -73,11 +73,9 @@ std::string proc_name_of(int pid) {
 
 } // namespace
 
-// ─── SO 加载/卸载时自动把自己包名注册/注销到 kernel hide_pkg ──
-// Android 的 JNI_OnUnload 在 app 进程被 kill 时通常不会回调，这里主要依赖
-// JNI_OnLoad 注册；后续 InjectHideActivity 的刷新会按运行快照自动清理掉
-// 已经消亡的包名（见 refreshAll 中的失效检测）。
-static std::string self_cached_pkg;
+// ─── SO 加载/卸载时自动把自己包名注册/注销�?kernel hide_pkg ──
+// Android �?JNI_OnUnload �?app 进程�?kill 时通常不会回调，这里主要依�?// JNI_OnLoad 注册；后�?InjectHideActivity 的刷新会按运行快照自动清理掉
+// 已经消亡的包名（�?refreshAll 中的失效检测）�?static std::string self_cached_pkg;
 
 static std::string read_self_pkg() {
     FILE* fp = fopen("/proc/self/cmdline", "r");
@@ -86,9 +84,8 @@ static std::string read_self_pkg() {
     size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
     fclose(fp);
     if (n == 0) return {};
-    // cmdline 以 \0 分隔，第一段即完整进程名（可能含 ':xxx' 子进程后缀）
-    std::string full(buf);
-    // 取主包名：去掉 ':xxx' 后缀
+    // cmdline �?\0 分隔，第一段即完整进程名（可能�?':xxx' 子进程后缀�?    std::string full(buf);
+    // 取主包名：去�?':xxx' 后缀
     size_t colon = full.find(':');
     if (colon != std::string::npos) full = full.substr(0, colon);
     return full;
@@ -97,27 +94,27 @@ static std::string read_self_pkg() {
 extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
     JNIEnv* env = nullptr;
     if (vm && vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK) {
-        // 拿不到 env 也不影响后续逻辑
+        // 拿不�?env 也不影响后续逻辑
     }
     self_cached_pkg = read_self_pkg();
-    if (!self_cached_pkg.empty() && InjectHideCtl::isModuleLoaded()) {
+    if (!self_cached_pkg.empty() && KpCtl::isModuleLoaded()) {
         std::string out;
-        bool ok = InjectHideCtl::rawCtl("add_hide_pkg:" + self_cached_pkg, &out);
+        bool ok = KpCtl::rawCtl("add_hide_pkg:" + self_cached_pkg, &out);
         __android_log_print(ANDROID_LOG_INFO, KTAG,
             "auto add_hide_pkg '%s' ok=%d resp='%s'",
             self_cached_pkg.c_str(), (int)ok, out.c_str());
     } else {
         __android_log_print(ANDROID_LOG_INFO, KTAG,
             "JNI_OnLoad: skip auto hide (pkg='%s', kpm_loaded=%d)",
-            self_cached_pkg.c_str(), (int)InjectHideCtl::isModuleLoaded());
+            self_cached_pkg.c_str(), (int)KpCtl::isModuleLoaded());
     }
     return JNI_VERSION_1_6;
 }
 
 extern "C" JNIEXPORT void JNICALL JNI_OnUnload(JavaVM*, void*) {
-    if (!self_cached_pkg.empty() && InjectHideCtl::isModuleLoaded()) {
+    if (!self_cached_pkg.empty() && KpCtl::isModuleLoaded()) {
         std::string out;
-        bool ok = InjectHideCtl::rawCtl("remove_hide_pkg:" + self_cached_pkg, &out);
+        bool ok = KpCtl::rawCtl("remove_hide_pkg:" + self_cached_pkg, &out);
         __android_log_print(ANDROID_LOG_INFO, KTAG,
             "auto remove_hide_pkg '%s' ok=%d",
             self_cached_pkg.c_str(), (int)ok);
@@ -131,51 +128,51 @@ extern "C" {
 
 // ─── 基础能力 ─────────────────────────────────────────────
 JNI_METHOD(jboolean, nativeIsModuleLoaded)(JNIEnv*, jobject) {
-    return InjectHideCtl::isModuleLoaded() ? JNI_TRUE : JNI_FALSE;
+    return KpCtl::isModuleLoaded() ? JNI_TRUE : JNI_FALSE;
 }
 
 JNI_METHOD(void, nativeSetSuperkey)(JNIEnv* env, jobject, jstring jKey) {
-    InjectHideCtl::setSuperkey(jstr(env, jKey));
-    // 设置 superkey 之后立刻尝试自动登记自身包名（此前 JNI_OnLoad 阶段
+    KpCtl::setSuperkey(jstr(env, jKey));
+    // 设置 superkey 之后立刻尝试自动登记自身包名（此�?JNI_OnLoad 阶段
     // 多半没有 key，rawCtl 会静默失败）
     if (self_cached_pkg.empty()) self_cached_pkg = read_self_pkg();
-    if (!self_cached_pkg.empty() && InjectHideCtl::isModuleLoaded()) {
+    if (!self_cached_pkg.empty() && KpCtl::isModuleLoaded()) {
         std::string out;
-        bool ok = InjectHideCtl::rawCtl("add_hide_pkg:" + self_cached_pkg, &out);
+        bool ok = KpCtl::rawCtl("add_hide_pkg:" + self_cached_pkg, &out);
         __android_log_print(ANDROID_LOG_INFO, KTAG,
-            "setSuperkey → auto add_hide_pkg '%s' ok=%d resp='%s'",
+            "setSuperkey �?auto add_hide_pkg '%s' ok=%d resp='%s'",
             self_cached_pkg.c_str(), (int)ok, out.c_str());
     }
 }
 
 JNI_METHOD(jstring, nativeRawCtl)(JNIEnv* env, jobject, jstring jCmd) {
     std::string out;
-    bool ok = InjectHideCtl::rawCtl(jstr(env, jCmd), &out);
+    bool ok = KpCtl::rawCtl(jstr(env, jCmd), &out);
     std::string r = (ok ? "OK: " : "FAIL: ") + out;
     return env->NewStringUTF(r.c_str());
 }
 
-// ─── proc_hide (PID 级) ──────────────────────────────────
+// ─── proc_hide (PID �? ──────────────────────────────────
 JNI_METHOD(jboolean, nativeEnableProcHide)(JNIEnv*, jobject) {
-    return InjectHideCtl::enableProcHide() ? JNI_TRUE : JNI_FALSE;
+    return KpCtl::enableProcHide() ? JNI_TRUE : JNI_FALSE;
 }
 JNI_METHOD(jboolean, nativeDisableProcHide)(JNIEnv*, jobject) {
-    return InjectHideCtl::disableProcHide() ? JNI_TRUE : JNI_FALSE;
+    return KpCtl::disableProcHide() ? JNI_TRUE : JNI_FALSE;
 }
 JNI_METHOD(jboolean, nativeAddHidePid)(JNIEnv*, jobject, jint pid) {
-    return InjectHideCtl::addHidePid((int)pid) ? JNI_TRUE : JNI_FALSE;
+    return KpCtl::addHidePid((int)pid) ? JNI_TRUE : JNI_FALSE;
 }
 JNI_METHOD(jboolean, nativeRemoveHidePid)(JNIEnv*, jobject, jint pid) {
-    return InjectHideCtl::removeHidePid((int)pid) ? JNI_TRUE : JNI_FALSE;
+    return KpCtl::removeHidePid((int)pid) ? JNI_TRUE : JNI_FALSE;
 }
 JNI_METHOD(jboolean, nativeClearHidePid)(JNIEnv*, jobject) {
-    return InjectHideCtl::clearHidePid() ? JNI_TRUE : JNI_FALSE;
+    return KpCtl::clearHidePid() ? JNI_TRUE : JNI_FALSE;
 }
 JNI_METHOD(jstring, nativeListHidePid)(JNIEnv* env, jobject) {
     std::string out;
-    InjectHideCtl::rawCtl("list_hide_pid", &out);
+    KpCtl::rawCtl("list_hide_pid", &out);
     // 输出格式: "total: N\npid1\npid2\n..."
-    // 我们把每个 pid 附上进程名：  "<pid>  (<cmdline>)"
+    // 我们把每�?pid 附上进程名：  "<pid>  (<cmdline>)"
     std::string result;
     size_t i = 0;
     while (i < out.size()) {
@@ -187,7 +184,7 @@ JNI_METHOD(jstring, nativeListHidePid)(JNIEnv* env, jobject) {
             result += line + "\n";
             continue;
         }
-        // 尝试把 line 解析为 PID
+        // 尝试�?line 解析�?PID
         int pid = 0;
         bool ok = true;
         for (char c : line) {
@@ -206,88 +203,88 @@ JNI_METHOD(jstring, nativeListHidePid)(JNIEnv* env, jobject) {
 
 JNI_METHOD(jstring, nativeGetStatus)(JNIEnv* env, jobject) {
     std::string out;
-    bool ok = InjectHideCtl::rawCtl("status", &out);
+    bool ok = KpCtl::rawCtl("status", &out);
     if (!ok) out = "unreachable";
     return env->NewStringUTF(out.c_str());
 }
 
-// ─── file_hide (SO 关键字) ───────────────────────────────
+// ─── file_hide (SO 关键�? ───────────────────────────────
 JNI_METHOD(jboolean, nativeEnableFileHide)(JNIEnv*, jobject) {
-    return InjectHideCtl::enableFileHide() ? JNI_TRUE : JNI_FALSE;
+    return KpCtl::enableFileHide() ? JNI_TRUE : JNI_FALSE;
 }
 JNI_METHOD(jboolean, nativeDisableFileHide)(JNIEnv*, jobject) {
-    return InjectHideCtl::disableFileHide() ? JNI_TRUE : JNI_FALSE;
+    return KpCtl::disableFileHide() ? JNI_TRUE : JNI_FALSE;
 }
 JNI_METHOD(jboolean, nativeAddHideSo)(JNIEnv* env, jobject, jstring jName) {
-    return InjectHideCtl::addHideSo(jstr(env, jName)) ? JNI_TRUE : JNI_FALSE;
+    return KpCtl::addHideSo(jstr(env, jName)) ? JNI_TRUE : JNI_FALSE;
 }
 JNI_METHOD(jboolean, nativeRemoveHideSo)(JNIEnv* env, jobject, jstring jName) {
-    return InjectHideCtl::removeHideSo(jstr(env, jName)) ? JNI_TRUE : JNI_FALSE;
+    return KpCtl::removeHideSo(jstr(env, jName)) ? JNI_TRUE : JNI_FALSE;
 }
 JNI_METHOD(jboolean, nativeClearHideSo)(JNIEnv*, jobject) {
-    return InjectHideCtl::clearHideSo() ? JNI_TRUE : JNI_FALSE;
+    return KpCtl::clearHideSo() ? JNI_TRUE : JNI_FALSE;
 }
 JNI_METHOD(jstring, nativeListHideSo)(JNIEnv* env, jobject) {
     std::string out;
-    InjectHideCtl::rawCtl("list_hide_so", &out);
+    KpCtl::rawCtl("list_hide_so", &out);
     return env->NewStringUTF(out.c_str());
 }
 
-// ─── 包名级监控列表 (hide_pkg) ───────────────────────────
+// ─── 包名级监控列�?(hide_pkg) ───────────────────────────
 JNI_METHOD(jstring, nativeListHidePkg)(JNIEnv* env, jobject) {
     std::string out;
-    InjectHideCtl::rawCtl("list_hide_pkg", &out);
+    KpCtl::rawCtl("list_hide_pkg", &out);
     return env->NewStringUTF(out.c_str());
 }
 JNI_METHOD(jboolean, nativeAddHidePkg)(JNIEnv* env, jobject, jstring jName) {
     std::string name = jstr(env, jName);
     if (name.empty()) return JNI_FALSE;
     std::string out;
-    return InjectHideCtl::rawCtl("add_hide_pkg:" + name, &out) ? JNI_TRUE : JNI_FALSE;
+    return KpCtl::rawCtl("add_hide_pkg:" + name, &out) ? JNI_TRUE : JNI_FALSE;
 }
 JNI_METHOD(jboolean, nativeRemoveHidePkg)(JNIEnv* env, jobject, jstring jName) {
     std::string name = jstr(env, jName);
     if (name.empty()) return JNI_FALSE;
     std::string out;
-    return InjectHideCtl::rawCtl("remove_hide_pkg:" + name, &out) ? JNI_TRUE : JNI_FALSE;
+    return KpCtl::rawCtl("remove_hide_pkg:" + name, &out) ? JNI_TRUE : JNI_FALSE;
 }
 JNI_METHOD(jboolean, nativeClearHidePkg)(JNIEnv*, jobject) {
     std::string out;
-    return InjectHideCtl::rawCtl("clear_hide_pkg", &out) ? JNI_TRUE : JNI_FALSE;
+    return KpCtl::rawCtl("clear_hide_pkg", &out) ? JNI_TRUE : JNI_FALSE;
 }
 
 // ─── 线程名级隐藏列表 (hide_comm) ────────────────────────
 JNI_METHOD(jstring, nativeListHideComm)(JNIEnv* env, jobject) {
     std::string out;
-    InjectHideCtl::rawCtl("list_hide_comm", &out);
+    KpCtl::rawCtl("list_hide_comm", &out);
     return env->NewStringUTF(out.c_str());
 }
 JNI_METHOD(jboolean, nativeAddHideComm)(JNIEnv* env, jobject, jstring jName) {
     std::string name = jstr(env, jName);
     if (name.empty()) return JNI_FALSE;
     std::string out;
-    return InjectHideCtl::rawCtl("add_hide_comm:" + name, &out) ? JNI_TRUE : JNI_FALSE;
+    return KpCtl::rawCtl("add_hide_comm:" + name, &out) ? JNI_TRUE : JNI_FALSE;
 }
 JNI_METHOD(jboolean, nativeRemoveHideComm)(JNIEnv* env, jobject, jstring jName) {
     std::string name = jstr(env, jName);
     if (name.empty()) return JNI_FALSE;
     std::string out;
-    return InjectHideCtl::rawCtl("remove_hide_comm:" + name, &out) ? JNI_TRUE : JNI_FALSE;
+    return KpCtl::rawCtl("remove_hide_comm:" + name, &out) ? JNI_TRUE : JNI_FALSE;
 }
 JNI_METHOD(jboolean, nativeClearHideComm)(JNIEnv*, jobject) {
     std::string out;
-    return InjectHideCtl::rawCtl("clear_hide_comm", &out) ? JNI_TRUE : JNI_FALSE;
+    return KpCtl::rawCtl("clear_hide_comm", &out) ? JNI_TRUE : JNI_FALSE;
 }
 JNI_METHOD(jboolean, nativeEnableCommHide)(JNIEnv*, jobject) {
     std::string out;
-    return InjectHideCtl::rawCtl("enable_comm_hide", &out) ? JNI_TRUE : JNI_FALSE;
+    return KpCtl::rawCtl("enable_comm_hide", &out) ? JNI_TRUE : JNI_FALSE;
 }
 JNI_METHOD(jboolean, nativeDisableCommHide)(JNIEnv*, jobject) {
     std::string out;
-    return InjectHideCtl::rawCtl("disable_comm_hide", &out) ? JNI_TRUE : JNI_FALSE;
+    return KpCtl::rawCtl("disable_comm_hide", &out) ? JNI_TRUE : JNI_FALSE;
 }
 
-// ─── 进程枚举 (root 读 /proc，复用 SoDumper 实现) ──────
+// ─── 进程枚举 (root �?/proc，复�?SoDumper 实现) ──────
 JNI_METHOD(jobjectArray, nativeListRunningApps)(JNIEnv* env, jobject, jstring jFilter) {
     std::string filter = jstr(env, jFilter);
     auto apps = SoDumper::listRunningApps(filter);
@@ -300,12 +297,12 @@ JNI_METHOD(jobjectArray, nativeListRunningApps)(JNIEnv* env, jobject, jstring jF
     return arr;
 }
 
-// ─── 便捷：隐藏/取消隐藏自身 ──────────────────────────────
+// ─── 便捷：隐�?取消隐藏自身 ──────────────────────────────
 JNI_METHOD(jboolean, nativeHideSelf)(JNIEnv*, jobject) {
-    return InjectHideCtl::hideSelf() ? JNI_TRUE : JNI_FALSE;
+    return KpCtl::hideSelf() ? JNI_TRUE : JNI_FALSE;
 }
 JNI_METHOD(jboolean, nativeUnhideSelf)(JNIEnv*, jobject) {
-    return InjectHideCtl::unhideSelf() ? JNI_TRUE : JNI_FALSE;
+    return KpCtl::unhideSelf() ? JNI_TRUE : JNI_FALSE;
 }
 
 } // extern "C"

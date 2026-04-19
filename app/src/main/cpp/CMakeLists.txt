@@ -135,7 +135,7 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
         "soDumper/so_dumper_jni.cpp"
         "ReadProcessMemory/mem_reader.cpp"
         "ReadProcessMemory/mem_reader_jni.cpp"
-        "ReadProcessMemory/inject_hide_ctl.cpp"
+        "ReadProcessMemory/kp_ctl.cpp"
         "KpmInterface/kpm_inject_hide_jni.cpp"
 )
 

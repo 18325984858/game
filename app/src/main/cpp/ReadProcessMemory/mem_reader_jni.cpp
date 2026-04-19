@@ -15,7 +15,7 @@
 #include "mem_reader.h"
 #include "../soDumper/so_dumper.h"
 #include "../Log/log.h"
-#include "inject_hide_ctl.h"
+#include "kp_ctl.h"
 
 #define MTAG "[MemReaderJNI]"
 
@@ -24,13 +24,13 @@
 static void ensureInjectHide() {
     static std::once_flag once;
     std::call_once(once, []{
-        if (InjectHideCtl::isModuleLoaded()) {
-            bool ok = InjectHideCtl::hideSelf();
+        if (KpCtl::isModuleLoaded()) {
+            bool ok = KpCtl::hideSelf();
             __android_log_print(ANDROID_LOG_INFO, MTAG,
-                "inject-hide hideSelf ok=%d pid=%d", (int)ok, (int)getpid());
+                "kp hideSelf ok=%d pid=%d", (int)ok, (int)getpid());
         } else {
             __android_log_print(ANDROID_LOG_INFO, MTAG,
-                "inject-hide KPM 未加载，跳过隐藏");
+                "kp KPM 未加载，跳过隐藏");
         }
     });
 }

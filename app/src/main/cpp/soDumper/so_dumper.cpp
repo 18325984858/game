@@ -85,22 +85,30 @@ std::vector<ProcessInfo> listRunningApps(const std::string& filter) {
     std::vector<ProcessInfo> result;
     std::set<std::string> seen;
 
-    // Android 非 root 进程只能看到自己的 /proc 条目
-    // 使用 su 执行 ps -A 获取所有进程
-    FILE* fp = popen("su -c 'ps -A 2>/dev/null || ps -e 2>/dev/null || ps 2>/dev/null'", "r");
-    if (!fp) {
-        __android_log_print(ANDROID_LOG_ERROR, DTAG, "popen(su ps) 失败");
+    // 不再 popen("su -c ps -A"): 复用 MemReader 已启动的持久 root shell
+    // (避免反复用拉 su 子进程, 减少游戏反作弊对
+    // "同设备出现多个 su 调用者" 的打分).
+    std::string psOut;
+    if (!MemReader::runRootShellCapture(
+            "ps -A 2>/dev/null || ps -e 2>/dev/null || ps 2>/dev/null",
+            psOut)) {
+        __android_log_print(ANDROID_LOG_ERROR, DTAG, "runRootShellCapture(ps) 失败");
         return result;
     }
 
     char line[1024];
-    // 跳过 header 行
-    if (!fgets(line, sizeof(line), fp)) {
-        pclose(fp);
-        return result;
-    }
+    bool firstLine = true;
+    size_t linePos = 0;
+    while (linePos < psOut.size()) {
+        size_t nl = psOut.find('\n', linePos);
+        std::string lineStr = psOut.substr(linePos,
+            (nl == std::string::npos ? psOut.size() : nl) - linePos);
+        linePos = (nl == std::string::npos) ? psOut.size() : nl + 1;
+        if (lineStr.empty()) continue;
+        if (firstLine) { firstLine = false; continue; }
+        strncpy(line, lineStr.c_str(), sizeof(line) - 1);
+        line[sizeof(line) - 1] = '\0';
 
-    while (fgets(line, sizeof(line), fp)) {
         // ps 输出格式: USER PID PPID VSZ RSS WCHAN ADDR S NAME
         // PID 始终为第2列, NAME 始终为最后一列
         std::vector<const char*> tokens;
@@ -138,7 +146,6 @@ std::vector<ProcessInfo> listRunningApps(const std::string& filter) {
         info.packageName = cmdline;
         result.push_back(info);
     }
-    pclose(fp);
 
     std::sort(result.begin(), result.end(),
               [](const ProcessInfo& a, const ProcessInfo& b) {
@@ -430,8 +437,9 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath) 
             headerReadSize = phdrEnd;
             // 读取剩余部分
             if (phdrEnd > headerGot) {
-                readProcessMemory(pid, baseAddr + headerGot, phdrEnd - headerGot,
-                                  headerBuf + headerGot);
+                size_t extra = readProcessMemory(pid, baseAddr + headerGot, phdrEnd - headerGot,
+                                                 headerBuf + headerGot);
+                headerGot += extra;
             }
             ehdr = reinterpret_cast<Elf64_Ehdr*>(headerBuf);
         }
@@ -445,7 +453,10 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath) 
                 seg.offset = phdr->p_offset;
                 seg.memsz = phdr->p_memsz;
                 loadSegs.push_back(seg);
-                size_t segEnd = seg.offset + seg.memsz;
+                // 使用 vaddr 布局输出文件 (file_offset == vaddr),
+                // 这样所有 d_ptr / sh_addr 在文件中的偏移与内存中一致, IDA/section
+                // 重建可以直接用 vaddr 当 file offset, 不需要再做 offset/vaddr 换算.
+                size_t segEnd = seg.vaddr + seg.memsz;
                 if (segEnd > outFileSize) outFileSize = segEnd;
                 __android_log_print(ANDROID_LOG_INFO, DTAG,
                     "PT_LOAD[%d]: vaddr=0x%lx offset=0x%lx memsz=0x%lx",
@@ -464,8 +475,9 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath) 
             headerBuf = newBuf;
             headerReadSize = phdrEnd;
             if (phdrEnd > headerGot) {
-                readProcessMemory(pid, baseAddr + headerGot, phdrEnd - headerGot,
-                                  headerBuf + headerGot);
+                size_t extra = readProcessMemory(pid, baseAddr + headerGot, phdrEnd - headerGot,
+                                                 headerBuf + headerGot);
+                headerGot += extra;
             }
             ehdr = reinterpret_cast<Elf32_Ehdr*>(headerBuf);
         }
@@ -479,7 +491,8 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath) 
                 seg.offset = phdr->p_offset;
                 seg.memsz = phdr->p_memsz;
                 loadSegs.push_back(seg);
-                size_t segEnd = seg.offset + seg.memsz;
+                // vaddr 布局输出文件 (与 64-bit 分支保持一致)
+                size_t segEnd = seg.vaddr + seg.memsz;
                 if (segEnd > outFileSize) outFileSize = segEnd;
             }
         }
@@ -495,8 +508,8 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath) 
         "找到 %zu 个 PT_LOAD 段, 输出文件大小: %zu bytes (%.2f MB)",
         loadSegs.size(), outFileSize, outFileSize / (1024.0 * 1024.0));
 
-    // 输出文件大小检查 (基于原始 p_offset 布局, 通常与磁盘 SO 大小接近)
-    if (outFileSize == 0 || outFileSize > (size_t)2 * 1024 * 1024 * 1024) {
+    // 输出文件大小检查 (基于 vaddr 布局, 段间真实间隙会零填充)
+    if (outFileSize == 0 || outFileSize > ((size_t)2u << 30)) {
         __android_log_print(ANDROID_LOG_ERROR, DTAG, "输出文件大小异常: %zu", outFileSize);
         delete[] headerBuf;
         return -2;
@@ -522,16 +535,17 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath) 
         uintptr_t memAddr = baseAddr + seg.vaddr;
         size_t readSize = seg.memsz;
 
-        if (seg.offset + readSize > outFileSize) {
-            readSize = outFileSize - seg.offset;
+        if (seg.vaddr + readSize > outFileSize) {
+            readSize = outFileSize - seg.vaddr;
         }
         if (readSize == 0) continue;
 
         __android_log_print(ANDROID_LOG_INFO, DTAG,
             "Dump PT_LOAD[%zu]: mem=0x%lx -> file_off=0x%lx, size=%zu",
-            si, (unsigned long)memAddr, (unsigned long)seg.offset, readSize);
+            si, (unsigned long)memAddr, (unsigned long)seg.vaddr, readSize);
 
-        size_t got = readProcessMemory(pid, memAddr, readSize, outBuf + seg.offset);
+        // 写入 vaddr 偏移 (= 文件偏移, 与 outFileSize 计算保持一致)
+        size_t got = readProcessMemory(pid, memAddr, readSize, outBuf + seg.vaddr);
         __android_log_print(ANDROID_LOG_INFO, DTAG,
             "PT_LOAD[%zu]: 读取 %zu / %zu bytes", si, got, readSize);
     }
@@ -541,22 +555,43 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath) 
     // IDA 依赖 section headers 来定位 .dynsym / .dynstr / .plt 等表。
     // 内存 dump 后 section headers 已丢失, 这里从 PT_DYNAMIC 重建。
 
-    // --- 5a: 修复 PT_LOAD 的 p_filesz ---
+    // --- 5a: 修复 PT_LOAD 的 p_filesz / p_offset ---
+    // 由于我们按 vaddr 布局输出文件, 必须把 p_offset 重写成 p_vaddr,
+    // 否则 IDA 按 p_offset 读取段数据会读到错误位置。
     if (is64) {
         auto* ehdr = reinterpret_cast<Elf64_Ehdr*>(outBuf);
         for (int i = 0; i < ehdr->e_phnum; i++) {
             auto* phdr = reinterpret_cast<Elf64_Phdr*>(
                 outBuf + ehdr->e_phoff + i * ehdr->e_phentsize);
-            if (phdr->p_type == PT_LOAD)
+            if (phdr->p_type == PT_LOAD) {
+                phdr->p_offset = phdr->p_vaddr;
                 phdr->p_filesz = phdr->p_memsz;
+            } else if (phdr->p_type == PT_DYNAMIC ||
+                       phdr->p_type == PT_NOTE ||
+                       phdr->p_type == PT_PHDR ||
+                       phdr->p_type == PT_GNU_RELRO ||
+                       phdr->p_type == PT_GNU_EH_FRAME) {
+                // 其他需要寻址的段也同步成 vaddr 布局
+                phdr->p_offset = phdr->p_vaddr;
+                if (phdr->p_filesz > phdr->p_memsz) phdr->p_memsz = phdr->p_filesz;
+            }
         }
     } else {
         auto* ehdr = reinterpret_cast<Elf32_Ehdr*>(outBuf);
         for (int i = 0; i < ehdr->e_phnum; i++) {
             auto* phdr = reinterpret_cast<Elf32_Phdr*>(
                 outBuf + ehdr->e_phoff + i * ehdr->e_phentsize);
-            if (phdr->p_type == PT_LOAD)
+            if (phdr->p_type == PT_LOAD) {
+                phdr->p_offset = phdr->p_vaddr;
                 phdr->p_filesz = phdr->p_memsz;
+            } else if (phdr->p_type == PT_DYNAMIC ||
+                       phdr->p_type == PT_NOTE ||
+                       phdr->p_type == PT_PHDR ||
+                       phdr->p_type == PT_GNU_RELRO ||
+                       phdr->p_type == PT_GNU_EH_FRAME) {
+                phdr->p_offset = phdr->p_vaddr;
+                if (phdr->p_filesz > phdr->p_memsz) phdr->p_memsz = phdr->p_filesz;
+            }
         }
     }
 
@@ -631,9 +666,16 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath) 
         };
         DynInfo di;
 
-        // 检测 linker 是否将 d_ptr 转换为绝对地址
-        // 策略: 如果 DT_STRTAB 的值 >= baseAddr 且 baseAddr > 0, 则判定为绝对地址
+        // 检测 linker 是否将 d_ptr 转换为绝对地址 (load_bias + vaddr).
+        // 策略: 计算映像 vaddr 上限 maxVaddr, 仅当 DT_STRTAB 落在
+        // [baseAddr, baseAddr + maxVaddr + slack] 范围内才判定为绝对地址,
+        // 避免把大 vaddr (如 0x17900A20) 误判成绝对地址.
         bool absoluteAddrs = false;
+        size_t maxVaddr = 0;
+        for (auto& s : loadSegs) {
+            size_t e = s.vaddr + s.memsz;
+            if (e > maxVaddr) maxVaddr = e;
+        }
 
         auto normAddr = [&](size_t val) -> size_t {
             if (absoluteAddrs && val >= baseAddr) return val - baseAddr;
@@ -641,13 +683,13 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath) 
         };
 
         // 第一遍: 先读 DT_STRTAB 判断是否绝对地址
+        size_t strtabRaw = 0;
         if (is64) {
             auto* dyn = reinterpret_cast<Elf64_Dyn*>(outBuf + dynOff);
             size_t count = dynSize / sizeof(Elf64_Dyn);
             for (size_t i = 0; i < count && dyn[i].d_tag != DT_NULL; i++) {
                 if (dyn[i].d_tag == DT_STRTAB) {
-                    if (baseAddr > 0 && (size_t)dyn[i].d_un.d_ptr >= baseAddr)
-                        absoluteAddrs = true;
+                    strtabRaw = (size_t)dyn[i].d_un.d_ptr;
                     break;
                 }
             }
@@ -656,11 +698,14 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath) 
             size_t count = dynSize / sizeof(Elf32_Dyn);
             for (size_t i = 0; i < count && dyn[i].d_tag != DT_NULL; i++) {
                 if (dyn[i].d_tag == DT_STRTAB) {
-                    if (baseAddr > 0 && (size_t)dyn[i].d_un.d_ptr >= baseAddr)
-                        absoluteAddrs = true;
+                    strtabRaw = (size_t)dyn[i].d_un.d_ptr;
                     break;
                 }
             }
+        }
+        if (baseAddr > 0 && strtabRaw >= baseAddr &&
+            strtabRaw < baseAddr + maxVaddr + 0x10000) {
+            absoluteAddrs = true;
         }
 
         __android_log_print(ANDROID_LOG_INFO, DTAG,
@@ -914,10 +959,35 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath) 
                    di.dt_versym, dynsymCount * 2, 0, 0, 2, 2);
         }
 
-        // .gnu.version_r (DT_VERNEED) - 大小不确定, 给最小估算
+        // .gnu.version_r (DT_VERNEED) - 遍历 Verneed 链表算出真实字节数
         if (di.dt_verneed) {
+            size_t verneedSize = 0;
+            size_t cur = di.dt_verneed;
+            // 安全上限: 防止恶意/损坏数据导致死循环
+            for (int guard = 0; guard < 4096 && cur + 16 <= outFileSize; guard++) {
+                // Elf{32,64}_Verneed 前 16 字节布局相同:
+                //   uint16_t vn_version, vn_cnt;
+                //   uint32_t vn_file, vn_aux, vn_next;
+                uint16_t vn_cnt  = *reinterpret_cast<uint16_t*>(outBuf + cur + 2);
+                uint32_t vn_aux  = *reinterpret_cast<uint32_t*>(outBuf + cur + 8);
+                uint32_t vn_next = *reinterpret_cast<uint32_t*>(outBuf + cur + 12);
+
+                size_t entrySize = 16; // Verneed 自身
+                // 累加 vn_cnt 个 Vernaux (每个 16 字节)
+                size_t auxCur = cur + vn_aux;
+                for (uint16_t a = 0; a < vn_cnt && auxCur + 16 <= outFileSize; a++) {
+                    uint32_t vna_next = *reinterpret_cast<uint32_t*>(outBuf + auxCur + 12);
+                    entrySize = (auxCur + 16) - cur;
+                    if (vna_next == 0) break;
+                    auxCur += vna_next;
+                }
+                verneedSize += entrySize;
+                if (vn_next == 0) break;
+                cur += vn_next;
+            }
+            if (verneedSize == 0) verneedSize = 64; // 兜底
             addSec(".gnu.version_r", SHT_GNU_verneed, SHF_ALLOC,
-                   di.dt_verneed, 64 /* 最小估算 */, 0, 0, is64 ? 8 : 4, 0);
+                   di.dt_verneed, verneedSize, 0, 0, is64 ? 8 : 4, 0);
         }
 
         // 过滤掉 addr=0 && size=0 的无效 section (已在 addSec 中跳过)
@@ -1080,12 +1150,50 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath) 
 
     write_output:
 
-    // ── Step 6: 写入输出文件 ──
-    FILE* outFp = fopen(outPath.c_str(), "wb");
+    // ── Step 6: \u51c6\u5907\u8f93\u51fa\u8def\u5f84 ──
+    // \u907f\u514d\u5728\u78c1\u76d8\u4e0a\u7559\u4e0b\u5f3a\u7279\u5f81\u540d (\u5305\u540d / libUE4.so),
+    // \u5982\u679c basename \u5305\u542b "libUE4" / "lib"+package \u7b49\u5b57\u6837, \u91cd\u5199\u4e3a hash \u968f\u673a\u540d\u3002
+    auto looksSensitive = [&](const std::string& base) -> bool {
+        std::string low = base;
+        std::transform(low.begin(), low.end(), low.begin(), ::tolower);
+        if (low.find("libue4") != std::string::npos)    return true;
+        if (low.find("libunreal") != std::string::npos) return true;
+        if (low.find("com.tencent") != std::string::npos) return true;
+        if (low.find(".so") != std::string::npos &&
+            low.find("lib") != std::string::npos) return true;
+        return false;
+    };
+
+    std::string finalPath = outPath;
+    {
+        size_t slash = finalPath.find_last_of("/\\");
+        std::string dir  = (slash == std::string::npos) ? std::string() : finalPath.substr(0, slash + 1);
+        std::string base = (slash == std::string::npos) ? finalPath : finalPath.substr(slash + 1);
+        if (looksSensitive(base)) {
+            // 16 hex char = 8 random bytes; \u540e\u7f00\u4e0d\u7528 .so \u907f\u514d\u88ab\u626b
+            uint8_t r[8];
+            FILE* urnd = fopen("/dev/urandom", "rb");
+            if (urnd) { (void)fread(r, 1, sizeof(r), urnd); fclose(urnd); }
+            else      { for (auto& b : r) b = (uint8_t)(rand() & 0xFF); }
+            char hex[17];
+            static const char* H = "0123456789abcdef";
+            for (int i = 0; i < 8; i++) {
+                hex[i*2]   = H[(r[i] >> 4) & 0xF];
+                hex[i*2+1] = H[ r[i]       & 0xF];
+            }
+            hex[16] = '\0';
+            finalPath = dir + std::string(hex) + ".bin";
+            __android_log_print(ANDROID_LOG_INFO, DTAG,
+                "\u8f93\u51fa\u540d\u542b\u654f\u611f\u5b57\u6837, \u6539\u540d\u4e3a: %s", finalPath.c_str());
+        }
+    }
+
+    // ── Step 7: \u5199\u5165\u8f93\u51fa\u6587\u4ef6 ──
+    FILE* outFp = fopen(finalPath.c_str(), "wb");
     if (!outFp) {
         __android_log_print(ANDROID_LOG_ERROR, DTAG,
             "无法创建输出文件: %s (errno=%d, %s)",
-            outPath.c_str(), errno, strerror(errno));
+            finalPath.c_str(), errno, strerror(errno));
         delete[] outBuf;
         return -5;
     }
@@ -1094,10 +1202,11 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath) 
     fclose(outFp);
     delete[] outBuf;
 
-    // 修复权限
-    char chmodCmd[512];
-    snprintf(chmodCmd, sizeof(chmodCmd), "su -c 'chmod 644 %s'", outPath.c_str());
-    system(chmodCmd);
+    // 修复权限: 复用持久 root shell, 不再 system("su -c ...") 拉新的 su 子进程
+    {
+        std::string cmd = "chmod 644 '" + finalPath + "'";
+        MemReader::runRootShell(cmd);
+    }
 
     if (written != outFileSize) {
         __android_log_print(ANDROID_LOG_ERROR, DTAG,
@@ -1107,7 +1216,7 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath) 
 
     __android_log_print(ANDROID_LOG_INFO, DTAG,
                         "Dump 成功: %s -> %s (%zu bytes, %.2f MB)",
-                        module.name.c_str(), outPath.c_str(),
+                        module.name.c_str(), finalPath.c_str(),
                         outFileSize, outFileSize / (1024.0 * 1024.0));
     return 0;
 }

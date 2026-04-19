@@ -5,7 +5,7 @@
 #include "../Log/log.h"
 #include "unitystart.h"
 #include "../Injector/Injector.h"
-#include "../ReadProcessMemory/inject_hide_ctl.h"
+#include "../ReadProcessMemory/kp_ctl.h"
 
 struct CommandResult {
     int exitCode;
@@ -84,7 +84,7 @@ Java_com_example_dobbyproject_MainActivity_nativeValidateKpKey(
         const char* p = env->GetStringUTFChars(jKey, nullptr);
         if (p) { key = p; env->ReleaseStringUTFChars(jKey, p); }
     }
-    bool ok = InjectHideCtl::verifyKey(key);
+    bool ok = KpCtl::verifyKey(key);
     return ok ? JNI_TRUE : JNI_FALSE;
 }
 

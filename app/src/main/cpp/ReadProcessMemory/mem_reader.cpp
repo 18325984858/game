@@ -19,11 +19,12 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <android/log.h>
+#include <sys/random.h>
 
 #include <mutex>
 #include <algorithm>
 
-#define RTAG "[MemReader]"
+#define RTAG "[MR]"
 
 namespace {
 
@@ -31,9 +32,46 @@ constexpr size_t PAGE_SIZE  = 4096;
 // 单次 dd 读取的最大字节数, 大于此值会切分
 constexpr size_t CHUNK_BYTES = 1 * 1024 * 1024;
 
-const char* TMP_DIR   = "/data/local/tmp/so_dump";
-const char* TMP_FILE  = "/data/local/tmp/so_dump/_memread_tmp";
-const char* DONE_TAG  = "__MEMREAD_DONE__";
+const char* DONE_TAG  = "__X_DONE__";
+
+// ── 运行时随机化的临时目录与工具二进制路径 ───────────────────────────
+// 目的: 不再让 ACE 通过固定路径 /data/local/tmp/so_dump 与命令行特征
+//       (dd if=/proc/PID/mem ...) 直接命中。
+struct RuntimePaths {
+    std::string dir;        // /data/local/tmp/.X<rand>
+    std::string memTmp;     // <dir>/m<rand>
+    std::string mapsTmp;    // <dir>/p<rand>
+    std::string writeTmp;   // <dir>/w<rand>
+    std::string ddBin;      // <dir>/<rand>  (renamed copy of /system/bin/dd)
+};
+
+static std::string randHex(size_t bytes) {
+    std::vector<uint8_t> r(bytes);
+    if (getrandom(r.data(), bytes, 0) != (ssize_t)bytes) {
+        // 兜底: 用 PID + nano 时间
+        for (size_t i = 0; i < bytes; i++) r[i] = (uint8_t)(rand() & 0xFF);
+    }
+    static const char hex[] = "0123456789abcdef";
+    std::string out(bytes * 2, '0');
+    for (size_t i = 0; i < bytes; i++) {
+        out[i*2]   = hex[(r[i] >> 4) & 0xF];
+        out[i*2+1] = hex[ r[i]       & 0xF];
+    }
+    return out;
+}
+
+static const RuntimePaths& paths() {
+    static RuntimePaths p = []{
+        RuntimePaths q;
+        q.dir       = "/data/local/tmp/." + randHex(4);
+        q.memTmp    = q.dir + "/" + randHex(3);
+        q.mapsTmp   = q.dir + "/" + randHex(3);
+        q.writeTmp  = q.dir + "/" + randHex(3);
+        q.ddBin     = q.dir + "/" + randHex(3);
+        return q;
+    }();
+    return p;
+}
 
 // ── 去除 aarch64 MTE/TBI 指针 tag ──
 inline uintptr_t untag(uintptr_t addr) {
@@ -177,7 +215,7 @@ private:
 };
 
 /**
- * 把 /proc/PID/mem 的一段 [addr, addr+size) 读到 TMP_FILE 并 fread 到 out
+ * 把 /proc/PID/mem 的一段 [addr, addr+size) 读到临时文件并 fread 到 out
  * 要求 size <= CHUNK_BYTES, 地址已 untag
  */
 ssize_t readChunk(int pid, uintptr_t addr, size_t size,
@@ -185,20 +223,22 @@ ssize_t readChunk(int pid, uintptr_t addr, size_t size,
     uintptr_t pageStart  = addr & ~(PAGE_SIZE - 1);
     size_t    pageOff    = addr - pageStart;
     size_t    pageCount  = (pageOff + size + PAGE_SIZE - 1) / PAGE_SIZE;
+    const auto& P = paths();
 
-    char cmd[512];
-    // 一次 shell 命令: 清 tmp + dd 拉数据 + chmod
+    char cmd[768];
+    // 一次 shell 命令: 清 tmp + (重命名后的) dd 拉数据 + chmod
+    // 用变量赋值方式拼接 if/of, 让 ps 中的 cmdline 不那么显眼
     snprintf(cmd, sizeof(cmd),
-        "rm -f %s; dd if=/proc/%d/mem of=%s bs=%zu skip=%zu count=%zu "
+        "rm -f %s; I=/proc/%d/mem; O=%s; %s i\"f\"=$I o\"f\"=$O bs=%zu skip=%zu count=%zu "
         "conv=noerror,sync 2>/dev/null; chmod 666 %s 2>/dev/null",
-        TMP_FILE, pid, TMP_FILE, PAGE_SIZE,
-        pageStart / PAGE_SIZE, pageCount, TMP_FILE);
+        P.memTmp.c_str(), pid, P.memTmp.c_str(), P.ddBin.c_str(),
+        PAGE_SIZE, pageStart / PAGE_SIZE, pageCount, P.memTmp.c_str());
 
     if (!RootShell::I().exec(cmd)) {
         return -1;
     }
 
-    FILE* fp = fopen(TMP_FILE, "rb");
+    FILE* fp = fopen(P.memTmp.c_str(), "rb");
     if (!fp) {
         __android_log_print(ANDROID_LOG_WARN, RTAG,
             "fopen tmp 失败 errno=%d %s", errno, strerror(errno));
@@ -210,10 +250,50 @@ ssize_t readChunk(int pid, uintptr_t addr, size_t size,
     return (ssize_t)got;
 }
 
+// 一次性初始化: 创建随机 tmp 目录, 把 /system/bin/dd 复制为随机名称
+// 这样 ps -A | grep dd 不会再命中我们的进程
+static void ensureRuntimeReady() {
+    static std::once_flag once;
+    std::call_once(once, []{
+        const auto& P = paths();
+        std::string cmd =
+            "mkdir -p " + P.dir + " && chmod 700 " + P.dir + " && "
+            "([ -x " + P.ddBin + " ] || (cp /system/bin/dd " + P.ddBin +
+            " 2>/dev/null || cp /system/bin/toybox " + P.ddBin + " 2>/dev/null) && "
+            "chmod 755 " + P.ddBin + ")";
+        RootShell::I().exec(cmd);
+    });
+}
+
 } // anonymous namespace
 
 
 namespace MemReader {
+
+// 暴露给同模块其他翻译单元 (如 so_dumper) 的持久 root shell 接口,
+// 取代各处 system("su -c ...") / popen("su -c ...") 调用。
+bool runRootShell(const std::string& cmd) {
+    ensureRuntimeReady();
+    return RootShell::I().exec(cmd);
+}
+
+bool runRootShellCapture(const std::string& cmd, std::string& out) {
+    out.clear();
+    ensureRuntimeReady();
+    const auto& P = paths();
+    std::string capPath = P.dir + "/" + randHex(3);
+    std::string wrapped = "(" + cmd + ") > " + capPath +
+                         " 2>/dev/null; chmod 666 " + capPath + " 2>/dev/null";
+    if (!RootShell::I().exec(wrapped)) return false;
+    FILE* fp = fopen(capPath.c_str(), "rb");
+    if (!fp) return false;
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) out.append(buf, n);
+    fclose(fp);
+    unlink(capPath.c_str());
+    return true;
+}
 
 ssize_t readMemory(int pid, uintptr_t address, size_t size,
                    std::vector<uint8_t>& out) {
@@ -230,12 +310,8 @@ ssize_t readMemory(int pid, uintptr_t address, size_t size,
             "去 tag: 0x%zx -> 0x%zx", (size_t)address, (size_t)realAddr);
     }
 
-    // 首次准备 tmp 目录
-    static std::once_flag s_mkdir;
-    std::call_once(s_mkdir, []{
-        RootShell::I().exec(
-            std::string("mkdir -p ") + TMP_DIR + " && chmod 777 " + TMP_DIR);
-    });
+    // 首次准备 tmp 目录 + 重命名 dd
+    ensureRuntimeReady();
 
     out.resize(size);
     size_t totalGot = 0;
@@ -278,24 +354,22 @@ bool readMaps(int pid, std::string& out) {
     if (pid <= 0) return false;
 
     // 首次准备 tmp 目录
-    static std::once_flag s_mkdir_maps;
-    std::call_once(s_mkdir_maps, []{
-        RootShell::I().exec(
-            std::string("mkdir -p ") + TMP_DIR + " && chmod 777 " + TMP_DIR);
-    });
+    ensureRuntimeReady();
+    const auto& P = paths();
 
-    const char* mapsTmp = "/data/local/tmp/so_dump/_maps_tmp";
-    char cmd[256];
+    char cmd[512];
+    // 不再用 cat: 改用 shell 内置 read 循环, ps 列表里看不到 cat 命令.
+    // 输出经 printf 写到 mapsTmp, 再由本进程 fopen 读回.
     snprintf(cmd, sizeof(cmd),
-        "cat /proc/%d/maps 2>/dev/null > %s; chmod 666 %s 2>/dev/null",
-        pid, mapsTmp, mapsTmp);
+        "M=/proc/%d/maps; T=%s; : > $T; while IFS= read -r L; do printf '%%s\\n' \"$L\"; done < $M >> $T 2>/dev/null; chmod 666 $T 2>/dev/null",
+        pid, P.mapsTmp.c_str());
     if (!RootShell::I().exec(cmd)) {
         __android_log_print(ANDROID_LOG_WARN, RTAG,
             "readMaps: RootShell exec 失败 pid=%d", pid);
         return false;
     }
 
-    FILE* fp = fopen(mapsTmp, "r");
+    FILE* fp = fopen(P.mapsTmp.c_str(), "r");
     if (!fp) {
         __android_log_print(ANDROID_LOG_WARN, RTAG,
             "readMaps: fopen tmp 失败 pid=%d errno=%d", pid, errno);
@@ -317,25 +391,24 @@ bool readMaps(int pid, std::string& out) {
 
 bool findRegion(int pid, uintptr_t address, RegionInfo& info) {
     uintptr_t realAddr = untag(address);
-    char mapsPath[64];
-    snprintf(mapsPath, sizeof(mapsPath), "/proc/%d/maps", pid);
 
-    // 读 maps 可能需要 root (别人的进程), 直接通过持久 shell cat 到 tmp
-    const char* mapsTmp = "/data/local/tmp/so_dump/_maps_tmp";
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd),
-        "cat %s 2>/dev/null > %s; chmod 666 %s 2>/dev/null",
-        mapsPath, mapsTmp, mapsTmp);
-    if (!RootShell::I().exec(cmd)) return false;
+    // 复用 readMaps (内部同样走 shell read 循环, 不再 popen cat)
+    std::string maps;
+    if (!readMaps(pid, maps)) return false;
 
-    FILE* fp = fopen(mapsTmp, "r");
-    if (!fp) return false;    char line[1024];
     bool found = false;
-    while (fgets(line, sizeof(line), fp)) {
+    size_t pos = 0;
+    while (pos < maps.size()) {
+        size_t nl = maps.find('\n', pos);
+        std::string line = maps.substr(pos,
+            (nl == std::string::npos ? maps.size() : nl) - pos);
+        pos = (nl == std::string::npos) ? maps.size() : nl + 1;
+        if (line.empty()) continue;
+
         uintptr_t s, e;
         char perms[8], path[512]; path[0] = 0;
         unsigned long off, d1, d2, inode;
-        int m = sscanf(line, "%lx-%lx %4s %lx %lx:%lx %lu %511[^\n]",
+        int m = sscanf(line.c_str(), "%lx-%lx %4s %lx %lx:%lx %lu %511[^\n]",
                        &s, &e, perms, &off, &d1, &d2, &inode, path);
         if (m < 7) continue;
         if (realAddr >= s && realAddr < e) {
@@ -356,7 +429,6 @@ bool findRegion(int pid, uintptr_t address, RegionInfo& info) {
             break;
         }
     }
-    fclose(fp);
     return found;
 }
 
@@ -468,14 +540,9 @@ ssize_t writeMemory(int pid, uintptr_t address,
             "写入去 tag: 0x%zx -> 0x%zx", (size_t)address, (size_t)realAddr);
     }
 
-    // 准备 tmp 目录
-    static std::once_flag s_mkdir;
-    std::call_once(s_mkdir, []{
-        RootShell::I().exec(
-            std::string("mkdir -p ") + TMP_DIR + " && chmod 777 " + TMP_DIR);
-    });
-
-    const char* TMP_WRITE = "/data/local/tmp/so_dump/_memwrite_tmp";
+    // 准备 tmp 目录 + 重命名 dd
+    ensureRuntimeReady();
+    const auto& P = paths();
 
     size_t written = 0;
     while (written < total) {
@@ -483,32 +550,36 @@ ssize_t writeMemory(int pid, uintptr_t address,
         std::string b64 = b64_encode(data.data() + written, chunk);
 
         // 构造命令:
-        //   1. 用 base64 -d 还原二进制到 TMP_WRITE
-        //   2. dd bs=1 seek=ADDR count=SIZE conv=notrunc 到 /proc/PID/mem
-        //      bs=1 慢但可按字节精确定位, 对一般修改 (<1KB) 可接受
-        //      大块时分段但每段仍按 bs=1 — 若需再提速可按页写, 先读再改再写回
+        //   1. 用 base64 -d 还原二进制到 writeTmp
+        //   2. (重命名后的) dd bs=1 seek=ADDR count=SIZE conv=notrunc 到 /proc/PID/mem
+        //      bs=1 慢但可按字节精确定位
+        //      把 if/of 用变量赋值方式写, 让 cmdline 中不直接出现 'if=/proc/...'
         std::string cmd;
         cmd.reserve(b64.size() + 256);
         cmd += "echo -n '";
         cmd += b64;
         cmd += "' | base64 -d > ";
-        cmd += TMP_WRITE;
+        cmd += P.writeTmp;
         cmd += " && chmod 666 ";
-        cmd += TMP_WRITE;
-        cmd += " && dd if=";
-        cmd += TMP_WRITE;
-        cmd += " of=/proc/";
+        cmd += P.writeTmp;
+        cmd += " && I=";
+        cmd += P.writeTmp;
+        cmd += "; O=/proc/";
         char ibuf[64];
         snprintf(ibuf, sizeof(ibuf), "%d", pid);
         cmd += ibuf;
-        cmd += "/mem bs=1 seek=";
+        cmd += "/mem; ";
+        cmd += P.ddBin;
+        cmd += " i\"f\"=$I o\"f\"=$O bs=1 seek=";
         snprintf(ibuf, sizeof(ibuf), "%zu", (size_t)(realAddr + written));
         cmd += ibuf;
         cmd += " count=";
         snprintf(ibuf, sizeof(ibuf), "%zu", chunk);
         cmd += ibuf;
         // 关键: 一定要 conv=notrunc, 否则 dd 会截断 /proc/PID/mem (在某些 kernel 会拒绝)
-        cmd += " conv=notrunc 2>/data/local/tmp/so_dump/_memwrite_err && ";
+        cmd += " conv=notrunc 2>";
+        cmd += P.dir;
+        cmd += "/e && ";
         // 成功时打印一个占位, 不成功则由外层 marker 感知不到错误码, 但 dd 的 err 可后续取
         cmd += "echo __WRITE_OK__";
 

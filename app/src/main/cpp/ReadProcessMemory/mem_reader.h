@@ -62,6 +62,19 @@ namespace MemReader {
     ssize_t writeMemory(int pid, uintptr_t address,
                         const std::vector<uint8_t>& data);
 
+    /**
+     * 在持久化 root shell 中执行任意命令 (内部已序列化).
+     * 提供给同模块复用, 避免到处 system("su -c ...")/popen("su -c ...")
+     * 拉新的 su 子进程产生检测痕迹.
+     */
+    bool runRootShell(const std::string& cmd);
+
+    /**
+     * 在持久化 root shell 中执行命令, 把 stdout 写到内部随机 tmp 文件后读回.
+     * 取代 popen("su -c ...") 模式.
+     */
+    bool runRootShellCapture(const std::string& cmd, std::string& out);
+
 } // namespace MemReader
 
 #endif // MEM_READER_H
