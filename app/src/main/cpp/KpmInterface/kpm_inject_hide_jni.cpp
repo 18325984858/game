@@ -73,9 +73,8 @@ std::string proc_name_of(int pid) {
 
 } // namespace
 
-// ─── SO 加载/卸载时自动把自己包名注册/注销�?kernel hide_pkg ──
-// Android �?JNI_OnUnload �?app 进程�?kill 时通常不会回调，这里主要依�?// JNI_OnLoad 注册；后�?InjectHideActivity 的刷新会按运行快照自动清理掉
-// 已经消亡的包名（�?refreshAll 中的失效检测）�?static std::string self_cached_pkg;
+// SO load/unload auto-register self pkg to kernel hide_pkg
+static std::string self_cached_pkg;
 
 static std::string read_self_pkg() {
     FILE* fp = fopen("/proc/self/cmdline", "r");
@@ -84,8 +83,9 @@ static std::string read_self_pkg() {
     size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
     fclose(fp);
     if (n == 0) return {};
-    // cmdline �?\0 分隔，第一段即完整进程名（可能�?':xxx' 子进程后缀�?    std::string full(buf);
-    // 取主包名：去�?':xxx' 后缀
+    // cmdline is \0 separated; take first segment as process name
+    std::string full(buf);
+    // strip ':xxx' subprocess suffix
     size_t colon = full.find(':');
     if (colon != std::string::npos) full = full.substr(0, colon);
     return full;

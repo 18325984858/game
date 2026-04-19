@@ -20,9 +20,21 @@
 #include <sys/wait.h>
 #include <android/log.h>
 #include <sys/random.h>
+#include <sys/syscall.h>
 
 #include <mutex>
 #include <algorithm>
+#include <vector>
+
+#ifndef SYS_getrandom
+#  if defined(__aarch64__) || defined(__arm__)
+#    define SYS_getrandom 278
+#  endif
+#endif
+
+static inline ssize_t compat_getrandom(void* buf, size_t buflen, unsigned int flags) {
+    return (ssize_t)syscall(SYS_getrandom, buf, buflen, flags);
+}
 
 #define RTAG "[MR]"
 
@@ -47,7 +59,7 @@ struct RuntimePaths {
 
 static std::string randHex(size_t bytes) {
     std::vector<uint8_t> r(bytes);
-    if (getrandom(r.data(), bytes, 0) != (ssize_t)bytes) {
+    if (compat_getrandom(r.data(), bytes, 0) != (ssize_t)bytes) {
         // 兜底: 用 PID + nano 时间
         for (size_t i = 0; i < bytes; i++) r[i] = (uint8_t)(rand() & 0xFF);
     }
