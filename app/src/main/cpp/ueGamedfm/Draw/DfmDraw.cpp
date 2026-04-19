@@ -9,6 +9,7 @@
 #include <cmath>
 #include <algorithm>
 #include <chrono>
+#include <atomic>
 
 namespace dfmdraw {
 
@@ -434,6 +435,39 @@ int DfmOverlay::drawESP(const dfm::DrawDfmData& data, float screenW, float scree
                 }
                 drawn++;
             }
+        }
+    }
+
+    // [debug] 限频(每 2s)输出本帧 ESP 实际通过过滤的目标, 用于和截图对照
+    {
+        static std::atomic<uint64_t> lastDumpMs{0};
+        auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        uint64_t prev = lastDumpMs.load(std::memory_order_relaxed);
+        if (nowMs - prev > 2000) {
+            lastDumpMs.store(nowMs, std::memory_order_relaxed);
+            std::string desc;
+            int n = 0;
+            for (const auto& p : data.players) {
+                if (p.hp <= 0) continue;
+                if (!hasValidPos(p.pos.x, p.pos.y, p.pos.z)) continue;
+                if (!m_enableTeammate && p.teamId >= 0 && p.teamId == data.myTeamId) continue;
+                float d = distMeters(p.pos.x, p.pos.y, p.pos.z,
+                                     data.camLocX, data.camLocY, data.camLocZ);
+                if (d > m_espMaxDist || d < kMinEspDistanceMeters) continue;
+                if (++n > 12) { desc += "..."; break; }
+                char buf[160];
+                snprintf(buf, sizeof(buf),
+                    "[%s%sname='%s' team=%d %.1fm pos=(%.0f,%.0f,%.0f)] ",
+                    p.isAI ? "AI " : "",
+                    (p.teamId >= 0 && p.teamId == data.myTeamId) ? "TM " : "",
+                    p.playerName.c_str(), p.teamId, d,
+                    p.pos.x, p.pos.y, p.pos.z);
+                desc += buf;
+            }
+            LOG(LOG_LEVEL_INFO,
+                "[espDraw] drawn=%d totalPlayers=%zu candidates=%s",
+                drawn, data.players.size(), desc.c_str());
         }
     }
 

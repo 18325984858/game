@@ -21,6 +21,7 @@
 #include <cctype>
 #include <cmath>
 #include <chrono>
+#include <atomic>
 #include <algorithm>
 
 #define TAG "[DFM]"
@@ -37,6 +38,32 @@ constexpr int kMaxMasterPoseDepth = 4;
 constexpr int kMinTrackedBoneMatches = 4;
 constexpr uintptr_t kReplicatedMovementLocationOffset = 0x18;
 constexpr uintptr_t kEncHandlerEncryptedFlagOffset = 0x0E;
+constexpr uintptr_t kSceneComponentGetSocketLocationVtableOffset = 0x468;
+
+// SceneComponent.ComponentToWorld 解密 trampoline (通过 K2_GetActorLocation 反编译定位):
+//   K2_GetActorLocation @ 0xEA2679C 内核心三步:
+//     X8 = actor + 0x180; X0 = atomic_load(X8)        // RootComponent
+//     BL  sub_D982DB0(rootComp)                       // 返回解密后的 FTransform*
+//     读取返回值 +0x10/+0x14/+0x18 = X/Y/Z
+//   sub_D982DB0 @ 0xD982DB0 (3 条指令的 vthunk):
+//     ADD X0, X0, #0x210                              // sceneComp + 0x210 = &ComponentToWorld
+//     LDR X16, =0xB400006Fxxxxxxxx                    // 字面量池中堆地址 (运行时被反作弊改写)
+//     BR  X16                                         // 跳到堆里的解密 stub
+// 后果:
+//   * SceneComponent.ComponentToWorld (sceneComp+0x210) 在内存里以加密/混淆形式存储。
+//   * 直接读字节得到的 X/Y/Z 对本地 Pawn / 简单 AI 是"刚被引擎写回"的明文 (因为引擎
+//     物理 Tick 也走同一条 hook 路径), 但对远端 replicated Pawn 几十秒才更新一次,
+//     读到的字节会陈旧到与真实位置完全错位。
+//   * 想拿到当前真实坐标必须调 sub_D982DB0(sceneComp), 它会让堆 stub 现场解密并返回
+//     一个明文 FTransform 指针。
+constexpr uintptr_t kSceneComponentDecryptCTWThunkOffset = 0xD982DB0;
+using DecryptComponentToWorldFn = const void* (*)(uintptr_t sceneComp);
+
+constexpr size_t kTrackedBoneHeadSlot = 0;
+constexpr size_t kTrackedBonePelvisSlot = 4;
+constexpr size_t kTrackedBoneRightFootSlot = 13;
+constexpr size_t kTrackedBoneLeftFootSlot = 16;
+constexpr FName kInvalidTrackedBoneName{-1, 0};
 
 using BoneAliasList = std::array<const char*, 8>;
 
@@ -447,13 +474,21 @@ DfmMatchMonitor::sampleReplicatedMovement(uintptr_t actorPtr) const {
         return snapshot;
     }
 
-    snapshot.movementEnabled = m_off.Actor_bReplicateMovement <= 0
-        || safeReadU8(actorPtr + static_cast<uintptr_t>(m_off.Actor_bReplicateMovement)) != 0;
+    // bReplicateMovement 是位字段, sdk_dump 标注 bit5 (Flags 含 EReplicate 位)
+    // 旧代码读整字节比较 != 0, 0x90 上还堆着 bHidden / bReplicates / bAlwaysRelevant 等多个 bit,
+    // 只要任一 bit 被置就误判为开启 — 修正为只检查 bit5.
+    if (m_off.Actor_bReplicateMovement <= 0) {
+        snapshot.movementEnabled = true;
+    } else {
+        const uint8_t bits = safeReadU8(actorPtr + static_cast<uintptr_t>(m_off.Actor_bReplicateMovement));
+        snapshot.movementEnabled = (bits & 0x20) != 0; // bit5 = bReplicateMovement
+    }
 
     const uintptr_t repMoveBase = actorPtr + static_cast<uintptr_t>(m_off.Actor_ReplicatedMovement);
     snapshot.location.x = safeReadFloat(repMoveBase + kReplicatedMovementLocationOffset + 0x00);
     snapshot.location.y = safeReadFloat(repMoveBase + kReplicatedMovementLocationOffset + 0x04);
     snapshot.location.z = safeReadFloat(repMoveBase + kReplicatedMovementLocationOffset + 0x08);
+    // EncVector.EncHandler @ +0xC: int16 Index@+0, int8 bEncrypted@+2, bitfield@+3
     snapshot.encByte = safeReadU8(repMoveBase + kReplicatedMovementLocationOffset + kEncHandlerEncryptedFlagOffset);
     snapshot.hasUsablePlainLocation = snapshot.movementEnabled
         && snapshot.encByte == 0
@@ -501,17 +536,30 @@ bool DfmMatchMonitor::shouldAcceptRootCompensation(uintptr_t actorPtr, float x, 
 bool DfmMatchMonitor::getActorLocation(uintptr_t actorPtr, FVector3& outLoc) const {
     const FVector3 previousLoc = outLoc;
     outLoc = {};
-    uintptr_t root = safeReadPtr(actorPtr + m_off.Actor_RootComponent);
-    if (!ok(root)) {
-        if (tryGetCachedActorLocation(actorPtr, outLoc)) {
-            return true;
-        }
-        if (hasUsableActorPoint(previousLoc)) {
-            outLoc = previousLoc;
-            rememberActorLocation(actorPtr, outLoc);
-            return true;
-        }
+    if (!ok(actorPtr)) {
+        if (tryGetCachedActorLocation(actorPtr, outLoc)) return true;
+        if (hasUsableActorPoint(previousLoc)) { outLoc = previousLoc; return true; }
         return false;
+    }
+    uintptr_t root = safeReadPtr(actorPtr + m_off.Actor_RootComponent);
+
+    // ── 方法 -1: RootComponent.ComponentToWorld 通过解密 trampoline ──
+    // SceneComponent+0x210 的 FTransform 在内存里加密存储, 直接读字节对远端
+    // replicated Pawn 几十秒才更新一次会严重错位; 调 sub_D982DB0 让游戏 stub 现场
+    // 解密一次, 拿到的才是当前真实坐标。本地 Pawn / AI 也走这条路, 反正游戏自己
+    // 就是这么读的, 不会更慢更不准。
+    if (ok(root)) {
+        FVector3 decryptedLoc{};
+        if (decryptSceneComponentLocation(root, decryptedLoc)) {
+            outLoc = decryptedLoc;
+            rememberActorLocation(actorPtr, outLoc);
+            static int s_cntD = 0;
+            if (s_cntD++ < 30) {
+                LOG(LOG_LEVEL_INFO, TAG " [getLoc] M-1 decrypt(root) actor=%p root=%p pos=(%.1f,%.1f,%.1f)",
+                    (void*)actorPtr, (void*)root, outLoc.x, outLoc.y, outLoc.z);
+            }
+            return true;
+        }
     }
 
     auto isUsableLocation = [](float x, float y, float z) {
@@ -520,16 +568,54 @@ bool DfmMatchMonitor::getActorLocation(uintptr_t actorPtr, FVector3& outLoc) con
             && (std::fabs(x) > 1.0f || std::fabs(y) > 1.0f || std::fabs(z) > 1.0f);
     };
 
-    // ── 方法 1: RootComponent.ComponentToWorld (有效四元数时直接使用) ──
-    uintptr_t ctwBase = root + m_off.Scene_ComponentToWorld;
-    float qx = safeReadFloat(ctwBase + 0x00);
-    float qy = safeReadFloat(ctwBase + 0x04);
-    float qz = safeReadFloat(ctwBase + 0x08);
-    float qw = safeReadFloat(ctwBase + 0x0C);
-    float tx = safeReadFloat(ctwBase + offsetof(FTransform, TranslationX));
-    float ty = safeReadFloat(ctwBase + offsetof(FTransform, TranslationY));
-    float tz = safeReadFloat(ctwBase + offsetof(FTransform, TranslationZ));
+    auto readCtwTranslation = [&](uintptr_t comp, float& tx, float& ty, float& tz,
+                                  float& qx, float& qy, float& qz, float& qw) {
+        const uintptr_t ctw = comp + static_cast<uintptr_t>(m_off.Scene_ComponentToWorld);
+        qx = safeReadFloat(ctw + 0x00);
+        qy = safeReadFloat(ctw + 0x04);
+        qz = safeReadFloat(ctw + 0x08);
+        qw = safeReadFloat(ctw + 0x0C);
+        tx = safeReadFloat(ctw + offsetof(FTransform, TranslationX));
+        ty = safeReadFloat(ctw + offsetof(FTransform, TranslationY));
+        tz = safeReadFloat(ctw + offsetof(FTransform, TranslationZ));
+    };
 
+    // ── 方法 0: SkeletalMeshComponent.ComponentToWorld (优先, 渲染管线维护) ──
+    // Mesh.CTW 由引擎渲染线程在客户端 LOD 内时持续刷新, 是 "可见敌人精确位置"
+    // 的唯一权威源。LOD 外 actor 的 CTW 会归零 / 冻结, 此时 hasValidPos 在 ESP
+    // 端会过滤掉 (宁可漏画, 也不画一个错位框)。
+    // 不要把 RepMovement 放前面: RepMovement 对远端 actor 给的是服务器几十秒前
+    // 最后一次同步的 spawn 区位置, 数值合法但完全错位, 会让 ESP 在地上画一堆
+    // 没有玩家的框。
+    if (m_off.Char_Mesh > 0) {
+        const uintptr_t meshComp = resolveObjectField(actorPtr + static_cast<uintptr_t>(m_off.Char_Mesh));
+        if (ok(meshComp)) {
+            float mx, my, mz, mqx, mqy, mqz, mqw;
+            readCtwTranslation(meshComp, mx, my, mz, mqx, mqy, mqz, mqw);
+            const bool quatValid = !(std::fabs(mqx) < 0.001f && std::fabs(mqy) < 0.001f
+                                  && std::fabs(mqz) < 0.001f && std::fabs(mqw) < 0.001f);
+            if (isUsableLocation(mx, my, mz) && quatValid) {
+                outLoc.x = mx; outLoc.y = my; outLoc.z = mz;
+                rememberActorLocation(actorPtr, outLoc);
+                static int s_cnt0 = 0;
+                if (s_cnt0++ < 30) {
+                    LOG(LOG_LEVEL_INFO, TAG " [getLoc] M0 mesh.CTW actor=%p pos=(%.1f,%.1f,%.1f)",
+                        (void*)actorPtr, mx, my, mz);
+                }
+                return true;
+            }
+        }
+    }
+
+    if (!ok(root)) {
+        if (tryGetCachedActorLocation(actorPtr, outLoc)) return true;
+        if (hasUsableActorPoint(previousLoc)) { outLoc = previousLoc; rememberActorLocation(actorPtr, outLoc); return true; }
+        return false;
+    }
+
+    // ── 方法 1: RootComponent.ComponentToWorld (四元数有效时使用) ──
+    float qx, qy, qz, qw, tx, ty, tz;
+    readCtwTranslation(root, tx, ty, tz, qx, qy, qz, qw);
     bool posValid = isUsableLocation(tx, ty, tz);
     bool quatValid = !(std::fabs(qx) < 0.001f && std::fabs(qy) < 0.001f
         && std::fabs(qz) < 0.001f && std::fabs(qw) < 0.001f);
@@ -537,18 +623,15 @@ bool DfmMatchMonitor::getActorLocation(uintptr_t actorPtr, FVector3& outLoc) con
     if (posValid && quatValid) {
         outLoc.x = tx; outLoc.y = ty; outLoc.z = tz;
         rememberActorLocation(actorPtr, outLoc);
+        static int s_cnt1 = 0;
+        if (s_cnt1++ < 30) {
+            LOG(LOG_LEVEL_INFO, TAG " [getLoc] M2 root.CTW actor=%p root=%p pos=(%.1f,%.1f,%.1f)",
+                (void*)actorPtr, (void*)root, tx, ty, tz);
+        }
         return true;
     }
 
-    // ── 方法 2: Actor.ReplicatedMovement.Location (EncVector 未加密时优先使用) ──
-    const ReplicatedMovementSnapshot repMove = sampleReplicatedMovement(actorPtr);
-    if (repMove.hasUsablePlainLocation) {
-        outLoc = repMove.location;
-        rememberActorLocation(actorPtr, outLoc);
-        return true;
-    }
-
-    // ── 方法 3: CameraViewLoc (明文 Vector, 网络复制的视角位置) ──
+    // ── 方法 3: CameraViewLoc (明文 Vector, 但语义为视角点 — 仅作粗略 fallback) ──
     if (m_off.Char_CameraViewLoc > 0) {
         float cvx = safeReadFloat(actorPtr + static_cast<uintptr_t>(m_off.Char_CameraViewLoc));
         float cvy = safeReadFloat(actorPtr + static_cast<uintptr_t>(m_off.Char_CameraViewLoc) + 4);
@@ -556,39 +639,61 @@ bool DfmMatchMonitor::getActorLocation(uintptr_t actorPtr, FVector3& outLoc) con
         if (isUsableLocation(cvx, cvy, cvz) && (std::fabs(cvx) > 1.0f || std::fabs(cvy) > 1.0f)) {
             outLoc.x = cvx; outLoc.y = cvy; outLoc.z = cvz;
             rememberActorLocation(actorPtr, outLoc);
+            static int s_cnt3 = 0;
+            if (s_cnt3++ < 30) {
+                LOG(LOG_LEVEL_WARN, TAG " [getLoc] M3 cameraView actor=%p pos=(%.1f,%.1f,%.1f)",
+                    (void*)actorPtr, cvx, cvy, cvz);
+            }
             return true;
         }
     }
 
-    // ── 方法 4: CTW (四元数无效) + Z 偏移补偿 ──
-    // 远程敌人的 CTW 四元数全零，XY 有效但 Z 低了固定偏移
-    // 实测: 队友 Z≈948 vs 敌人 raw Z≈-10, 差值≈958
-    if (posValid && shouldAcceptRootCompensation(actorPtr, tx, ty)) {
-        outLoc.x = tx; outLoc.y = ty;
-        outLoc.z = tz + kRootCompensationZBias;  // 补偿远程角色的 Z 偏移
-        rememberActorLocation(actorPtr, outLoc);
-        return true;
-    }
-
-    // ── 方法 5: RelativeLocation (EncVector 可能加密) ──
+    // ── 方法 4: RelativeLocation (EncVector, 仅当未加密 + 无父附加 = 等价世界坐标) ──
     if (ok(root)) {
-        float x = safeReadFloat(root + m_off.Scene_RelativeLocation);
-        float y = safeReadFloat(root + m_off.Scene_RelativeLocation + offsetof(FVector, Y));
-        float z = safeReadFloat(root + m_off.Scene_RelativeLocation + offsetof(FVector, Z));
-        if (isUsableLocation(x, y, z)) {
-            outLoc.x = x; outLoc.y = y; outLoc.z = z;
-            rememberActorLocation(actorPtr, outLoc);
-            return true;
+        const uintptr_t relBase = root + static_cast<uintptr_t>(m_off.Scene_RelativeLocation);
+        const uint8_t encByte = safeReadU8(relBase + kEncHandlerEncryptedFlagOffset);
+        const uintptr_t attachParent = m_off.Scene_AttachParent > 0
+            ? safeReadPtr(root + static_cast<uintptr_t>(m_off.Scene_AttachParent)) : 0;
+        if (encByte == 0 && attachParent == 0) {
+            float x = safeReadFloat(relBase + 0x00);
+            float y = safeReadFloat(relBase + 0x04);
+            float z = safeReadFloat(relBase + 0x08);
+            if (isUsableLocation(x, y, z)) {
+                outLoc.x = x; outLoc.y = y; outLoc.z = z;
+                rememberActorLocation(actorPtr, outLoc);
+                static int s_cnt4 = 0;
+                if (s_cnt4++ < 30) {
+                    LOG(LOG_LEVEL_WARN, TAG " [getLoc] M4 relLoc actor=%p pos=(%.1f,%.1f,%.1f)",
+                        (void*)actorPtr, x, y, z);
+                }
+                return true;
+            }
+        } else {
+            static int s_cntSkip = 0;
+            if (s_cntSkip++ < 10) {
+                LOG(LOG_LEVEL_WARN, TAG " [getLoc] M4 skip actor=%p enc=%u attachParent=%p",
+                    (void*)actorPtr, (unsigned)encByte, (void*)attachParent);
+            }
         }
     }
 
     if (tryGetCachedActorLocation(actorPtr, outLoc)) {
+        static int s_cntCache = 0;
+        if (s_cntCache++ < 10) {
+            LOG(LOG_LEVEL_WARN, TAG " [getLoc] cached actor=%p pos=(%.1f,%.1f,%.1f)",
+                (void*)actorPtr, outLoc.x, outLoc.y, outLoc.z);
+        }
         return true;
     }
     if (hasUsableActorPoint(previousLoc)) {
         outLoc = previousLoc;
         rememberActorLocation(actorPtr, outLoc);
         return true;
+    }
+    static int s_cntFail = 0;
+    if (s_cntFail++ < 30) {
+        LOG(LOG_LEVEL_ERROR, TAG " [getLoc] FAIL actor=%p root=%p (no usable source)",
+            (void*)actorPtr, (void*)root);
     }
     return false;
 }
@@ -741,16 +846,30 @@ MatchState DfmMatchMonitor::getMatchState() const {
     uintptr_t gworldAddr = m_moduleBase + m_offGWorld;
     uintptr_t gworld = safeReadPtr(gworldAddr);
     if (!ok(gworld)) {
-        LOG(LOG_LEVEL_ERROR, TAG " [matchState] GWorld 无效: gworldAddr=%p val=%p base=%p offGWorld=0x%X",
-            (void*)gworldAddr, (void*)gworld, (void*)m_moduleBase, m_offGWorld);
+        static std::atomic<uint64_t> lastTickMs{0};
+        auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        uint64_t prev = lastTickMs.load(std::memory_order_relaxed);
+        if (nowMs - prev > 5000) {
+            lastTickMs.store(nowMs, std::memory_order_relaxed);
+            LOG(LOG_LEVEL_ERROR, TAG " [matchState] GWorld 无效: gworldAddr=%p val=%p base=%p offGWorld=0x%X",
+                (void*)gworldAddr, (void*)gworld, (void*)m_moduleBase, m_offGWorld);
+        }
         return ms;
     }
 
     ms.worldName = readObjName(gworld);
     ms.gameStatePtr = safeReadPtr(gworld + m_off.World_GameState);
     if (!ok(ms.gameStatePtr)) {
-        LOG(LOG_LEVEL_ERROR, TAG " [matchState] GameState 无效: gworld=%p +0x%X=%p world='%s'",
-            (void*)gworld, m_off.World_GameState, (void*)ms.gameStatePtr, ms.worldName.c_str());
+        static std::atomic<uint64_t> lastTickMs{0};
+        auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        uint64_t prev = lastTickMs.load(std::memory_order_relaxed);
+        if (nowMs - prev > 5000) {
+            lastTickMs.store(nowMs, std::memory_order_relaxed);
+            LOG(LOG_LEVEL_ERROR, TAG " [matchState] GameState 无效: gworld=%p +0x%X=%p world='%s'",
+                (void*)gworld, m_off.World_GameState, (void*)ms.gameStatePtr, ms.worldName.c_str());
+        }
         return ms;
     }
 
@@ -764,8 +883,16 @@ MatchState DfmMatchMonitor::getMatchState() const {
     if (gsClassName.find("SafeHouse") != std::string::npos ||
         gsClassName.find("Lobby") != std::string::npos ||
         gsClassName.find("Entry") != std::string::npos) {
-        LOG(LOG_LEVEL_INFO, TAG " [matchState] 安全屋GS: gsClass='%s' world='%s'",
-            gsClassName.c_str(), ms.worldName.c_str());
+        // 限频: 每 5 秒最多打一条, 避免每帧爆刷把 trace 文件撑到 GB 级
+        static std::atomic<uint64_t> lastTickMs{0};
+        auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        uint64_t prev = lastTickMs.load(std::memory_order_relaxed);
+        if (nowMs - prev > 5000) {
+            lastTickMs.store(nowMs, std::memory_order_relaxed);
+            LOG(LOG_LEVEL_INFO, TAG " [matchState] 安全屋GS: gsClass='%s' world='%s'",
+                gsClassName.c_str(), ms.worldName.c_str());
+        }
         ms.inMatch = false; return ms;
     }
 
@@ -848,6 +975,42 @@ std::vector<uintptr_t> DfmMatchMonitor::getAllActors() const {
     uintptr_t gworld = safeReadPtr(m_moduleBase + m_offGWorld);
     if (!ok(gworld)) return actors;
 
+    // ── NetDriver.OpenChannels (优先, 让真人 pawn 先占 dedup key) ──
+    // 服务器按相关性 (relevancy) 复制到客户端的真人/AI actor 都通过 UActorChannel
+    // 暴露在 NetConnection.OpenChannels[]。这是 DFM 这种 100v100 大场战斗里
+    // 唯一覆盖"近距可见但 PersistentLevel 不收录"敌人的列表。
+    // 必须放在 PersistentLevel 之前: PersistentLevel 收录的是 placeholder pawn,
+    // 它们和真 pawn 共享同一个 PlayerState, 后续 scanActors 用 PS 做 dedup,
+    // 谁先进 charSeen 谁赢; 我们要的是让真 pawn 赢。
+    auto addFromConnection = [&](uintptr_t conn) {
+        if (!ok(conn)) return;
+        uintptr_t chArr = safeReadPtr(conn + m_off.NC_OpenChannels);
+        int32_t chNum  = safeReadS32(conn + m_off.NC_OpenChannels + offsetof(TArray<void*>, Num));
+        if (!ok(chArr) || chNum <= 0) return;
+        for (int i = 0; i < std::min(chNum, 8000); ++i) {
+            uintptr_t ch = safeReadPtr(chArr + static_cast<uintptr_t>(i) * 8);
+            if (!ok(ch)) continue;
+            uintptr_t a = safeReadPtr(ch + m_off.AChan_Actor);
+            if (!ok(a)) continue;             // ControlChannel/VoiceChannel.Actor==0
+            if (seen.count(a)) continue;
+            seen[a] = true;
+            actors.push_back(a);
+        }
+    };
+    uintptr_t netDriver = safeReadPtr(gworld + m_off.World_NetDriver);
+    int beforeNet = static_cast<int>(actors.size());
+    if (ok(netDriver)) {
+        addFromConnection(safeReadPtr(netDriver + m_off.Net_ServerConnection));
+        uintptr_t ccArr = safeReadPtr(netDriver + m_off.Net_ClientConnections);
+        int32_t ccNum  = safeReadS32(netDriver + m_off.Net_ClientConnections + offsetof(TArray<void*>, Num));
+        if (ok(ccArr) && ccNum > 0) {
+            for (int i = 0; i < std::min(ccNum, 32); ++i) {
+                addFromConnection(safeReadPtr(ccArr + static_cast<uintptr_t>(i) * 8));
+            }
+        }
+    }
+    int netActorsAdded = static_cast<int>(actors.size()) - beforeNet;
+
     // PersistentLevel
     addFromLevel(safeReadPtr(gworld + m_off.World_PersistentLevel));
 
@@ -867,6 +1030,21 @@ std::vector<uintptr_t> DfmMatchMonitor::getAllActors() const {
         for (int i = 0; i < std::min(slCount, 500); i++) {
             uintptr_t sl = safeReadPtr(slPtr + static_cast<uintptr_t>(i) * 8);
             if (ok(sl)) addFromLevel(safeReadPtr(sl + m_off.Streaming_LoadedLevel));
+        }
+    }
+
+    {
+        // 限频 3s 日志
+        static std::atomic<uint64_t> lastNetLogMs{0};
+        auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        uint64_t prev = lastNetLogMs.load(std::memory_order_relaxed);
+        if (nowMs - prev > 3000) {
+            lastNetLogMs.store(nowMs, std::memory_order_relaxed);
+            LOG(LOG_LEVEL_INFO,
+                "[netDriver] gworld=0x%lx nd=0x%lx netActors=%d totalActors=%zu",
+                (unsigned long)gworld, (unsigned long)netDriver,
+                netActorsAdded, actors.size());
         }
     }
 
@@ -930,19 +1108,47 @@ void DfmMatchMonitor::scanActors(const std::vector<uintptr_t>& actors, DrawDfmDa
             pi.hp = hi.hp; pi.maxHp = hi.maxHp;
             pi.armor = hi.armor; pi.helmet = hi.helmet;
 
-            getActorLocation(actor, pi.pos);
-            fillPlayerBones(pi);  // 读取骨骼世界坐标
-
-            // ── 真人敌人优先使用骨骼反推脚底位置，AI 保持原采集链 ──
-            {
-                FVector3 bonePos{};
+            // ── 坐标采集 ──
+            // AI / 自机: getActorLocation 可信, 先拿 actor pos 再补骨骼(这样骨骼不合理会被过滤)。
+            // 真人敌人: M0~M4 都在腾讯加密路径上, getActorLocation 返回的 pos 可能是错位。
+            // 为避免 fillPlayerBones 用错位 pos 误判、拒掉所有骨骼(>16m 阈值),
+            //   这里采取 "骨骼优先" 顺序: pos 先置空 → fillPlayerBones 不受根点约束 →
+            //   deriveFootPositionFromBones 拿到脚底世界坐标, 这才是渲染管线使用的明文值.
+            //   骨骼不可用时才退回 getActorLocation.
+            FVector3 bonePos{};
+            FVector3 socketPos{};
+            bool posResolved = false;
+            if (!pi.isAI) {
+                pi.pos = {}; // 取消根点约束, 允许骨骼任意坐标被接受
+                if (getCharacterSocketLocation(actor, socketPos)) {
+                    pi.pos = socketPos;
+                    rememberActorLocation(actor, pi.pos);
+                    posResolved = true;
+                }
+                fillPlayerBones(pi);
+                if (!posResolved && deriveFootPositionFromBones(pi, bonePos)) {
+                    pi.pos = bonePos;
+                    rememberActorLocation(actor, pi.pos);
+                    posResolved = true;
+                }
+            }
+            if (!posResolved) {
+                getActorLocation(actor, pi.pos);
+                fillPlayerBones(pi);
+                // AI 仍允许骨骼复核 (原逻辑): pos 不可用时补上
                 const bool posUsable = hasUsableActorPoint(pi.pos);
                 if (((!pi.isAI) || !posUsable) && deriveFootPositionFromBones(pi, bonePos)) {
                     pi.pos = bonePos;
                     rememberActorLocation(actor, pi.pos);
+                }
+            }
+            {
+                static int s_cntFix = 0;
+                if (s_cntFix++ < 30) {
                     LOG(LOG_LEVEL_INFO,
-                        "[posFixBone] %s isAI=%d final=(%.0f,%.0f,%.0f)",
+                        "[posFixBone] %s isAI=%d boneFirst=%d bonesValid=%d final=(%.0f,%.0f,%.0f)",
                         pi.playerName.c_str(), pi.isAI ? 1 : 0,
+                        posResolved ? 1 : 0, pi.bonesValid ? 1 : 0,
                         pi.pos.x, pi.pos.y, pi.pos.z);
                 }
             }
@@ -1032,12 +1238,27 @@ void DfmMatchMonitor::scanFromPlayerArray(DrawDfmData& outData) const {
         pi.hp = hi.hp; pi.maxHp = hi.maxHp;
         pi.armor = hi.armor; pi.helmet = hi.helmet;
 
-        getActorLocation(pawn, pi.pos);
-        fillPlayerBones(pi);
-
-        // 真人敌人优先使用骨骼反推脚底位置
-        {
-            FVector3 bonePos{};
+        // 骨骼优先链 (与 scanActors 一致): 真人敌人先读骨骼避免被错位 pos 拒掉
+        FVector3 bonePos{};
+        FVector3 socketPos{};
+        bool posResolved = false;
+        if (!pi.isAI) {
+            pi.pos = {};
+            if (getCharacterSocketLocation(pawn, socketPos)) {
+                pi.pos = socketPos;
+                rememberActorLocation(pawn, pi.pos);
+                posResolved = true;
+            }
+            fillPlayerBones(pi);
+            if (!posResolved && deriveFootPositionFromBones(pi, bonePos)) {
+                pi.pos = bonePos;
+                rememberActorLocation(pawn, pi.pos);
+                posResolved = true;
+            }
+        }
+        if (!posResolved) {
+            getActorLocation(pawn, pi.pos);
+            fillPlayerBones(pi);
             const bool posUsable = hasUsableActorPoint(pi.pos);
             if (((!pi.isAI) || !posUsable) && deriveFootPositionFromBones(pi, bonePos)) {
                 pi.pos = bonePos;
@@ -1469,6 +1690,7 @@ bool DfmMatchMonitor::initOffsets() {
     TRY_RESOLVE("Actor", "RootComponent", m_off.Actor_RootComponent);
 
     // SceneComponent
+    TRY_RESOLVE("SceneComponent", "AttachParent", m_off.Scene_AttachParent);
     TRY_RESOLVE("SceneComponent", "RelativeLocation", m_off.Scene_RelativeLocation);
     TRY_RESOLVE("SceneComponent", "ComponentToWorld", m_off.Scene_ComponentToWorld);
 
@@ -1652,18 +1874,27 @@ int DfmMatchMonitor::matchBoneNamesFromFNameArray(uintptr_t dataPtr,
                                                   int count,
                                                   BoneAssetCacheEntry& entry) const {
     entry.trackedBoneIndices.fill(-1);
+    entry.trackedBoneNames.fill(kInvalidTrackedBoneName);
+    entry.trackedBoneNameValid.fill(0);
     entry.matchedCount = 0;
     if (dataPtr < 0x10000 || count <= 0 || count > kMaxRenderableBoneCount) return 0;
 
     for (int index = 0; index < count; ++index) {
+        const uintptr_t nameAddr = dataPtr + static_cast<uintptr_t>(index) * sizeof(FName);
+        FName rawBoneName = kInvalidTrackedBoneName;
+        const bool haveRawBoneName = safeReadMemory(nameAddr, &rawBoneName, sizeof(rawBoneName));
         const std::string normalizedName = normalizeBoneName(
-            readFName(dataPtr + static_cast<uintptr_t>(index) * sizeof(FName)));
+            readFName(nameAddr));
         if (normalizedName.empty()) continue;
 
         for (size_t slot = 0; slot < PlayerInfo::BONE_COUNT; ++slot) {
             if (entry.trackedBoneIndices[slot] >= 0) continue;
             if (matchesTrackedBoneName(slot, normalizedName)) {
                 entry.trackedBoneIndices[slot] = index;
+                if (haveRawBoneName) {
+                    entry.trackedBoneNames[slot] = rawBoneName;
+                    entry.trackedBoneNameValid[slot] = 1;
+                }
                 entry.matchedCount++;
                 break;
             }
@@ -1678,20 +1909,29 @@ int DfmMatchMonitor::matchBoneNamesFromBoneInfoArray(uintptr_t dataPtr,
                                                      int stride,
                                                      BoneAssetCacheEntry& entry) const {
     entry.trackedBoneIndices.fill(-1);
+    entry.trackedBoneNames.fill(kInvalidTrackedBoneName);
+    entry.trackedBoneNameValid.fill(0);
     entry.matchedCount = 0;
     if (dataPtr < 0x10000 || count <= 0 || count > kMaxRenderableBoneCount || stride < 8) {
         return 0;
     }
 
     for (int index = 0; index < count; ++index) {
+        const uintptr_t nameAddr = dataPtr + static_cast<uintptr_t>(index) * static_cast<uintptr_t>(stride);
+        FName rawBoneName = kInvalidTrackedBoneName;
+        const bool haveRawBoneName = safeReadMemory(nameAddr, &rawBoneName, sizeof(rawBoneName));
         const std::string normalizedName = normalizeBoneName(
-            readFName(dataPtr + static_cast<uintptr_t>(index) * static_cast<uintptr_t>(stride)));
+            readFName(nameAddr));
         if (normalizedName.empty()) continue;
 
         for (size_t slot = 0; slot < PlayerInfo::BONE_COUNT; ++slot) {
             if (entry.trackedBoneIndices[slot] >= 0) continue;
             if (matchesTrackedBoneName(slot, normalizedName)) {
                 entry.trackedBoneIndices[slot] = index;
+                if (haveRawBoneName) {
+                    entry.trackedBoneNames[slot] = rawBoneName;
+                    entry.trackedBoneNameValid[slot] = 1;
+                }
                 entry.matchedCount++;
                 break;
             }
@@ -1709,6 +1949,8 @@ uintptr_t DfmMatchMonitor::getSkeletalMeshAsset(uintptr_t meshComp) const {
 bool DfmMatchMonitor::resolveTrackedBoneIndices(uintptr_t skeletalMeshAssetPtr,
                                                 BoneAssetCacheEntry& outEntry) const {
     outEntry.trackedBoneIndices.fill(-1);
+    outEntry.trackedBoneNames.fill(kInvalidTrackedBoneName);
+    outEntry.trackedBoneNameValid.fill(0);
     outEntry.matchedCount = 0;
     if (!ok(skeletalMeshAssetPtr)) return false;
 
@@ -1948,6 +2190,131 @@ uintptr_t DfmMatchMonitor::followMasterPoseChain(uintptr_t meshComp) const {
     return bestComp;
 }
 
+bool DfmMatchMonitor::decryptSceneComponentToWorld(uintptr_t sceneComp,
+                                                   FTransform& outTransform) const {
+    if (!ok(sceneComp) || m_moduleBase == 0) return false;
+
+    // 通过 sub_D982DB0 trampoline 拿到当前帧解密后的 ComponentToWorld 指针。
+    // 该 trampoline 已被反作弊改写, 真正实现位于 RWX 堆里; 但 trampoline 自身
+    // (ADD X0,#0x210; LDR X16,=imm; BR X16) 在游戏 .text 内偏移固定, 我们 BL 它即可,
+    // 字面量池由游戏自己维护并在每次启动时重新指向当前的解密 stub。
+    const uintptr_t vtable = safeReadPtr(sceneComp);
+    if (!ok(vtable)) return false;
+
+    auto fn = reinterpret_cast<DecryptComponentToWorldFn>(
+        m_moduleBase + kSceneComponentDecryptCTWThunkOffset);
+    const void* result = fn(sceneComp);
+    if (!result) return false;
+
+    // 解密后的 FTransform 由 stub 内部 buffer 持有, 立即拷贝出来。
+    // 直接 memcpy: stub 返回的指针在 mmap 出来的合法堆段, 内核可读, 无需 safeReadMemory。
+    std::memcpy(&outTransform, result, sizeof(outTransform));
+    return std::isfinite(outTransform.TranslationX)
+        && std::isfinite(outTransform.TranslationY)
+        && std::isfinite(outTransform.TranslationZ);
+}
+
+bool DfmMatchMonitor::decryptSceneComponentLocation(uintptr_t sceneComp,
+                                                   FVector3& outLoc) const {
+    FTransform t{};
+    if (!decryptSceneComponentToWorld(sceneComp, t)) return false;
+    outLoc = {t.TranslationX, t.TranslationY, t.TranslationZ};
+    return hasUsableActorPoint(outLoc);
+}
+
+bool DfmMatchMonitor::getSocketLocationFromMesh(uintptr_t meshComp,
+                                                const FName& socketName,
+                                                FVector3& outLoc) const {
+    outLoc = {};
+    if (!ok(meshComp) || socketName.ComparisonIndex <= 0) {
+        return false;
+    }
+
+    const uintptr_t vtable = safeReadPtr(meshComp);
+    if (!ok(vtable)) {
+        return false;
+    }
+
+    const uintptr_t fnAddr = safeReadPtr(vtable + kSceneComponentGetSocketLocationVtableOffset);
+    if (!ok(fnAddr)) {
+        return false;
+    }
+    if (m_moduleBase != 0 && m_moduleSize != 0
+        && (fnAddr < m_moduleBase || fnAddr >= (m_moduleBase + m_moduleSize))) {
+        return false;
+    }
+
+    using GetSocketLocationFn = FVector3 (*)(void*, FName);
+    const auto fn = reinterpret_cast<GetSocketLocationFn>(fnAddr);
+    const FVector3 value = fn(reinterpret_cast<void*>(meshComp), socketName);
+    if (!hasUsableActorPoint(value)) {
+        return false;
+    }
+
+    outLoc = value;
+    return true;
+}
+
+bool DfmMatchMonitor::getCharacterSocketLocation(uintptr_t characterPtr, FVector3& outLoc) const {
+    outLoc = {};
+    if (!ok(characterPtr)) {
+        return false;
+    }
+
+    const uintptr_t meshComp = resolveBestBoneMeshComponent(characterPtr);
+    if (!ok(meshComp)) {
+        return false;
+    }
+
+    BoneAssetCacheEntry boneEntry;
+    resolveTrackedBoneIndices(getSkeletalMeshAsset(meshComp), boneEntry);
+
+    auto trySocketSlot = [&](size_t slot, FVector3& socketPos) -> bool {
+        if (slot >= PlayerInfo::BONE_COUNT || boneEntry.trackedBoneIndices[slot] < 0
+            || boneEntry.trackedBoneNameValid[slot] == 0) {
+            return false;
+        }
+        return getSocketLocationFromMesh(meshComp, boneEntry.trackedBoneNames[slot], socketPos);
+    };
+
+    FVector3 rightFoot{};
+    FVector3 leftFoot{};
+    const bool haveRightFoot = trySocketSlot(kTrackedBoneRightFootSlot, rightFoot);
+    const bool haveLeftFoot = trySocketSlot(kTrackedBoneLeftFootSlot, leftFoot);
+    if (haveRightFoot && haveLeftFoot) {
+        outLoc.x = (rightFoot.x + leftFoot.x) * 0.5f;
+        outLoc.y = (rightFoot.y + leftFoot.y) * 0.5f;
+        outLoc.z = std::min(rightFoot.z, leftFoot.z);
+        return true;
+    }
+    if (haveRightFoot) {
+        outLoc = rightFoot;
+        return true;
+    }
+    if (haveLeftFoot) {
+        outLoc = leftFoot;
+        return true;
+    }
+
+    FVector3 pelvis{};
+    if (trySocketSlot(kTrackedBonePelvisSlot, pelvis)) {
+        outLoc.x = pelvis.x;
+        outLoc.y = pelvis.y;
+        outLoc.z = pelvis.z - 90.0f;
+        return hasUsableActorPoint(outLoc);
+    }
+
+    FVector3 head{};
+    if (trySocketSlot(kTrackedBoneHeadSlot, head)) {
+        outLoc.x = head.x;
+        outLoc.y = head.y;
+        outLoc.z = head.z - 160.0f;
+        return hasUsableActorPoint(outLoc);
+    }
+
+    return false;
+}
+
 uintptr_t DfmMatchMonitor::resolveBestBoneMeshComponent(uintptr_t characterPtr) const {
     struct Candidate {
         uintptr_t meshComp = 0;
@@ -2109,11 +2476,18 @@ bool DfmMatchMonitor::fillPlayerBones(PlayerInfo& player) const {
         return false;
     }
 
+    // SkeletalMeshComponent.ComponentToWorld 与 SceneComponent.ComponentToWorld
+    // 是同一个加密字段; 直接读 meshComp+0x210 对远端 replicated 角色会拿到陈旧/
+    // 错位的矩阵, 把所有局部空间骨骼变换乘上去后整副骨架就会平移到错误位置 ──
+    // 这就是 ESP 框 "目标一动就跟不上" 的真正物理来源。先尝试通过解密 trampoline
+    // 拿到当前帧的明文 CTW; 失败才退回直接内存读。
     FTransform componentToWorld{};
-    if (!safeReadMemory(meshComp + static_cast<uintptr_t>(m_off.Scene_ComponentToWorld),
-                        &componentToWorld,
-                        sizeof(componentToWorld))) {
-        return false;
+    if (!decryptSceneComponentToWorld(meshComp, componentToWorld)) {
+        if (!safeReadMemory(meshComp + static_cast<uintptr_t>(m_off.Scene_ComponentToWorld),
+                            &componentToWorld,
+                            sizeof(componentToWorld))) {
+            return false;
+        }
     }
 
     std::array<FTransform, kMaxRenderableBoneCount> localTransforms{};
@@ -2176,7 +2550,34 @@ void DfmMatchMonitor::updatePlayerPositions(DrawDfmData& data) const {
 
     for (auto& p : data.players) {
         if (p.characterPtr == 0) continue;
-        getActorLocation(p.characterPtr, p.pos);
+        bool posResolved = false;
+
+        // ── 真人玩家: 骨骼优先 (与 scanActors 保持一致) ──
+        // 不要先调 getCharacterSocketLocation: 该函数走 SceneComponent::GetSocketLocation
+        // 虚函数 (vtable+0x468)。这条 vthunk 在 DFM 上被反作弊 hook (典型特征:
+        // ADD X0, X0, #0x210; LDR X16, =0xB400006Fxxxxxxxx; BR X16, 目标是 scudo
+        // 堆地址)。对静止远端 actor 该 hook 返回的值还能凑合, 一旦目标移动就返回
+        // 锁住 / 错位的坐标。这个错位坐标进 p.pos 后又被 fillPlayerBones 当成
+        // 16m 距离过滤的锚点, 把所有真实骨骼全过滤掉, 于是 deriveFootPositionFromBones
+        // 也救不回来, p.pos 永远卡在错位值。
+        // 这里改成 "先 fillPlayerBones (无锚点约束) → deriveFootPositionFromBones",
+        // 直接用 CachedComponentSpaceTransforms × ComponentToWorld 自己算脚底世界
+        // 坐标, 完全绕过被 hook 的 vfunc, 与渲染管线读到的同一份矩阵保持一致。
+        if (!p.isAI) {
+            p.pos = {};
+            fillPlayerBones(p);
+            FVector3 bonePos{};
+            if (deriveFootPositionFromBones(p, bonePos)) {
+                p.pos = bonePos;
+                rememberActorLocation(p.characterPtr, p.pos);
+                posResolved = true;
+            }
+        }
+
+        if (!posResolved) {
+            // AI / 骨骼不可用: 走 mesh.CTW 直接内存读 (绕过 vfunc, 也避开 hook)
+            getActorLocation(p.characterPtr, p.pos);
+        }
 
         // 诊断: 每 10 秒采样最多 3 个玩家的详细坐标
         if (doDiag && p.hp > 0) {
@@ -2235,10 +2636,12 @@ void DfmMatchMonitor::updatePlayerPositions(DrawDfmData& data) const {
         // 更新武器
         p.weapon = getWeaponName(p.characterPtr);
 
-        // 更新骨骼
-        fillPlayerBones(p);
+        // 更新骨骼 (非真人 / 骨骼之前没填上时才需要再算一次)
+        if (p.isAI || !p.bonesValid) {
+            fillPlayerBones(p);
+        }
 
-        // ── 真人敌人优先使用骨骼反推脚底位置 ──
+        // ── AI / 真人(若上方骨骼链失败): 用骨骼脚底覆盖 p.pos ──
         {
             FVector3 bonePos{};
             const bool posUsable = hasUsableActorPoint(p.pos);
@@ -2360,6 +2763,57 @@ void DfmMatchMonitor::pollLoop() {
 
                 if (persistentData.players.empty()) {
                     scanFromPlayerArray(persistentData);
+                }
+
+                // [placeholder 去重] DFM 远端 actor 大部分时间共享同一个 placeholder
+                // RootComponent (RelativeLocation/RepMovement/Mesh CTW 都返回相同的
+                // spawn 点坐标), 多个不同 actor 解出 byte-identical 位置 → 视为占位
+                // 并清空其 pos, 避免 ESP 框堆在地图固定点。
+                // 自己 (characterPtr == ackPawn / ctrlPawn) 不参与去重统计。
+                {
+                    uintptr_t pcPtr = findLocalPlayerController();
+                    uintptr_t ackPawn = ok(pcPtr) ? safeReadPtr(pcPtr + m_off.PC_AcknowledgedPawn) : 0;
+                    uintptr_t ctrlPawn = ok(pcPtr) ? safeReadPtr(pcPtr + m_off.Ctrl_Pawn) : 0;
+
+                    // 统计每个位置出现次数 (按厘米取整, 同一 cm 视为同位置)
+                    struct Key { int x, y, z; bool operator==(const Key& o) const { return x==o.x&&y==o.y&&z==o.z; } };
+                    struct KeyHash { size_t operator()(const Key& k) const noexcept {
+                        return (static_cast<size_t>(k.x) * 73856093u) ^
+                               (static_cast<size_t>(k.y) * 19349663u) ^
+                               (static_cast<size_t>(k.z) * 83492791u); } };
+                    std::unordered_map<Key, int, KeyHash> posCount;
+                    for (const auto& p : persistentData.players) {
+                        if (p.characterPtr == ackPawn || p.characterPtr == ctrlPawn) continue;
+                        if (!hasUsableActorPoint(p.pos)) continue;
+                        Key k{ static_cast<int>(p.pos.x), static_cast<int>(p.pos.y), static_cast<int>(p.pos.z) };
+                        posCount[k]++;
+                    }
+
+                    int dropped = 0;
+                    for (auto& p : persistentData.players) {
+                        if (p.characterPtr == ackPawn || p.characterPtr == ctrlPawn) continue;
+                        if (!hasUsableActorPoint(p.pos)) continue;
+                        Key k{ static_cast<int>(p.pos.x), static_cast<int>(p.pos.y), static_cast<int>(p.pos.z) };
+                        auto it = posCount.find(k);
+                        if (it != posCount.end() && it->second >= 2) {
+                            // 共享坐标 = placeholder, 清空位置 (ESP 不绘制), 但保留条目供
+                            // 玩家列表显示名字/血量
+                            p.pos = {};
+                            p.bonesValid = false;
+                            for (auto& b : p.bones) b = {};
+                            ++dropped;
+                        }
+                    }
+                    if (dropped > 0) {
+                        static std::atomic<uint64_t> lastDropLogMs{0};
+                        auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch()).count();
+                        uint64_t prev = lastDropLogMs.load(std::memory_order_relaxed);
+                        if (nowMs - prev > 2000) {
+                            lastDropLogMs.store(nowMs, std::memory_order_relaxed);
+                            LOG(LOG_LEVEL_INFO, TAG " [placeholder] 丢弃 %d 个共享坐标 actor (placeholder)", dropped);
+                        }
+                    }
                 }
 
                 persistentData.totalCount = static_cast<int32_t>(persistentData.players.size());
@@ -2680,6 +3134,15 @@ void DfmMatchMonitor::pollLoop() {
             }
 
             SharedDfmData::getInstance().pushData(persistentData);
+        }
+
+        // 大厅期心跳: 即使不在对局, 也每秒推一帧空数据, 防止 GUI 看门狗 (uestart.cpp
+        // kStaleExitMs=10s) 把渲染线程清屏退出, 导致菜单消失
+        if (!ms.inMatch) {
+            int64_t sinceLastPush = SharedDfmData::getInstance().getMsSinceLastPush();
+            if (sinceLastPush < 0 || sinceLastPush >= 1000) {
+                SharedDfmData::getInstance().pushData(persistentData);
+            }
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(POLL_INTERVAL_MS));

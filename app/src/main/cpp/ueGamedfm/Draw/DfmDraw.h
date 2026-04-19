@@ -26,7 +26,7 @@ private:
     bool m_enableName      = true;     // 玩家名
     bool m_enableHP        = true;     // 血条
     bool m_enableDistance   = true;     // 距离
-    bool m_enableTeammate  = false;    // 显示队友
+    bool m_enableTeammate  = true;     // 显示队友 (默认开, 否则同队全部被过滤)
     bool m_enableMinimap   = true;     // 小地图
     bool m_enableLoot      = true;     // 物资显示
     bool m_enableLootESP   = true;     // 物资3D名称标签

@@ -67,8 +67,9 @@ struct ResolvedOffsets {
     int32_t Actor_RootComponent      = 0x180;  // Actor.RootComponent (SceneComponent*)
 
     // ── SceneComponent (反射可查) ──
-    int32_t Scene_RelativeLocation = 0x168;  // SceneComponent.RelativeLocation
-    int32_t Scene_ComponentToWorld = 0x210;  // SceneComponent.ComponentToWorld (FTransform)
+    int32_t Scene_AttachParent     = 0x108;  // SceneComponent.AttachParent (SceneComponent*) — sdk_dump
+    int32_t Scene_RelativeLocation = 0x168;  // SceneComponent.RelativeLocation (EncVector, Size=0x10)
+    int32_t Scene_ComponentToWorld = 0x210;  // SceneComponent.ComponentToWorld (FTransform, Translation@+0x10)
 
     // ── 位置相关字段 ──
     // IntCharacter.CosmeticData_Server_Character_OnFire (+0x810) 内的 CameraViewLoc (+0xE8)
@@ -114,6 +115,16 @@ struct ResolvedOffsets {
     int32_t World_GameState       = 0x140;   // World.GameState
     int32_t World_Levels          = 0x158;   // World.Levels (TArray<Level*>)
     int32_t World_StreamingLevels = 0x90;    // World.StreamingLevelsToConsider
+    int32_t World_NetDriver       = 0x30;    // World.NetDriver (NetDriver*) — sdk_dump
+    int32_t World_DemoNetDriver   = 0xE8;    // World.DemoNetDriver (回放网络)
+    // ── NetDriver / NetConnection / ActorChannel (sdk_dump 验证) ──
+    // 通过 NetDriver 链路枚举服务端真正复制到客户端的活跃 actor;
+    // 解决 Persistent/Streaming Level.Actors[] 只含静态/占位 actor、漏掉
+    // 服务器按需复制的真人/AI 的问题。
+    int32_t Net_ServerConnection  = 0x88;    // NetDriver.ServerConnection (NetConnection*)
+    int32_t Net_ClientConnections = 0x90;    // NetDriver.ClientConnections (TArray<NetConnection*>)
+    int32_t NC_OpenChannels       = 0x70;    // NetConnection.OpenChannels (TArray<UChannel*>)
+    int32_t AChan_Actor           = 0x70;    // ActorChannel.Actor (AActor*)
 
     // ── ULevel (反射可查) ──
     int32_t Level_Actors          = 0x98;    // Level.Actors (TArray<Actor*>)
@@ -418,6 +429,7 @@ private:
 
     // ── 坐标读取 ──
     bool getActorLocation(uintptr_t actorPtr, FVector3& outLoc) const;
+    bool getCharacterSocketLocation(uintptr_t characterPtr, FVector3& outLoc) const;
     ReplicatedMovementSnapshot sampleReplicatedMovement(uintptr_t actorPtr) const;
     bool tryGetCachedActorLocation(uintptr_t actorPtr, FVector3& outLoc) const;
     void rememberActorLocation(uintptr_t actorPtr, const FVector3& location) const;
@@ -474,8 +486,16 @@ private:
     int32_t getCachedTransformCount(uintptr_t meshComp) const;
     struct BoneAssetCacheEntry {
         std::array<int32_t, PlayerInfo::BONE_COUNT> trackedBoneIndices{};
+        std::array<ue5dfm::FName, PlayerInfo::BONE_COUNT> trackedBoneNames{};
+        std::array<uint8_t, PlayerInfo::BONE_COUNT> trackedBoneNameValid{};
         int matchedCount = 0;
     };
+    bool getSocketLocationFromMesh(uintptr_t meshComp, const ue5dfm::FName& socketName, FVector3& outLoc) const;
+    // 通过 sub_D982DB0 trampoline 解密 SceneComponent.ComponentToWorld。
+    // 返回 true 时 outTransform 是 stub 内部 scratch 指向的 FTransform 副本; 调用方
+    // 必须立即拷贝, 不要长时间持有 (内部 buffer 会在下次调用时被覆盖)。
+    bool decryptSceneComponentToWorld(uintptr_t sceneComp, ue5dfm::FTransform& outTransform) const;
+    bool decryptSceneComponentLocation(uintptr_t sceneComp, FVector3& outLoc) const;
     bool resolveTrackedBoneIndices(uintptr_t skeletalMeshAssetPtr, BoneAssetCacheEntry& outEntry) const;
     int matchBoneNamesFromFNameArray(uintptr_t dataPtr, int count, BoneAssetCacheEntry& entry) const;
     int matchBoneNamesFromBoneInfoArray(uintptr_t dataPtr, int count, int stride,
@@ -513,7 +533,8 @@ private:
 
     static constexpr int POLL_INTERVAL_MS = 16;          // 主循环间隔 (~60fps, 相机+位置高频更新)
     static constexpr int SCAN_INTERVAL_MS = 5000;        // 完整 Actor 扫描间隔
-    static constexpr int PLAYER_UPDATE_INTERVAL_MS = 1000;  // 玩家位置快速更新
+    // 玩家位置/骨骼必须每帧刷新, 否则相机一动世界→屏幕投影就漂移 (旧值=1s 前坐标)
+    static constexpr int PLAYER_UPDATE_INTERVAL_MS = POLL_INTERVAL_MS;
 };
 
 } // namespace dfm

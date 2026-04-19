@@ -82,7 +82,15 @@ void overlayThreadMain(ANativeWindow* window, int width, int height, int rotateT
         // 客户端断开后不退出, 继续 BeginFrame/EndFrame 让 AImGui 内部清屏路径
         // 持续刷掉所有 EGL 后备缓冲区里的旧画面, 同时支持游戏重启后客户端重连
         while (!g_overlayStopRequested.load(std::memory_order_acquire)) {
-            imgui->ProcessInputEvent();
+            // ProcessInputEvent 每次只从 /dev/input 读 1 个 input_event (非阻塞);
+            // 一帧触摸事件需要消化 4-10 个 input_event (X/Y/BTN/SYN_REPORT 等),
+            // 手指快速滑动时设备会以 >1000 events/s 的速率产生事件。每帧只调一次
+            // 会让事件在内核缓冲堆积, 导致点击/拖动响应延迟几十到上百毫秒。
+            // 在 RenderServer 模式下 ProcessInputEvent 只做 read+forward, 不触
+            // ImGui IO, 多调安全; 单次调用没数据时立即返回 (EAGAIN), 几乎无开销。
+            for (int i = 0; i < 256; ++i) {
+                imgui->ProcessInputEvent();
+            }
             imgui->BeginFrame();
             imgui->EndFrame();
 
