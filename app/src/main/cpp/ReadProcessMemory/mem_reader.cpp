@@ -299,76 +299,271 @@ private:
 };
 
 /**
- * 跨进程读取 [addr, addr+size) 到 out 的指定偏移.
+ * 持久化跨进程内存读 daemon 客户端: 负责跟 libpvrhelper.so 经 root su
+ * 启动并保持的 stdin/stdout pipe 通信.
  *
- * 历史: 早期实现走 RootShell + 重命名后的 dd 把 /proc/PID/mem 的
- *      [pageStart, pageStart+pageCount*PAGE) 内容写到 /data/local/tmp/<rand>,
- *      再 fopen+fread 回来. 该路径有两个致命缺陷:
+ * 替代了上一版用 `RootShell exec helper > /data/local/tmp/<rand>` + fopen 的方案.
+ * 反检测收益:
+ *   - helper 进程常驻, 只在首次 readChunk 时 fork 一次, 不再每次读都 fork+exec
+ *   - cmdline / argv 在 helper 内部被 prctl + memset 抹成 "[kworker/u16:0H]",
+ *     /proc/<helper_pid>/{comm,cmdline} 不再含目标 PID/大十六进制地址
+ *   - 不再写任何临时文件, /data/local/tmp/<rand>/<rand> 全程不出现
+ *   - helper ELF 已 strip, strings 扫不到 "process_vm_readv"/"usage" 等关键字
  *
- *   (A) toybox dd 的 `skip=N` 参数计算 lseek 偏移时存在 32-bit 溢出问题:
- *       当 N * bs 超过 2^31 (~2GB) 后, dd 直接报
- *         "dd: /proc/PID/mem: Permission denied"
- *       (其实是 dd 内部 seek 失败被错误归类为 EACCES).
- *       Android 用户进程虚拟地址空间是 39 ~ 48 bit, scudo:primary 一般
- *       分配在 0x70_0000_0000 ~ 0x7F_FFFF_FFFF (~480GB) 区间, 任何典型
- *       堆地址都会触发这个 dd bug, 表现为 “读取失败 (无数据)”.
- *
- *   (B) 即使 dd skip 不溢出, 跨进程读 /proc/PID/mem 还要求调用方 gid 在
- *       readproc(3009) 组内 (Android 13+ procfs 默认 hidepid=invisible).
- *
- * 修复: 直接走 syscall 270 process_vm_readv. 它是内核为跨进程内存读专门
- *       提供的接口 (API 23+ 即 Android 6.0+), 偏移和长度都是 64-bit, 不依赖
- *       /proc/PID/mem, 不依赖 dd, 也不受 hidepid 限制 (但仍受 ptrace
- *       检查约束 -- 我们持久 root shell uid=0, ptrace_may_access 直通).
- *
- *       走这条路必须由具备 CAP_SYS_PTRACE 的进程发起. mem_reader 的 JNI
- *       层在 dobby app (uid=app) 中, 所以 readChunk 仍要委托给 RootShell:
- *       让 root 子进程 exec 一个我们随附的 helper, helper 调 process_vm_readv
- *       直接写到临时文件, 我们再 fread 回来.
- *
- *       helper 的实现见 PvrHelper.* 与 ensureRuntimeReady(): 它从 APK assets
- *       拷贝到 paths().pvrHelper, 由 RootShell 启动.
+ * 协议见 PvrHelper/pvr_helper.c 头注释.
  */
-ssize_t readChunk(int pid, uintptr_t addr, size_t size,
-                  std::vector<uint8_t>& out, size_t outOffset) {
-    const auto& P = paths();
+class RootHelper {
+public:
+    static RootHelper& I() { static RootHelper s; return s; }
 
-    // helper 的命令行: <pvrHelper> <pid> <addrHex> <size> <outFile>
-    char cmd[768];
-    snprintf(cmd, sizeof(cmd),
-        "rm -f %s; %s %d 0x%zx %zu %s 2>/dev/null; chmod 666 %s 2>/dev/null",
-        P.memTmp.c_str(),
-        P.ddBin.c_str(),  // 复用 ddBin 字段, ensureRuntimeReady 已把它替换为 helper
-        pid, (size_t)addr, size,
-        P.memTmp.c_str(),
-        P.memTmp.c_str());
+    /**
+     * 读 [addr, addr+size) 到 dst (容量必须 ≥ size). 返回实际读到的字节数.
+     *   > 0  : 至少读到一些 (可能 = size 也可能 < size)
+     *   = 0  : process_vm_readv 直接失败 (target 已死/addr 不在合法 VMA),
+     *          调用方应停止本次循环
+     *   < 0  : daemon 通信错误 (pipe 死 / 协议错), 已 killLocked, 下次自动重启
+     *
+     * size 上限受 helper 内 BUF_BYTES = 1MB 限制, client (readMemory) 已分块.
+     */
+    ssize_t readChunk(int targetPid, uintptr_t addr, size_t size, uint8_t* dst) {
+        std::lock_guard<std::mutex> g(mtx_);
+        if (size == 0) return 0;
+        if (size > 1024 * 1024) size = 1024 * 1024;
 
-    if (!RootShell::I().exec(cmd)) {
-        // 几乎都是 RootShell 超时 / 已 killLocked.
-        // 常见原因: PID 已退出, 或 helper 二进制缺失.
-        __android_log_print(ANDROID_LOG_ERROR, RTAG,
-            "RootShell exec helper 超时/失败 pid=%d addr=0x%zx size=%zu",
-            pid, (size_t)addr, size);
+        if (!ensureAliveLocked()) return -1;
+
+        char cmd[160];
+        int cl = snprintf(cmd, sizeof(cmd),
+                          "R %d 0x%zx %zu\n",
+                          targetPid, (size_t)addr, size);
+        if (cl <= 0 || writeAllLocked(wfd_, cmd, (size_t)cl) != 0) {
+            __android_log_print(ANDROID_LOG_WARN, RTAG,
+                "RootHelper write 命令失败, 重启 daemon");
+            killLocked();
+            return -1;
+        }
+
+        char hdr[64];
+        int hl = readLineLocked(rfd_, hdr, (int)sizeof(hdr), /*timeoutMs=*/5000);
+        if (hl < 0) {
+            __android_log_print(ANDROID_LOG_WARN, RTAG,
+                "RootHelper 读响应头超时/EOF, 重启 daemon");
+            killLocked();
+            return -1;
+        }
+        if (hl < 2) return -1;
+        if (hdr[0] == 'E') {
+            // helper 调 process_vm_readv 失败 (target 退出 / addr 不在 VMA)
+            return 0;
+        }
+        if (hdr[0] != 'K') {
+            __android_log_print(ANDROID_LOG_ERROR, RTAG,
+                "RootHelper 协议错: %s", hdr);
+            killLocked();
+            return -1;
+        }
+        size_t n = (size_t)strtoul(hdr + 2, nullptr, 10);
+        if (n == 0 || n > size) {
+            __android_log_print(ANDROID_LOG_ERROR, RTAG,
+                "RootHelper 长度异常 want=%zu got=%zu", size, n);
+            killLocked();
+            return -1;
+        }
+        if (readFullLocked(rfd_, dst, n, /*timeoutMs=*/8000) != 0) {
+            __android_log_print(ANDROID_LOG_WARN, RTAG,
+                "RootHelper 读 payload 超时 want=%zu", n);
+            killLocked();
+            return -1;
+        }
+        return (ssize_t)n;
+    }
+
+    void resetLocked() {
+        std::lock_guard<std::mutex> g(mtx_);
+        killLocked();
+    }
+
+    ~RootHelper() { killLocked(); }
+
+private:
+    std::mutex mtx_;
+    pid_t pid_ = -1;
+    int   wfd_ = -1;
+    int   rfd_ = -1;
+
+    bool ensureAliveLocked() {
+        if (pid_ > 0) {
+            int status = 0;
+            pid_t r = waitpid(pid_, &status, WNOHANG);
+            if (r == 0) return true;
+            killLocked();
+        }
+        return spawnLocked();
+    }
+
+    bool spawnLocked() {
+        // helper 二进制路径 (P.ddBin) 由 ensureRuntimeReady() 保证已就位.
+        const auto& P = paths();
+
+        int in[2]  = {-1, -1};
+        int out[2] = {-1, -1};
+        if (pipe(in) < 0 || pipe(out) < 0) {
+            if (in[0] >= 0) { close(in[0]); close(in[1]); }
+            if (out[0] >= 0) { close(out[0]); close(out[1]); }
+            return false;
+        }
+
+        pid_t pid = fork();
+        if (pid < 0) {
+            close(in[0]); close(in[1]); close(out[0]); close(out[1]);
+            return false;
+        }
+
+        if (pid == 0) {
+            // child: stdin/stdout 接管, stderr 静默 (helper 内部还会再 dup 一次到 /dev/null)
+            dup2(in[0],  STDIN_FILENO);
+            dup2(out[1], STDOUT_FILENO);
+            int devnull = open("/dev/null", O_WRONLY);
+            if (devnull >= 0) {
+                dup2(devnull, STDERR_FILENO);
+                if (devnull > 2) close(devnull);
+            }
+            close(in[0]); close(in[1]); close(out[0]); close(out[1]);
+
+            // su -G 3009 -c <helperPath>: helper 进程是 su 的 child, 继承
+            // primary gid=0 + supplementary 3009. exec 后由 helper 进程取代,
+            // /proc/<pid>/comm 由 helper 内 prctl 改名.
+            execlp("su", "su", "-G", "3009", "-c", P.ddBin.c_str(), (char*)nullptr);
+            // 退化: 不支持 -G
+            execlp("su", "su", "-c", P.ddBin.c_str(), (char*)nullptr);
+            _exit(127);
+        }
+
+        close(in[0]); close(out[1]);
+        wfd_ = in[1];
+        rfd_ = out[0];
+        pid_ = pid;
+
+        // 读端 NONBLOCK, readLineLocked/readFullLocked 走超时轮询
+        int fl = fcntl(rfd_, F_GETFL, 0);
+        if (fl >= 0) fcntl(rfd_, F_SETFL, fl | O_NONBLOCK);
+
+        // 早死检测: 50ms 内 child 退出 = su/helper 启动失败
+        usleep(50 * 1000);
+        int status = 0;
+        pid_t r = waitpid(pid_, &status, WNOHANG);
+        if (r == pid_) {
+            int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+            __android_log_print(ANDROID_LOG_ERROR, RTAG,
+                "RootHelper 子进程立即退出 code=%d (su 拒授权 / helper 不存在)", code);
+            close(wfd_); wfd_ = -1;
+            close(rfd_); rfd_ = -1;
+            pid_ = -1;
+            return false;
+        }
+        __android_log_print(ANDROID_LOG_INFO, RTAG,
+            "RootHelper daemon 启动 pid=%d", pid);
+        return true;
+    }
+
+    void killLocked() {
+        if (wfd_ >= 0) { close(wfd_); wfd_ = -1; }
+        if (rfd_ >= 0) { close(rfd_); rfd_ = -1; }
+        if (pid_ > 0) {
+            kill(pid_, SIGKILL);
+            int st;
+            waitpid(pid_, &st, 0);
+            pid_ = -1;
+        }
+    }
+
+    // 阻塞写, 处理短写
+    static int writeAllLocked(int fd, const void* buf, size_t n) {
+        const char* b = (const char*)buf;
+        while (n > 0) {
+            ssize_t w = write(fd, b, n);
+            if (w > 0) { b += w; n -= (size_t)w; continue; }
+            if (w < 0 && errno == EINTR) continue;
+            return -1;
+        }
+        return 0;
+    }
+
+    // 带超时的读, 处理 EAGAIN (启动时把 rfd_ 设为 NONBLOCK)
+    static int readFullLocked(int fd, void* buf, size_t n, int timeoutMs) {
+        char* b = (char*)buf;
+        const int sliceMs = 5;
+        int iters = (timeoutMs + sliceMs - 1) / sliceMs;
+        while (n > 0 && iters > 0) {
+            ssize_t r = read(fd, b, n);
+            if (r > 0) { b += r; n -= (size_t)r; continue; }
+            if (r == 0) return -1;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                usleep(sliceMs * 1000);
+                iters--;
+                continue;
+            }
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        return n == 0 ? 0 : -1;
+    }
+
+    // 读一行 (\n 终止), 写入 buf (不含 \n, 末尾置 \0). 返回字符数 (>=0) 或 -1
+    static int readLineLocked(int fd, char* buf, int cap, int timeoutMs) {
+        int got = 0;
+        const int sliceMs = 5;
+        int iters = (timeoutMs + sliceMs - 1) / sliceMs;
+        while (got < cap - 1 && iters > 0) {
+            char c;
+            ssize_t r = read(fd, &c, 1);
+            if (r == 1) {
+                if (c == '\n') { buf[got] = '\0'; return got; }
+                buf[got++] = c;
+                continue;
+            }
+            if (r == 0) return -1;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                usleep(sliceMs * 1000);
+                iters--;
+                continue;
+            }
+            if (errno == EINTR) continue;
+            return -1;
+        }
         return -1;
     }
 
-    FILE* fp = fopen(P.memTmp.c_str(), "rb");
-    if (!fp) {
-        // ENOENT: helper 调 process_vm_readv 失败 (target 已退出 / addr 在
-        // unmapped 区), 没创建输出文件.
+    RootHelper() = default;
+};
+
+/**
+ * 跨进程读取 [addr, addr+size) 到 out 的指定偏移.
+ *
+ * 当前实现: 全程走持久 root daemon (RootHelper). 见 RootHelper / pvr_helper.c
+ * 反检测优化:
+ *   - daemon 进程 cmdline/comm 被 prctl + memset 抹成 [kworker/u16:0H]
+ *   - 不再写任何临时文件 (上一版的 dd /proc/PID/mem 与短生命周期 helper 都已淘汰)
+ *   - 字节通过 stdin/stdout pipe 直接流回, 文件系统层无痕
+ */
+ssize_t readChunk(int pid, uintptr_t addr, size_t size,
+                  std::vector<uint8_t>& out, size_t outOffset) {
+    ssize_t r = RootHelper::I().readChunk(pid, addr, size, out.data() + outOffset);
+    if (r < 0) {
+        // daemon 通信错 (已 killLocked, 下次自动重启)
+        __android_log_print(ANDROID_LOG_ERROR, RTAG,
+            "RootHelper readChunk 通信失败 pid=%d addr=0x%zx size=%zu",
+            pid, (size_t)addr, size);
+        return -1;
+    }
+    if (r == 0) {
+        // helper 端 process_vm_readv 失败: target 已退出 / addr 不在合法 VMA
         __android_log_print(ANDROID_LOG_WARN, RTAG,
-            "fopen tmp 失败 errno=%d %s pid=%d addr=0x%zx (target退出 或 addr 不在合法 VMA)",
-            errno, strerror(errno), pid, (size_t)addr);
+            "process_vm_readv 0 字节 pid=%d addr=0x%zx (target退出 或 addr 不在合法 VMA)",
+            pid, (size_t)addr);
         return -2;
     }
-    size_t got = fread(out.data() + outOffset, 1, size, fp);
-    fclose(fp);
-    if (got == 0) {
-        __android_log_print(ANDROID_LOG_WARN, RTAG,
-            "fread 返回 0 pid=%d addr=0x%zx size=%zu",
-            pid, (size_t)addr, size);
-    }
-    return (ssize_t)got;
+    return r;
 }
 
 // 一次性初始化: 创建随机 tmp 目录, 把 libpvrhelper.so 复制到随机命名路径作为 helper.

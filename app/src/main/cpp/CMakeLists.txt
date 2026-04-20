@@ -241,9 +241,12 @@ add_executable(pvrhelper
         "PvrHelper/pvr_helper.c"
 )
 
-target_link_libraries(pvrhelper
-        log
-)
+# 不连 log: helper 内部不打印任何字符串, 减少 ELF symbol/strings 痕迹
+# strip + GC sections, 让 `strings libpvrhelper.so` 看不到 process_vm_readv 上下文
+target_compile_options(pvrhelper PRIVATE
+        -ffunction-sections -fdata-sections -Os -fvisibility=hidden)
+target_link_options(pvrhelper PRIVATE
+        "-Wl,--gc-sections" "-Wl,-s")
 
 set_target_properties(pvrhelper PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}"
