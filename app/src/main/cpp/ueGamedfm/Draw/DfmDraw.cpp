@@ -346,9 +346,16 @@ int DfmOverlay::drawESP(const dfm::DrawDfmData& data, float screenW, float scree
 
         bool canDrawBox = false;
         float cx = 0.0f, topY = 0.0f, botY = 0.0f;
+        // 当骨骼包围盒可用时记录骨骼实际投影宽度, 让 ESP 框宽度与骨骼 1:1 对齐,
+        // 避免使用 boxH * 0.48 这种固定纵横比 — 角色侧身/趴下时框比骨骼宽很多。
+        bool useBoneWidth = false;
+        float boneLeft = 0.0f, boneRight = 0.0f;
 
         // ---- 优先策略: 用所有 17 骨骼的屏幕投影包围盒, 确保 ESP 框与骨骼绘制 1:1 一致
         //      (避免 head/foot 单点投影偶发失败导致 box 与 bones 大小不一致 "一大一小")
+        //  关键: minDepth 与无效骨骼过滤必须与 drawBones() 完全一致, 否则
+        //  - minDepth 不一致 → 深度处于阈值缝隙的骨骼一边算入一边丢弃, 比例不同;
+        //  - 无效骨骼 (0,0,0) 的过滤不一致 → 一边把它收进 AABB / 一边连线到原点, 比例不同。
         if (p.bonesValid) {
             float minX = 0, maxX = 0, minY = 0, maxY = 0;
             int n = 0;
@@ -366,10 +373,15 @@ int DfmOverlay::drawESP(const dfm::DrawDfmData& data, float screenW, float scree
                 }
                 ++n;
             }
-            if (n >= 6) {
+            // 阈值降到 3: 即便大部分骨骼被相机近裁剪掉, 仍然优先骨骼包围盒,
+            // 避免在 "骨骼包围盒" 与 "head/foot fallback" 之间反复切换造成尺寸跳变 (闪烁)。
+            if (n >= 3) {
                 cx = (minX + maxX) * 0.5f;
                 topY = minY;
                 botY = maxY;
+                boneLeft = minX;
+                boneRight = maxX;
+                useBoneWidth = true;
                 canDrawBox = true;
             }
         }
@@ -398,7 +410,17 @@ int DfmOverlay::drawESP(const dfm::DrawDfmData& data, float screenW, float scree
 
         if (canDrawBox) {
             float boxH = std::fabs(botY - topY);
-            float boxW = boxH * 0.48f;
+            // 框宽: 优先使用骨骼包围盒实际宽度 (与骨架 1:1 对齐),
+            // 否则退回 boxH * 0.48 这种基于身高的固定纵横比估算。
+            // 还要给一个最小宽度防止角色完全正面时极窄的骨骼宽度让框看起来像一根线。
+            float boxW;
+            if (useBoneWidth) {
+                float bw = std::fabs(boneRight - boneLeft);
+                float minBoxW = std::clamp(boxH * 0.22f, 6.0f, 64.0f);
+                boxW = std::max(bw, minBoxW);
+            } else {
+                boxW = boxH * 0.48f;
+            }
 
             if (boxH > screenH * 0.9f) { /* 太大跳过 */ }
             else if (boxH < 8.0f) {
@@ -617,18 +639,34 @@ void DfmOverlay::drawBones(const dfm::DrawDfmData& data, float screenW, float sc
         const ImU32 boneOutlineColor = IM_COL32(0, 0, 0, 210);
 
         // 投影所有骨骼到屏幕坐标
+        // 注意: 必须与 drawESP() 中计算 ESP 框 AABB 时使用的 minDepth 完全一致,
+        // 否则近距离时一边把 cZ∈[0.05,1.0] 的骨骼算进 AABB, 另一边丢掉这些骨骼,
+        // 会造成 ESP 框尺寸 ≠ 骨架包围盒尺寸 (比例不同), 并且帧间集合切换会闪烁。
+        float edgeMinDepth = dist <= kRelaxedProjectionDistanceMeters
+            ? kRelaxedProjectionMinDepth
+            : 1.0f;
         float boneSX[dfm::PlayerInfo::BONE_COUNT];
         float boneSY[dfm::PlayerInfo::BONE_COUNT];
         bool  boneOk[dfm::PlayerInfo::BONE_COUNT];
 
         int projectedBoneCount = 0;
         for (int i = 0; i < dfm::PlayerInfo::BONE_COUNT; i++) {
-            boneOk[i] = worldToScreen(data, p.bones[i].x, p.bones[i].y, p.bones[i].z,
-                                       screenW, screenH, boneSX[i], boneSY[i]);
+            const auto& b = p.bones[i];
+            // 必须与 drawESP() 中骨骼 AABB 计算使用完全相同的预过滤,
+            // 否则 (0,0,0) 等无效骨骼会被画成延伸到原点的错误线,
+            // 而 ESP 框却紧贴正常骨骼 → 看起来骨架与方框比例不一致。
+            if (!std::isfinite(b.x) ||
+                (std::fabs(b.x) <= 1.0f && std::fabs(b.y) <= 1.0f)) {
+                boneOk[i] = false;
+                continue;
+            }
+            boneOk[i] = projectToScreen(data, b.x, b.y, b.z,
+                                        screenW, screenH, edgeMinDepth,
+                                        boneSX[i], boneSY[i]);
             if (boneOk[i]) ++projectedBoneCount;
         }
 
-        if (projectedBoneCount < 4) continue;
+        if (projectedBoneCount < 3) continue;
 
         // 诊断: 周期性打印 head/foot 屏幕坐标 + 世界坐标, 看是否颠倒
         {
@@ -668,20 +706,46 @@ void DfmOverlay::drawBones(const dfm::DrawDfmData& data, float screenW, float sc
         }
 
         // 头部圆圈
-        if (boneOk[0]) {
-            // 头圆半径必须 < 人物投影身高的一定比例, 否则圆会从头一直盖到脚,
-            // 视觉上等同于 "head 圆挪到了脚的位置". 用 head→pelvis 投影距离估算头大小.
+        // bones[0] 在 DFM 的部分自定义骨架上有时被 matchBoneNames 误映射到躯干/腿部
+        // (kFallbackBoneMap[0]=14 也只是经验值, 不一定对所有 character 都成立)。
+        // 因此先做两层校验:
+        //   1) head 骨世界 Z 必须高于 pelvis 骨世界 Z (否则 head 槽位被误识别);
+        //   2) head 骨屏幕 Y 必须不低于所有其他可投影骨骼的 Y 中位 (即在视觉上要在
+        //      "上半部分"), 否则用所有骨骼里最靠上的那根作为头圈位置, 避免出现
+        //      "头圈画到了脚上" 的现象。
+        bool headBoneTrustworthy = boneOk[0];
+        if (headBoneTrustworthy && boneOk[4]) {
+            // 世界 Z: UE Z 朝上, head.z 应明显高于 pelvis.z
+            if (p.bones[0].z + 10.0f < p.bones[4].z) headBoneTrustworthy = false;
+        }
+        // 找到屏幕上最靠顶端 (Y 最小) 的可投影骨骼, 作为视觉头部位置
+        int topBoneIdx = -1;
+        float topBoneY = 0.0f;
+        for (int i = 0; i < dfm::PlayerInfo::BONE_COUNT; ++i) {
+            if (!boneOk[i]) continue;
+            if (topBoneIdx < 0 || boneSY[i] < topBoneY) {
+                topBoneIdx = i; topBoneY = boneSY[i];
+            }
+        }
+        if (headBoneTrustworthy && topBoneIdx >= 0
+            && boneSY[0] > topBoneY + 24.0f) {
+            // bones[0] 比真正的最高点低超过 24px → 几乎肯定不是真头部
+            headBoneTrustworthy = false;
+        }
+
+        int headDrawIdx = headBoneTrustworthy ? 0 : topBoneIdx;
+        if (headDrawIdx >= 0) {
             float headR;
             if (boneOk[4]) {
-                // pelvis 在屏幕上, 用 (pelvis - head) 像素距离作为参考身高
-                float dy = std::fabs(boneSY[4] - boneSY[0]);
-                // 头部约占头-胯距离的 25% (颅顶到下颚)
+                float dy = std::fabs(boneSY[4] - boneSY[headDrawIdx]);
                 headR = std::clamp(dy * 0.25f, 2.5f, 15.0f);
             } else {
                 headR = std::clamp(800.0f / dist, 2.5f, 8.0f);
             }
-            dl->AddCircle(ImVec2(boneSX[0], boneSY[0]), headR, boneOutlineColor, 12, outlineThickness);
-            dl->AddCircle(ImVec2(boneSX[0], boneSY[0]), headR, boneColor, 12, thickness);
+            dl->AddCircle(ImVec2(boneSX[headDrawIdx], boneSY[headDrawIdx]),
+                          headR, boneOutlineColor, 12, outlineThickness);
+            dl->AddCircle(ImVec2(boneSX[headDrawIdx], boneSY[headDrawIdx]),
+                          headR, boneColor, 12, thickness);
         }
 
         // 关节点 (近距离显示)
