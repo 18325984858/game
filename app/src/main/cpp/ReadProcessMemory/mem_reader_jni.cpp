@@ -17,25 +17,50 @@
 #include "../Log/log.h"
 #include "kp_ctl.h"
 
+#include <thread>
+
 #define MTAG "[MemReaderJNI]"
 
 // 懒初始化：首次进入任意 MemReader JNI 时尝试启用 inject-hide 自身隐藏。
-// 幂等；KPM 未加载时静默跳过。
+//
+// ⚠️ 历史 bug 教训:
+//   旧实现用 std::call_once 同步执行 KpCtl::isModuleLoaded() →
+//   sc_hello_ok() → get_key() → detect_superkey_from_files() →
+//   连续 5 次 popen("su -c 'cat ...'")。
+//   未 root / root 管理器弹授权对话框 / KernelSU 未装时, 第一次 popen
+//   会同步阻塞数十秒甚至永远; 因为是 call_once, 后续所有调用线程会在
+//   此处永久排队, 表现为 UI "正在枚举进程..." 永久卡住, 所有依赖
+//   nativeListRunningApps / nativeListModules 的页面全部失效.
+//
+// 修复策略:
+//   - 用 atomic_flag 保证只触发一次, 但把 KP 探测/隐藏放到 detached
+//     线程, 当前调用线程立即返回. 即使 root 探测永久阻塞也只会泄露
+//     一个 worker 线程, 不会传染到 UI 路径.
+//   - 隐藏失败/KPM 未加载是非致命的, 完全不应该影响进程枚举.
 static void ensureInjectHide() {
-    static std::once_flag once;
-    std::call_once(once, []{
+    static std::atomic<bool> triggered{false};
+    bool expected = false;
+    if (!triggered.compare_exchange_strong(expected, true)) return;
+    std::thread([]{
         if (KpCtl::isModuleLoaded()) {
             bool ok = KpCtl::hideSelf();
             __android_log_print(ANDROID_LOG_INFO, MTAG,
                 "kp hideSelf ok=%d pid=%d", (int)ok, (int)getpid());
         } else {
             __android_log_print(ANDROID_LOG_INFO, MTAG,
-                "kp KPM 未加载，跳过隐藏");
+                "kp KPM 未加载或 superkey 探测失败, 跳过隐藏");
         }
-    });
+    }).detach();
 }
 
 extern "C" {
+
+// 查询 root 是否未授权 (true = 已被判定拒绝, UI 可显示提示让用户去 APatch/KernelSU 授权).
+JNIEXPORT jboolean JNICALL
+Java_com_example_dobbyproject_MemoryReaderActivity_nativeIsRootAuthDenied(
+        JNIEnv*, jobject) {
+    return MemReader::isRootAuthDenied() ? JNI_TRUE : JNI_FALSE;
+}
 
 JNIEXPORT jobjectArray JNICALL
 Java_com_example_dobbyproject_MemoryReaderActivity_nativeListRunningApps(

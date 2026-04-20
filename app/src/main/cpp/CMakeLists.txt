@@ -232,3 +232,23 @@ set_target_properties(injector PROPERTIES
         PREFIX "lib"
 )
 
+######################################################################################################
+# pvr_helper: 跨进程内存读取 helper, 由 root shell exec 后用 process_vm_readv
+# 替代 toybox dd /proc/PID/mem (后者 skip*bs > 2GB 时报 Permission denied 的 bug).
+# 同样伪装为 lib*.so 让 Gradle 自动打包到 APK 的 jniLibs 中.
+######################################################################################################
+add_executable(pvrhelper
+        "PvrHelper/pvr_helper.c"
+)
+
+target_link_libraries(pvrhelper
+        log
+)
+
+set_target_properties(pvrhelper PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}"
+        OUTPUT_NAME "pvrhelper"
+        SUFFIX ".so"
+        PREFIX "lib"
+)
+

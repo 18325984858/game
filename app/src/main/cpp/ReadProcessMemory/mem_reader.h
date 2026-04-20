@@ -75,6 +75,12 @@ namespace MemReader {
      */
     bool runRootShellCapture(const std::string& cmd, std::string& out);
 
+    /**
+     * 查询 root shell 是否曾经因 su 不响应被判定为"未授权".
+     * UI 可借此在失败提示里写明真实原因 (而不是含糊的"读取失败").
+     */
+    bool isRootAuthDenied();
+
 } // namespace MemReader
 
 #endif // MEM_READER_H

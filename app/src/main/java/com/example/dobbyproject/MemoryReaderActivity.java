@@ -42,6 +42,8 @@ public class MemoryReaderActivity extends AppCompatActivity {
                                                  byte[] pattern, byte[] mask, int maxHits);
     private native String[] nativeGlobalSearch(int pid, byte[] pattern, byte[] mask,
                                                 int maxHits, boolean onlyWritable, boolean skipBigRo);
+    /** true = 持久 root shell 已被判定为"未授权" (su 无响应). */
+    private native boolean  nativeIsRootAuthDenied();
 
     static { System.loadLibrary("dobbyproject"); }
 
@@ -84,6 +86,7 @@ public class MemoryReaderActivity extends AppCompatActivity {
             "字符串 (自动识别 GBK/UTF-8/UTF-16)",
             "C 字符串 (ANSI, 遇 \\0 停止)",
             "宽字符串 (UTF-16LE, 遇 \\0\\0 停止)",
+            "反汇编 (ARM64)",
     };
 
     private static final String[] ENDIANS = { "小端 LE", "大端 BE" };
@@ -229,8 +232,17 @@ public class MemoryReaderActivity extends AppCompatActivity {
                 appAdapter.addAll(labels);
                 appAdapter.notifyDataSetChanged();
                 btnRefresh.setEnabled(true);
-                tvStatus.setText("共 " + appList.size() + " 个进程");
-                if (!appList.isEmpty()) {
+                if (appList.isEmpty()) {
+                    boolean denied = false;
+                    try { denied = nativeIsRootAuthDenied(); } catch (Throwable ignored) {}
+                    if (denied) {
+                        tvStatus.setText("✘ 枚举失败: 本 app 未获 root 授权\n" +
+                                "请打开 APatch / KernelSU 管理器 → 超级用户 → 为本 app 授权 → 重启 app");
+                    } else {
+                        tvStatus.setText("共 0 个进程 (未找到匹配, 或 root shell 无响应)");
+                    }
+                } else {
+                    tvStatus.setText("共 " + appList.size() + " 个进程");
                     spApps.setSelection(0);
                     selectedPid = appList.get(0).pid;
                     loadModules(selectedPid);
@@ -910,6 +922,7 @@ public class MemoryReaderActivity extends AppCompatActivity {
             case 8:  return dumpStringAuto(data);
             case 9:  return dumpCString(data);
             case 10: return dumpWideString(data);
+            case 11: return Arm64Disassembler.disassemble(data, baseAddr);
             default: return dumpHex(data, baseAddr);
         }
     }

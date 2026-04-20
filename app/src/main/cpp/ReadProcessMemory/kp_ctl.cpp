@@ -39,7 +39,14 @@ static std::string g_superkey;
 static int g_kp_ready = -1;
 
 static std::string popen_su(const std::string& cmd) {
-    std::string full = "su -c '" + cmd + "' 2>/dev/null";
+    // 用 timeout(1) 包裹避免 su 未授权时永久挂起.
+    // 2s 足够读几个小文件, 且不会拖住 UI.
+    // 注意: 这里不能加 `-g 3009` (readproc) — 因为 detect_superkey_from_files 要读
+    //       /data/adb/ksu/.tmp/superkey 等 chmod 600 root:root 文件,
+    //       一旦 gid 被切到 readproc 反而失去访问权限, 导致 sc_hello 一直失败.
+    //       hidepid 限制只发生在跨进程读 /proc/PID/* 上, 这里读的是 /data/adb,
+    //       保留默认 gid=0 即可.
+    std::string full = "timeout 2 su -c '" + cmd + "' 2>/dev/null";
     FILE* fp = popen(full.c_str(), "r");
     if (!fp) return "";
     char buf[512];
@@ -58,16 +65,32 @@ static std::string detect_superkey_from_files() {
         "/data/adb/.superkey",
         nullptr,
     };
-    for (int i = 0; files[i]; i++) {
-        std::string s = popen_su(std::string("cat ") + files[i]);
-        while (!s.empty() && (s.back() == '\n' || s.back() == '\r' ||
-                              s.back() == ' '  || s.back() == '\t'))
-            s.pop_back();
-        if (!s.empty() && s.size() <= 64) {
+    // 一次 popen 合并读取所有候选路径, 避免 5 次串行启动 su 运行时 5x 开销.
+    std::string cmd = "for f in";
+    for (int i = 0; files[i]; i++) { cmd += " "; cmd += files[i]; }
+    cmd += "; do if [ -f \"$f\" ]; then echo \"==$f==\"; cat \"$f\"; echo; fi; done";
+    std::string s = popen_su(cmd);
+    if (s.empty()) return "";
+    // 按顺序取第一个非空块
+    size_t pos = 0;
+    while ((pos = s.find("==", pos)) != std::string::npos) {
+        size_t end = s.find("==", pos + 2);
+        if (end == std::string::npos) break;
+        size_t lineStart = s.find('\n', end);
+        if (lineStart == std::string::npos) break;
+        size_t blockEnd = s.find("==", lineStart);
+        if (blockEnd == std::string::npos) blockEnd = s.size();
+        std::string val = s.substr(lineStart + 1, blockEnd - lineStart - 1);
+        while (!val.empty() && (val.back() == '\n' || val.back() == '\r' ||
+                                val.back() == ' '  || val.back() == '\t'))
+            val.pop_back();
+        if (!val.empty() && val.size() <= 64) {
+            std::string fname = s.substr(pos + 2, end - pos - 2);
             __android_log_print(ANDROID_LOG_INFO, HTAG,
-                "superkey from %s (len=%zu)", files[i], s.size());
-            return s;
+                "superkey from %s (len=%zu)", fname.c_str(), val.size());
+            return val;
         }
+        pos = blockEnd;
     }
     return "";
 }

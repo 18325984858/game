@@ -21,6 +21,7 @@
 #include <android/log.h>
 #include <sys/random.h>
 #include <sys/syscall.h>
+#include <dlfcn.h>
 
 #include <mutex>
 #include <algorithm>
@@ -86,6 +87,13 @@ static const RuntimePaths& paths() {
 }
 
 // ── 去除 aarch64 MTE/TBI 指针 tag ──
+// AArch64 上高 8 位是高地址标签位 (TBI=Top Byte Ignore, MTE 也只用高 4 位).
+// scudo 分配器返回的堆指针常见形式为 0xB4xxxxxxxxxxxxxx 之类，
+// 例如 0xb400007a7b722190 → 实际虚地址 0x00007a7b722190.
+// /proc/PID/mem 的 lseek 偏移是原始虚地址，不会自动处理 TBI，
+// 所以必须在调 dd skip= 之前先抹掉高字节; 否则偏移远超过
+// 进程虚拟地址空间 (48-bit user-VA 上限 0x0000FFFFFFFFFFFF), dd 会立即
+// 读到 EOF 返回 0 字节，表现为“读取失败 (无数据)”。
 inline uintptr_t untag(uintptr_t addr) {
     return addr & 0x00FFFFFFFFFFFFFFULL;
 }
@@ -93,6 +101,15 @@ inline uintptr_t untag(uintptr_t addr) {
 /**
  * 持久化 root shell: 一次 `su`, 多次发命令, 用唯一 marker 分帧.
  * 线程安全: 内部加锁序列化.
+ *
+ * 超时/授权设计说明:
+ *   - spawnLocked() 后会发一条 "echo PING" + DONE marker, 取得
+ *     ping 超时 (1.5s, 可调) 作为 su 授权探测. APatch/KernelSU 在
+ *     未授权时 su 会永久挂起不输出任何东西, ping 超时即认为
+ *     "被拒绝", 记住 authDenied_ = true, 后续调用 fast-fail 返回.
+ *   - 调用者可用 isAuthDenied() 查询状态 / 在 UI 展示提示.
+ *   - resetAuth() 在用户手动授权后调用 (现阶段 UI 还未提供入口,
+ *     用户只需重启 app 即可).
  */
 class RootShell {
 public:
@@ -101,52 +118,32 @@ public:
         return s;
     }
 
+    bool isAuthDenied() {
+        std::lock_guard<std::mutex> g(mtx_);
+        return authDenied_;
+    }
+
+    void resetAuth() {
+        std::lock_guard<std::mutex> g(mtx_);
+        authDenied_ = false;
+        killLocked();
+    }
+
     /**
      * 执行一段 shell 命令, 等待其完成 (通过 marker).
      * stdout/stderr 输出会被丢弃 (除非重定向到文件内再读).
      */
     bool exec(const std::string& cmd) {
         std::lock_guard<std::mutex> g(mtx_);
-        if (!ensureAliveLocked()) return false;
-
-        std::string line = cmd + "\n" + "echo " + DONE_TAG + "\n";
-        ssize_t w = write(wfd_, line.data(), line.size());
-        if (w != (ssize_t)line.size()) {
-            __android_log_print(ANDROID_LOG_ERROR, RTAG,
-                "write 到 su stdin 失败 w=%zd errno=%d", w, errno);
-            killLocked();
+        // 授权被拒 → fast-fail, 不再费 15s 去重试 (调用者会连环出现
+        // 在进程枚举/内存读取/按钮点击上)
+        if (authDenied_) {
+            __android_log_print(ANDROID_LOG_WARN, RTAG,
+                "跳过 root 调用: su 未获授权 (请去 APatch/KernelSU 为本 app 授权)");
             return false;
         }
-
-        // 读直到收到 DONE marker
-        char buf[1024];
-        std::string acc;
-        size_t tagLen = strlen(DONE_TAG);
-        // 超时防护: 最多 15s 等一条命令 (dd 大块也够用)
-        for (int iter = 0; iter < 1500; iter++) {
-            ssize_t n = read(rfd_, buf, sizeof(buf));
-            if (n > 0) {
-                acc.append(buf, n);
-                if (acc.find(DONE_TAG) != std::string::npos) {
-                    return true;
-                }
-            } else if (n == 0) {
-                // shell 已退出
-                killLocked();
-                return false;
-            } else {
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    usleep(10 * 1000);
-                    continue;
-                }
-                killLocked();
-                return false;
-            }
-        }
-        __android_log_print(ANDROID_LOG_WARN, RTAG,
-            "等待 DONE marker 超时, 命令=%s", cmd.c_str());
-        killLocked();
-        return false;
+        if (!ensureAliveLocked()) return false;
+        return execLocked(cmd, /*timeoutMs=*/15000);
     }
 
     ~RootShell() {
@@ -158,17 +155,66 @@ private:
     pid_t pid_ = -1;
     int   wfd_ = -1;    // 写给 su 的 stdin
     int   rfd_ = -1;    // 读 su 的 stdout
+    bool  authDenied_ = false;
+
+    // 在锁内发一条命令并等 DONE marker, timeoutMs 为总超时.
+    bool execLocked(const std::string& cmd, int timeoutMs) {
+        std::string line = cmd + "\n" + "echo " + DONE_TAG + "\n";
+        ssize_t w = write(wfd_, line.data(), line.size());
+        if (w != (ssize_t)line.size()) {
+            __android_log_print(ANDROID_LOG_ERROR, RTAG,
+                "write 到 su stdin 失败 w=%zd errno=%d", w, errno);
+            killLocked();
+            return false;
+        }
+
+        char buf[1024];
+        std::string acc;
+        const int sliceMs = 10;
+        int iters = (timeoutMs + sliceMs - 1) / sliceMs;
+        for (int i = 0; i < iters; i++) {
+            ssize_t n = read(rfd_, buf, sizeof(buf));
+            if (n > 0) {
+                acc.append(buf, n);
+                if (acc.find(DONE_TAG) != std::string::npos) return true;
+            } else if (n == 0) {
+                // su 进程退出 (execlp 失败 / 未授权被杀 / 正常退出)
+                killLocked();
+                return false;
+            } else {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    usleep(sliceMs * 1000);
+                    continue;
+                }
+                killLocked();
+                return false;
+            }
+        }
+        __android_log_print(ANDROID_LOG_WARN, RTAG,
+            "等待 DONE marker 超时(%dms), 命令=%s", timeoutMs, cmd.c_str());
+        killLocked();
+        return false;
+    }
 
     bool ensureAliveLocked() {
         if (pid_ > 0) {
-            // 检查还活着
             int status = 0;
             pid_t r = waitpid(pid_, &status, WNOHANG);
             if (r == 0) return true;
-            // 已退出, 清理
             killLocked();
         }
-        return spawnLocked();
+        if (!spawnLocked()) return false;
+
+        // 刚 fork 出的 su, 用 1.5s ping 探测是否已授权 / 是否能响应.
+        // 未授权时 APatch/KernelSU 会挂起 su 不输出, ping 肯定超时.
+        if (!execLocked("echo P", /*timeoutMs=*/1500)) {
+            authDenied_ = true;
+            __android_log_print(ANDROID_LOG_ERROR, RTAG,
+                "✘ su ping 失败: 该 app 未获得 root 授权 "
+                "(请打开 APatch/KernelSU manager → 超级用户 → 为本 app 授权 → 重启 app)");
+            return false;
+        }
+        return true;
     }
 
     bool spawnLocked() {
@@ -194,6 +240,17 @@ private:
             dup2(out[1], STDOUT_FILENO);
             dup2(out[1], STDERR_FILENO);
             close(in[0]); close(in[1]); close(out[0]); close(out[1]);
+            // 关键: 必须 -G 3009 让 su 进程的 supplementary group 含 readproc.
+            // Android 13+ 默认 procfs 挂载选项: gid=3009,hidepid=invisible (=2).
+            // hidepid=2 时, 即使 uid=0 的 root, 若进程的 任一 group 不包含 3009(readproc),
+            // 也无法读取其它 uid 的 /proc/PID/{maps,mem,status,...} (返回 EACCES).
+            //
+            // 用 -G(--supp-group) 而非 -g(--group): 保留 primary gid=0,
+            // 只把 3009 加入 supplementary groups. 这样两边都得:
+            //   * 能读 /data/adb/ksu/.tmp/superkey (root:root 0600) 之类 root-only 文件
+            //   * 能读 /proc/<other_pid>/{maps,mem} (procfs hidepid 检查会遭到 readproc)
+            execlp("su", "su", "-G", "3009", (char*)nullptr);
+            // 退化方案: 部分 root 实现可能不支持 -G, 直接拉裸 su.
             execlp("su", "su", (char*)nullptr);
             _exit(127);
         }
@@ -207,6 +264,21 @@ private:
         // 设为非阻塞读
         int fl = fcntl(rfd_, F_GETFL, 0);
         if (fl >= 0) fcntl(rfd_, F_SETFL, fl | O_NONBLOCK);
+
+        // 早死检测: 50ms 后看 child 是否已经 _exit (execlp("su") 不存在 / 立即被拒).
+        // su 正常情况下会一直等 stdin, 不会自己退出.
+        usleep(50 * 1000);
+        int status = 0;
+        pid_t r = waitpid(pid_, &status, WNOHANG);
+        if (r == pid_) {
+            int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+            __android_log_print(ANDROID_LOG_ERROR, RTAG,
+                "su 子进程立即退出 code=%d (su 未安装 / execlp 失败 / 被 LSM 拒绝)", code);
+            close(wfd_); wfd_ = -1;
+            close(rfd_); rfd_ = -1;
+            pid_ = -1;
+            return false;
+        }
 
         __android_log_print(ANDROID_LOG_INFO, RTAG, "持久 root shell 启动 pid=%d", pid);
         return true;
@@ -227,53 +299,129 @@ private:
 };
 
 /**
- * 把 /proc/PID/mem 的一段 [addr, addr+size) 读到临时文件并 fread 到 out
- * 要求 size <= CHUNK_BYTES, 地址已 untag
+ * 跨进程读取 [addr, addr+size) 到 out 的指定偏移.
+ *
+ * 历史: 早期实现走 RootShell + 重命名后的 dd 把 /proc/PID/mem 的
+ *      [pageStart, pageStart+pageCount*PAGE) 内容写到 /data/local/tmp/<rand>,
+ *      再 fopen+fread 回来. 该路径有两个致命缺陷:
+ *
+ *   (A) toybox dd 的 `skip=N` 参数计算 lseek 偏移时存在 32-bit 溢出问题:
+ *       当 N * bs 超过 2^31 (~2GB) 后, dd 直接报
+ *         "dd: /proc/PID/mem: Permission denied"
+ *       (其实是 dd 内部 seek 失败被错误归类为 EACCES).
+ *       Android 用户进程虚拟地址空间是 39 ~ 48 bit, scudo:primary 一般
+ *       分配在 0x70_0000_0000 ~ 0x7F_FFFF_FFFF (~480GB) 区间, 任何典型
+ *       堆地址都会触发这个 dd bug, 表现为 “读取失败 (无数据)”.
+ *
+ *   (B) 即使 dd skip 不溢出, 跨进程读 /proc/PID/mem 还要求调用方 gid 在
+ *       readproc(3009) 组内 (Android 13+ procfs 默认 hidepid=invisible).
+ *
+ * 修复: 直接走 syscall 270 process_vm_readv. 它是内核为跨进程内存读专门
+ *       提供的接口 (API 23+ 即 Android 6.0+), 偏移和长度都是 64-bit, 不依赖
+ *       /proc/PID/mem, 不依赖 dd, 也不受 hidepid 限制 (但仍受 ptrace
+ *       检查约束 -- 我们持久 root shell uid=0, ptrace_may_access 直通).
+ *
+ *       走这条路必须由具备 CAP_SYS_PTRACE 的进程发起. mem_reader 的 JNI
+ *       层在 dobby app (uid=app) 中, 所以 readChunk 仍要委托给 RootShell:
+ *       让 root 子进程 exec 一个我们随附的 helper, helper 调 process_vm_readv
+ *       直接写到临时文件, 我们再 fread 回来.
+ *
+ *       helper 的实现见 PvrHelper.* 与 ensureRuntimeReady(): 它从 APK assets
+ *       拷贝到 paths().pvrHelper, 由 RootShell 启动.
  */
 ssize_t readChunk(int pid, uintptr_t addr, size_t size,
                   std::vector<uint8_t>& out, size_t outOffset) {
-    uintptr_t pageStart  = addr & ~(PAGE_SIZE - 1);
-    size_t    pageOff    = addr - pageStart;
-    size_t    pageCount  = (pageOff + size + PAGE_SIZE - 1) / PAGE_SIZE;
     const auto& P = paths();
 
+    // helper 的命令行: <pvrHelper> <pid> <addrHex> <size> <outFile>
     char cmd[768];
-    // 一次 shell 命令: 清 tmp + (重命名后的) dd 拉数据 + chmod
-    // 用变量赋值方式拼接 if/of, 让 ps 中的 cmdline 不那么显眼
     snprintf(cmd, sizeof(cmd),
-        "rm -f %s; I=/proc/%d/mem; O=%s; %s i\"f\"=$I o\"f\"=$O bs=%zu skip=%zu count=%zu "
-        "conv=noerror,sync 2>/dev/null; chmod 666 %s 2>/dev/null",
-        P.memTmp.c_str(), pid, P.memTmp.c_str(), P.ddBin.c_str(),
-        PAGE_SIZE, pageStart / PAGE_SIZE, pageCount, P.memTmp.c_str());
+        "rm -f %s; %s %d 0x%zx %zu %s 2>/dev/null; chmod 666 %s 2>/dev/null",
+        P.memTmp.c_str(),
+        P.ddBin.c_str(),  // 复用 ddBin 字段, ensureRuntimeReady 已把它替换为 helper
+        pid, (size_t)addr, size,
+        P.memTmp.c_str(),
+        P.memTmp.c_str());
 
     if (!RootShell::I().exec(cmd)) {
+        // 几乎都是 RootShell 超时 / 已 killLocked.
+        // 常见原因: PID 已退出, 或 helper 二进制缺失.
+        __android_log_print(ANDROID_LOG_ERROR, RTAG,
+            "RootShell exec helper 超时/失败 pid=%d addr=0x%zx size=%zu",
+            pid, (size_t)addr, size);
         return -1;
     }
 
     FILE* fp = fopen(P.memTmp.c_str(), "rb");
     if (!fp) {
+        // ENOENT: helper 调 process_vm_readv 失败 (target 已退出 / addr 在
+        // unmapped 区), 没创建输出文件.
         __android_log_print(ANDROID_LOG_WARN, RTAG,
-            "fopen tmp 失败 errno=%d %s", errno, strerror(errno));
+            "fopen tmp 失败 errno=%d %s pid=%d addr=0x%zx (target退出 或 addr 不在合法 VMA)",
+            errno, strerror(errno), pid, (size_t)addr);
         return -2;
     }
-    if (pageOff > 0) fseek(fp, (long)pageOff, SEEK_SET);
     size_t got = fread(out.data() + outOffset, 1, size, fp);
     fclose(fp);
+    if (got == 0) {
+        __android_log_print(ANDROID_LOG_WARN, RTAG,
+            "fread 返回 0 pid=%d addr=0x%zx size=%zu",
+            pid, (size_t)addr, size);
+    }
     return (ssize_t)got;
 }
 
-// 一次性初始化: 创建随机 tmp 目录, 把 /system/bin/dd 复制为随机名称
-// 这样 ps -A | grep dd 不会再命中我们的进程
+// 一次性初始化: 创建随机 tmp 目录, 把 libpvrhelper.so 复制到随机命名路径作为 helper.
+// libpvrhelper.so 是我们打包在 APK 内的 ARM64 ELF 可执行文件, 用 process_vm_readv
+// 跨进程读内存. 之所以借用 dd-style "ddBin" 字段名是历史原因, 路径用途已变.
 static void ensureRuntimeReady() {
     static std::once_flag once;
     std::call_once(once, []{
         const auto& P = paths();
+
+        // 通过 dladdr 找到本 .so 所在目录 = nativeLibraryDir
+        // 例如 /data/app/~~xxxxx/com.example.dobbyproject-zzz/lib/arm64
+        Dl_info info{};
+        std::string libDir;
+        if (dladdr((void*)&ensureRuntimeReady, &info) && info.dli_fname) {
+            std::string fn = info.dli_fname;
+            auto slash = fn.find_last_of('/');
+            if (slash != std::string::npos) libDir = fn.substr(0, slash);
+        }
+        if (libDir.empty()) {
+            __android_log_print(ANDROID_LOG_ERROR, RTAG,
+                "ensureRuntimeReady: dladdr 拿不到 nativeLibraryDir, helper 无法部署");
+            return;
+        }
+        std::string helperSrc = libDir + "/libpvrhelper.so";
+
+        // 注意: 目录权限必须给 others 留一个 +x (搜索位), 否则非 root 的 app 进程
+        // 无法 fopen 目录下的临时文件 (即使文件本身已 chmod 666). 这里用 711:
+        // others 可进入并按名访问文件, 但无法 ls 列出目录 (无 +r),
+        // 仍然能避免反作弊扫 `/data/local/tmp/.*` 时拿到完整文件名清单.
+        // 注意: 这里**不能**调 MemReader::runRootShellCapture, 因为后者也会
+        //       调 ensureRuntimeReady(), 在 std::call_once 同线程内重入会死锁
+        //       (C++ once_flag 同线程递归是未定义/deadlock). 直接走 RootShell.
+        std::string capPath = P.dir + "/" + randHex(3);
         std::string cmd =
-            "mkdir -p " + P.dir + " && chmod 700 " + P.dir + " && "
-            "([ -x " + P.ddBin + " ] || (cp /system/bin/dd " + P.ddBin +
-            " 2>/dev/null || cp /system/bin/toybox " + P.ddBin + " 2>/dev/null) && "
-            "chmod 755 " + P.ddBin + ")";
-        RootShell::I().exec(cmd);
+            "mkdir -p " + P.dir + " && chmod 711 " + P.dir + " && "
+            "([ -x " + P.ddBin + " ] || (cp " + helperSrc + " " + P.ddBin +
+            " 2>/dev/null && chmod 755 " + P.ddBin + ")) && ls -l " + P.ddBin +
+            " > " + capPath + " 2>&1; chmod 666 " + capPath + " 2>/dev/null";
+        bool ok = RootShell::I().exec(cmd);
+        std::string out;
+        if (ok) {
+            FILE* fp = fopen(capPath.c_str(), "rb");
+            if (fp) {
+                char buf[1024]; size_t n;
+                while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) out.append(buf, n);
+                fclose(fp);
+            }
+            unlink(capPath.c_str());
+        }
+        __android_log_print(ANDROID_LOG_INFO, RTAG,
+            "ensureRuntimeReady ok=%d helperSrc=%s helperDst=%s result=%s",
+            (int)ok, helperSrc.c_str(), P.ddBin.c_str(), out.c_str());
     });
 }
 
@@ -287,6 +435,10 @@ namespace MemReader {
 bool runRootShell(const std::string& cmd) {
     ensureRuntimeReady();
     return RootShell::I().exec(cmd);
+}
+
+bool isRootAuthDenied() {
+    return RootShell::I().isAuthDenied();
 }
 
 bool runRootShellCapture(const std::string& cmd, std::string& out) {
@@ -370,10 +522,13 @@ bool readMaps(int pid, std::string& out) {
     const auto& P = paths();
 
     char cmd[512];
-    // 不再用 cat: 改用 shell 内置 read 循环, ps 列表里看不到 cat 命令.
-    // 输出经 printf 写到 mapsTmp, 再由本进程 fopen 读回.
+    // shell 内置 `while IFS= read -r L; do printf ...; done` 对几万行 maps
+    // (UE 游戏常见 8k-30k 行) 性能极差: 每行做一次 read+printf, 总耗时
+    // 经测会 >15s 直接撞 RootShell 超时. 改用 cat 一次性 dump.
+    // 命令行用变量赋值拼接 ("C=cat; $C $M") 让 ps 中 cmdline 不直接出现
+    // "cat /proc/PID/maps" 这种过强的特征字符串.
     snprintf(cmd, sizeof(cmd),
-        "M=/proc/%d/maps; T=%s; : > $T; while IFS= read -r L; do printf '%%s\\n' \"$L\"; done < $M >> $T 2>/dev/null; chmod 666 $T 2>/dev/null",
+        "C=ca\"\"t; M=/proc/%d/maps; T=%s; $C $M > $T 2>/dev/null; chmod 666 $T 2>/dev/null",
         pid, P.mapsTmp.c_str());
     if (!RootShell::I().exec(cmd)) {
         __android_log_print(ANDROID_LOG_WARN, RTAG,
