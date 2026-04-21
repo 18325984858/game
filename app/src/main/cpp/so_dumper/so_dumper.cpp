@@ -835,9 +835,48 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath,
         }
 
         if (dynsymCount == 0) {
-            // 兜底: 从 symtab 到 strtab 估算
+            // 兜底 1: 从 symtab 到 strtab 估算 (要求 strtab 紧跟 symtab)
             if (di.dt_symtab && di.dt_strtab > di.dt_symtab && symEntSize > 0) {
                 dynsymCount = (di.dt_strtab - di.dt_symtab) / symEntSize;
+                LOG(LOG_LEVEL_INFO, DTAG " dynsym 兜底1 (strtab-symtab): count=%zu", dynsymCount);
+            }
+        }
+
+        if (dynsymCount == 0) {
+            // 兜底 2: 扫描所有 RELA / JMPREL 条目, 取 r_sym 最大值 + 1
+            // 适用场景: ACE 等保护擦掉了 DT_HASH 内容 (nchain=0), 且没有 DT_GNU_HASH,
+            //          且 .dynstr 在 .dynsym 之前无法用兜底 1.
+            // 原理: 每条重定位条目都引用一个符号 index; 该 index 必 < dynsymCount,
+            //       所以 max(r_sym)+1 是 dynsymCount 的可靠下界 (通常等于真实值).
+            uint32_t maxSym = 0;
+            auto scanRela = [&](size_t base, size_t sz, size_t entSize) {
+                if (!base || !sz || !entSize) return;
+                for (size_t off = base; off + entSize <= base + sz && off + entSize <= outFileSize;
+                     off += entSize) {
+                    uint32_t symIdx;
+                    if (is64) {
+                        // Elf64_Rela: r_offset(8) r_info(8) r_addend(8); r_sym = r_info >> 32
+                        uint64_t r_info = *reinterpret_cast<uint64_t*>(outBuf + off + 8);
+                        symIdx = (uint32_t)(r_info >> 32);
+                    } else {
+                        // Elf32_Rel(a): r_offset(4) r_info(4) [r_addend(4)]; r_sym = r_info >> 8
+                        uint32_t r_info = *reinterpret_cast<uint32_t*>(outBuf + off + 4);
+                        symIdx = r_info >> 8;
+                    }
+                    if (symIdx > maxSym && symIdx < 0x100000) maxSym = symIdx;
+                }
+            };
+            size_t relaEnt = di.dt_relaent ? di.dt_relaent : (is64 ? 24 : 12);
+            size_t relEnt  = di.dt_relent  ? di.dt_relent  : (is64 ? 16 : 8);
+            scanRela(di.dt_rela, di.dt_relasz, relaEnt);
+            scanRela(di.dt_rel,  di.dt_relsz,  relEnt);
+            // .rela.plt / .rel.plt
+            size_t jmpEnt = ((di.dt_pltrel == DT_RELA) || is64) ? relaEnt : relEnt;
+            scanRela(di.dt_jmprel, di.dt_pltrelsz, jmpEnt);
+            if (maxSym > 0) {
+                dynsymCount = maxSym + 1;
+                LOG(LOG_LEVEL_WARN, DTAG " dynsym 兜底2 (扫 RELA r_sym 最大值): count=%zu"
+                                          " — 通常表明 DT_HASH 被反逆向工具擦零", dynsymCount);
             }
         }
         size_t dynsymSize = dynsymCount * symEntSize;
@@ -851,6 +890,29 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath,
             uint32_t nbucket = *reinterpret_cast<uint32_t*>(outBuf + di.dt_hash);
             uint32_t nchain  = *reinterpret_cast<uint32_t*>(outBuf + di.dt_hash + 4);
             hashSize = 8 + (nbucket + nchain) * 4;
+        }
+
+        // --- 5e2: 重建被反逆向工具擦零的 .hash 表 ---
+        // bionic 自 Android 6 起优先使用 DT_GNU_HASH, DT_HASH 只是兼容字段,
+        // 因此运行时几乎不读 .hash, ACE 等保护常把这块清零让 dumper 拿不到 nchain.
+        // 我们用上面已得的 dynsymCount 重建一个最简但合法的 .hash:
+        //   nbucket=1, nchain=dynsymCount, bucket[0]=0, chain[0..N-1]=0
+        // 这样 IDA / readelf 加载时能正确解析符号数, .hash 链空也不影响静态分析.
+        if (di.dt_hash && dynsymCount > 0 && hashSize <= 8) {
+            size_t neededHashSize = 8 + (1 + dynsymCount) * 4;
+            if (di.dt_hash + neededHashSize <= outFileSize) {
+                uint32_t* h = reinterpret_cast<uint32_t*>(outBuf + di.dt_hash);
+                h[0] = 1;                          // nbucket
+                h[1] = (uint32_t)dynsymCount;      // nchain
+                h[2] = 0;                          // bucket[0]
+                for (size_t i = 0; i < dynsymCount; i++) h[3 + i] = 0;  // chain[]
+                hashSize = neededHashSize;
+                LOG(LOG_LEVEL_WARN, DTAG " .hash 已被运行时清零, 重建为 nbucket=1 nchain=%zu (size=0x%zx)",
+                                          dynsymCount, hashSize);
+            } else {
+                LOG(LOG_LEVEL_WARN, DTAG " .hash 重建跳过: 重建后越界 (need=0x%zx, fileEnd=0x%zx)",
+                                          neededHashSize, outFileSize - di.dt_hash);
+            }
         }
 
         // --- 5f: 计算 .gnu.hash 大小 ---
