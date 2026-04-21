@@ -155,6 +155,7 @@ private:
     int   wfd_ = -1;    // 写给 su 的 stdin
     int   rfd_ = -1;    // 读 su 的 stdout
     bool  authDenied_ = false;
+    bool  alive_ = false;  // 双 fork 守护化后, su 不再是本进程子进程, 用 flag 跟踪
 
     // 在锁内发一条命令并等 DONE marker, timeoutMs 为总超时.
     bool execLocked(const std::string& cmd, int timeoutMs) {
@@ -194,12 +195,8 @@ private:
     }
 
     bool ensureAliveLocked() {
-        if (pid_ > 0) {
-            int status = 0;
-            pid_t r = waitpid(pid_, &status, WNOHANG);
-            if (r == 0) return true;
-            killLocked();
-        }
+        if (alive_ && wfd_ >= 0 && rfd_ >= 0) return true;
+        killLocked();
         if (!spawnLocked()) return false;
 
         // 刚 fork 出的 su, 用 1.5s ping 探测是否已授权 / 是否能响应.
@@ -223,15 +220,26 @@ private:
             return false;
         }
 
-        pid_t pid = fork();
-        if (pid < 0) {
+        // 双 fork (daemonize) 让 su 被 init 重养, PPid 变成 1.
+        // 单 fork 时 su (及其子 sh, 再到 dd) 的 PPid 链回溯能找到 app 进程,
+        // ACE 沿 /proc/<dd>/status 的 PPid 上溯发现祖先含 zygote-app 就把
+        // /proc/<game>/mem 对应页 read 静默返零. 双 fork 后整条链祖先=init,
+        // ACE 看不出 dd 跟 app 的关系, 那些被过滤的 .text 页就读得到.
+        pid_t mid = fork();
+        if (mid < 0) {
             LOG(LOG_LEVEL_ERROR, RTAG " fork 失败 errno=%d", errno);
             close(in[0]); close(in[1]); close(out[0]); close(out[1]);
             return false;
         }
 
-        if (pid == 0) {
-            // child
+        if (mid == 0) {
+            // intermediate child: setsid + 二次 fork, 立即退出.
+            setsid();
+            pid_t gc = fork();
+            if (gc < 0) _exit(125);
+            if (gc > 0) _exit(0);   // 中间进程退出, grandchild 被 init 重养
+
+            // grandchild: 真正 exec su
             dup2(in[0],  STDIN_FILENO);
             dup2(out[1], STDOUT_FILENO);
             dup2(out[1], STDERR_FILENO);
@@ -255,39 +263,40 @@ private:
         close(in[0]); close(out[1]);
         wfd_ = in[1];
         rfd_ = out[0];
-        pid_ = pid;
+        pid_ = -1;     // grandchild 不是本进程的子进程, 无法 waitpid
 
         // 设为非阻塞读
         int fl = fcntl(rfd_, F_GETFL, 0);
         if (fl >= 0) fcntl(rfd_, F_SETFL, fl | O_NONBLOCK);
 
-        // 早死检测: 50ms 后看 child 是否已经 _exit (execlp("su") 不存在 / 立即被拒).
-        // su 正常情况下会一直等 stdin, 不会自己退出.
-        usleep(50 * 1000);
+        // 同步等中间进程退出 (microseconds 量级), 拿其退出码判断 grandchild fork 是否成功.
         int status = 0;
-        pid_t r = waitpid(pid_, &status, WNOHANG);
-        if (r == pid_) {
-            int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-            LOG(LOG_LEVEL_ERROR, RTAG " su 子进程立即退出 code=%d (su 未安装 / execlp 失败 / 被 LSM 拒绝)", code);
+        if (waitpid(mid, &status, 0) != mid) {
+            LOG(LOG_LEVEL_ERROR, RTAG " 等中间进程 失败 errno=%d", errno);
             close(wfd_); wfd_ = -1;
             close(rfd_); rfd_ = -1;
-            pid_ = -1;
+            return false;
+        }
+        int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+        if (code != 0) {
+            LOG(LOG_LEVEL_ERROR, RTAG " 中间进程异常退出 code=%d (二次 fork 失败?)", code);
+            close(wfd_); wfd_ = -1;
+            close(rfd_); rfd_ = -1;
             return false;
         }
 
-        LOG(LOG_LEVEL_INFO, RTAG " 持久 root shell 启动 pid=%d", pid);
+        alive_ = true;
+        LOG(LOG_LEVEL_INFO, RTAG " 持久 root shell 启动 (双 fork daemon, PPid=1)");
         return true;
     }
 
     void killLocked() {
         if (wfd_ >= 0) { close(wfd_); wfd_ = -1; }
         if (rfd_ >= 0) { close(rfd_); rfd_ = -1; }
-        if (pid_ > 0) {
-            kill(pid_, SIGKILL);
-            int status;
-            waitpid(pid_, &status, 0);
-            pid_ = -1;
-        }
+        // grandchild 已被 init 收养, 不再是我们的子进程, 关掉 pipe 后
+        // 它会在下次 read stdin 时收到 EOF 自行退出, 由 init 收尸.
+        pid_ = -1;
+        alive_ = false;
     }
 
     RootShell() { spawnLocked(); }
