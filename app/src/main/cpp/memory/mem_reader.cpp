@@ -794,16 +794,19 @@ ssize_t readMemoryViaProcMem(int pid, uintptr_t address, size_t size,
             // 用 shell 变量包 if=/of= 避免静态扫描特征.
             // conv=sync,noerror: 遇 PROT_NONE 哨兵页 (read EIO) 填零继续, 不
             // 中途退出. 这样一次 dd 总能读 cntPg*4096 字节, 哨兵页表现为零.
+            // setsid: 让 dd 脱离 app 的 controlling session/pgid, 绕过
+            // ACE 基于 sid 路径回溯到 zygote 的进程身份过滤 (实测对部分
+            // .text 页可多救回, 不带 setsid 时 ACE 直接返 0).
             snprintf(buf, sizeof(buf),
                      "I=/proc/%d/mem; O=%s; "
-                     "/system/bin/dd i\"f\"=$I o\"f\"=$O bs=4096 skip=%zu count=%zu "
+                     "/system/bin/setsid /system/bin/dd i\"f\"=$I o\"f\"=$O bs=4096 skip=%zu count=%zu "
                      "conv=sync,noerror,notrunc 2>/dev/null; chmod 666 %s 2>/dev/null",
                      pid, P.memTmp.c_str(), skipPg, cntPg, P.memTmp.c_str());
         } else {
             // bs=1 路径不能用 conv=sync (会按 1 字节填零), 保持原行为
             snprintf(buf, sizeof(buf),
                      "I=/proc/%d/mem; O=%s; "
-                     "/system/bin/dd i\"f\"=$I o\"f\"=$O bs=1 skip=%zu count=%zu "
+                     "/system/bin/setsid /system/bin/dd i\"f\"=$I o\"f\"=$O bs=1 skip=%zu count=%zu "
                      "conv=notrunc 2>/dev/null; chmod 666 %s 2>/dev/null",
                      pid, P.memTmp.c_str(),
                      (size_t)curAddr, want, P.memTmp.c_str());
