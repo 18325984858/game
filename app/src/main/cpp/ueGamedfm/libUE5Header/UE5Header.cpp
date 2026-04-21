@@ -1,7 +1,7 @@
 #include "UE5Header.h"
 #include "../ilbUE5Dumper/UE5DfmDumper.h"
 #include "../ilbUE5Struct/UE5DfmStruct.h"
-#include "../../Log/log.h"
+#include "../../core/log/log.h"
 #include <fstream>
 #include <sstream>
 #include <vector>

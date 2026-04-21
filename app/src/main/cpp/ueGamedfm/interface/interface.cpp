@@ -9,7 +9,7 @@
  *    - 所有偏移通过 offsetof(结构体, 成员) 获取
  */
 #include "interface.h"
-#include "../../Log/log.h"
+#include "../../core/log/log.h"
 
 #include <cstring>
 #include <cstdio>

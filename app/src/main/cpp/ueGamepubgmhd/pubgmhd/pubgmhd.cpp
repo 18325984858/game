@@ -2,7 +2,7 @@
 #include "../libUE4Struct/ilbUE4Struct.h"
 #include "../interface/interface.h"
 #include "../Draw/UE4Draw.h"
-#include "../../Log/log.h"
+#include "../../core/log/log.h"
 
 #include <thread>
 #include <chrono>

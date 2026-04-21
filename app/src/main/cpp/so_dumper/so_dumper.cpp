@@ -7,8 +7,8 @@
  *          - listRunningApps 仍用 popen("su -c ps") 做一次性进程枚举.
  */
 #include "so_dumper.h"
-#include "../Log/log.h"
-#include "../ReadProcessMemory/mem_reader.h"
+#include "../core/log/log.h"
+#include "../memory/mem_reader.h"
 
 #include <cstdio>
 #include <cstring>

@@ -4,7 +4,7 @@
 
 #include "Symbol.h"
 #include "../../Dobby/include/dobby.h"
-#include "../../Log/log.h"
+#include "../../core/log/log.h"
 
 
 Symbol::Symbol::Symbol(const std::string & sopath):m_sopath(sopath),m_Mmodule(nullptr) {

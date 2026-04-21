@@ -8,7 +8,7 @@
 #include <mutex>
 #include <thread>
 
-#include "../Log/log.h"
+#include "../core/log/log.h"
 #include "../AndroidSurfaceImgui/includes/AImGui.h"
 
 #define OLOG(level, fmt, ...) LOG(level, fmt, ##__VA_ARGS__)

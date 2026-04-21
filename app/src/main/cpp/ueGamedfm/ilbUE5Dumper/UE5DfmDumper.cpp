@@ -1,6 +1,6 @@
 #include "UE5DfmDumper.h"
 #include "UE5DfmStruct.h"
-#include "../../Log/log.h"
+#include "../../core/log/log.h"
 #include <algorithm>
 #include <cerrno>
 #include <csetjmp>

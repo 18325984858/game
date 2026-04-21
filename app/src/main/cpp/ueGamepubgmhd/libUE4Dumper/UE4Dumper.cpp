@@ -1,6 +1,6 @@
 ﻿#include "UE4Dumper.h"
 #include "../libUE4Struct/ilbUE4Struct.h"
-#include "../../Log/log.h"
+#include "../../core/log/log.h"
 #include <algorithm>
 #include <cerrno>
 #include <sys/stat.h>

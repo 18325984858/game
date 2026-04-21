@@ -104,19 +104,19 @@ find_library(
 # used in the AndroidManifest.xml file.
 add_library(${CMAKE_PROJECT_NAME} SHARED
         # List C/C++ source files with relative paths to this CMakeLists.txt.
-        publicOverlay/PublicOverlayRenderer.cpp
+        core/overlay/PublicOverlayRenderer.cpp
         unityGame/native-lib.cpp
         unityGame/unitystart.cpp
         "unityGame/Draw/Draw.cpp"
-        "Log/log.cpp"
+        "core/log/log.cpp"
         "unityGame/Symbol/Symbol.cpp"
-        "File/file.cpp"
+        "core/file/file.cpp"
         "unityGame/UnityApi/unityapi.cpp"
         "unityGame/li2cppDumper/li2cppdumper.cpp"
         "unityGame/lol/lolm.cpp"
         "unityGame/interface/interface.cpp"
         "unityGame/il2cppHeader/il2cppHeader.cpp"
-        "Injector/Injector.cpp"
+        "injector/Injector.cpp"
         "ueGamepubgmhd/libUE4Struct/ilbUE4Struct.cpp"
         "ueGamepubgmhd/libUE4Dumper/UE4Dumper.cpp"
         "ueGamepubgmhd/libUE4Header/UE4Header.cpp"
@@ -131,12 +131,12 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
         "ueGamedfm/interface/interface.cpp"
         "ueGamedfm/dfm/dfm.cpp"
         "ueGamedfm/Draw/DfmDraw.cpp"
-        "soDumper/so_dumper.cpp"
-        "soDumper/so_dumper_jni.cpp"
-        "ReadProcessMemory/mem_reader.cpp"
-        "ReadProcessMemory/mem_reader_jni.cpp"
-        "ReadProcessMemory/kp_ctl.cpp"
-        "KpmInterface/kpm_inject_hide_jni.cpp"
+        "so_dumper/so_dumper.cpp"
+        "so_dumper/so_dumper_jni.cpp"
+        "memory/mem_reader.cpp"
+        "memory/mem_reader_jni.cpp"
+        "kpatch/kp_ctl.cpp"
+        "kpatch/kpm_inject_hide_jni.cpp"
 )
 
 # Specifies libraries CMake should link to your target library. You
@@ -205,9 +205,9 @@ endif()
 # 伪装�?.so 文件, �?Gradle 自动打包�?APK
 ######################################################################################################
 add_executable(injector
-        "Injector/injector_main.cpp"
-        "Injector/Injector.cpp"
-        "Log/log.cpp"
+        "injector/injector_main.cpp"
+        "injector/Injector.cpp"
+        "core/log/log.cpp"
 )
 
 target_link_libraries(injector
@@ -238,7 +238,7 @@ set_target_properties(injector PROPERTIES
 # 同样伪装为 lib*.so 让 Gradle 自动打包到 APK 的 jniLibs 中.
 ######################################################################################################
 add_executable(pvrhelper
-        "PvrHelper/pvr_helper.c"
+        "pvr_helper/pvr_helper.c"
 )
 
 # 不连 log: helper 内部不打印任何字符串, 减少 ELF symbol/strings 痕迹

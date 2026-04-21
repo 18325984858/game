@@ -8,7 +8,7 @@
  *          - 提供地址归属查询 / 字节模式搜索
  */
 #include "mem_reader.h"
-#include "../Log/log.h"
+#include "../core/log/log.h"
 
 #include <cstdio>
 #include <cstdlib>

@@ -2,10 +2,10 @@
 #include <string>
 #include <android/log.h>
 
-#include "../Log/log.h"
+#include "../core/log/log.h"
 #include "unitystart.h"
-#include "../Injector/Injector.h"
-#include "../ReadProcessMemory/kp_ctl.h"
+#include "../injector/Injector.h"
+#include "../kpatch/kp_ctl.h"
 
 struct CommandResult {
     int exitCode;

@@ -1,7 +1,7 @@
 #include "UE4Header.h"
 #include "../libUE4Dumper/UE4Dumper.h"
 #include "../libUE4Struct/ilbUE4Struct.h"
-#include "../../Log/log.h"
+#include "../../core/log/log.h"
 #include <fstream>
 #include <sstream>
 #include <vector>

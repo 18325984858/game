@@ -4,7 +4,7 @@
  *          从 loot_scan.js (Frida) 转写, 遵循 pubgmhd.cpp 代码规范
  */
 #include "dfm.h"
-#include "../../Log/log.h"
+#include "../../core/log/log.h"
 #include "../ilbUE5Struct/UE5DfmStruct.h"
 #include "../interface/interface.h"
 

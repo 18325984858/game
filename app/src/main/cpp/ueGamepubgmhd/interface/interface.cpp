@@ -1,5 +1,5 @@
 #include "interface.h"
-#include "../../Log/log.h"
+#include "../../core/log/log.h"
 
 #include <cstring>
 #include <cstdio>

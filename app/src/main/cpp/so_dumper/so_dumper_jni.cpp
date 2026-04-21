@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 #include "so_dumper.h"
-#include "../Log/log.h"
+#include "../core/log/log.h"
 
 #define DTAG "[SoDumperJNI]"
 

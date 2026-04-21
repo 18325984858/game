@@ -3,7 +3,7 @@
 //
 
 #include "li2cppdumper.h"
-#include "../../Log/log.h"
+#include "../../core/log/log.h"
 #include <sstream>
 #include <vector>
 #include <iomanip>

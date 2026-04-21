@@ -1,5 +1,5 @@
 #include "uestart.h"
-#include "../Log/log.h"
+#include "../core/log/log.h"
 #include "UE5DfmDumper.h"
 #include "UE5DfmStruct.h"
 #include "libUE5Header/UE5Header.h"

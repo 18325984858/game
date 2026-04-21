@@ -3,7 +3,7 @@
 //
 
 #include "il2cppHeader.h"
-#include "../../Log/log.h"
+#include "../../core/log/log.h"
 #include <sstream>
 #include <fstream>
 #include <set>

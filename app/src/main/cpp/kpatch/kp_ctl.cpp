@@ -6,7 +6,7 @@
  *  不能在用户态修改。仅命名空间 / 日志 tag / 文件名做了中性化。
  */
 #include "kp_ctl.h"
-#include "../Log/log.h"
+#include "../core/log/log.h"
 
 #include <cstdio>
 #include <cstdlib>

@@ -4,7 +4,7 @@
 
 #include "lolm.h"
 #include "../UnityApi/unityapi.h"
-#include "../../Log/log.h"
+#include "../../core/log/log.h"
 #include "LolOffset.h"
 #include <array>
 #include <cmath>

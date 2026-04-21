@@ -13,9 +13,9 @@
 #include <android/log.h>
 
 #include "mem_reader.h"
-#include "../soDumper/so_dumper.h"
-#include "../Log/log.h"
-#include "kp_ctl.h"
+#include "../so_dumper/so_dumper.h"
+#include "../core/log/log.h"
+#include "../kpatch/kp_ctl.h"
 
 #include <thread>
 

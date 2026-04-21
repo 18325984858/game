@@ -3,7 +3,7 @@
 //
 
 #include "unitystart.h"
-#include "../Log/log.h"
+#include "../core/log/log.h"
 #include "./lol/lolm.h"
 #include "./il2cppHeader/il2cppHeader.h"
 #include "./li2cppDumper/li2cppdumper.h"

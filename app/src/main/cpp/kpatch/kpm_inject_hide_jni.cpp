@@ -23,9 +23,9 @@
 #include <cstdio>
 #include <android/log.h>
 
-#include "../ReadProcessMemory/kp_ctl.h"
-#include "../soDumper/so_dumper.h"
-#include "../Log/log.h"
+#include "../kpatch/kp_ctl.h"
+#include "../so_dumper/so_dumper.h"
+#include "../core/log/log.h"
 
 #define KTAG "[KpmInjectHideJNI]"
 

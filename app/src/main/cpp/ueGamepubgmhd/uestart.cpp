@@ -1,5 +1,5 @@
 #include "uestart.h"
-#include "../Log/log.h"
+#include "../core/log/log.h"
 #include "libUE4Dumper/UE4Dumper.h"
 #include "libUE4Header/UE4Header.h"
 #include "interface/interface.h"
