@@ -212,10 +212,22 @@ private:
         // 双 fork 只能改 PPid, cgroup 是按 fork 时父进程继承的, 仍是
         // /apps/uid_<app>/pid_<app>. ACE 沿 /proc/<dd>/cgroup 检查发现
         // 在 app cgroup 内就把 /proc/<game>/mem 对应页 read 静默返零.
-        // 把自己 PID 写入 root cgroup.procs (su 已 root, 有写权限) 即可
-        // 迁出. 后续 fork 出来的 dd 自动继承 root cgroup.
-        // 静默失败兜底: 部分 ROM 可能拒绝写入, 但不影响主流程.
-        execLocked("echo $$ > /sys/fs/cgroup/cgroup.procs 2>/dev/null; echo $$ > /dev/cpuset/cgroup.procs 2>/dev/null; true", /*timeoutMs=*/2000);
+        //
+        // cgroup v1 cpuset (Android 还在用 hybrid) 限制: 进程只能往自己
+        // 当前 cgroup 的 子cgroup 迁, 不能往兄弟 / 祖先迁. 所以 daemon
+        // 自己往 / 写不了 (Permission denied). 解决: 让 dd 在执行前用
+        // 另一种方式 — 通过 /proc/self/cgroup 读出当前位置, 然后写入
+        // tasks 文件. 但还是要符合 cgroup 移动规则...
+        //
+        // 实际可行: 直接写 /dev/cpuset/cgroup.procs 把自己 PID 塞进去.
+        // 测试发现 daemon (cpuset:/top-app) 写自己进 / 时 EACCES, 但
+        // 写到任何子cgroup (/foreground/, /restricted/) 都可能成功.
+        // 重要的是离开 /top-app, ACE 看 cgroup 路径 != app cgroup 即可.
+        execLocked("for D in / /foreground /background /system-background /restricted; do "
+                   "echo $$ > /dev/cpuset$D/cgroup.procs 2>/dev/null && break; "
+                   "done; "
+                   "echo $$ > /sys/fs/cgroup/cgroup.procs 2>/dev/null; true",
+                   /*timeoutMs=*/2000);
         return true;
     }
 
