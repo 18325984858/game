@@ -237,8 +237,21 @@ std::vector<ModuleInfo> listModules(int pid) {
             displayName = std::string("[hidden] ") + displayName;
         }
 
-        // 不再只按 path 合并, 否则同一个 base.apk 里的多个原生库会被错误折叠。
-        std::string moduleKey = pathStr + "|" + perms + "|" + std::to_string(offset);
+        // 合并策略:
+        //   - 真正的 .so 文件 (路径以 .so 结尾或含 .so.): 按 path 合并为一条,
+        //     这样 r-xp / r--p / rw-p 多段会归为同一个模块, 用户不再看到一堆重复
+        //     条目, 也保证传给 dumpAndFixSo 的 baseAddr 是 ELF 头所在段 (r-xp).
+        //   - .apk / memfd / anon: 仍按 path|perms|offset 区分, 因为 base.apk
+        //     可能直接映射出多个不同的原生库.
+        auto isRealSoPath = [](const std::string& p) -> bool {
+            if (p.size() >= 3 && p.compare(p.size() - 3, 3, ".so") == 0) return true;
+            if (p.find(".so.") != std::string::npos) return true; // libfoo.so.1.2
+            return false;
+        };
+        const bool mergeByPath = isRealSoPath(pathStr);
+        std::string moduleKey = mergeByPath
+                ? pathStr
+                : (pathStr + "|" + perms + "|" + std::to_string(offset));
 
         if (moduleMap.find(moduleKey) == moduleMap.end()) {
             ModuleAcc acc;
@@ -252,7 +265,18 @@ std::vector<ModuleInfo> listModules(int pid) {
             moduleMap[moduleKey] = acc;
         } else {
             auto& acc = moduleMap[moduleKey];
-            if (start < acc.info.baseAddr) acc.info.baseAddr = start;
+            // 优先把 r-xp 段 (含 ELF 头) 当作主映射记录的 base/offset,
+            // 否则保留地址最低的段.
+            const bool incomingIsExec = (strchr(perms, 'x') != nullptr);
+            const bool currentIsExec = (acc.info.perms.find('x') != std::string::npos);
+            const bool preferIncoming =
+                    (incomingIsExec && !currentIsExec) ||
+                    (incomingIsExec == currentIsExec && start < acc.info.baseAddr);
+            if (preferIncoming) {
+                acc.info.baseAddr = start;
+                acc.info.fileOffset = offset;
+                acc.info.perms = perms;
+            }
             if (end > acc.info.endAddr) acc.info.endAddr = end;
             acc.mappedBytes += (end - start);
         }
