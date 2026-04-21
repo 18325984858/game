@@ -791,13 +791,16 @@ ssize_t readMemoryViaProcMem(int pid, uintptr_t address, size_t size,
         if ((curAddr & (PAGE - 1)) == 0 && (want & (PAGE - 1)) == 0) {
             size_t skipPg = curAddr / PAGE;
             size_t cntPg  = want / PAGE;
-            // 用 shell 变量包 if=/of= 避免静态扫描特征
+            // 用 shell 变量包 if=/of= 避免静态扫描特征.
+            // conv=sync,noerror: 遇 PROT_NONE 哨兵页 (read EIO) 填零继续, 不
+            // 中途退出. 这样一次 dd 总能读 cntPg*4096 字节, 哨兵页表现为零.
             snprintf(buf, sizeof(buf),
                      "I=/proc/%d/mem; O=%s; "
                      "/system/bin/dd i\"f\"=$I o\"f\"=$O bs=4096 skip=%zu count=%zu "
-                     "conv=notrunc 2>/dev/null; chmod 666 %s 2>/dev/null",
+                     "conv=sync,noerror,notrunc 2>/dev/null; chmod 666 %s 2>/dev/null",
                      pid, P.memTmp.c_str(), skipPg, cntPg, P.memTmp.c_str());
         } else {
+            // bs=1 路径不能用 conv=sync (会按 1 字节填零), 保持原行为
             snprintf(buf, sizeof(buf),
                      "I=/proc/%d/mem; O=%s; "
                      "/system/bin/dd i\"f\"=$I o\"f\"=$O bs=1 skip=%zu count=%zu "
