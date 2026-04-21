@@ -669,6 +669,65 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath,
 
         LOG(LOG_LEVEL_INFO, DTAG " R-X /proc/mem 重读完成: 扫描 %zu 页, 回填 %zu 页, 仍全零 %zu 页",
             totalPagesScanned, totalPagesPatched, totalPagesStillZero);
+
+        // ── Step 4c: 残留全零页延迟单独重试 ──
+        //
+        // 实测 ACE 对部分 .text/.rodata 页是"时序性清零"防护: 大块 dd 那一刻
+        // 该页是 0, 但隔几百毫秒后单页 dd 又能读到真代码. 对每页延迟 + 单独
+        // 重试 N 次, 可以把这种页捞回来. PROT_NONE 真哨兵页则永远 0, 跳过.
+        if (totalPagesStillZero > 0) {
+            const int  RETRY_ROUNDS = 3;       // 总共重试 3 轮
+            const int  RETRY_DELAY_MS = 250;   // 每轮间隔 250ms
+            size_t retryRecovered = 0;
+            size_t retryStillZero = 0;
+            std::vector<uint8_t> pbuf;
+            // 收集所有残留全零页 (vaddr)
+            std::vector<size_t> zeroPageVaddrs;
+            for (size_t si = 0; si < loadSegs.size(); si++) {
+                const auto& seg = loadSegs[si];
+                if (!(seg.flags & PF_X)) continue;
+                if (seg.flags & PF_W) continue;
+                if (seg.filesz == 0) continue;
+                size_t maxLen = seg.filesz;
+                if (seg.vaddr + maxLen > outFileSize) maxLen = outFileSize - seg.vaddr;
+                for (size_t off = 0; off < maxLen; off += PAGE) {
+                    size_t len = std::min(PAGE, maxLen - off);
+                    uint8_t* p = outBuf + seg.vaddr + off;
+                    bool z = true;
+                    for (size_t k = 0; k < len; k++) {
+                        if (p[k] != 0) { z = false; break; }
+                    }
+                    if (z) zeroPageVaddrs.push_back(seg.vaddr + off);
+                }
+            }
+            for (int round = 0; round < RETRY_ROUNDS && !zeroPageVaddrs.empty(); round++) {
+                usleep(RETRY_DELAY_MS * 1000);
+                std::vector<size_t> stillZero;
+                stillZero.reserve(zeroPageVaddrs.size());
+                for (size_t v : zeroPageVaddrs) {
+                    uintptr_t memAddr = baseAddr + v;
+                    ssize_t got = MemReader::readMemoryViaProcMem(pid, memAddr, PAGE, pbuf);
+                    if (got > 0) {
+                        bool z = true;
+                        for (ssize_t k = 0; k < got; k++) {
+                            if (pbuf[(size_t)k] != 0) { z = false; break; }
+                        }
+                        if (!z) {
+                            memcpy(outBuf + v, pbuf.data(), (size_t)got);
+                            retryRecovered++;
+                            continue;
+                        }
+                    }
+                    stillZero.push_back(v);
+                }
+                LOG(LOG_LEVEL_INFO, DTAG " R-X 全零页延迟重试 round=%d 剩 %zu -> %zu, 累计回填 %zu",
+                    round + 1, zeroPageVaddrs.size(), stillZero.size(), retryRecovered);
+                zeroPageVaddrs.swap(stillZero);
+            }
+            retryStillZero = zeroPageVaddrs.size();
+            LOG(LOG_LEVEL_INFO, DTAG " R-X 全零页重试完成: 额外回填 %zu 页, 最终仍全零 %zu 页",
+                retryRecovered, retryStillZero);
+        }
     } while (false);
 
     // ── Step 5: IDA 兼容 ELF 修复 (重建 section headers) ──
