@@ -48,9 +48,10 @@ public class SoDumperActivity extends AppCompatActivity {
     private native String[] nativeListRunningApps(String filter);
     /** 枚举指定进程加载的所有 .so 模块 (通过 su + cat /proc/PID/maps) */
     private native String[] nativeListModules(int pid);
-    /** Dump 指定 SO 到文件并修复 ELF 头 (通过 su + dd /proc/PID/mem) */
-    private native int nativeDumpSo(int pid, long baseAddr, long endAddr,
-                                    String moduleName, String outPath);
+    /** Dump 指定 SO 到文件并修复 ELF (通过 su + dd /proc/PID/mem)
+     *  @return 成功返回实际落盘路径 (反检测可能重写为随机 hex.bin); 失败返回 "ERR:&lt;code&gt;" */
+    private native String nativeDumpSo(int pid, long baseAddr, long endAddr,
+                                       String moduleName, String outPath);
 
     // ─── UI 元素 ─────────────────────────────────────────────────────
     private AutoCompleteTextView etSearch;       // 应用包名搜索框
@@ -434,18 +435,20 @@ public class SoDumperActivity extends AppCompatActivity {
 
                 String outFile = DUMP_DIR + "/" + selectedPackage + "_" + mod.name;
 
-                int ret = nativeDumpSo(selectedPid, mod.baseAddr, mod.endAddr, mod.name, outFile);
+                String result = nativeDumpSo(selectedPid, mod.baseAddr, mod.endAddr, mod.name, outFile);
+                boolean ok = result != null && !result.startsWith("ERR:");
 
-                // 修复输出文件权限
-                if (ret == 0) {
-                    execSuCommand("chmod 644 " + outFile);
+                // 修复输出文件权限 (使用实际落盘路径)
+                if (ok) {
+                    execSuCommand("chmod 644 '" + result + "'");
                 }
 
                 final String resultMsg;
-                if (ret == 0) {
-                    resultMsg = "Dump 成功!\n" + outFile + "\n大小: " + ModuleItem.formatSize(mod.size);
+                if (ok) {
+                    resultMsg = "Dump 成功!\n" + result + "\n大小: " + ModuleItem.formatSize(mod.size);
                 } else {
-                    resultMsg = "Dump 失败 (错误码: " + ret + ")\n模块: " + mod.name +
+                    String code = (result == null) ? "null" : result;
+                    resultMsg = "Dump 失败 (" + code + ")\n模块: " + mod.name +
                             "\n映射: " + String.format(Locale.ROOT, "0x%x-0x%x %s off=0x%x",
                             mod.baseAddr, mod.endAddr, mod.perms, mod.fileOffset);
                 }
@@ -455,7 +458,7 @@ public class SoDumperActivity extends AppCompatActivity {
                     btnDump.setEnabled(true);
                     tvStatus.setText(resultMsg);
                     Toast.makeText(SoDumperActivity.this,
-                            ret == 0 ? "Dump 完成!" : "Dump 失败",
+                            ok ? "Dump 完成!" : "Dump 失败",
                             Toast.LENGTH_SHORT).show();
                 });
 

@@ -383,7 +383,8 @@ static uintptr_t resolveElfBaseFromMaps(int pid, const ModuleInfo& module) {
 
 // ─── Dump + 修复 (PT_LOAD 段感知) ──────────────────────────────────
 
-int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath) {
+int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath,
+                 std::string* actualOutPath) {
     LOG(LOG_LEVEL_INFO, DTAG " 开始 dump: pid=%d, module=%s, map_base=0x%lx, end=0x%lx, off=0x%lx, perms=%s, size=%zu",
                         pid, module.name.c_str(),
                         (unsigned long)module.baseAddr, (unsigned long)module.endAddr,
@@ -1215,6 +1216,8 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath) 
         LOG(LOG_LEVEL_ERROR, DTAG " 写入不完整: %zu / %zu", written, outFileSize);
         return -6;
     }
+
+    if (actualOutPath) *actualOutPath = finalPath;
 
     LOG(LOG_LEVEL_INFO, DTAG " Dump 成功: %s -> %s (%zu bytes, %.2f MB)",
                         module.name.c_str(), finalPath.c_str(),

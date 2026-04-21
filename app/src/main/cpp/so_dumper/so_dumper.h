@@ -43,12 +43,14 @@ namespace SoDumper {
 
     /**
      * 从目标进程内存 dump 指定 SO 并修复 ELF
-     * @param pid       目标进程 PID
-     * @param module    要 dump 的模块信息
-     * @param outPath   输出文件路径
+     * @param pid             目标进程 PID
+     * @param module          要 dump 的模块信息
+     * @param outPath         期望输出文件路径
+     * @param actualOutPath   出参: 实际落盘路径 (反检测时会被改成随机 hex.bin)。可为 nullptr。
      * @return 0 成功, 负数失败
      */
-    int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath);
+    int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath,
+                     std::string* actualOutPath = nullptr);
 
 } // namespace SoDumper
 

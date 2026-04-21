@@ -72,7 +72,7 @@ Java_com_example_dobbyproject_SoDumperActivity_nativeListModules(
  * @param outPath   输出文件路径
  * @return 0 成功, 负数失败
  */
-JNIEXPORT jint JNICALL
+JNIEXPORT jstring JNICALL
 Java_com_example_dobbyproject_SoDumperActivity_nativeDumpSo(
         JNIEnv* env, jobject /* this */,
         jint pid, jlong baseAddr, jlong endAddr, jstring jModuleName, jstring jOutPath) {
@@ -99,7 +99,15 @@ Java_com_example_dobbyproject_SoDumperActivity_nativeDumpSo(
                         (unsigned long)mod.baseAddr, (unsigned long)mod.endAddr,
                         outPathStr.c_str());
 
-    return SoDumper::dumpAndFixSo((int)pid, mod, outPathStr);
+    std::string actualPath;
+    int ret = SoDumper::dumpAndFixSo((int)pid, mod, outPathStr, &actualPath);
+    if (ret == 0) {
+        return env->NewStringUTF(actualPath.empty() ? outPathStr.c_str() : actualPath.c_str());
+    } else {
+        char errBuf[32];
+        snprintf(errBuf, sizeof(errBuf), "ERR:%d", ret);
+        return env->NewStringUTF(errBuf);
+    }
 }
 
 } // extern "C"
