@@ -10,21 +10,21 @@
  *      配合 CMake `-Wl,-s` strip ELF, 静态 strings 扫不到 process_vm_readv 上下文.
  *
  * 协议 (line-based 请求 / binary 响应):
- *   client → helper:  "R <pid_dec> <addr_hex_or_dec> <size_dec>\n"
+ *   client → helper:  "R <pid_dec> <addr_hex_or_dec> <size_dec>\n"   (process_vm_readv)
+ *                  或 "M <pid_dec> <addr_hex_or_dec> <size_dec>\n"   (pread64 /proc/<pid>/mem)
  *   helper → client:  "K <n>\n" + <n> raw bytes        (成功)
- *                  或 "E <errno>\n"                    (process_vm_readv 失败)
+ *                  或 "E <errno>\n"                    (读取失败)
  *   client 关闭 stdin → helper 自然 EOF 退出.
  *
  * 单次 size 上限 = 1MB (内部缓冲), client 自行分块.
  *
- * 跨进程读路径 (按优先级):
- *   1) process_vm_readv (syscall 270): 主路径, 不 attach, 不写 TracerPid,
- *      目标进程的 /proc/self/{maps,status} 完全无变化.
- *   2) pread64 on /proc/<pid>/mem: 当 (1) 失败或返回的数据全 0 时自动 fallback.
- *      某些 anti-cheat (Tencent ACE) 会 hook process_vm_readv 让 R-X 段
- *      静默返回全 0; 而 /proc/<pid>/mem 的 pread64 通常未被 hook, 能拿到真实
- *      代码段。fd 按 pid 缓存, 避免每次重复 open。
- */
+ * 跨进程读路径:
+ *   R - process_vm_readv(syscall 270): 主路径, 不 attach, 不写 TracerPid,
+ *       目标进程的 /proc/self/{maps,status} 完全无变化.
+ *   M - pread64('/proc/<pid>/mem'): 备用路径, 当某些 anti-cheat (Tencent ACE)
+ *       hook process_vm_readv 让 R-X 段静默返回全 0 时, /proc/<pid>/mem 的
+ *       pread64 通常未被 hook, 能拿到真实代码段。fd 按 pid 缓存。
+ *       由 client 显式选择: 调用方决定何时切到这条路径。 */
 #define _GNU_SOURCE
 #include <stdlib.h>
 #include <string.h>
@@ -197,62 +197,65 @@ int main(int argc, char** argv) {
         int ll = read_line(line, (int)sizeof(line));
         if (ll < 0) break;
         if (ll == 0) continue;
-        if (line[0] != 'R' || line[1] != ' ') {
-            write_all(STDOUT_FILENO, "E 22\n", 5);
+        if (line[0] == 'R' && line[1] == ' ') {
+            /* 原有路径: process_vm_readv. 不动。 */
+            char* p = line + 2;
+            long long pidv = strtoll(p, &p, 10);
+            unsigned long long addr = strtoull(p, &p, 0);
+            unsigned long long sz   = strtoull(p, &p, 0);
+            if (pidv <= 0 || sz == 0) { write_all(STDOUT_FILENO, "E 22\n", 5); continue; }
+            if (sz > BUF_BYTES) sz = BUF_BYTES;
+
+            addr &= 0x00FFFFFFFFFFFFFFULL;
+
+            struct iovec local  = { .iov_base = buf, .iov_len = (size_t)sz };
+            struct iovec remote = {
+                .iov_base = (void*)(uintptr_t)addr,
+                .iov_len  = (size_t)sz
+            };
+            ssize_t r = pvr((pid_t)pidv, &local, 1, &remote, 1, 0);
+            if (r <= 0) {
+                char hdr[32];
+                int hl = snprintf(hdr, sizeof(hdr), "E %d\n", errno);
+                write_all(STDOUT_FILENO, hdr, (size_t)hl);
+            } else {
+                char hdr[32];
+                int hl = snprintf(hdr, sizeof(hdr), "K %zd\n", r);
+                write_all(STDOUT_FILENO, hdr, (size_t)hl);
+                write_all(STDOUT_FILENO, buf, (size_t)r);
+            }
             continue;
         }
-        char* p = line + 2;
-        long long pidv = strtoll(p, &p, 10);
-        unsigned long long addr = strtoull(p, &p, 0);
-        unsigned long long sz   = strtoull(p, &p, 0);
-        if (pidv <= 0 || sz == 0) { write_all(STDOUT_FILENO, "E 22\n", 5); continue; }
-        if (sz > BUF_BYTES) sz = BUF_BYTES;
 
-        addr &= 0x00FFFFFFFFFFFFFFULL;
+        if (line[0] == 'M' && line[1] == ' ') {
+            /* 新路径: pread64('/proc/<pid>/mem'). 协议与 'R' 完全一致, 仅
+             * 使用不同的内核接口, 用于绕过 anti-cheat 对 process_vm_readv
+             * 的 hook (例如 Tencent ACE 让 R-X 段静默返回全 0)。
+             * 调用方根据需要自行选择 'R' 或 'M'。 */
+            char* p = line + 2;
+            long long pidv = strtoll(p, &p, 10);
+            unsigned long long addr = strtoull(p, &p, 0);
+            unsigned long long sz   = strtoull(p, &p, 0);
+            if (pidv <= 0 || sz == 0) { write_all(STDOUT_FILENO, "E 22\n", 5); continue; }
+            if (sz > BUF_BYTES) sz = BUF_BYTES;
 
-        struct iovec local  = { .iov_base = buf, .iov_len = (size_t)sz };
-        struct iovec remote = {
-            .iov_base = (void*)(uintptr_t)addr,
-            .iov_len  = (size_t)sz
-        };
-        ssize_t r = pvr((pid_t)pidv, &local, 1, &remote, 1, 0);
+            addr &= 0x00FFFFFFFFFFFFFFULL;
 
-        /* fallback 触发条件:
-         *   (a) process_vm_readv 直接失败 (返回 <= 0)
-         *   (b) 读取成功但数据全 0 且块较大 — 大概率是 anti-cheat hook 了
-         *       process_vm_readv 让 R-X 段静默返回全 0。这里只对 >= 1KB 的块
-         *       做 fallback 校验, 避免 .bss 之类合法零页频繁触发额外 syscall。
-         * 任一条件命中时改用 /proc/<pid>/mem + pread64。 */
-        int needFallback = 0;
-        if (r <= 0) {
-            needFallback = 1;
-        } else if ((size_t)r >= 1024) {
-            /* 仅采样首尾 64 字节判断, 避免对每个 1MB 块全扫一遍 */
-            int allZero = 1;
-            const unsigned char* ub = (const unsigned char*)buf;
-            size_t headN = (size_t)r < 64 ? (size_t)r : 64;
-            for (size_t k = 0; k < headN; k++) if (ub[k]) { allZero = 0; break; }
-            if (allZero) {
-                size_t tailStart = (size_t)r > 64 ? (size_t)r - 64 : 0;
-                for (size_t k = tailStart; k < (size_t)r; k++) if (ub[k]) { allZero = 0; break; }
+            ssize_t r = mem_pread((pid_t)pidv, (uintptr_t)addr, buf, (size_t)sz);
+            if (r <= 0) {
+                char hdr[32];
+                int hl = snprintf(hdr, sizeof(hdr), "E %d\n", errno);
+                write_all(STDOUT_FILENO, hdr, (size_t)hl);
+            } else {
+                char hdr[32];
+                int hl = snprintf(hdr, sizeof(hdr), "K %zd\n", r);
+                write_all(STDOUT_FILENO, hdr, (size_t)hl);
+                write_all(STDOUT_FILENO, buf, (size_t)r);
             }
-            if (allZero) needFallback = 1;
-        }
-        if (needFallback) {
-            ssize_t r2 = mem_pread((pid_t)pidv, (uintptr_t)addr, buf, (size_t)sz);
-            if (r2 > 0) r = r2;   /* fallback 成功覆盖 r; 失败保留原 r */
+            continue;
         }
 
-        if (r <= 0) {
-            char hdr[32];
-            int hl = snprintf(hdr, sizeof(hdr), "E %d\n", errno);
-            write_all(STDOUT_FILENO, hdr, (size_t)hl);
-        } else {
-            char hdr[32];
-            int hl = snprintf(hdr, sizeof(hdr), "K %zd\n", r);
-            write_all(STDOUT_FILENO, hdr, (size_t)hl);
-            write_all(STDOUT_FILENO, buf, (size_t)r);
-        }
+        write_all(STDOUT_FILENO, "E 22\n", 5);
     }
 
     if (g_mem_fd >= 0) close(g_mem_fd);
