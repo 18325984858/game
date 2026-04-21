@@ -103,40 +103,54 @@ find_library(
 # for GameActivity/NativeActivity derived applications, the same library name must be
 # used in the AndroidManifest.xml file.
 add_library(${CMAKE_PROJECT_NAME} SHARED
-        # List C/C++ source files with relative paths to this CMakeLists.txt.
-        core/overlay/PublicOverlayRenderer.cpp
-        games/unity_lol/native-lib.cpp
-        games/unity_lol/unitystart.cpp
-        "games/unity_lol/draw/Draw.cpp"
+        # ── core (跨游戏基础设施) ──
         "core/log/log.cpp"
-        "games/unity_lol/symbol/Symbol.cpp"
         "core/file/file.cpp"
+        "core/overlay/PublicOverlayRenderer.cpp"
+
+        # ── memory (跨进程内存读取 + JNI) ──
+        "memory/mem_reader.cpp"
+        "memory/mem_reader_jni.cpp"
+
+        # ── so_dumper (运行时 SO dump + JNI) ──
+        "so_dumper/so_dumper.cpp"
+        "so_dumper/so_dumper_jni.cpp"
+
+        # ── kpatch (KernelPatch / KPM 控制 + JNI) ──
+        "kpatch/kp_ctl.cpp"
+        "kpatch/kpm_inject_hide_jni.cpp"
+
+        # ── injector (注入器实现, 同时被 libinjector.so 复用) ──
+        "injector/Injector.cpp"
+
+        # ── games/unity_lol (Unity / LoL) ──
+        "games/unity_lol/native-lib.cpp"
+        "games/unity_lol/unitystart.cpp"
+        "games/unity_lol/draw/Draw.cpp"
+        "games/unity_lol/symbol/Symbol.cpp"
         "games/unity_lol/unity_api/unityapi.cpp"
         "games/unity_lol/il2cpp_dumper/il2cpp_dumper.cpp"
+        "games/unity_lol/il2cpp_header/il2cppHeader.cpp"
         "games/unity_lol/lol/lolm.cpp"
         "games/unity_lol/interface/interface.cpp"
-        "games/unity_lol/il2cpp_header/il2cppHeader.cpp"
-        "injector/Injector.cpp"
+
+        # ── games/ue_pubgmhd (UE4 / PUBGMHD) ──
+        "games/ue_pubgmhd/uestart.cpp"
         "games/ue_pubgmhd/engine/UE4Struct.cpp"
         "games/ue_pubgmhd/engine/UE4Dumper.cpp"
         "games/ue_pubgmhd/engine/UE4Header.cpp"
-        "games/ue_pubgmhd/interface/interface.cpp"
         "games/ue_pubgmhd/draw/UE4Draw.cpp"
+        "games/ue_pubgmhd/interface/interface.cpp"
         "games/ue_pubgmhd/pubgmhd/pubgmhd.cpp"
-        "games/ue_pubgmhd/uestart.cpp"
+
+        # ── games/ue_dfm (UE5 / DFM) ──
         "games/ue_dfm/uestart.cpp"
         "games/ue_dfm/engine/UE5DfmStruct.cpp"
         "games/ue_dfm/engine/UE5DfmDumper.cpp"
         "games/ue_dfm/engine/UE5Header.cpp"
+        "games/ue_dfm/draw/DfmDraw.cpp"
         "games/ue_dfm/interface/interface.cpp"
         "games/ue_dfm/dfm/dfm.cpp"
-        "games/ue_dfm/draw/DfmDraw.cpp"
-        "so_dumper/so_dumper.cpp"
-        "so_dumper/so_dumper_jni.cpp"
-        "memory/mem_reader.cpp"
-        "memory/mem_reader_jni.cpp"
-        "kpatch/kp_ctl.cpp"
-        "kpatch/kpm_inject_hide_jni.cpp"
 )
 
 # Specifies libraries CMake should link to your target library. You
