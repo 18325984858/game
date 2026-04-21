@@ -501,6 +501,17 @@ private:
     // ── 物品名映射 ──
     std::string getItemDisplayName(int32_t itemId) const;
 
+    // 综合物品名解析 (4 级回退):
+    //   1. InteractorName (FText, 本地化, +0x790) — 通常运行时为空, 由 UMG 异步填充
+    //   2. InventoryType  (UClass*, +0xF80)        — 类名 e.g. "Inventory_M4A1_C"
+    //   3. ItemID 数字大类映射 (上面 getItemDisplayName)
+    //   4. 原始 InventoryIdName FName 字符串 — 兜底
+    // pickupActor 既可以是地面 PickupBase, 也可以是箱内 sub-pickup (同 InteractorBase + PickupBase 布局)
+    std::string resolveItemDisplay(uintptr_t pickupActor, const std::string& rawId, int32_t numId) const;
+
+    // 把 UE 类名 (e.g. "Inventory_Wpn_AKM_C", "BP_Item_FirstAidKit_C") 转成可读名 (中文优先)
+    static std::string translateItemClassName(const std::string& className);
+
     // ── 本地玩家位置 + 相机 ──
     FVector3 getMyPosition() const;
     uintptr_t findLocalPlayerController() const;

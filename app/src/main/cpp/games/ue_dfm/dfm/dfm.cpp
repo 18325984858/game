@@ -839,6 +839,132 @@ std::string DfmMatchMonitor::getItemDisplayName(int32_t itemId) const {
 }
 
 // =====================================================================
+//  类名 → 可读名翻译
+//  规则: 剥离 BP_/Inventory_/_C 等前后缀, 然后查询固定翻译表
+//  (来自 sdk_dump.cs 中常见 InventoryPickup 子类 + DFM SDK CDO 类名)
+// =====================================================================
+std::string DfmMatchMonitor::translateItemClassName(const std::string& className) {
+    if (className.empty() || className == "?" || className == "None") return "";
+
+    // 1. 提取核心 token: 剥离常见前后缀
+    auto stripPrefix = [](std::string s, const char* p) {
+        size_t pl = strlen(p);
+        if (s.size() >= pl && s.compare(0, pl, p) == 0) s.erase(0, pl);
+        return s;
+    };
+    auto stripSuffix = [](std::string s, const char* p) {
+        size_t pl = strlen(p);
+        if (s.size() >= pl && s.compare(s.size() - pl, pl, p) == 0) s.erase(s.size() - pl);
+        return s;
+    };
+
+    std::string core = className;
+    // 反复剥离前缀
+    for (const char* p : {"BP_", "Default__", "InventoryPickup_", "Inventory_", "Pickup_",
+                          "Item_", "Wpn_", "Weapon_", "DFM_"}) {
+        core = stripPrefix(core, p);
+    }
+    // 反复剥离后缀
+    for (const char* p : {"_C", "_BP", "_Default", "_Server", "_Mobile"}) {
+        core = stripSuffix(core, p);
+    }
+    if (core.empty()) return "";
+
+    // 2. 翻译表: 经典 PUBG/DFM 物品名 → 中文 (大小写不敏感匹配)
+    static const std::unordered_map<std::string, const char*> kMap = {
+        // ── 武器 ──
+        {"AKM",        "AKM"},          {"AK74",       "AK-74"},        {"AK15",       "AK-15"},
+        {"M4A1",       "M4A1"},         {"M16A4",      "M16A4"},        {"HK416",      "HK416"},
+        {"SCAR",       "SCAR"},         {"SCARH",      "SCAR-H"},       {"AUG",        "AUG"},
+        {"G36",        "G36"},          {"M249",       "M249"},         {"PKM",        "PKM"},
+        {"VECTOR",     "Vector"},       {"MP5",        "MP5"},          {"MP7",        "MP7"},
+        {"UMP",        "UMP-45"},       {"UMP9",       "UMP-9"},        {"P90",        "P90"},
+        {"AWM",        "AWM"},          {"M24",        "M24"},          {"K98",        "Kar98k"},
+        {"Mosin",      "莫辛纳甘"},     {"R93",         "R93"},          {"SVD",         "SVD"},
+        {"M870",       "M870"},         {"S686",       "S686"},         {"S12K",       "S12K"},
+        {"M9",         "M9"},           {"P92",        "P92"},          {"P1911",      "P1911"},
+        {"Glock",      "Glock"},        {"Deagle",     "沙漠之鹰"},     {"Revolver",   "左轮"},
+        // ── 投掷物 ──
+        {"Grenade",    "手雷"},         {"Frag",       "破片手雷"},     {"Flash",      "闪光弹"},
+        {"Smoke",      "烟雾弹"},       {"Molotov",    "燃烧瓶"},       {"Stun",       "震撼弹"},
+        // ── 药品 ──
+        {"FirstAidKit","急救包"},       {"Bandage",    "绷带"},         {"MedKit",     "医疗包"},
+        {"Painkiller", "止痛药"},       {"Adrenaline", "肾上腺素"},     {"EnergyDrink","能量饮料"},
+        {"Syringe",    "注射器"},       {"Drink",      "饮料"},         {"Water",      "水"},
+        // ── 装备 ──
+        {"Vest",       "护甲"},         {"Armor",      "护甲"},         {"Helmet",     "头盔"},
+        {"Backpack",   "背包"},         {"Pack",       "背包"},
+        // ── 配件 ──
+        {"Scope",      "瞄准镜"},       {"Suppressor", "消音器"},       {"Compensator","枪口补偿"},
+        {"Grip",       "握把"},         {"Foregrip",   "前握把"},       {"Mag",        "弹匣"},
+        {"Magazine",   "弹匣"},         {"Stock",      "枪托"},         {"Laser",      "激光"},
+        {"Sight",      "瞄具"},
+        // ── 弹药 ──
+        {"556",        "5.56mm"},       {"762",        "7.62mm"},       {"545",        "5.45mm"},
+        {"9mm",        "9mm"},          {"45ACP",      ".45 ACP"},      {"12g",        "12号弹"},
+        {"Shell",      "霰弹"},         {"Ammo",       "弹药"},
+        // ── 物资箱/特殊 ──
+        {"DeadBody",   "尸体"},         {"Container",  "物资箱"},       {"OpenBox",    "开启箱"},
+        {"SafeBox",    "保险箱"},       {"GoldenNest", "金蛋"},
+    };
+
+    // 大小写不敏感查找
+    std::string lcCore;
+    lcCore.reserve(core.size());
+    for (char c : core) lcCore += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    for (const auto& kv : kMap) {
+        std::string k = kv.first;
+        std::string lcK; lcK.reserve(k.size());
+        for (char c : k) lcK += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (lcCore == lcK) return kv.second;
+    }
+    // 子串匹配 (e.g. core="Wpn_AKM_Variant" 含 "AKM")
+    for (const auto& kv : kMap) {
+        std::string k = kv.first;
+        std::string lcK; lcK.reserve(k.size());
+        for (char c : k) lcK += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (lcK.size() >= 3 && lcCore.find(lcK) != std::string::npos) return kv.second;
+    }
+    // 没找到, 返回剥离后的核心名 (英文也比纯数字 ID 强)
+    return core;
+}
+
+// =====================================================================
+//  综合物品显示名解析 — 4 级回退
+// =====================================================================
+std::string DfmMatchMonitor::resolveItemDisplay(uintptr_t pickupActor,
+                                                const std::string& rawId,
+                                                int32_t numId) const {
+    if (!ok(pickupActor)) {
+        if (numId > 0) return getItemDisplayName(numId);
+        return rawId.empty() ? std::string("?") : rawId;
+    }
+
+    // 1. InteractorName FText (优先, 本地化)
+    std::string fromText = readFText(pickupActor + m_off.Interactor_Name);
+    if (!fromText.empty()) return fromText;
+
+    // 2. InventoryType UClass* → 类名 → 翻译
+    if (m_off.Pickup_InvType > 0) {
+        uintptr_t invClass = safeReadPtr(pickupActor + m_off.Pickup_InvType);
+        if (ok(invClass)) {
+            std::string clsName = readObjName(invClass);
+            std::string translated = translateItemClassName(clsName);
+            if (!translated.empty()) return translated;
+        }
+    }
+
+    // 3. 数字 ID → 大类映射
+    if (numId > 0) {
+        std::string fromId = getItemDisplayName(numId);
+        if (!fromId.empty()) return fromId;
+    }
+
+    // 4. 兜底: 原始 FName
+    return rawId.empty() ? std::string("?") : rawId;
+}
+
+// =====================================================================
 //  对局状态检测
 // =====================================================================
 
@@ -1071,14 +1197,8 @@ void DfmMatchMonitor::scanActors(const std::vector<uintptr_t>& actors, DrawDfmDa
             try { numId = std::stoi(rawId); } catch (...) {}
 
             LootItem item;
-            // [修复] 优先读取 InteractorName (FText, 本地化物品名)
-            // 解决物品只显示数字 ID 的问题
-            std::string displayName = readFText(actor + m_off.Interactor_Name);
-            if (!displayName.empty()) {
-                item.itemName = displayName;
-            } else {
-                item.itemName = (numId > 0) ? getItemDisplayName(numId) : rawId;
-            }
+            // 4 级回退: InteractorName(FText) → InventoryType(UClass) → 数字大类 → rawFName
+            item.itemName = resolveItemDisplay(actor, rawId, numId);
             item.className = cn;
             item.itemId = numId;
             item.stackCount = safeReadS32(actor + m_off.Pickup_StackCount);
@@ -1349,17 +1469,12 @@ std::vector<ContainerItem> DfmMatchMonitor::readContainerItems(uintptr_t actorPt
                 int32_t stackCount = safeReadS32(pickup + m_off.Pickup_StackCount);
 
                 ContainerItem ci;
-                // [修复] 优先读取本地化名称, 解决箱内物品只显示数字 ID
-                std::string displayName = readFText(pickup + m_off.Interactor_Name);
-                if (!displayName.empty()) {
-                    ci.name = displayName;
-                } else {
-                    int32_t numId = 0;
-                    try { numId = std::stoi(idName); } catch (...) {}
-                    ci.name = (numId > 0) ? getItemDisplayName(numId) : idName;
-                }
+                int32_t numId = 0;
+                try { numId = std::stoi(idName); } catch (...) {}
+                // 4 级回退同 ground loot
+                ci.name = resolveItemDisplay(pickup, idName, numId);
                 ci.count = stackCount;
-                try { ci.itemId = std::stoi(idName); } catch (...) {}
+                ci.itemId = numId;
                 items.push_back(std::move(ci));
             }
         }
