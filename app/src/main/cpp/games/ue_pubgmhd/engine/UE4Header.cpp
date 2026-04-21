@@ -1,6 +1,6 @@
 #include "UE4Header.h"
-#include "../libUE4Dumper/UE4Dumper.h"
-#include "../libUE4Struct/ilbUE4Struct.h"
+#include "../engine/UE4Dumper.h"
+#include "../engine/UE4Struct.h"
 #include "../../../core/log/log.h"
 #include <fstream>
 #include <sstream>

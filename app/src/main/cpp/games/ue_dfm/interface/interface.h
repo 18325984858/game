@@ -1,8 +1,8 @@
 #ifndef UE5_DFM_INTERFACE_H
 #define UE5_DFM_INTERFACE_H
 
-#include "../ilbUE5Dumper/UE5DfmDumper.h"
-#include "../ilbUE5Struct/UE5DfmStruct.h"
+#include "../engine/UE5DfmDumper.h"
+#include "../engine/UE5DfmStruct.h"
 #include <string>
 #include <vector>
 #include <unordered_map>

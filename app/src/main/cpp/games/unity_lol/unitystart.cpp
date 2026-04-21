@@ -5,9 +5,9 @@
 #include "unitystart.h"
 #include "../../core/log/log.h"
 #include "./lol/lolm.h"
-#include "./il2cppHeader/il2cppHeader.h"
-#include "./li2cppDumper/li2cppdumper.h"
-#include "Draw/Draw.h"
+#include "./il2cpp_header/il2cppHeader.h"
+#include "./il2cpp_dumper/il2cpp_dumper.h"
+#include "draw/Draw.h"
 #include <chrono>
 #include <thread>
 #include <csignal>

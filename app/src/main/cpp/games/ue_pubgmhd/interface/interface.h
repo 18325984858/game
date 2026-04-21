@@ -1,8 +1,8 @@
 #ifndef UE4_INTERFACE_H
 #define UE4_INTERFACE_H
 
-#include "../libUE4Dumper/UE4Dumper.h"
-#include "../libUE4Struct/ilbUE4Struct.h"
+#include "../engine/UE4Dumper.h"
+#include "../engine/UE4Struct.h"
 #include <string>
 #include <vector>
 #include <unordered_map>

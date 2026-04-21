@@ -11,7 +11,7 @@
 #include <chrono>
 #include <array>
 #include <cstring>
-#include "../ilbUE5Struct/UE5DfmStruct.h"
+#include "../engine/UE5DfmStruct.h"
 
 // 前向声明
 namespace ue5dfminf { class UE5DfmInterface; }

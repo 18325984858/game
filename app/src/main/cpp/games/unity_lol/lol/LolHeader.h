@@ -1057,6 +1057,6 @@ struct SkillUILogic_StaticFields {
 };
 
 // 导入 il2cpp.h 中的完整结构体定义 (SkillUILogic, BattleSkillJoystickUILogic 等)
-#include "../il2cppGenerated/il2cpp_structs.h"
+#include "../il2cpp_generated/il2cpp_structs.h"
 
 #endif //DOBBY_PROJECT_LOLHEADER_H

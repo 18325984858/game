@@ -11,7 +11,7 @@
 #include <thread>
 #include <algorithm>
 #include <cstring>
-#include "../libUE4Struct/ilbUE4Struct.h"
+#include "../engine/UE4Struct.h"
 
 // 前向声明
 namespace ue4inf { class UE4Interface; }

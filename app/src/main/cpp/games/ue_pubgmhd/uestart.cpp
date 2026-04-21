@@ -1,10 +1,10 @@
 #include "uestart.h"
 #include "../../core/log/log.h"
-#include "libUE4Dumper/UE4Dumper.h"
-#include "libUE4Header/UE4Header.h"
+#include "engine/UE4Dumper.h"
+#include "engine/UE4Header.h"
 #include "interface/interface.h"
 #include "pubgmhd/pubgmhd.h"
-#include "Draw/UE4Draw.h"
+#include "draw/UE4Draw.h"
 #include "AImGui.h"
 #include "ANativeWindowCreator.h"
 #include <atomic>

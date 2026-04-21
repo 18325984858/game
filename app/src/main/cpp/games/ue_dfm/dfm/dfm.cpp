@@ -5,7 +5,7 @@
  */
 #include "dfm.h"
 #include "../../../core/log/log.h"
-#include "../ilbUE5Struct/UE5DfmStruct.h"
+#include "../engine/UE5DfmStruct.h"
 #include "../interface/interface.h"
 
 // IM_COL32 兼容宏 (避免引入 imgui.h)

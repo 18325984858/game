@@ -14,15 +14,15 @@
 #ifndef DOBBY_PROJECT_UNITYAPI_H
 #define DOBBY_PROJECT_UNITYAPI_H
 
-#include "../Symbol/Symbol.h"
+#include "../symbol/Symbol.h"
 
 
 #define UNITY_2018_4_16F1
 
 #ifdef UNITY_2018_4_16F1
-#include "../UnityStruct/unity2018-4-16f1/UnityStructInfo.h"
+#include "../unity_struct/unity2018-4-16f1/UnityStructInfo.h"
 #else
-#include "../UnityStruct/UnityInfo.h"
+#include "../unity_struct/UnityInfo.h"
 #endif
 
 namespace li2cppApi {

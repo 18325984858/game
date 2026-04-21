@@ -2,7 +2,7 @@
 // Created by Song on 2025/11/19.
 //
 
-#include "li2cppdumper.h"
+#include "il2cpp_dumper.h"
 #include "../../../core/log/log.h"
 #include <sstream>
 #include <vector>

@@ -2,9 +2,9 @@
 #include "../../core/log/log.h"
 #include "UE5DfmDumper.h"
 #include "UE5DfmStruct.h"
-#include "libUE5Header/UE5Header.h"
+#include "engine/UE5Header.h"
 #include "dfm/dfm.h"
-#include "Draw/DfmDraw.h"
+#include "draw/DfmDraw.h"
 #include "AImGui.h"
 #include "ANativeWindowCreator.h"
 #include <atomic>

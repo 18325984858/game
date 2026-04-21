@@ -1,7 +1,7 @@
 #include "pubgmhd.h"
-#include "../libUE4Struct/ilbUE4Struct.h"
+#include "../engine/UE4Struct.h"
 #include "../interface/interface.h"
-#include "../Draw/UE4Draw.h"
+#include "../draw/UE4Draw.h"
 #include "../../../core/log/log.h"
 
 #include <thread>
