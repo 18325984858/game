@@ -21,3 +21,5 @@ Windows-llvm/
 replay_pid*.log
 
 sdk_dump.cs
+
+build.log

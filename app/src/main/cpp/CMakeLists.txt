@@ -105,32 +105,32 @@ find_library(
 add_library(${CMAKE_PROJECT_NAME} SHARED
         # List C/C++ source files with relative paths to this CMakeLists.txt.
         core/overlay/PublicOverlayRenderer.cpp
-        unityGame/native-lib.cpp
-        unityGame/unitystart.cpp
-        "unityGame/Draw/Draw.cpp"
+        games/unity_lol/native-lib.cpp
+        games/unity_lol/unitystart.cpp
+        "games/unity_lol/Draw/Draw.cpp"
         "core/log/log.cpp"
-        "unityGame/Symbol/Symbol.cpp"
+        "games/unity_lol/Symbol/Symbol.cpp"
         "core/file/file.cpp"
-        "unityGame/UnityApi/unityapi.cpp"
-        "unityGame/li2cppDumper/li2cppdumper.cpp"
-        "unityGame/lol/lolm.cpp"
-        "unityGame/interface/interface.cpp"
-        "unityGame/il2cppHeader/il2cppHeader.cpp"
+        "games/unity_lol/UnityApi/unityapi.cpp"
+        "games/unity_lol/li2cppDumper/li2cppdumper.cpp"
+        "games/unity_lol/lol/lolm.cpp"
+        "games/unity_lol/interface/interface.cpp"
+        "games/unity_lol/il2cppHeader/il2cppHeader.cpp"
         "injector/Injector.cpp"
-        "ueGamepubgmhd/libUE4Struct/ilbUE4Struct.cpp"
-        "ueGamepubgmhd/libUE4Dumper/UE4Dumper.cpp"
-        "ueGamepubgmhd/libUE4Header/UE4Header.cpp"
-        "ueGamepubgmhd/interface/interface.cpp"
-        "ueGamepubgmhd/Draw/UE4Draw.cpp"
-        "ueGamepubgmhd/pubgmhd/pubgmhd.cpp"
-        "ueGamepubgmhd/uestart.cpp"
-        "ueGamedfm/uestart.cpp"
-        "ueGamedfm/ilbUE5Struct/UE5DfmStruct.cpp"
-        "ueGamedfm/ilbUE5Dumper/UE5DfmDumper.cpp"
-        "ueGamedfm/libUE5Header/UE5Header.cpp"
-        "ueGamedfm/interface/interface.cpp"
-        "ueGamedfm/dfm/dfm.cpp"
-        "ueGamedfm/Draw/DfmDraw.cpp"
+        "games/ue_pubgmhd/libUE4Struct/ilbUE4Struct.cpp"
+        "games/ue_pubgmhd/libUE4Dumper/UE4Dumper.cpp"
+        "games/ue_pubgmhd/libUE4Header/UE4Header.cpp"
+        "games/ue_pubgmhd/interface/interface.cpp"
+        "games/ue_pubgmhd/Draw/UE4Draw.cpp"
+        "games/ue_pubgmhd/pubgmhd/pubgmhd.cpp"
+        "games/ue_pubgmhd/uestart.cpp"
+        "games/ue_dfm/uestart.cpp"
+        "games/ue_dfm/ilbUE5Struct/UE5DfmStruct.cpp"
+        "games/ue_dfm/ilbUE5Dumper/UE5DfmDumper.cpp"
+        "games/ue_dfm/libUE5Header/UE5Header.cpp"
+        "games/ue_dfm/interface/interface.cpp"
+        "games/ue_dfm/dfm/dfm.cpp"
+        "games/ue_dfm/Draw/DfmDraw.cpp"
         "so_dumper/so_dumper.cpp"
         "so_dumper/so_dumper_jni.cpp"
         "memory/mem_reader.cpp"
@@ -159,14 +159,14 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
         AndroidSurfaceImgui/modules
         AndroidSurfaceImgui/third_party
         AndroidSurfaceImgui/third_party/imgui
-        ueGamedfm
-        ueGamedfm/ilbUE5Struct
-        ueGamedfm/ilbUE5Dumper
-        ueGamedfm/libUE5Header
+        games/ue_dfm
+        games/ue_dfm/ilbUE5Struct
+        games/ue_dfm/ilbUE5Dumper
+        games/ue_dfm/libUE5Header
 )
 
 target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE
-        "-include" "${CMAKE_CURRENT_SOURCE_DIR}/unityGame/obfu_attrs.h"
+        "-include" "${CMAKE_CURRENT_SOURCE_DIR}/games/unity_lol/obfu_attrs.h"
 )
 
 if(USE_WINDOWS_LLVM_FRONTEND AND ENABLE_WINDOWS_LLVM_OBFUSCATION)
@@ -178,24 +178,24 @@ if(USE_WINDOWS_LLVM_FRONTEND AND ENABLE_WINDOWS_LLVM_OBFUSCATION)
         # 强制包含注解头，�?Polaris pass 对所有函数生�?
         target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE OBFU_ENABLE_ANNOTATIONS)
         target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE
-                "-include" "${CMAKE_CURRENT_SOURCE_DIR}/unityGame/obfu_attrs.h"
+                "-include" "${CMAKE_CURRENT_SOURCE_DIR}/games/unity_lol/obfu_attrs.h"
                 "-mllvm"
                 "-passes=${WINDOWS_LLVM_BASE_PASSES}"
         )
 
         set_source_files_properties(
-                "unityGame/Draw/Draw.cpp"
-                "unityGame/Symbol/Symbol.cpp"
-                "unityGame/li2cppDumper/li2cppdumper.cpp"
-                "ueGamepubgmhd/libUE4Struct/ilbUE4Struct.cpp"
-                "ueGamepubgmhd/libUE4Dumper/UE4Dumper.cpp"
+                "games/unity_lol/Draw/Draw.cpp"
+                "games/unity_lol/Symbol/Symbol.cpp"
+                "games/unity_lol/li2cppDumper/li2cppdumper.cpp"
+                "games/ue_pubgmhd/libUE4Struct/ilbUE4Struct.cpp"
+                "games/ue_pubgmhd/libUE4Dumper/UE4Dumper.cpp"
                 PROPERTIES COMPILE_OPTIONS "-mllvm;-passes=${WINDOWS_LLVM_MEDIUM_PASSES}"
         )
 
         set_source_files_properties(
-                unityGame/unitystart.cpp
-                "unityGame/lol/lolm.cpp"
-                "unityGame/interface/interface.cpp"
+                games/unity_lol/unitystart.cpp
+                "games/unity_lol/lol/lolm.cpp"
+                "games/unity_lol/interface/interface.cpp"
                 PROPERTIES COMPILE_OPTIONS "-mllvm;-passes=${WINDOWS_LLVM_HEAVY_PASSES}"
         )
 endif()
@@ -218,7 +218,7 @@ target_link_libraries(injector
 if(USE_WINDOWS_LLVM_FRONTEND AND ENABLE_WINDOWS_LLVM_OBFUSCATION)
         target_compile_definitions(injector PRIVATE OBFU_ENABLE_ANNOTATIONS)
         target_compile_options(injector PRIVATE
-                "-include" "${CMAKE_CURRENT_SOURCE_DIR}/unityGame/obfu_attrs.h"
+                "-include" "${CMAKE_CURRENT_SOURCE_DIR}/games/unity_lol/obfu_attrs.h"
                 "-mllvm"
                 "-passes=${WINDOWS_LLVM_BASE_PASSES}"
         )
