@@ -231,6 +231,14 @@ struct ResolvedOffsets {
     int32_t GI_LocalPlayers          = 0x38;    // GameInstance.LocalPlayers (TArray<ULocalPlayer*>)
     int32_t LP_PlayerController      = 0x30;    // Player.PlayerController (SDK: 0x30)
 
+    // ── 远程开箱 RPC ──
+    // 实现采用 vtable 调用: ProcessEvent 在 UObject vtable 的 byte offset 552
+    // (slot 69), 通过 m_interface 反射 InventoryPickup_OpenBox 类拿到
+    // OpenThisBox UFunction*, 然后 (*box->vtable[69])(box, ufunc, &params)。
+    // 详见 dfm.cpp sendServerOpenPickupBox / callUFunction 注释。
+    // 此处不再保留 module-relative 函数偏移, 因为 vtable 路径无需它们。
+
+
     /// 关键偏移是否有效
     bool isValid() const {
         return Actor_RootComponent > 0 && Pawn_PlayerState > 0 && GS_PlayerArray > 0;
@@ -292,6 +300,9 @@ struct ContainerItem {
 struct ContainerInfo {
     std::string className;
     std::string boxType;
+    // 物资箱 actor 原始指针 (用于远程开箱 RPC; GUI 把它发回 Monitor 线程)。
+    // 跨帧使用前 Monitor 线程会做有效性校验, 防止 actor 已销毁。
+    uintptr_t   actorPtr = 0;
     bool        opened = false;
     bool        finished = false;
     FVector3    pos;
@@ -379,6 +390,12 @@ public:
     // 若从未 push 过, 返回 -1
     int64_t getMsSinceLastPush() const;
 
+    // ── 远程开箱命令通道 (GUI → Monitor) ──
+    // GUI 线程点按钮时调 enqueueOpenBox(box.actorPtr); Monitor 线程在 pollLoop 内
+    // 调 drainOpenBoxQueue() 取出, 在游戏线程访问 UE 对象。
+    void enqueueOpenBox(uintptr_t actorPtr);
+    std::vector<uintptr_t> drainOpenBoxQueue();
+
 private:
     SharedDfmData() = default;
     std::mutex m_mutex;
@@ -386,6 +403,9 @@ private:
     int m_frontIdx = 0;
     std::atomic<bool> m_inMatch{false};
     std::atomic<int64_t> m_lastPushMs{-1};  // steady_clock 毫秒, -1 = 从未推送
+
+    std::mutex m_cmdMutex;
+    std::vector<uintptr_t> m_openBoxQueue;
 };
 
 // =====================================================================
@@ -458,6 +478,19 @@ private:
     // ── 物资箱 ──
     ContainerInfo readContainerInfo(uintptr_t actorPtr, const std::string& cn) const;
     std::vector<ContainerItem> readContainerItems(uintptr_t actorPtr, const std::string& cn) const;
+
+    // ── 远程开箱 ──
+    // 处理由 GUI 入队的开箱请求, 在 pollLoop 中调用 (Monitor 线程)。
+    // 通过 PlayerController::ServerOpenPickupBox RPC, 服务端无距离校验,
+    // 适用于 InventoryPickup_Container 及其子类 (杂物/枪/甲/尸体, 不含密码保险箱)。
+    void processOpenBoxRequests();
+    bool sendServerOpenPickupBox(uintptr_t pcPtr, uintptr_t boxPtr) const;
+    // 通过 UObject::ProcessEvent 调 UFunction; 偏移由 m_processEventOffset 控制。
+    bool callUFunction(uintptr_t obj, uintptr_t func, void* params) const;
+    // 通过 UClass::FindFunctionByName 在 obj 的类上查找 UFunction*。
+    uintptr_t findFunctionByName(uintptr_t obj, const ue5dfm::FName& fname) const;
+    // 在已知 actor 列表中校验指针仍然有效 (防止 GUI 持有的旧指针造成 SIGSEGV)。
+    bool isContainerActorAlive(uintptr_t actorPtr) const;
 
     // ── 类名分类 ──
     static bool isPickupClass(const std::string& cn);
@@ -536,6 +569,21 @@ private:
     mutable std::unordered_map<uint64_t, RootCompensationOwner> m_rootCompensationOwners;
 
     mutable uintptr_t m_cachedPC = 0;      // 缓存的本地 PlayerController
+
+    // ── 远程开箱缓存 ──
+    // 存活物资箱白名单 (上一次完整扫描收集到的 actor 指针 + 类名);
+    // GUI 入队的 box 指针在调 RPC 之前必须出现在该集合里, 否则视为脏指针拒绝。
+    mutable std::mutex m_aliveContainersMu;
+    mutable std::unordered_map<uintptr_t, std::string> m_aliveContainers;
+    // 每个 box 上次开箱时间, 用作节流, 防止用户连点导致刷包封禁。
+    mutable std::unordered_map<uintptr_t, std::chrono::steady_clock::time_point> m_lastOpenTime;
+    mutable std::chrono::steady_clock::time_point m_lastOpenGlobal{};  // 全局节流
+    // 每个 UClass* 缓存的 OpenThisBox UFunction*, 减少 FindFunctionByName 调用。
+    mutable std::unordered_map<uintptr_t, uintptr_t> m_openFuncByClass;
+    // 启动时通过 interface 解析得到的 OpenThisBox UFunction* (类: InventoryPickup_OpenBox)
+    mutable uintptr_t m_openThisBoxUFunction = 0;
+    mutable bool      m_openThisBoxResolved  = false;
+
     std::atomic<bool> m_running{false};
     std::thread m_pollThread;
 

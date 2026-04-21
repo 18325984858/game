@@ -138,8 +138,7 @@ public:
         // 授权被拒 → fast-fail, 不再费 15s 去重试 (调用者会连环出现
         // 在进程枚举/内存读取/按钮点击上)
         if (authDenied_) {
-            __android_log_print(ANDROID_LOG_WARN, RTAG,
-                "跳过 root 调用: su 未获授权 (请去 APatch/KernelSU 为本 app 授权)");
+            LOG(LOG_LEVEL_WARN, RTAG " 跳过 root 调用: su 未获授权 (请去 APatch/KernelSU 为本 app 授权)");
             return false;
         }
         if (!ensureAliveLocked()) return false;
@@ -162,8 +161,7 @@ private:
         std::string line = cmd + "\n" + "echo " + DONE_TAG + "\n";
         ssize_t w = write(wfd_, line.data(), line.size());
         if (w != (ssize_t)line.size()) {
-            __android_log_print(ANDROID_LOG_ERROR, RTAG,
-                "write 到 su stdin 失败 w=%zd errno=%d", w, errno);
+            LOG(LOG_LEVEL_ERROR, RTAG " write 到 su stdin 失败 w=%zd errno=%d", w, errno);
             killLocked();
             return false;
         }
@@ -190,8 +188,7 @@ private:
                 return false;
             }
         }
-        __android_log_print(ANDROID_LOG_WARN, RTAG,
-            "等待 DONE marker 超时(%dms), 命令=%s", timeoutMs, cmd.c_str());
+        LOG(LOG_LEVEL_WARN, RTAG " 等待 DONE marker 超时(%dms), 命令=%s", timeoutMs, cmd.c_str());
         killLocked();
         return false;
     }
@@ -209,8 +206,7 @@ private:
         // 未授权时 APatch/KernelSU 会挂起 su 不输出, ping 肯定超时.
         if (!execLocked("echo P", /*timeoutMs=*/1500)) {
             authDenied_ = true;
-            __android_log_print(ANDROID_LOG_ERROR, RTAG,
-                "✘ su ping 失败: 该 app 未获得 root 授权 "
+            LOG(LOG_LEVEL_ERROR, RTAG " ✘ su ping 失败: 该 app 未获得 root 授权 "
                 "(请打开 APatch/KernelSU manager → 超级用户 → 为本 app 授权 → 重启 app)");
             return false;
         }
@@ -221,7 +217,7 @@ private:
         int in[2]  = {-1, -1};
         int out[2] = {-1, -1};
         if (pipe(in) < 0 || pipe(out) < 0) {
-            __android_log_print(ANDROID_LOG_ERROR, RTAG, "pipe 失败 errno=%d", errno);
+            LOG(LOG_LEVEL_ERROR, RTAG " pipe 失败 errno=%d", errno);
             if (in[0] >= 0) { close(in[0]); close(in[1]); }
             if (out[0] >= 0) { close(out[0]); close(out[1]); }
             return false;
@@ -229,7 +225,7 @@ private:
 
         pid_t pid = fork();
         if (pid < 0) {
-            __android_log_print(ANDROID_LOG_ERROR, RTAG, "fork 失败 errno=%d", errno);
+            LOG(LOG_LEVEL_ERROR, RTAG " fork 失败 errno=%d", errno);
             close(in[0]); close(in[1]); close(out[0]); close(out[1]);
             return false;
         }
@@ -272,15 +268,14 @@ private:
         pid_t r = waitpid(pid_, &status, WNOHANG);
         if (r == pid_) {
             int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-            __android_log_print(ANDROID_LOG_ERROR, RTAG,
-                "su 子进程立即退出 code=%d (su 未安装 / execlp 失败 / 被 LSM 拒绝)", code);
+            LOG(LOG_LEVEL_ERROR, RTAG " su 子进程立即退出 code=%d (su 未安装 / execlp 失败 / 被 LSM 拒绝)", code);
             close(wfd_); wfd_ = -1;
             close(rfd_); rfd_ = -1;
             pid_ = -1;
             return false;
         }
 
-        __android_log_print(ANDROID_LOG_INFO, RTAG, "持久 root shell 启动 pid=%d", pid);
+        LOG(LOG_LEVEL_INFO, RTAG " 持久 root shell 启动 pid=%d", pid);
         return true;
     }
 
@@ -337,8 +332,7 @@ public:
                           "R %d 0x%zx %zu\n",
                           targetPid, (size_t)addr, size);
         if (cl <= 0 || writeAllLocked(wfd_, cmd, (size_t)cl) != 0) {
-            __android_log_print(ANDROID_LOG_WARN, RTAG,
-                "RootHelper write 命令失败, 重启 daemon");
+            LOG(LOG_LEVEL_WARN, RTAG " RootHelper write 命令失败, 重启 daemon");
             killLocked();
             return -1;
         }
@@ -346,8 +340,7 @@ public:
         char hdr[64];
         int hl = readLineLocked(rfd_, hdr, (int)sizeof(hdr), /*timeoutMs=*/5000);
         if (hl < 0) {
-            __android_log_print(ANDROID_LOG_WARN, RTAG,
-                "RootHelper 读响应头超时/EOF, 重启 daemon");
+            LOG(LOG_LEVEL_WARN, RTAG " RootHelper 读响应头超时/EOF, 重启 daemon");
             killLocked();
             return -1;
         }
@@ -357,21 +350,18 @@ public:
             return 0;
         }
         if (hdr[0] != 'K') {
-            __android_log_print(ANDROID_LOG_ERROR, RTAG,
-                "RootHelper 协议错: %s", hdr);
+            LOG(LOG_LEVEL_ERROR, RTAG " RootHelper 协议错: %s", hdr);
             killLocked();
             return -1;
         }
         size_t n = (size_t)strtoul(hdr + 2, nullptr, 10);
         if (n == 0 || n > size) {
-            __android_log_print(ANDROID_LOG_ERROR, RTAG,
-                "RootHelper 长度异常 want=%zu got=%zu", size, n);
+            LOG(LOG_LEVEL_ERROR, RTAG " RootHelper 长度异常 want=%zu got=%zu", size, n);
             killLocked();
             return -1;
         }
         if (readFullLocked(rfd_, dst, n, /*timeoutMs=*/8000) != 0) {
-            __android_log_print(ANDROID_LOG_WARN, RTAG,
-                "RootHelper 读 payload 超时 want=%zu", n);
+            LOG(LOG_LEVEL_WARN, RTAG " RootHelper 读 payload 超时 want=%zu", n);
             killLocked();
             return -1;
         }
@@ -454,15 +444,13 @@ private:
         pid_t r = waitpid(pid_, &status, WNOHANG);
         if (r == pid_) {
             int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-            __android_log_print(ANDROID_LOG_ERROR, RTAG,
-                "RootHelper 子进程立即退出 code=%d (su 拒授权 / helper 不存在)", code);
+            LOG(LOG_LEVEL_ERROR, RTAG " RootHelper 子进程立即退出 code=%d (su 拒授权 / helper 不存在)", code);
             close(wfd_); wfd_ = -1;
             close(rfd_); rfd_ = -1;
             pid_ = -1;
             return false;
         }
-        __android_log_print(ANDROID_LOG_INFO, RTAG,
-            "RootHelper daemon 启动 pid=%d", pid);
+        LOG(LOG_LEVEL_INFO, RTAG " RootHelper daemon 启动 pid=%d", pid);
         return true;
     }
 
@@ -551,15 +539,13 @@ ssize_t readChunk(int pid, uintptr_t addr, size_t size,
     ssize_t r = RootHelper::I().readChunk(pid, addr, size, out.data() + outOffset);
     if (r < 0) {
         // daemon 通信错 (已 killLocked, 下次自动重启)
-        __android_log_print(ANDROID_LOG_ERROR, RTAG,
-            "RootHelper readChunk 通信失败 pid=%d addr=0x%zx size=%zu",
+        LOG(LOG_LEVEL_ERROR, RTAG " RootHelper readChunk 通信失败 pid=%d addr=0x%zx size=%zu",
             pid, (size_t)addr, size);
         return -1;
     }
     if (r == 0) {
         // helper 端 process_vm_readv 失败: target 已退出 / addr 不在合法 VMA
-        __android_log_print(ANDROID_LOG_WARN, RTAG,
-            "process_vm_readv 0 字节 pid=%d addr=0x%zx (target退出 或 addr 不在合法 VMA)",
+        LOG(LOG_LEVEL_WARN, RTAG " process_vm_readv 0 字节 pid=%d addr=0x%zx (target退出 或 addr 不在合法 VMA)",
             pid, (size_t)addr);
         return -2;
     }
@@ -584,8 +570,7 @@ static void ensureRuntimeReady() {
             if (slash != std::string::npos) libDir = fn.substr(0, slash);
         }
         if (libDir.empty()) {
-            __android_log_print(ANDROID_LOG_ERROR, RTAG,
-                "ensureRuntimeReady: dladdr 拿不到 nativeLibraryDir, helper 无法部署");
+            LOG(LOG_LEVEL_ERROR, RTAG " ensureRuntimeReady: dladdr 拿不到 nativeLibraryDir, helper 无法部署");
             return;
         }
         std::string helperSrc = libDir + "/libpvrhelper.so";
@@ -614,8 +599,7 @@ static void ensureRuntimeReady() {
             }
             unlink(capPath.c_str());
         }
-        __android_log_print(ANDROID_LOG_INFO, RTAG,
-            "ensureRuntimeReady ok=%d helperSrc=%s helperDst=%s result=%s",
+        LOG(LOG_LEVEL_INFO, RTAG " ensureRuntimeReady ok=%d helperSrc=%s helperDst=%s result=%s",
             (int)ok, helperSrc.c_str(), P.ddBin.c_str(), out.c_str());
     });
 }
@@ -665,8 +649,7 @@ ssize_t readMemory(int pid, uintptr_t address, size_t size,
 
     uintptr_t realAddr = untag(address);
     if (realAddr != address) {
-        __android_log_print(ANDROID_LOG_INFO, RTAG,
-            "去 tag: 0x%zx -> 0x%zx", (size_t)address, (size_t)realAddr);
+        LOG(LOG_LEVEL_INFO, RTAG " 去 tag: 0x%zx -> 0x%zx", (size_t)address, (size_t)realAddr);
     }
 
     // 首次准备 tmp 目录 + 重命名 dd
@@ -695,15 +678,13 @@ ssize_t readMemory(int pid, uintptr_t address, size_t size,
 
     if (totalGot == 0) {
         out.clear();
-        __android_log_print(ANDROID_LOG_WARN, RTAG,
-            "读取失败: pid=%d addr=0x%zx->0x%zx size=%zu",
+        LOG(LOG_LEVEL_WARN, RTAG " 读取失败: pid=%d addr=0x%zx->0x%zx size=%zu",
             pid, (size_t)address, (size_t)realAddr, size);
         return -3;
     }
     if (totalGot < size) out.resize(totalGot);
 
-    __android_log_print(ANDROID_LOG_INFO, RTAG,
-        "读取 pid=%d addr=0x%zx->0x%zx 请求=%zu 实际=%zu",
+    LOG(LOG_LEVEL_INFO, RTAG " 读取 pid=%d addr=0x%zx->0x%zx 请求=%zu 实际=%zu",
         pid, (size_t)address, (size_t)realAddr, size, totalGot);
     return (ssize_t)totalGot;
 }
@@ -726,15 +707,13 @@ bool readMaps(int pid, std::string& out) {
         "C=ca\"\"t; M=/proc/%d/maps; T=%s; $C $M > $T 2>/dev/null; chmod 666 $T 2>/dev/null",
         pid, P.mapsTmp.c_str());
     if (!RootShell::I().exec(cmd)) {
-        __android_log_print(ANDROID_LOG_WARN, RTAG,
-            "readMaps: RootShell exec 失败 pid=%d", pid);
+        LOG(LOG_LEVEL_WARN, RTAG " readMaps: RootShell exec 失败 pid=%d", pid);
         return false;
     }
 
     FILE* fp = fopen(P.mapsTmp.c_str(), "r");
     if (!fp) {
-        __android_log_print(ANDROID_LOG_WARN, RTAG,
-            "readMaps: fopen tmp 失败 pid=%d errno=%d", pid, errno);
+        LOG(LOG_LEVEL_WARN, RTAG " readMaps: fopen tmp 失败 pid=%d errno=%d", pid, errno);
         return false;
     }
     char buf[4096];
@@ -744,8 +723,7 @@ bool readMaps(int pid, std::string& out) {
     }
     fclose(fp);
     if (out.empty()) {
-        __android_log_print(ANDROID_LOG_WARN, RTAG,
-            "readMaps: maps 为空 pid=%d (进程可能已退出或无权限)", pid);
+        LOG(LOG_LEVEL_WARN, RTAG " readMaps: maps 为空 pid=%d (进程可能已退出或无权限)", pid);
         return false;
     }
     return true;
@@ -856,8 +834,7 @@ std::vector<uintptr_t> searchPattern(int pid,
         cur += (uintptr_t)got;
     }
 
-    __android_log_print(ANDROID_LOG_INFO, RTAG,
-        "搜索完成 pid=%d 范围=[0x%zx,0x%zx) 命中=%zu",
+    LOG(LOG_LEVEL_INFO, RTAG " 搜索完成 pid=%d 范围=[0x%zx,0x%zx) 命中=%zu",
         pid, (size_t)rangeStart, (size_t)rangeEnd, hits.size());
     return hits;
 }
@@ -898,8 +875,7 @@ ssize_t writeMemory(int pid, uintptr_t address,
     size_t total = data.size();
     uintptr_t realAddr = untag(address);
     if (realAddr != address) {
-        __android_log_print(ANDROID_LOG_INFO, RTAG,
-            "写入去 tag: 0x%zx -> 0x%zx", (size_t)address, (size_t)realAddr);
+        LOG(LOG_LEVEL_INFO, RTAG " 写入去 tag: 0x%zx -> 0x%zx", (size_t)address, (size_t)realAddr);
     }
 
     // 准备 tmp 目录 + 重命名 dd
@@ -947,8 +923,7 @@ ssize_t writeMemory(int pid, uintptr_t address,
 
         bool ok = RootShell::I().exec(cmd);
         if (!ok) {
-            __android_log_print(ANDROID_LOG_ERROR, RTAG,
-                "写入 shell 失败 pid=%d addr=0x%zx size=%zu written=%zu",
+            LOG(LOG_LEVEL_ERROR, RTAG " 写入 shell 失败 pid=%d addr=0x%zx size=%zu written=%zu",
                 pid, (size_t)realAddr, chunk, written);
             break;
         }
@@ -957,14 +932,12 @@ ssize_t writeMemory(int pid, uintptr_t address,
     }
 
     if (written == 0) {
-        __android_log_print(ANDROID_LOG_WARN, RTAG,
-            "写入 0 字节: pid=%d addr=0x%zx size=%zu",
+        LOG(LOG_LEVEL_WARN, RTAG " 写入 0 字节: pid=%d addr=0x%zx size=%zu",
             pid, (size_t)realAddr, total);
         return -2;
     }
 
-    __android_log_print(ANDROID_LOG_INFO, RTAG,
-        "写入 pid=%d addr=0x%zx->0x%zx 请求=%zu 实际=%zu",
+    LOG(LOG_LEVEL_INFO, RTAG " 写入 pid=%d addr=0x%zx->0x%zx 请求=%zu 实际=%zu",
         pid, (size_t)address, (size_t)realAddr, total, written);
     return (ssize_t)written;
 }

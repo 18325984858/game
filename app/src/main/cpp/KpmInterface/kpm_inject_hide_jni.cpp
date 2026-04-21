@@ -25,6 +25,7 @@
 
 #include "../ReadProcessMemory/kp_ctl.h"
 #include "../soDumper/so_dumper.h"
+#include "../Log/log.h"
 
 #define KTAG "[KpmInjectHideJNI]"
 
@@ -100,12 +101,10 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
     if (!self_cached_pkg.empty() && KpCtl::isModuleLoaded()) {
         std::string out;
         bool ok = KpCtl::rawCtl("add_hide_pkg:" + self_cached_pkg, &out);
-        __android_log_print(ANDROID_LOG_INFO, KTAG,
-            "auto add_hide_pkg '%s' ok=%d resp='%s'",
+        LOG(LOG_LEVEL_INFO, KTAG " auto add_hide_pkg '%s' ok=%d resp='%s'",
             self_cached_pkg.c_str(), (int)ok, out.c_str());
     } else {
-        __android_log_print(ANDROID_LOG_INFO, KTAG,
-            "JNI_OnLoad: skip auto hide (pkg='%s', kpm_loaded=%d)",
+        LOG(LOG_LEVEL_INFO, KTAG " JNI_OnLoad: skip auto hide (pkg='%s', kpm_loaded=%d)",
             self_cached_pkg.c_str(), (int)KpCtl::isModuleLoaded());
     }
     return JNI_VERSION_1_6;
@@ -115,8 +114,7 @@ extern "C" JNIEXPORT void JNICALL JNI_OnUnload(JavaVM*, void*) {
     if (!self_cached_pkg.empty() && KpCtl::isModuleLoaded()) {
         std::string out;
         bool ok = KpCtl::rawCtl("remove_hide_pkg:" + self_cached_pkg, &out);
-        __android_log_print(ANDROID_LOG_INFO, KTAG,
-            "auto remove_hide_pkg '%s' ok=%d",
+        LOG(LOG_LEVEL_INFO, KTAG " auto remove_hide_pkg '%s' ok=%d",
             self_cached_pkg.c_str(), (int)ok);
     }
 }
@@ -139,8 +137,7 @@ JNI_METHOD(void, nativeSetSuperkey)(JNIEnv* env, jobject, jstring jKey) {
     if (!self_cached_pkg.empty() && KpCtl::isModuleLoaded()) {
         std::string out;
         bool ok = KpCtl::rawCtl("add_hide_pkg:" + self_cached_pkg, &out);
-        __android_log_print(ANDROID_LOG_INFO, KTAG,
-            "setSuperkey �?auto add_hide_pkg '%s' ok=%d resp='%s'",
+        LOG(LOG_LEVEL_INFO, KTAG " setSuperkey �?auto add_hide_pkg '%s' ok=%d resp='%s'",
             self_cached_pkg.c_str(), (int)ok, out.c_str());
     }
 }

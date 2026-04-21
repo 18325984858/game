@@ -37,7 +37,8 @@ struct UEFieldInfo {
 /// 函数信息 (来自 UFunction)
 struct UEFuncInfo {
     std::string name;           ///< 函数名称
-    uintptr_t   funcPtr = 0;   ///< C++ 函数指针 (UFunction::Func)
+    uintptr_t   funcPtr = 0;   ///< C++ 函数指针 (UFunction::Func) — 一般是 exec thunk
+    uintptr_t   ufunctionPtr = 0; ///< UFunction UObject* 自身地址 (用于 ProcessEvent 第二参)
     uint32_t    funcFlags = 0;  ///< EFunctionFlags (UFunction::FunctionFlags)
     uint8_t     numParms = 0;   ///< 参数数量 (UFunction::NumParms)
     std::string location;       ///< 模块内偏移文本

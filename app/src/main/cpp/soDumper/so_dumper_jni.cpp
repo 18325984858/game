@@ -94,8 +94,7 @@ Java_com_example_dobbyproject_SoDumperActivity_nativeDumpSo(
     env->ReleaseStringUTFChars(jModuleName, moduleName);
     env->ReleaseStringUTFChars(jOutPath, outPath);
 
-    __android_log_print(ANDROID_LOG_INFO, DTAG,
-                        "JNI dumpSo: pid=%d, module=%s, base=0x%lx, end=0x%lx, out=%s",
+    LOG(LOG_LEVEL_INFO, DTAG " JNI dumpSo: pid=%d, module=%s, base=0x%lx, end=0x%lx, out=%s",
                         (int)pid, mod.name.c_str(),
                         (unsigned long)mod.baseAddr, (unsigned long)mod.endAddr,
                         outPathStr.c_str());

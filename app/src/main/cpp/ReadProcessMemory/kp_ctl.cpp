@@ -86,8 +86,7 @@ static std::string detect_superkey_from_files() {
             val.pop_back();
         if (!val.empty() && val.size() <= 64) {
             std::string fname = s.substr(pos + 2, end - pos - 2);
-            __android_log_print(ANDROID_LOG_INFO, HTAG,
-                "superkey from %s (len=%zu)", fname.c_str(), val.size());
+            LOG(LOG_LEVEL_INFO, HTAG " superkey from %s (len=%zu)", fname.c_str(), val.size());
             return val;
         }
         pos = blockEnd;
@@ -99,8 +98,7 @@ static const std::string& get_key() {
     if (!g_superkey.empty()) return g_superkey;
     std::string k = detect_superkey_from_files();
     if (k.empty()) {
-        __android_log_print(ANDROID_LOG_WARN, HTAG,
-            "no superkey, fallback to \"su\"");
+        LOG(LOG_LEVEL_WARN, HTAG " no superkey, fallback to \"su\"");
         k = "su";
     }
     g_superkey = std::move(k);
@@ -110,8 +108,7 @@ static const std::string& get_key() {
 static bool sc_hello_ok() {
     const std::string& key = get_key();
     long ret = syscall(KP_NR_SUPERCALL, key.c_str(), ver_and_cmd(KP_SUPERCALL_HELLO));
-    __android_log_print(ANDROID_LOG_INFO, HTAG,
-        "sc_hello ret=0x%lx (expect 0x%x) key_len=%zu",
+    LOG(LOG_LEVEL_INFO, HTAG " sc_hello ret=0x%lx (expect 0x%x) key_len=%zu",
         (long)ret, (unsigned)KP_SUPERCALL_HELLO_MAGIC, key.size());
     return ret == (long)KP_SUPERCALL_HELLO_MAGIC;
 }
@@ -130,8 +127,7 @@ static bool sc_kpm_ctl(const std::string& cmd, std::string* out) {
         resp[sizeof(resp) - 1] = '\0';
         *out = resp;
     }
-    __android_log_print(ANDROID_LOG_INFO, HTAG,
-        "ctl <- %s | ret=%ld out=%s",
+    LOG(LOG_LEVEL_INFO, HTAG " ctl <- %s | ret=%ld out=%s",
         cmd.c_str(), ret, resp);
     return ret == 0;
 }
@@ -159,15 +155,13 @@ namespace KpCtl {
 bool isModuleLoaded() {
     if (g_kp_ready < 0) g_kp_ready = sc_hello_ok() ? 1 : 0;
     if (!g_kp_ready) {
-        __android_log_print(ANDROID_LOG_WARN, HTAG,
-            "kp not ready (sc_hello failed)");
+        LOG(LOG_LEVEL_WARN, HTAG " kp not ready (sc_hello failed)");
         return false;
     }
     std::string out;
     bool ok = sc_kpm_ctl("list_hide_pid", &out);
     bool loaded = ok && out.find("total:") != std::string::npos;
-    __android_log_print(ANDROID_LOG_INFO, HTAG,
-        "isModuleLoaded loaded=%d out='%s'",
+    LOG(LOG_LEVEL_INFO, HTAG " isModuleLoaded loaded=%d out='%s'",
         (int)loaded, out.c_str());
     return loaded;
 }
@@ -214,8 +208,7 @@ bool hideSelf() {
     int pid = (int)getpid();
     bool ok1 = addHidePid(pid);
     bool ok2 = enableProcHide();
-    __android_log_print(ANDROID_LOG_INFO, HTAG,
-        "hideSelf pid=%d addPid=%d enable=%d", pid, ok1, ok2);
+    LOG(LOG_LEVEL_INFO, HTAG " hideSelf pid=%d addPid=%d enable=%d", pid, ok1, ok2);
     return ok1 && ok2;
 }
 
@@ -234,8 +227,7 @@ bool unhideSelf() {
 void setSuperkey(const std::string& key) {
     g_superkey = key;
     g_kp_ready = -1;
-    __android_log_print(ANDROID_LOG_INFO, HTAG,
-        "setSuperkey len=%zu (cached)", key.size());
+    LOG(LOG_LEVEL_INFO, HTAG " setSuperkey len=%zu (cached)", key.size());
 }
 
 bool verifyKey(const std::string& key) {

@@ -100,6 +100,7 @@ void UE5DfmInterface::collectClassData(uintptr_t classPtr) {
                 UEFuncInfo fi;
                 fi.name = m_dumper.oname(ufCur);
 
+                fi.ufunctionPtr = ufCur;  // UFunction UObject* — 用于 ProcessEvent 第二参
                 // UFunction 成员通过 offsetof 读取
                 fi.funcPtr   = rp(ufCur + offsetof(UFunction, Func));
                 fi.funcFlags = r32(ufCur + offsetof(UFunction, FunctionFlags));

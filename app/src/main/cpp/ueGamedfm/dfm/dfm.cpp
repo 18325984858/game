@@ -1200,6 +1200,7 @@ void DfmMatchMonitor::scanActors(const std::vector<uintptr_t>& actors, DrawDfmDa
         if (isContainerClass(cn)) {
             ContainerInfo ci = readContainerInfo(actor, cn);
             ci.items = readContainerItems(actor, cn);
+            ci.actorPtr = actor;  // 供 GUI 后续发起远程开箱
             outData.containers.push_back(std::move(ci));
         }
     }
@@ -1636,6 +1637,22 @@ int64_t SharedDfmData::getMsSinceLastPush() const {
     return nowMs - last;
 }
 
+void SharedDfmData::enqueueOpenBox(uintptr_t actorPtr) {
+    if (!actorPtr) return;
+    std::lock_guard<std::mutex> lock(m_cmdMutex);
+    // 去重: 短时间内同一 box 多次按钮按下只发一次
+    for (auto p : m_openBoxQueue) if (p == actorPtr) return;
+    if (m_openBoxQueue.size() >= 32) return;  // 防溢出
+    m_openBoxQueue.push_back(actorPtr);
+}
+
+std::vector<uintptr_t> SharedDfmData::drainOpenBoxQueue() {
+    std::lock_guard<std::mutex> lock(m_cmdMutex);
+    std::vector<uintptr_t> out;
+    out.swap(m_openBoxQueue);
+    return out;
+}
+
 // =====================================================================
 //  DfmMatchMonitor 构造/析构
 // =====================================================================
@@ -1885,12 +1902,32 @@ int DfmMatchMonitor::matchBoneNamesFromFNameArray(uintptr_t dataPtr,
     entry.matchedCount = 0;
     if (dataPtr < 0x10000 || count <= 0 || count > kMaxRenderableBoneCount) return 0;
 
+    // 一次性诊断: 全量dump 骨骼名字 + 索引, 让人看清哪个才是真头/脚骨。
+    // 同一个 dataPtr 只 dump 一次, 避免刷屏。
+    bool dumpThis = false;
+    {
+        static std::mutex sMu;
+        static std::unordered_map<uintptr_t, bool> sDumped;
+        std::lock_guard<std::mutex> lk(sMu);
+        if (sDumped.find(dataPtr) == sDumped.end() && sDumped.size() < 8) {
+            sDumped[dataPtr] = true;
+            dumpThis = true;
+        }
+    }
+    std::string dumpBuf;
+    if (dumpThis) dumpBuf.reserve(2048);
+
     for (int index = 0; index < count; ++index) {
         const uintptr_t nameAddr = dataPtr + static_cast<uintptr_t>(index) * sizeof(FName);
         FName rawBoneName = kInvalidTrackedBoneName;
         const bool haveRawBoneName = safeReadMemory(nameAddr, &rawBoneName, sizeof(rawBoneName));
-        const std::string normalizedName = normalizeBoneName(
-            readFName(nameAddr));
+        const std::string rawName = readFName(nameAddr);
+        const std::string normalizedName = normalizeBoneName(rawName);
+        if (dumpThis && !rawName.empty()) {
+            char tb[80];
+            std::snprintf(tb, sizeof(tb), "[%d]%s ", index, rawName.c_str());
+            dumpBuf += tb;
+        }
         if (normalizedName.empty()) continue;
 
         for (size_t slot = 0; slot < PlayerInfo::BONE_COUNT; ++slot) {
@@ -1905,7 +1942,25 @@ int DfmMatchMonitor::matchBoneNamesFromFNameArray(uintptr_t dataPtr,
                 break;
             }
         }
-        if (entry.matchedCount == PlayerInfo::BONE_COUNT) break;
+        // 不提前 break: 即使全部 slot 匹配完, 仍要 dump 完名字表 (仅dumpThis)
+        if (!dumpThis && entry.matchedCount == PlayerInfo::BONE_COUNT) break;
+    }
+    if (dumpThis) {
+        // 分 chunk 输出, logcat 单行上限 ~4KB, 超过会被截断
+        size_t off = 0;
+        int chunk = 0;
+        while (off < dumpBuf.size()) {
+            size_t take = std::min<size_t>(dumpBuf.size() - off, 1500);
+            LOG(LOG_LEVEL_WARN, TAG " [bones-dump] dataPtr=%p count=%d chunk=%d: %.*s",
+                (void*)dataPtr, count, chunk, (int)take, dumpBuf.c_str() + off);
+            off += take;
+            ++chunk;
+        }
+        LOG(LOG_LEVEL_WARN, TAG " [bones-dump] dataPtr=%p matched=%d slots: head[0]=%d neck[1]=%d chest[2]=%d pelvis[4]=%d rhand[7]=%d rfoot[13]=%d",
+            (void*)dataPtr, entry.matchedCount,
+            entry.trackedBoneIndices[0], entry.trackedBoneIndices[1],
+            entry.trackedBoneIndices[2], entry.trackedBoneIndices[4],
+            entry.trackedBoneIndices[7], entry.trackedBoneIndices[13]);
     }
     return entry.matchedCount;
 }
@@ -1922,12 +1977,30 @@ int DfmMatchMonitor::matchBoneNamesFromBoneInfoArray(uintptr_t dataPtr,
         return 0;
     }
 
+    bool dumpThis = false;
+    {
+        static std::mutex sMu;
+        static std::unordered_map<uintptr_t, bool> sDumped;
+        std::lock_guard<std::mutex> lk(sMu);
+        if (sDumped.find(dataPtr) == sDumped.end() && sDumped.size() < 8) {
+            sDumped[dataPtr] = true;
+            dumpThis = true;
+        }
+    }
+    std::string dumpBuf;
+    if (dumpThis) dumpBuf.reserve(2048);
+
     for (int index = 0; index < count; ++index) {
         const uintptr_t nameAddr = dataPtr + static_cast<uintptr_t>(index) * static_cast<uintptr_t>(stride);
         FName rawBoneName = kInvalidTrackedBoneName;
         const bool haveRawBoneName = safeReadMemory(nameAddr, &rawBoneName, sizeof(rawBoneName));
-        const std::string normalizedName = normalizeBoneName(
-            readFName(nameAddr));
+        const std::string rawName = readFName(nameAddr);
+        const std::string normalizedName = normalizeBoneName(rawName);
+        if (dumpThis && !rawName.empty()) {
+            char tb[80];
+            std::snprintf(tb, sizeof(tb), "[%d]%s ", index, rawName.c_str());
+            dumpBuf += tb;
+        }
         if (normalizedName.empty()) continue;
 
         for (size_t slot = 0; slot < PlayerInfo::BONE_COUNT; ++slot) {
@@ -1942,7 +2015,23 @@ int DfmMatchMonitor::matchBoneNamesFromBoneInfoArray(uintptr_t dataPtr,
                 break;
             }
         }
-        if (entry.matchedCount == PlayerInfo::BONE_COUNT) break;
+        if (!dumpThis && entry.matchedCount == PlayerInfo::BONE_COUNT) break;
+    }
+    if (dumpThis) {
+        size_t off = 0;
+        int chunk = 0;
+        while (off < dumpBuf.size()) {
+            size_t take = std::min<size_t>(dumpBuf.size() - off, 1500);
+            LOG(LOG_LEVEL_WARN, TAG " [bones-dump-bi] dataPtr=%p count=%d stride=%d chunk=%d: %.*s",
+                (void*)dataPtr, count, stride, chunk, (int)take, dumpBuf.c_str() + off);
+            off += take;
+            ++chunk;
+        }
+        LOG(LOG_LEVEL_WARN, TAG " [bones-dump-bi] dataPtr=%p matched=%d slots: head[0]=%d neck[1]=%d chest[2]=%d pelvis[4]=%d rhand[7]=%d rfoot[13]=%d",
+            (void*)dataPtr, entry.matchedCount,
+            entry.trackedBoneIndices[0], entry.trackedBoneIndices[1],
+            entry.trackedBoneIndices[2], entry.trackedBoneIndices[4],
+            entry.trackedBoneIndices[7], entry.trackedBoneIndices[13]);
     }
     return entry.matchedCount;
 }
@@ -2539,7 +2628,13 @@ bool DfmMatchMonitor::fillPlayerBones(PlayerInfo& player) const {
     //   ② 大多数四元数模长 ∈ [0.5, 1.5] (有效 FQuat 都是单位四元数)
     //   ③ Translation 全部有限且 |xyz| < 5e3 cm
     // 命中后按 meshComp 缓存, 避免每帧重新枚举。
-    static const int32_t kCandidateOffsets[] = { 0x9E8, 0x9F8, 0xA08, 0x9D8, 0x9C8 };
+    static const int32_t kCandidateOffsets[] = {
+        0x9E8, 0x9F8, 0xA08, 0x9D8, 0x9C8,           // 原候选 (CachedComponentSpaceTransforms 周边)
+        0xA18, 0xA28, 0xA38, 0xA48,                  // 向后扩展 16 字节步进
+        0x9B8, 0x9A8, 0x998,                         // 向前扩展
+        0xAA8, 0xAB8, 0xAC8,                         // ComponentSpaceTransformsArray 在某些版本位置
+        0xC30, 0xC40, 0xC50,                         // BoneSpaceTransforms 之外的另一个布局
+    };
     constexpr float kMinHumanHeightCm = 60.f;   // 蹲伏/儿童 mesh 下限
     constexpr float kMaxHumanHeightCm = 500.f;  // 含巨型 mesh / 挂件
     constexpr float kMaxTranslationCm = 5000.f; // 单根骨骼 Translation 绝对值上限
@@ -2603,12 +2698,77 @@ bool DfmMatchMonitor::fillPlayerBones(PlayerInfo& player) const {
     }
 
     if (chosenOffset == 0) {
+        // 一次性诊断: 打出所有候选的实际 (Zmin, Zmax, count) 让用户判断哪个才是
+        // 真正的标准 component-space (foot 应该 ≈ 0)。每 5s 输出一次, 防刷屏。
+        bool wantProbe = false;
+        {
+            static auto sLastProbe = std::chrono::steady_clock::time_point{};
+            auto now = std::chrono::steady_clock::now();
+            if (now - sLastProbe > std::chrono::seconds(5)) {
+                sLastProbe = now;
+                wantProbe = true;
+            }
+        }
+
+        struct CandSnap {
+            int32_t off;
+            int     num;
+            float   zMin, zMax, spread;
+            float   bone0Z, bone1Z, bone2Z;
+            bool    valid;
+        };
+        std::vector<CandSnap> probes;
+
         for (int32_t off : kCandidateOffsets) {
             TArray<FTransform> tmp{};
-            if (!tryReadArray(off, tmp)) continue;
+            if (!tryReadArray(off, tmp)) {
+                if (wantProbe) probes.push_back({off, 0, 0, 0, 0, 0, 0, 0, false});
+                continue;
+            }
             float sp = evaluateSpread(tmp);
+            if (wantProbe) {
+                // 抓前 32 根再算一遍 zMin/zMax (无校验, 纯展示)
+                int n = std::min<int>(tmp.Num, 32);
+                std::array<FTransform, 32> rawBuf{};
+                CandSnap cs{off, tmp.Num, 1e30f, -1e30f, sp, 0.f, 0.f, 0.f, false};
+                cs.spread = sp;
+                if (safeReadMemory(reinterpret_cast<uintptr_t>(tmp.Data),
+                                   rawBuf.data(), sizeof(FTransform) * n)) {
+                    for (int i = 0; i < n; ++i) {
+                        float z = rawBuf[i].TranslationZ;
+                        if (std::isfinite(z)) {
+                            cs.zMin = std::min(cs.zMin, z);
+                            cs.zMax = std::max(cs.zMax, z);
+                        }
+                    }
+                    cs.bone0Z = rawBuf[0].TranslationZ;
+                    cs.bone1Z = rawBuf[1].TranslationZ;
+                    cs.bone2Z = rawBuf[2].TranslationZ;
+                    cs.valid = true;
+                }
+                probes.push_back(cs);
+            }
             if (sp > bestSpread) { bestSpread = sp; boneArray = tmp; chosenOffset = off; }
         }
+
+        if (wantProbe) {
+            std::string buf;
+            char tmp[160];
+            for (const auto& c : probes) {
+                if (!c.valid) {
+                    std::snprintf(tmp, sizeof(tmp), "[0x%X readFail] ", c.off);
+                } else {
+                    std::snprintf(tmp, sizeof(tmp),
+                        "[0x%X n=%d z=[%.0f..%.0f]=%.0f sp_eval=%.0f b0z=%.0f b1z=%.0f b2z=%.0f] ",
+                        c.off, c.num, c.zMin, c.zMax, c.zMax - c.zMin, c.spread,
+                        c.bone0Z, c.bone1Z, c.bone2Z);
+                }
+                buf += tmp;
+            }
+            LOG(LOG_LEVEL_WARN, TAG " [bones-probe] mesh=%p picked=0x%X cands: %s",
+                (void*)meshComp, chosenOffset, buf.c_str());
+        }
+
         if (chosenOffset == 0) {
             // 所有候选要么读失败要么校验不过 (BoneSpace 局部偏移 / 垃圾内存)
             static auto lastWarn = std::chrono::steady_clock::time_point{};
@@ -2642,13 +2802,20 @@ bool DfmMatchMonitor::fillPlayerBones(PlayerInfo& player) const {
         }
     }
 
-    // ── 关键修复: 始终用 root.CTW.Translation 锚定 mesh 的平移 ──
-    //   UE Character 默认 SkeletalMeshComponent.RelativeLocation = (0,0,-CapsuleHalfHeight),
-    //   所以正常情况下 mesh.T 本就 = root.T - (0,0,88cm). 我们直接用这个公式,
-    //   彻底消除 mesh.CTW 滞后 / LOD 冻结 / 视锥外不更新带来的整副骨架平移到错位
-    //   位置 (典型现象: bone-derived foot 跑到 actor 几十米外的旧 mesh 位置)。
-    //   保留 mesh 自己的 Rotation/Scale (动画/朝向仍由 mesh 提供)。
-    //   只有当 root 解密失败 / Translation 无效 / 与 mesh 同步差 < 5cm 时, 不动 mesh.T。
+    // ── mesh 平移锚定 (修复版) ──
+    //   旧版无条件 `mesh.T = root.T - (0,0,88)`, 假设 UE 默认 capsule half-height=88,
+    //   但 DFM IntCharacter 的实际半高未必是 88, 导致整副骨架被强制下移到脚下。
+    //   症状: ESP 框出现在角色脚跟附近, 框高很短只覆盖小腿。
+    //
+    //   修复策略 (按可信度优先):
+    //     A. mesh.CTW 解密成功且 mesh.T 与 root.T 距离合理 (drift < 200cm)
+    //        → 直接用 mesh.T (UE 引擎已经计算好的当前帧明文, 含正确的 RelativeLocation 偏移)
+    //     B. mesh.CTW 解密成功但 drift 太大 (滞后/LOD 冻结)
+    //        → 用 root.T 校正 XY, Z 用 mesh.T 自己的相对值 (root.Z + (mesh.Z - mesh.Z_at_anchor)),
+    //          这里简化为只校正 XY, Z 保留 mesh 自己的值
+    //     C. mesh.CTW 解密失败
+    //        → 退回 root.T (Z 不偏移; 由 bone localPos.Z 决定垂直分布)
+    //   保留 mesh 自身的 Rotation/Scale (动画/朝向)。
     {
         const uintptr_t rootComp = safeReadPtr(player.characterPtr + m_off.Actor_RootComponent);
         FTransform rootCtw{};
@@ -2657,39 +2824,40 @@ bool DfmMatchMonitor::fillPlayerBones(PlayerInfo& player) const {
             && std::isfinite(rootCtw.TranslationX) && std::isfinite(rootCtw.TranslationY) && std::isfinite(rootCtw.TranslationZ)
             && (std::fabs(rootCtw.TranslationX) > 1.f || std::fabs(rootCtw.TranslationY) > 1.f || std::fabs(rootCtw.TranslationZ) > 1.f)
             && std::fabs(rootCtw.TranslationX) < 1e7f && std::fabs(rootCtw.TranslationY) < 1e7f && std::fabs(rootCtw.TranslationZ) < 1e7f;
-        if (rootTValid) {
+        const bool meshTValid = ctwDecrypted
+            && std::isfinite(componentToWorld.TranslationX)
+            && std::isfinite(componentToWorld.TranslationY)
+            && std::isfinite(componentToWorld.TranslationZ);
+
+        if (rootTValid && meshTValid) {
             const float dx = componentToWorld.TranslationX - rootCtw.TranslationX;
             const float dy = componentToWorld.TranslationY - rootCtw.TranslationY;
-            const float dz = componentToWorld.TranslationZ - (rootCtw.TranslationZ - 88.f);
-            const float drift2 = dx*dx + dy*dy + dz*dz;
-            componentToWorld.TranslationX = rootCtw.TranslationX;
-            componentToWorld.TranslationY = rootCtw.TranslationY;
-            componentToWorld.TranslationZ = rootCtw.TranslationZ - 88.f;
-            // 节流诊断: 仅当锚定位移 > 50cm (即修正了一个真实的滞后) 才打印
-            if (drift2 > 50.f * 50.f) {
+            const float dz_xy = std::sqrt(dx*dx + dy*dy);  // 仅 XY 偏差
+            // 路径 A: mesh 与 root 同步 → 信任 mesh.T (含正确 RelativeLocation.Z)
+            // 路径 B: mesh 滞后 (XY 偏差 > 200cm) → 用 root.T 校正 XY, 保留 Z
+            //         这避免假设具体的 capsule_half_height 值
+            if (dz_xy > 200.f) {
+                componentToWorld.TranslationX = rootCtw.TranslationX;
+                componentToWorld.TranslationY = rootCtw.TranslationY;
                 static auto s_lastAnchorLog = std::chrono::steady_clock::time_point{};
                 auto now = std::chrono::steady_clock::now();
                 if (now - s_lastAnchorLog > std::chrono::seconds(2)) {
                     s_lastAnchorLog = now;
-                    LOG(LOG_LEVEL_WARN, TAG " [bones-anchor] %s drift=%.0fcm meshT_old=(%.0f,%.0f,%.0f) -> rootT-88=(%.0f,%.0f,%.0f)",
-                        player.playerName.c_str(), std::sqrt(drift2),
-                        componentToWorld.TranslationX + dx,
-                        componentToWorld.TranslationY + dy,
-                        componentToWorld.TranslationZ + dz,
-                        componentToWorld.TranslationX,
-                        componentToWorld.TranslationY,
-                        componentToWorld.TranslationZ);
+                    LOG(LOG_LEVEL_WARN, TAG " [bones-anchor] %s mesh-XY-drift=%.0fcm > 200cm, snap to root.XY",
+                        player.playerName.c_str(), dz_xy);
                 }
             }
-        } else {
-            // root 解密失败诊断 (节流, 仅警告级)
-            static auto s_lastNoRootLog = std::chrono::steady_clock::time_point{};
+        } else if (rootTValid && !meshTValid) {
+            // 路径 C: mesh 解密失败, 用 root 校正 XY, Z 保留原值
+            componentToWorld.TranslationX = rootCtw.TranslationX;
+            componentToWorld.TranslationY = rootCtw.TranslationY;
+            // Z 不变: 让骨骼 localPos.Z 自己决定垂直分布
+            static auto s_lastNoMeshLog = std::chrono::steady_clock::time_point{};
             auto now = std::chrono::steady_clock::now();
-            if (now - s_lastNoRootLog > std::chrono::seconds(5)) {
-                s_lastNoRootLog = now;
-                LOG(LOG_LEVEL_WARN, TAG " [bones-anchor] %s rootDecFail rootComp=%p -> 保留 mesh.T=(%.0f,%.0f,%.0f)",
-                    player.playerName.c_str(), (void*)rootComp,
-                    componentToWorld.TranslationX, componentToWorld.TranslationY, componentToWorld.TranslationZ);
+            if (now - s_lastNoMeshLog > std::chrono::seconds(5)) {
+                s_lastNoMeshLog = now;
+                LOG(LOG_LEVEL_WARN, TAG " [bones-anchor] %s meshDecFail, using root.XY",
+                    player.playerName.c_str());
             }
         }
     }
@@ -3029,6 +3197,16 @@ void DfmMatchMonitor::pollLoop() {
 
                 if (persistentData.players.empty()) {
                     scanFromPlayerArray(persistentData);
+                }
+
+                // 同步存活物资箱白名单 — 供 GUI 远程开箱按钮校验脏指针
+                {
+                    std::lock_guard<std::mutex> lock(m_aliveContainersMu);
+                    m_aliveContainers.clear();
+                    m_aliveContainers.reserve(persistentData.containers.size());
+                    for (const auto& c : persistentData.containers) {
+                        if (c.actorPtr) m_aliveContainers.emplace(c.actorPtr, c.className);
+                    }
                 }
 
                 // [placeholder 去重] DFM 远端 actor 大部分时间共享同一个 placeholder
@@ -3402,6 +3580,11 @@ void DfmMatchMonitor::pollLoop() {
             SharedDfmData::getInstance().pushData(persistentData);
         }
 
+        // 处理 GUI 入队的远程开箱请求 (在游戏线程的 polling tick 内执行)
+        if (ms.inMatch) {
+            processOpenBoxRequests();
+        }
+
         // 大厅期心跳: 即使不在对局, 也每秒推一帧空数据, 防止 GUI 看门狗 (uestart.cpp
         // kStaleExitMs=10s) 把渲染线程清屏退出, 导致菜单消失
         if (!ms.inMatch) {
@@ -3415,6 +3598,244 @@ void DfmMatchMonitor::pollLoop() {
     }
 
     LOG(LOG_LEVEL_INFO, TAG " pollLoop 退出");
+}
+
+// =====================================================================
+//  远程开箱 (普通杂物/枪/甲/尸体箱)
+// =====================================================================
+//
+//  IDA 验证 (libUE4.so):
+//   * AInventoryPickup_OpenBox::OpenThisBox  exec thunk @ 0x1335C8E4
+//     - thunk 调 box->vtable[?]( box, PC )  →  OpenThisBoxInner_Impl
+//     - thunk 上层路径: 客户端调 ProcessEvent → UE 检测 FUNC_NetServer
+//       → CallRemoteFunction → NetDriver 包发服务端 → 服务端执行 thunk
+//   * 服务端 OpenThisBoxInner_Impl @ 0x1225CEF4 仅校验:
+//        if (box.PickupBoxType == 3 && !box.bAlreadyOpened)
+//        → SetOpenState(box,1); 触发 OnRep
+//     **没有 距离/视线/朝向 校验**, 因此可远程触发。
+//   * 密码保险箱: ServerVerifySafeBoxCode @ 0x13259A0C 服务端验密码,
+//     本通道无法绕过, 已在类名过滤里跳过。
+//
+//  调用方式: 通过 UObject::ProcessEvent(UFunction*, &params)。
+//
+//  ProcessEvent 定位 (IDA 反编译相邻 wrapper sub_1335B7FC 等):
+//     wrapper(this, arg) {
+//        UFunction* f = FindFunctionChecked(this, &cachedFName);
+//        return (*(vtable + 552))(this, f, &params);   // ← ProcessEvent
+//     }
+//   → ProcessEvent 在 UObject vtable 的 byte offset **552** (slot 69).
+//   → 每个 UObject 实例 *(uintptr_t*)box 就是 vtable, 读 vtable[552/8] 拿到地址。
+//
+//  UFunction* OpenThisBox 通过 m_interface 在启动时枚举 UClass.Children
+//  得到, 缓存在 m_openThisBoxUFunction; 避免每次开箱都做反射。
+
+// UE5 UObject vtable 中 ProcessEvent 的字节偏移. 由 wrapper 反编译验证:
+//   sub_1335B7FC ... ret (*(vtable+552))(this, f, params)
+constexpr uintptr_t kProcessEventVtableByteOffset = 552;
+
+// ★★★ 远程开箱实际 RPC 发送总开关 ★★★
+// false = 安全模式: GUI 按钮入队、Monitor 走完所有校验/日志, 但不真正调
+//         box.vtable[69](ProcessEvent), 不发任何包。物资透视/内容显示
+//         完全可用, 程序也不会崩溃。
+// true  = 实战模式: 真正向服务端发 RPC。仅在以下条件全部满足时再开启:
+//         1) 已确认 ProcessEvent 在 vtable byte offset 552 不变
+//         2) 已通过 hook 确保调用发生在 UE 游戏主线程
+//         3) 接受可能崩溃 / 封号风险
+// UE 的 ProcessEvent 内部多处假设 IsInGameThread(), 在 std::thread 上直接
+// 调几乎一定会触发 ensure/check 崩溃 — 这是上次 "程序崩溃" 的根因。
+constexpr bool kRemoteOpenActuallyFireRPC = false;
+
+bool DfmMatchMonitor::isContainerActorAlive(uintptr_t actorPtr) const {
+    if (!ok(actorPtr)) return false;
+    std::lock_guard<std::mutex> lock(m_aliveContainersMu);
+    return m_aliveContainers.find(actorPtr) != m_aliveContainers.end();
+}
+
+uintptr_t DfmMatchMonitor::findFunctionByName(uintptr_t obj, const FName& fname) const {
+    (void)obj;
+    (void)fname;
+    // 旧的 FindFunctionByName 路径不再使用; 通过 m_interface 在启动时一次性
+    // 解析 UFunction* 并缓存在 m_openThisBoxUFunction (见 sendServerOpenPickupBox)。
+    return 0;
+}
+
+bool DfmMatchMonitor::callUFunction(uintptr_t obj, uintptr_t func, void* params) const {
+    if (!ok(obj) || !ok(func)) return false;
+    // ProcessEvent 通过 obj 的 vtable 第 (552/8 = 69) 个槽调用; 这是 UE5 UObject
+    // 基类的 ProcessEvent 虚函数槽, 所有 UObject 子类共享同一槽位 (vtable 前段)。
+    uintptr_t vtable = safeReadPtr(obj);
+    if (!ok(vtable)) return false;
+    uintptr_t pe = safeReadPtr(vtable + kProcessEventVtableByteOffset);
+    if (!ok(pe)) return false;
+    // 校验 pe 在模块代码段内 (防止 vtable 被篡改导致跳到野指针)
+    if (m_moduleBase != 0 && m_moduleSize != 0
+        && (pe < m_moduleBase || pe >= (m_moduleBase + m_moduleSize))) {
+        LOG(LOG_LEVEL_WARN, TAG " [openbox] ProcessEvent 地址 %p 超出模块范围", (void*)pe);
+        return false;
+    }
+
+    // ★ 默认安全模式: 不真正调 ProcessEvent (跨线程必崩, 见文件顶部宏注释)
+    if (!kRemoteOpenActuallyFireRPC) {
+        LOG(LOG_LEVEL_INFO, TAG " [openbox] [SAFE-MODE] would call PE@%p obj=%p func=%p params=%p",
+            (void*)pe, (void*)obj, (void*)func, params);
+        return true;  // 假装成功, GUI 反馈 OK
+    }
+
+    // 实战路径: 用 sigsetjmp 包住, 一旦内部崩溃可恢复 (但 UE 状态可能已损坏,
+    // 下一帧仍可能崩, 自行承担)
+    using PEFn = void (*)(uintptr_t self, uintptr_t func, void* params);
+    auto fn = reinterpret_cast<PEFn>(pe);
+
+    installSafeReadGuard();
+    if (sigsetjmp(s_safeReadJmpBuf, 1) != 0) {
+        s_safeReadActive = 0;
+        LOG(LOG_LEVEL_ERROR, TAG " [openbox] PE 调用触发 SIGSEGV/SIGBUS, 已恢复");
+        return false;
+    }
+    s_safeReadActive = 1;
+    fn(obj, func, params);
+    s_safeReadActive = 0;
+    return true;
+}
+
+// 通过 m_interface 解析 InventoryPickup_OpenBox 类的 OpenThisBox UFunction*
+static uintptr_t resolveOpenThisBoxUFunctionImpl(ue5dfminf::UE5DfmInterface* iface) {
+    if (!iface) return 0;
+    // sdk_dump 里这个类名 (无 'A' 前缀, UE5 反射使用裸名)
+    static const char* kCandClasses[] = {
+        "InventoryPickup_OpenBox",
+        "InventoryPickup_OpenBoxServer",
+    };
+    for (const char* cls : kCandClasses) {
+        const auto* cd = iface->findClass(cls);
+        if (!cd) continue;
+        for (const auto& f : cd->functions) {
+            if (f.name == "OpenThisBox" && f.ufunctionPtr != 0) {
+                return f.ufunctionPtr;
+            }
+        }
+    }
+    return 0;
+}
+
+bool DfmMatchMonitor::sendServerOpenPickupBox(uintptr_t pcPtr, uintptr_t boxPtr) const {
+    (void)pcPtr;  // OpenThisBox(PC) 把 PC 作为参数; 但根据 sdk_dump 这是 server-only RPC,
+                  // 客户端调时 ProcessEvent 把整个 params 打包发给服务端, 服务端在
+                  // _Implementation 里读 PC 是 nullptr 时会用自己的 GetOwningPlayerController.
+                  // 这里仍把 PC 传过去以满足签名。
+    if (!ok(boxPtr)) return false;
+
+    // 一次性 lazy-resolve OpenThisBox UFunction*
+    if (!m_openThisBoxResolved) {
+        m_openThisBoxUFunction = resolveOpenThisBoxUFunctionImpl(m_interface);
+        m_openThisBoxResolved  = true;
+        LOG(LOG_LEVEL_INFO, TAG " [openbox] resolve OpenThisBox UFunction* = %p",
+            (void*)m_openThisBoxUFunction);
+    }
+    if (!ok(m_openThisBoxUFunction)) {
+        LOG(LOG_LEVEL_WARN, TAG " [openbox] OpenThisBox UFunction* 未解析 (interface 不可用?)");
+        return false;
+    }
+
+    // 校验 box 类: vtable[1=ClassPrivate]=UClass*, 该 UClass 的 oname 应该包含 OpenBox。
+    // 这里不再做严格类校验, 因为 m_aliveContainers 已经在外层卡过 isContainerClass.
+
+    // OpenThisBox(PlayerController* PC) — 单参数
+    struct OpenThisBoxParams { uintptr_t PC; } params{pcPtr};
+    bool ok2 = callUFunction(boxPtr, m_openThisBoxUFunction, &params);
+    LOG(LOG_LEVEL_INFO, TAG " [openbox] PE OpenThisBox box=%p pc=%p uf=%p -> %d",
+        (void*)boxPtr, (void*)pcPtr, (void*)m_openThisBoxUFunction, ok2 ? 1 : 0);
+    return ok2;
+}
+
+void DfmMatchMonitor::processOpenBoxRequests() {
+    auto requests = SharedDfmData::getInstance().drainOpenBoxQueue();
+    if (requests.empty()) return;
+
+    uintptr_t pc = findLocalPlayerController();
+    if (!ok(pc)) {
+        LOG(LOG_LEVEL_WARN, TAG " [openbox] 无本地 PlayerController, 丢弃 %zu 个请求",
+            requests.size());
+        return;
+    }
+
+    // 取本地角色位置, 用作距离阀
+    FVector3 myPos = getMyPosition();
+    const bool myPosValid = std::isfinite(myPos.x) && std::isfinite(myPos.y) && std::isfinite(myPos.z)
+                            && (myPos.x != 0.0f || myPos.y != 0.0f);
+    // 反作弊"距离异常"阀值: 50m (5000uu)
+    // 服务端虽不校验距离, 但 ACE 后台用统计窗口, 远距离开箱会落异常列表
+    constexpr float kMaxOpenDistanceUU = 5000.0f;
+    constexpr int   kGlobalThrottleMs  = 3000;       // 全局每 3s 最多 1 次
+
+    auto now = std::chrono::steady_clock::now();
+
+    // 全局节流: 总流量上限
+    if (m_lastOpenGlobal.time_since_epoch().count() != 0) {
+        auto dtAll = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - m_lastOpenGlobal).count();
+        if (dtAll < kGlobalThrottleMs) {
+            LOG(LOG_LEVEL_INFO, TAG " [openbox] 全局节流, 距上次 %lldms < %dms, 丢弃本批 %zu",
+                (long long)dtAll, kGlobalThrottleMs, requests.size());
+            return;
+        }
+    }
+
+    bool sentAny = false;
+    for (uintptr_t box : requests) {
+        if (!isContainerActorAlive(box)) {
+            LOG(LOG_LEVEL_WARN, TAG " [openbox] 拒绝脏指针 box=%p (不在存活集合)", (void*)box);
+            continue;
+        }
+        // 单 box 节流: 1 秒内只发一次
+        auto it = m_lastOpenTime.find(box);
+        if (it != m_lastOpenTime.end()) {
+            auto dt = std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second).count();
+            if (dt < 1000) {
+                LOG(LOG_LEVEL_INFO, TAG " [openbox] 节流跳过 box=%p (%lldms ago)",
+                    (void*)box, (long long)dt);
+                continue;
+            }
+        }
+
+        // 距离阀: 必须在合理交互范围内, 避免触发 ACE "异常远距离 RPC" 统计
+        if (myPosValid) {
+            FVector3 boxPos{};
+            if (getActorLocation(box, boxPos)) {
+                float dx = boxPos.x - myPos.x;
+                float dy = boxPos.y - myPos.y;
+                float dz = boxPos.z - myPos.z;
+                float dist = std::sqrt(dx*dx + dy*dy + dz*dz);
+                if (dist > kMaxOpenDistanceUU) {
+                    LOG(LOG_LEVEL_WARN, TAG " [openbox] 距离过远 box=%p dist=%.0fuu (>%.0f), 丢弃",
+                        (void*)box, dist, kMaxOpenDistanceUU);
+                    continue;
+                }
+            }
+        }
+
+        // 类型过滤: 密码保险箱 / DrillingSafe 不走本通道
+        std::string cn;
+        {
+            std::lock_guard<std::mutex> lock(m_aliveContainersMu);
+            auto cit = m_aliveContainers.find(box);
+            if (cit != m_aliveContainers.end()) cn = cit->second;
+        }
+        if (cn.find("SafeBox") != std::string::npos ||
+            cn.find("DrillingSafe") != std::string::npos) {
+            LOG(LOG_LEVEL_WARN, TAG " [openbox] 跳过保险箱 box=%p cn=%s", (void*)box, cn.c_str());
+            continue;
+        }
+
+        m_lastOpenTime[box] = now;
+        if (sendServerOpenPickupBox(pc, box)) {
+            sentAny = true;
+            // 全局节流策略: 一批最多发 1 个, 后续请求等下次 tick
+            m_lastOpenGlobal = now;
+            break;
+        }
+    }
+    (void)sentAny;
 }
 
 } // namespace dfm

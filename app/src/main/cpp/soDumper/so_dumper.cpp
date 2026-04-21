@@ -92,7 +92,7 @@ std::vector<ProcessInfo> listRunningApps(const std::string& filter) {
     if (!MemReader::runRootShellCapture(
             "ps -A 2>/dev/null || ps -e 2>/dev/null || ps 2>/dev/null",
             psOut)) {
-        __android_log_print(ANDROID_LOG_ERROR, DTAG, "runRootShellCapture(ps) 失败");
+        LOG(LOG_LEVEL_ERROR, DTAG " runRootShellCapture(ps) 失败");
         return result;
     }
 
@@ -152,7 +152,7 @@ std::vector<ProcessInfo> listRunningApps(const std::string& filter) {
                   return a.packageName < b.packageName;
               });
 
-    __android_log_print(ANDROID_LOG_INFO, DTAG, "找到 %zu 个匹配进程 (filter='%s')",
+    LOG(LOG_LEVEL_INFO, DTAG " 找到 %zu 个匹配进程 (filter='%s')",
                         result.size(), filter.c_str());
     return result;
 }
@@ -171,8 +171,7 @@ std::vector<ModuleInfo> listModules(int pid) {
     // 避免每次 popen(su) 的昂贵开销, 也与 mem_reader 共用一条 root 通道.
     std::string mapsText;
     if (!MemReader::readMaps(pid, mapsText)) {
-        __android_log_print(ANDROID_LOG_ERROR, DTAG,
-            "MemReader::readMaps 失败, pid=%d", pid);
+        LOG(LOG_LEVEL_ERROR, DTAG " MemReader::readMaps 失败, pid=%d", pid);
         return result;
     }
 
@@ -272,7 +271,7 @@ std::vector<ModuleInfo> listModules(int pid) {
                   return a.name < b.name;
               });
 
-    __android_log_print(ANDROID_LOG_INFO, DTAG, "进程 %d 加载了 %zu 个 SO 模块", pid, result.size());
+    LOG(LOG_LEVEL_INFO, DTAG " 进程 %d 加载了 %zu 个 SO 模块", pid, result.size());
     return result;
 }
 
@@ -348,14 +347,12 @@ static uintptr_t resolveElfBaseFromMaps(int pid, const ModuleInfo& module) {
 
     for (uintptr_t candidate : candidates) {
         if (hasElfMagicAt(pid, candidate)) {
-            __android_log_print(ANDROID_LOG_INFO, DTAG,
-                                "ELF 头定位成功: 0x%lx", (unsigned long)candidate);
+            LOG(LOG_LEVEL_INFO, DTAG " ELF 头定位成功: 0x%lx", (unsigned long)candidate);
             return candidate;
         }
     }
 
-    __android_log_print(ANDROID_LOG_WARN, DTAG,
-                        "无法从 maps/offset 自动定位 ELF 头, candidates=%zu",
+    LOG(LOG_LEVEL_WARN, DTAG " 无法从 maps/offset 自动定位 ELF 头, candidates=%zu",
                         candidates.size());
     return 0;
 }
@@ -363,8 +360,7 @@ static uintptr_t resolveElfBaseFromMaps(int pid, const ModuleInfo& module) {
 // ─── Dump + 修复 (PT_LOAD 段感知) ──────────────────────────────────
 
 int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath) {
-    __android_log_print(ANDROID_LOG_INFO, DTAG,
-                        "开始 dump: pid=%d, module=%s, map_base=0x%lx, end=0x%lx, off=0x%lx, perms=%s, size=%zu",
+    LOG(LOG_LEVEL_INFO, DTAG " 开始 dump: pid=%d, module=%s, map_base=0x%lx, end=0x%lx, off=0x%lx, perms=%s, size=%zu",
                         pid, module.name.c_str(),
                         (unsigned long)module.baseAddr, (unsigned long)module.endAddr,
                         (unsigned long)module.fileOffset,
@@ -373,16 +369,14 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath) 
 
     uintptr_t baseAddr = resolveElfBaseFromMaps(pid, module);
     if (baseAddr == 0) {
-        __android_log_print(ANDROID_LOG_ERROR, DTAG,
-                            "无法定位有效 ELF 基址: map_base=0x%lx off=0x%lx path=%s",
+        LOG(LOG_LEVEL_ERROR, DTAG " 无法定位有效 ELF 基址: map_base=0x%lx off=0x%lx path=%s",
                             (unsigned long)module.baseAddr,
                             (unsigned long)module.fileOffset,
                             module.path.c_str());
         return -2;
     }
 
-    __android_log_print(ANDROID_LOG_INFO, DTAG,
-                        "最终使用 ELF 基址: 0x%lx",
+    LOG(LOG_LEVEL_INFO, DTAG " 最终使用 ELF 基址: 0x%lx",
                         (unsigned long)baseAddr);
 
     // 临时目录由 MemReader 初始化时保证 (/data/local/tmp/so_dump)
@@ -397,20 +391,20 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath) 
 
     size_t headerGot = readProcessMemory(pid, baseAddr, headerReadSize, headerBuf);
     if (headerGot < sizeof(Elf64_Ehdr)) {
-        __android_log_print(ANDROID_LOG_ERROR, DTAG, "读取 ELF 头失败, got=%zu", headerGot);
+        LOG(LOG_LEVEL_ERROR, DTAG " 读取 ELF 头失败, got=%zu", headerGot);
         delete[] headerBuf;
         return -4;
     }
 
     // 验证 ELF magic
     if (memcmp(headerBuf, ELFMAG, SELFMAG) != 0) {
-        __android_log_print(ANDROID_LOG_ERROR, DTAG, "无效 ELF magic");
+        LOG(LOG_LEVEL_ERROR, DTAG " 无效 ELF magic");
         delete[] headerBuf;
         return -2;
     }
 
     bool is64 = (headerBuf[EI_CLASS] == ELFCLASS64);
-    __android_log_print(ANDROID_LOG_INFO, DTAG, "ELF class: %s", is64 ? "64-bit" : "32-bit");
+    LOG(LOG_LEVEL_INFO, DTAG " ELF class: %s", is64 ? "64-bit" : "32-bit");
 
     // ── Step 2: 解析 PT_LOAD 段 ──
     struct LoadSeg {
@@ -426,8 +420,7 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath) 
         size_t phdrEnd = ehdr->e_phoff + (size_t)ehdr->e_phnum * ehdr->e_phentsize;
         if (phdrEnd > headerGot) {
             // phdr 表超出已读范围, 需要额外读取
-            __android_log_print(ANDROID_LOG_WARN, DTAG,
-                "phdr 表偏移 %zu 超出首次读取范围 %zu, 扩展读取",
+            LOG(LOG_LEVEL_WARN, DTAG " phdr 表偏移 %zu 超出首次读取范围 %zu, 扩展读取",
                 phdrEnd, headerGot);
             uint8_t* newBuf = new(std::nothrow) uint8_t[phdrEnd];
             if (!newBuf) { delete[] headerBuf; return -3; }
@@ -458,8 +451,7 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath) 
                 // 重建可以直接用 vaddr 当 file offset, 不需要再做 offset/vaddr 换算.
                 size_t segEnd = seg.vaddr + seg.memsz;
                 if (segEnd > outFileSize) outFileSize = segEnd;
-                __android_log_print(ANDROID_LOG_INFO, DTAG,
-                    "PT_LOAD[%d]: vaddr=0x%lx offset=0x%lx memsz=0x%lx",
+                LOG(LOG_LEVEL_INFO, DTAG " PT_LOAD[%d]: vaddr=0x%lx offset=0x%lx memsz=0x%lx",
                     i, (unsigned long)seg.vaddr, (unsigned long)seg.offset,
                     (unsigned long)seg.memsz);
             }
@@ -499,18 +491,17 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath) 
     }
 
     if (loadSegs.empty()) {
-        __android_log_print(ANDROID_LOG_ERROR, DTAG, "未找到 PT_LOAD 段");
+        LOG(LOG_LEVEL_ERROR, DTAG " 未找到 PT_LOAD 段");
         delete[] headerBuf;
         return -2;
     }
 
-    __android_log_print(ANDROID_LOG_INFO, DTAG,
-        "找到 %zu 个 PT_LOAD 段, 输出文件大小: %zu bytes (%.2f MB)",
+    LOG(LOG_LEVEL_INFO, DTAG " 找到 %zu 个 PT_LOAD 段, 输出文件大小: %zu bytes (%.2f MB)",
         loadSegs.size(), outFileSize, outFileSize / (1024.0 * 1024.0));
 
     // 输出文件大小检查 (基于 vaddr 布局, 段间真实间隙会零填充)
     if (outFileSize == 0 || outFileSize > ((size_t)2u << 30)) {
-        __android_log_print(ANDROID_LOG_ERROR, DTAG, "输出文件大小异常: %zu", outFileSize);
+        LOG(LOG_LEVEL_ERROR, DTAG " 输出文件大小异常: %zu", outFileSize);
         delete[] headerBuf;
         return -2;
     }
@@ -518,7 +509,7 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath) 
     // ── Step 3: 分配输出缓冲区 (零初始化) ──
     uint8_t* outBuf = new(std::nothrow) uint8_t[outFileSize]();
     if (!outBuf) {
-        __android_log_print(ANDROID_LOG_ERROR, DTAG, "分配 %zu 字节失败", outFileSize);
+        LOG(LOG_LEVEL_ERROR, DTAG " 分配 %zu 字节失败", outFileSize);
         delete[] headerBuf;
         return -3;
     }
@@ -540,14 +531,12 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath) 
         }
         if (readSize == 0) continue;
 
-        __android_log_print(ANDROID_LOG_INFO, DTAG,
-            "Dump PT_LOAD[%zu]: mem=0x%lx -> file_off=0x%lx, size=%zu",
+        LOG(LOG_LEVEL_INFO, DTAG " Dump PT_LOAD[%zu]: mem=0x%lx -> file_off=0x%lx, size=%zu",
             si, (unsigned long)memAddr, (unsigned long)seg.vaddr, readSize);
 
         // 写入 vaddr 偏移 (= 文件偏移, 与 outFileSize 计算保持一致)
         size_t got = readProcessMemory(pid, memAddr, readSize, outBuf + seg.vaddr);
-        __android_log_print(ANDROID_LOG_INFO, DTAG,
-            "PT_LOAD[%zu]: 读取 %zu / %zu bytes", si, got, readSize);
+        LOG(LOG_LEVEL_INFO, DTAG " PT_LOAD[%zu]: 读取 %zu / %zu bytes", si, got, readSize);
     }
 
     // ── Step 5: IDA 兼容 ELF 修复 (重建 section headers) ──
@@ -622,8 +611,7 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath) 
     }
 
     if (dynOff == 0 || dynOff + dynSize > outFileSize) {
-        __android_log_print(ANDROID_LOG_WARN, DTAG,
-            "PT_DYNAMIC 未找到或越界 (off=0x%lx sz=0x%lx), 跳过 section 重建",
+        LOG(LOG_LEVEL_WARN, DTAG " PT_DYNAMIC 未找到或越界 (off=0x%lx sz=0x%lx), 跳过 section 重建",
             (unsigned long)dynOff, (unsigned long)dynSize);
         // 直接清零 section header 并跳过
         if (is64) {
@@ -708,8 +696,7 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath) 
             absoluteAddrs = true;
         }
 
-        __android_log_print(ANDROID_LOG_INFO, DTAG,
-            "Dynamic entries 地址模式: %s", absoluteAddrs ? "绝对地址" : "相对地址");
+        LOG(LOG_LEVEL_INFO, DTAG " Dynamic entries 地址模式: %s", absoluteAddrs ? "绝对地址" : "相对地址");
 
         // 第二遍: 完整解析
         if (is64) {
@@ -774,8 +761,7 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath) 
             }
         }
 
-        __android_log_print(ANDROID_LOG_INFO, DTAG,
-            "Dynamic: strtab=0x%lx(%zu) symtab=0x%lx hash=0x%lx gnu_hash=0x%lx",
+        LOG(LOG_LEVEL_INFO, DTAG " Dynamic: strtab=0x%lx(%zu) symtab=0x%lx hash=0x%lx gnu_hash=0x%lx",
             (unsigned long)di.dt_strtab, di.dt_strsz,
             (unsigned long)di.dt_symtab,
             (unsigned long)di.dt_hash, (unsigned long)di.dt_gnu_hash);
@@ -831,8 +817,7 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath) 
         }
         size_t dynsymSize = dynsymCount * symEntSize;
 
-        __android_log_print(ANDROID_LOG_INFO, DTAG,
-            "dynsym: count=%zu, entsize=%zu, total=%zu",
+        LOG(LOG_LEVEL_INFO, DTAG " dynsym: count=%zu, entsize=%zu, total=%zu",
             dynsymCount, symEntSize, dynsymSize);
 
         // --- 5e: 计算 .hash 大小 ---
@@ -997,15 +982,13 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath) 
             if (s.addr + s.size <= outFileSize) {
                 validSections.push_back(s);
             } else {
-                __android_log_print(ANDROID_LOG_WARN, DTAG,
-                    "Section '%s' 越界 (off=0x%lx, sz=0x%lx), 跳过",
+                LOG(LOG_LEVEL_WARN, DTAG " Section '%s' 越界 (off=0x%lx, sz=0x%lx), 跳过",
                     s.name, (unsigned long)s.addr, (unsigned long)s.size);
             }
         }
         sections = std::move(validSections);
 
-        __android_log_print(ANDROID_LOG_INFO, DTAG,
-            "重建 %zu 个 section headers", sections.size());
+        LOG(LOG_LEVEL_INFO, DTAG " 重建 %zu 个 section headers", sections.size());
 
         // 构建 .shstrtab
         std::vector<uint8_t> shstrtab;
@@ -1056,8 +1039,7 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath) 
         // 重新分配输出缓冲区
         uint8_t* newBuf = new(std::nothrow) uint8_t[newFileSize]();
         if (!newBuf) {
-            __android_log_print(ANDROID_LOG_ERROR, DTAG,
-                "追加 section header 内存分配失败");
+            LOG(LOG_LEVEL_ERROR, DTAG " 追加 section header 内存分配失败");
             goto write_output;
         }
         memcpy(newBuf, outBuf, outFileSize);
@@ -1143,8 +1125,7 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath) 
         }
 
         outFileSize = newFileSize;
-        __android_log_print(ANDROID_LOG_INFO, DTAG,
-            "Section headers 重建完成: %zu sections, 文件大小 %zu -> %zu",
+        LOG(LOG_LEVEL_INFO, DTAG " Section headers 重建完成: %zu sections, 文件大小 %zu -> %zu",
             totalSections, outFileSize - totalAppend, outFileSize);
     }
 
@@ -1183,16 +1164,14 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath) 
             }
             hex[16] = '\0';
             finalPath = dir + std::string(hex) + ".bin";
-            __android_log_print(ANDROID_LOG_INFO, DTAG,
-                "\u8f93\u51fa\u540d\u542b\u654f\u611f\u5b57\u6837, \u6539\u540d\u4e3a: %s", finalPath.c_str());
+            LOG(LOG_LEVEL_INFO, DTAG " \u8f93\u51fa\u540d\u542b\u654f\u611f\u5b57\u6837, \u6539\u540d\u4e3a: %s", finalPath.c_str());
         }
     }
 
     // ── Step 7: \u5199\u5165\u8f93\u51fa\u6587\u4ef6 ──
     FILE* outFp = fopen(finalPath.c_str(), "wb");
     if (!outFp) {
-        __android_log_print(ANDROID_LOG_ERROR, DTAG,
-            "无法创建输出文件: %s (errno=%d, %s)",
+        LOG(LOG_LEVEL_ERROR, DTAG " 无法创建输出文件: %s (errno=%d, %s)",
             finalPath.c_str(), errno, strerror(errno));
         delete[] outBuf;
         return -5;
@@ -1209,13 +1188,11 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath) 
     }
 
     if (written != outFileSize) {
-        __android_log_print(ANDROID_LOG_ERROR, DTAG,
-            "写入不完整: %zu / %zu", written, outFileSize);
+        LOG(LOG_LEVEL_ERROR, DTAG " 写入不完整: %zu / %zu", written, outFileSize);
         return -6;
     }
 
-    __android_log_print(ANDROID_LOG_INFO, DTAG,
-                        "Dump 成功: %s -> %s (%zu bytes, %.2f MB)",
+    LOG(LOG_LEVEL_INFO, DTAG " Dump 成功: %s -> %s (%zu bytes, %.2f MB)",
                         module.name.c_str(), finalPath.c_str(),
                         outFileSize, outFileSize / (1024.0 * 1024.0));
     return 0;

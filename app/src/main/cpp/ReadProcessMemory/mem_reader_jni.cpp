@@ -44,11 +44,9 @@ static void ensureInjectHide() {
     std::thread([]{
         if (KpCtl::isModuleLoaded()) {
             bool ok = KpCtl::hideSelf();
-            __android_log_print(ANDROID_LOG_INFO, MTAG,
-                "kp hideSelf ok=%d pid=%d", (int)ok, (int)getpid());
+            LOG(LOG_LEVEL_INFO, MTAG " kp hideSelf ok=%d pid=%d", (int)ok, (int)getpid());
         } else {
-            __android_log_print(ANDROID_LOG_INFO, MTAG,
-                "kp KPM 未加载或 superkey 探测失败, 跳过隐藏");
+            LOG(LOG_LEVEL_INFO, MTAG " kp KPM 未加载或 superkey 探测失败, 跳过隐藏");
         }
     }).detach();
 }
@@ -364,8 +362,7 @@ Java_com_example_dobbyproject_MemoryReaderActivity_nativeGlobalSearch(
         pclose(fp);
     }
 
-    __android_log_print(ANDROID_LOG_INFO, MTAG,
-          "global search: pid=%d regions=%zu pat=%zd onlyW=%d skipBigRo=%d",
+    LOG(LOG_LEVEL_INFO, MTAG " global search: pid=%d regions=%zu pat=%zd onlyW=%d skipBigRo=%d",
           (int)pid, regions.size(), (ssize_t)pn,
           (int)onlyWritable, (int)skipBigRo);
 
@@ -396,8 +393,7 @@ Java_com_example_dobbyproject_MemoryReaderActivity_nativeGlobalSearch(
         }
     }
 
-    __android_log_print(ANDROID_LOG_INFO, MTAG,
-          "global search done: scanned %zu regions, %zu hits",
+    LOG(LOG_LEVEL_INFO, MTAG " global search done: scanned %zu regions, %zu hits",
           scanned, allHits.size());
 
     // 组装 String[]

@@ -149,6 +149,7 @@ void DfmOverlay::drawOverlay(const dfm::DrawDfmData& data) {
     if (m_enableMinimap) drawMinimap(data, screenW, screenH);
     if (m_enablePlayerList) drawPlayerList(data, screenW, screenH);
     if (m_enableLoot) drawLootList(data, screenW, screenH);
+    if (m_enableAimAssist) drawAimAssist(data, screenW, screenH);
     drawNotifications(data, screenW, screenH);
 }
 
@@ -194,6 +195,7 @@ void DfmOverlay::drawMenu(const dfm::DrawDfmData& data) {
         ImGui::Checkbox("物资显示", &m_enableLoot);
         ImGui::Checkbox("物资3D标签", &m_enableLootESP);
         ImGui::Checkbox("物资箱", &m_enableContainer);
+        ImGui::Checkbox("远程开箱", &m_enableRemoteOpen);
         ImGui::Checkbox("显示血条", &m_enableHP);
         ImGui::Checkbox("显示距离", &m_enableDistance);
         ImGui::Checkbox("显示名字", &m_enableName);
@@ -205,6 +207,21 @@ void DfmOverlay::drawMenu(const dfm::DrawDfmData& data) {
         ImGui::SliderFloat("ESP距离(m)", &m_espMaxDist, 50.0f, 1000.0f, "%.0f");
         ImGui::SliderFloat("地图范围(m)", &m_minimapRange, 50.0f, 500.0f, "%.0f");
         ImGui::SliderFloat("物资距离(m)", &m_lootMaxDist, 20.0f, 300.0f, "%.0f");
+
+        ImGui::Separator();
+        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "辅助瞄准 (只显示, 不接管)");
+        ImGui::Checkbox("启用辅助瞄准信息", &m_enableAimAssist);
+        if (m_enableAimAssist) {
+            ImGui::Checkbox("显示弹道下坠点", &m_aimAssistShowDrop);
+            ImGui::Checkbox("显示移动提前量", &m_aimAssistShowLead);
+            const char* boneNames[] = {"头部", "胸部", "骨盆"};
+            ImGui::Combo("目标部位", &m_aimAssistBoneIdx, boneNames, 3);
+            ImGui::SliderFloat("最大距离(m)", &m_aimAssistMaxDist, 30.0f, 500.0f, "%.0f");
+            ImGui::SliderFloat("屏幕锥角(°)", &m_aimAssistFOVDeg, 1.0f, 30.0f, "%.1f");
+            ImGui::SliderFloat("子弹初速(m/s)", &m_aimAssistBulletVel, 200.0f, 1200.0f, "%.0f");
+            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
+                "红十字=目标 绿+=预瞄点\n请手动对准, 系统不动准星");
+        }
     }
 
     // [修复] ▲▼ 替换为 ASCII <</>>, 避免超出字体字形范围显示为 ?
@@ -359,19 +376,48 @@ int DfmOverlay::drawESP(const dfm::DrawDfmData& data, float screenW, float scree
         if (p.bonesValid) {
             float minX = 0, maxX = 0, minY = 0, maxY = 0;
             int n = 0;
-            for (int i = 0; i < dfm::PlayerInfo::BONE_COUNT; ++i) {
-                const auto& b = p.bones[i];
-                if (!std::isfinite(b.x)) continue;
-                if (std::fabs(b.x) <= 1.0f && std::fabs(b.y) <= 1.0f) continue;
+            // 追加两个虚拟世界点扩展 AABB:
+            //   ① head_crown = head bone + 25cm  (UE Head 骨在颅底, 不含头骨+头盔)
+            //   ② foot_ground = min(foot_l, foot_r) - 15cm  (Foot 骨在脚踝, 不含脚跟到地面)
+            // 不加这两个点, 骨骼 AABB 只覆盖 ankle→neck (~120cm), 而真实角色身高 ~175cm,
+            // 导致 ESP 框看起来"框在目标脚下"或"短一截"。
+            const dfm::FVector3& headBone = p.bones[0];
+            const dfm::FVector3& rfootBone = p.bones[13];
+            const dfm::FVector3& lfootBone = p.bones[16];
+            float footMinZ = 1e30f;
+            for (const auto& fb : {rfootBone, lfootBone}) {
+                if (std::isfinite(fb.x) && (std::fabs(fb.x) > 1.0f || std::fabs(fb.y) > 1.0f)) {
+                    footMinZ = std::min(footMinZ, fb.z);
+                }
+            }
+            auto addVirtualPoint = [&](float vx, float vy, float vz) {
                 float bsx = 0, bsy = 0;
-                if (!projectToScreen(data, b.x, b.y, b.z, screenW, screenH,
-                                     edgeMinDepth, bsx, bsy)) continue;
+                if (!projectToScreen(data, vx, vy, vz, screenW, screenH,
+                                     edgeMinDepth, bsx, bsy)) return;
                 if (n == 0) { minX = maxX = bsx; minY = maxY = bsy; }
                 else {
                     if (bsx < minX) minX = bsx; else if (bsx > maxX) maxX = bsx;
                     if (bsy < minY) minY = bsy; else if (bsy > maxY) maxY = bsy;
                 }
                 ++n;
+            };
+            for (int i = 0; i < dfm::PlayerInfo::BONE_COUNT; ++i) {
+                const auto& b = p.bones[i];
+                if (!std::isfinite(b.x)) continue;
+                if (std::fabs(b.x) <= 1.0f && std::fabs(b.y) <= 1.0f) continue;
+                addVirtualPoint(b.x, b.y, b.z);
+            }
+            // 头顶虚拟点
+            if (std::isfinite(headBone.x) && (std::fabs(headBone.x) > 1.0f || std::fabs(headBone.y) > 1.0f)) {
+                addVirtualPoint(headBone.x, headBone.y, headBone.z + 25.0f);
+            }
+            // 脚底虚拟点
+            if (footMinZ < 1e29f) {
+                float footRefX = std::isfinite(rfootBone.x) && std::fabs(rfootBone.x) > 1.0f ? rfootBone.x : lfootBone.x;
+                float footRefY = std::isfinite(rfootBone.y) && std::fabs(rfootBone.y) > 1.0f ? rfootBone.y : lfootBone.y;
+                if (std::isfinite(footRefX) && std::fabs(footRefX) > 1.0f) {
+                    addVirtualPoint(footRefX, footRefY, footMinZ - 15.0f);
+                }
             }
             // 阈值降到 3: 即便大部分骨骼被相机近裁剪掉, 仍然优先骨骼包围盒,
             // 避免在 "骨骼包围盒" 与 "head/foot fallback" 之间反复切换造成尺寸跳变 (闪烁)。
@@ -674,8 +720,7 @@ void DfmOverlay::drawBones(const dfm::DrawDfmData& data, float screenW, float sc
             auto now = std::chrono::steady_clock::now();
             if (now - s_lastBoneDiag > std::chrono::seconds(3)) {
                 s_lastBoneDiag = now;
-                __android_log_print(ANDROID_LOG_WARN, "DFM",
-                    "[draw-bones] %s dist=%.1fm "
+                LOG(LOG_LEVEL_WARN, "DFM" " [draw-bones] %s dist=%.1fm "
                     "headW=(%.0f,%.0f,%.0f) S=(%.0f,%.0f,ok=%d) "
                     "pelvW=(%.0f,%.0f,%.0f) S=(%.0f,%.0f,ok=%d) "
                     "rfootW=(%.0f,%.0f,%.0f) S=(%.0f,%.0f,ok=%d) "
@@ -701,6 +746,34 @@ void DfmOverlay::drawBones(const dfm::DrawDfmData& data, float screenW, float sc
                             boneOutlineColor, outlineThickness);
                 dl->AddLine(ImVec2(boneSX[a], boneSY[a]),
                             ImVec2(boneSX[b], boneSY[b]),
+                            boneColor, thickness);
+            }
+        }
+
+        // 头顶延伸线 (Head 骨 → +25cm 颅顶虚拟点) — 让骨架视觉高度匹配真实角色
+        if (boneOk[0]) {
+            const auto& hb = p.bones[0];
+            float crownSx, crownSy;
+            if (projectToScreen(data, hb.x, hb.y, hb.z + 25.0f,
+                                screenW, screenH, edgeMinDepth, crownSx, crownSy)) {
+                dl->AddLine(ImVec2(boneSX[0], boneSY[0]), ImVec2(crownSx, crownSy),
+                            boneOutlineColor, outlineThickness);
+                dl->AddLine(ImVec2(boneSX[0], boneSY[0]), ImVec2(crownSx, crownSy),
+                            boneColor, thickness);
+            }
+        }
+        // 脚底延伸线 (Foot 骨 → -15cm 地面虚拟点)
+        for (int footIdx : {13, 16}) {
+            if (!boneOk[footIdx]) continue;
+            const auto& fb = p.bones[footIdx];
+            float groundSx, groundSy;
+            if (projectToScreen(data, fb.x, fb.y, fb.z - 15.0f,
+                                screenW, screenH, edgeMinDepth, groundSx, groundSy)) {
+                dl->AddLine(ImVec2(boneSX[footIdx], boneSY[footIdx]),
+                            ImVec2(groundSx, groundSy),
+                            boneOutlineColor, outlineThickness);
+                dl->AddLine(ImVec2(boneSX[footIdx], boneSY[footIdx]),
+                            ImVec2(groundSx, groundSy),
                             boneColor, thickness);
             }
         }
@@ -1145,8 +1218,32 @@ void DfmOverlay::drawLootList(const dfm::DrawDfmData& data, float screenW, float
                 c.opened ? "[已开]" : "[未开]", c.boxType.c_str());
             if (dist >= 0) { ImGui::SameLine(); ImGui::Text("%.0fm", dist); }
 
-            for (const auto& it : c.items) {
-                ImGui::Text("  - %s x%d", it.name.c_str(), it.count);
+            // 远程开箱按钮: 只对未开 + 非保险箱 + 有指针的箱子显示
+            const bool isSafeBox = c.className.find("SafeBox") != std::string::npos
+                                  || c.className.find("DrillingSafe") != std::string::npos;
+            if (m_enableRemoteOpen && c.actorPtr && !c.opened && !isSafeBox) {
+                ImGui::SameLine();
+                // 用 box 指针确保 ID 唯一, 避免多个按钮被 ImGui 合并
+                ImGui::PushID(static_cast<int>(c.actorPtr & 0x7FFFFFFF));
+                if (ImGui::SmallButton("开")) {
+                    dfm::SharedDfmData::getInstance().enqueueOpenBox(c.actorPtr);
+                }
+                ImGui::PopID();
+            }
+
+            // 完整物资清单: 不论是否打开, 客户端 RepItemArray 已可见时直接展示。
+            // 这就是"无需打开就知道里面有什么": ItemInfo 已通过 RepNotify 复制到客户端。
+            if (c.items.empty()) {
+                ImGui::TextColored(ImVec4(0.4f, 0.4f, 0.4f, 1), "  (无可见物品)");
+            } else {
+                for (const auto& it : c.items) {
+                    if (it.durabilityMax > 0.0f) {
+                        ImGui::Text("  - %s x%d (%.0f/%.0f)", it.name.c_str(), it.count,
+                                    it.durability, it.durabilityMax);
+                    } else {
+                        ImGui::Text("  - %s x%d", it.name.c_str(), it.count);
+                    }
+                }
             }
             shown++;
         }
@@ -1205,6 +1302,187 @@ void DfmOverlay::drawNotifications(const dfm::DrawDfmData& data, float screenW, 
     while (m_activeNotifications.size() > 8) {
         m_activeNotifications.erase(m_activeNotifications.begin());
     }
+}
+
+// =====================================================================
+//  辅助瞄准信息显示 — 只读视觉提示
+//  ──────────────────────────────────────────────────────────────────
+//  设计原则:
+//   * 不修改 ControlRotation, 不注入触摸事件, 不调用任何游戏函数。
+//   * 只在屏幕中心一个角度锥内挑一个最近敌人, 高亮 + 显示距离/下坠。
+//   * 预瞄点 = 目标骨骼位置 + (重力下坠补偿 + 移动提前量) → 投影到屏幕。
+//     玩家自己手动把准星移过去, 系统不做任何输入操作。
+//   * 队友、AI、自己、远超距离的目标全部跳过。
+// =====================================================================
+void DfmOverlay::drawAimAssist(const dfm::DrawDfmData& data, float screenW, float screenH) {
+    if (!m_enableAimAssist) return;
+    if (!std::isfinite(data.camLocX)) return;
+    if (data.players.empty()) return;
+
+    const float crossX = screenW * 0.5f;
+    const float crossY = screenH * 0.5f;
+    // 屏幕角度锥换算为像素半径: 用与 projectToScreen 同款的焦距推导。
+    constexpr float DEG2RAD = 3.14159265358979f / 180.0f;
+    constexpr float kRefAspect = 16.0f / 9.0f;
+    float fov = data.camFOV;
+    if (fov < 30.0f || fov > 170.0f) fov = 90.0f;
+    float tanHalfBase = std::tan(fov * 0.5f * DEG2RAD);
+    if (tanHalfBase < 0.01f) return;
+    float focal = screenH * 0.5f * kRefAspect / tanHalfBase;
+    float coneHalfRad = std::clamp(m_aimAssistFOVDeg, 0.5f, 45.0f) * 0.5f * DEG2RAD;
+    float conePixels  = focal * std::tan(coneHalfRad);
+
+    // 选择目标骨骼: 头(0) / 胸(2) / 骨盆(4); 若骨骼无效, 回退到 actor pos + 偏移
+    auto pickAimWorld = [&](const dfm::PlayerInfo& p, float& wx, float& wy, float& wz) {
+        int boneSel = std::clamp(m_aimAssistBoneIdx, 0, 2);
+        int boneIdx = (boneSel == 0) ? 0 : (boneSel == 1) ? 2 : 4;
+        if (p.bonesValid && boneIdx < dfm::PlayerInfo::BONE_COUNT) {
+            const auto& b = p.bones[boneIdx];
+            if (std::isfinite(b.x) && (std::fabs(b.x) > 1.0f || std::fabs(b.y) > 1.0f)) {
+                wx = b.x; wy = b.y; wz = b.z; return true;
+            }
+        }
+        // 回退: 骨骼无效时, 用 actor 位置 + 一个估算高度偏移 (UE 单位 cm)
+        if (!std::isfinite(p.pos.x)) return false;
+        wx = p.pos.x; wy = p.pos.y;
+        wz = p.pos.z + ((boneSel == 0) ? 170.f : (boneSel == 1) ? 130.f : 90.f);
+        return true;
+    };
+
+    const dfm::PlayerInfo* best = nullptr;
+    float bestScreenDist = conePixels;  // 必须在锥内
+    float bestSx = 0.f, bestSy = 0.f;
+    float bestWx = 0.f, bestWy = 0.f, bestWz = 0.f;
+    float bestDistMeters = 0.f;
+
+    for (const auto& p : data.players) {
+        // 过滤: 队友 / AI / 死亡 / 自己 / 无位置
+        if (p.isAI) continue;
+        if (p.hp <= 0.0f) continue;
+        if (p.teamId >= 0 && data.myTeamId >= 0 && p.teamId == data.myTeamId) continue;
+        if (!std::isfinite(p.pos.x)) continue;
+
+        float dM = distMeters(p.pos.x, p.pos.y, p.pos.z,
+                              data.camLocX, data.camLocY, data.camLocZ);
+        if (dM > m_aimAssistMaxDist || dM < 1.0f) continue;
+
+        float wx, wy, wz;
+        if (!pickAimWorld(p, wx, wy, wz)) continue;
+        float sx, sy;
+        if (!worldToScreen(data, wx, wy, wz, screenW, screenH, sx, sy)) continue;
+
+        float dx = sx - crossX, dy = sy - crossY;
+        float pixDist = std::sqrt(dx * dx + dy * dy);
+        if (pixDist < bestScreenDist) {
+            bestScreenDist = pixDist;
+            best = &p;
+            bestSx = sx; bestSy = sy;
+            bestWx = wx; bestWy = wy; bestWz = wz;
+            bestDistMeters = dM;
+        }
+    }
+
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    // 始终画屏幕中心锥指示 (淡圆), 让玩家知道辅助范围
+    dl->AddCircle(ImVec2(crossX, crossY), conePixels,
+                  IM_COL32(255, 220, 80, 60), 32, 1.0f);
+
+    if (!best) return;
+
+    // ── 弹道下坠补偿 (粗略物理: 真空中重力, 不算空气阻力) ──
+    // UE 单位: 1 UU = 1 cm. 重力 g = 980 cm/s^2.
+    // 飞行时间 t = d_cm / v_cm; v_cm = m_aimAssistBulletVel * 100
+    // 下坠 cm   = 0.5 * 980 * t^2
+    float v_cm = std::max(m_aimAssistBulletVel, 50.0f) * 100.0f;
+    float d_cm = bestDistMeters * 100.0f;
+    float t_flight = d_cm / v_cm;                    // s
+    float drop_cm  = 0.5f * 980.0f * t_flight * t_flight;
+
+    // ── 移动提前量 (可选, 极粗略) ──
+    // 用 m_lastPlayerSample 缓存上一帧位置, 估算速度。游戏数据频率约 60Hz,
+    // 噪声大, 这里只在 dt 在 [50ms, 500ms] 之间时才采用, 否则跳过。
+    float lead_x = 0.f, lead_y = 0.f, lead_z = 0.f;
+    if (m_aimAssistShowLead && best->characterPtr) {
+        auto now = Clock::now();
+        auto& s = m_lastPlayerSample[best->characterPtr];
+        if (s.t.time_since_epoch().count() != 0) {
+            float dt = std::chrono::duration<float>(now - s.t).count();
+            if (dt > 0.05f && dt < 0.5f) {
+                float vx = (best->pos.x - s.x) / dt;
+                float vy = (best->pos.y - s.y) / dt;
+                float vz = (best->pos.z - s.z) / dt;
+                // 速度过大视为传送/采样错误, 丢弃
+                float speed_cm = std::sqrt(vx * vx + vy * vy + vz * vz);
+                if (speed_cm < 1500.0f) {  // < 15 m/s, 跑步上限
+                    lead_x = vx * t_flight;
+                    lead_y = vy * t_flight;
+                    lead_z = vz * t_flight;
+                }
+            }
+        }
+        s.x = best->pos.x; s.y = best->pos.y; s.z = best->pos.z; s.t = now;
+        // 防止 map 无限增长: > 64 项时清半 (粗略 LRU)
+        if (m_lastPlayerSample.size() > 64) {
+            auto it = m_lastPlayerSample.begin();
+            for (int i = 0; i < 32 && it != m_lastPlayerSample.end(); ++i) {
+                it = m_lastPlayerSample.erase(it);
+            }
+        }
+    } else {
+        m_lastPlayerSample.erase(best->characterPtr);
+    }
+
+    // ── 计算预瞄世界坐标 → 投影 ──
+    float aimWx = bestWx + lead_x;
+    float aimWy = bestWy + lead_y;
+    float aimWz = bestWz + lead_z + (m_aimAssistShowDrop ? drop_cm : 0.0f);
+    float aimSx, aimSy;
+    bool aimOk = worldToScreen(data, aimWx, aimWy, aimWz, screenW, screenH, aimSx, aimSy);
+
+    // ── 绘制 ──
+    const ImU32 colTarget  = IM_COL32(255, 80, 80, 230);
+    const ImU32 colAim     = IM_COL32(80, 255, 120, 240);
+    const ImU32 colText    = IM_COL32(255, 255, 255, 240);
+    const ImU32 colTextBg  = IM_COL32(0, 0, 0, 160);
+
+    // 目标当前位置: 红色十字
+    float r = std::clamp(800.0f / std::max(bestDistMeters, 1.0f), 8.0f, 32.0f);
+    dl->AddLine(ImVec2(bestSx - r, bestSy), ImVec2(bestSx + r, bestSy), colTarget, 2.0f);
+    dl->AddLine(ImVec2(bestSx, bestSy - r), ImVec2(bestSx, bestSy + r), colTarget, 2.0f);
+    dl->AddCircle(ImVec2(bestSx, bestSy), r, colTarget, 16, 1.5f);
+
+    // 预瞄点: 绿色 "+" 与目标连线
+    if (aimOk && (m_aimAssistShowDrop || m_aimAssistShowLead)) {
+        float ar = 6.0f;
+        dl->AddLine(ImVec2(aimSx - ar, aimSy), ImVec2(aimSx + ar, aimSy), colAim, 2.0f);
+        dl->AddLine(ImVec2(aimSx, aimSy - ar), ImVec2(aimSx, aimSy + ar), colAim, 2.0f);
+        dl->AddCircle(ImVec2(aimSx, aimSy), ar + 3.0f, colAim, 12, 1.0f);
+        dl->AddLine(ImVec2(bestSx, bestSy), ImVec2(aimSx, aimSy),
+                    IM_COL32(80, 255, 120, 120), 1.0f);
+    }
+
+    // 信息文本 (在目标右侧)
+    char buf[160];
+    std::snprintf(buf, sizeof(buf),
+                  "%.0fm  drop %.0fcm  t=%.0fms",
+                  bestDistMeters, drop_cm, t_flight * 1000.0f);
+    ImVec2 ts = ImGui::CalcTextSize(buf);
+    float tx = bestSx + r + 6.0f;
+    float ty = bestSy - ts.y * 0.5f;
+    dl->AddRectFilled(ImVec2(tx - 3, ty - 1),
+                      ImVec2(tx + ts.x + 3, ty + ts.y + 1), colTextBg, 2.0f);
+    dl->AddText(ImVec2(tx, ty), colText, buf);
+
+    // 中心准星附加信息 (距离 + 弹速)
+    char info[96];
+    std::snprintf(info, sizeof(info),
+                  "v=%.0fm/s  cone=%.1f°", m_aimAssistBulletVel, m_aimAssistFOVDeg);
+    ImVec2 is = ImGui::CalcTextSize(info);
+    float ix = crossX - is.x * 0.5f;
+    float iy = crossY + conePixels + 4.0f;
+    dl->AddRectFilled(ImVec2(ix - 3, iy - 1),
+                      ImVec2(ix + is.x + 3, iy + is.y + 1), colTextBg, 2.0f);
+    dl->AddText(ImVec2(ix, iy), colText, info);
 }
 
 } // namespace dfmdraw
