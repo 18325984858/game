@@ -368,6 +368,58 @@ public:
         return (ssize_t)n;
     }
 
+    /**
+     * 与 readChunk 相同协议, 但用 'M' 命令 (helper 端走 pread64('/proc/<pid>/mem')).
+     * 用途: 绕过 anti-cheat 对 process_vm_readv 的 hook。
+     */
+    ssize_t readChunkM(int targetPid, uintptr_t addr, size_t size, uint8_t* dst) {
+        std::lock_guard<std::mutex> g(mtx_);
+        if (size == 0) return 0;
+        if (size > 1024 * 1024) size = 1024 * 1024;
+
+        if (!ensureAliveLocked()) return -1;
+
+        char cmd[160];
+        int cl = snprintf(cmd, sizeof(cmd),
+                          "M %d 0x%zx %zu\n",
+                          targetPid, (size_t)addr, size);
+        if (cl <= 0 || writeAllLocked(wfd_, cmd, (size_t)cl) != 0) {
+            LOG(LOG_LEVEL_WARN, RTAG " RootHelper write 'M' 失败, 重启 daemon");
+            killLocked();
+            return -1;
+        }
+
+        char hdr[64];
+        int hl = readLineLocked(rfd_, hdr, (int)sizeof(hdr), /*timeoutMs=*/5000);
+        if (hl < 0) {
+            LOG(LOG_LEVEL_WARN, RTAG " RootHelper 'M' 响应超时/EOF, 重启 daemon");
+            killLocked();
+            return -1;
+        }
+        if (hl < 2) return -1;
+        if (hdr[0] == 'E') {
+            // helper 端 pread64 失败 (open /proc/<pid>/mem 失败 / 地址越界)
+            return 0;
+        }
+        if (hdr[0] != 'K') {
+            LOG(LOG_LEVEL_ERROR, RTAG " RootHelper 'M' 协议错: %s", hdr);
+            killLocked();
+            return -1;
+        }
+        size_t n = (size_t)strtoul(hdr + 2, nullptr, 10);
+        if (n == 0 || n > size) {
+            LOG(LOG_LEVEL_ERROR, RTAG " RootHelper 'M' 长度异常 want=%zu got=%zu", size, n);
+            killLocked();
+            return -1;
+        }
+        if (readFullLocked(rfd_, dst, n, /*timeoutMs=*/8000) != 0) {
+            LOG(LOG_LEVEL_WARN, RTAG " RootHelper 'M' payload 超时 want=%zu", n);
+            killLocked();
+            return -1;
+        }
+        return (ssize_t)n;
+    }
+
     void resetLocked() {
         std::lock_guard<std::mutex> g(mtx_);
         killLocked();
@@ -685,6 +737,45 @@ ssize_t readMemory(int pid, uintptr_t address, size_t size,
     if (totalGot < size) out.resize(totalGot);
 
     LOG(LOG_LEVEL_INFO, RTAG " 读取 pid=%d addr=0x%zx->0x%zx 请求=%zu 实际=%zu",
+        pid, (size_t)address, (size_t)realAddr, size, totalGot);
+    return (ssize_t)totalGot;
+}
+
+ssize_t readMemoryViaProcMem(int pid, uintptr_t address, size_t size,
+                             std::vector<uint8_t>& out) {
+    out.clear();
+    if (pid <= 0 || size == 0) return -1;
+
+    const size_t HARD_LIMIT = 64 * 1024 * 1024;
+    if (size > HARD_LIMIT) size = HARD_LIMIT;
+
+    uintptr_t realAddr = untag(address);
+
+    ensureRuntimeReady();
+
+    out.resize(size);
+    size_t totalGot = 0;
+    uintptr_t cur = realAddr;
+    size_t left = size;
+    while (left > 0) {
+        size_t chunk = std::min(left, CHUNK_BYTES);
+        ssize_t got = RootHelper::I().readChunkM(pid, cur, chunk, out.data() + totalGot);
+        if (got <= 0) break;
+        totalGot += (size_t)got;
+        cur      += (uintptr_t)got;
+        left     -= (size_t)got;
+        if ((size_t)got < chunk) break;
+    }
+
+    if (totalGot == 0) {
+        out.clear();
+        LOG(LOG_LEVEL_WARN, RTAG " readMemoryViaProcMem 失败 pid=%d addr=0x%zx size=%zu",
+            pid, (size_t)realAddr, size);
+        return -3;
+    }
+    if (totalGot < size) out.resize(totalGot);
+
+    LOG(LOG_LEVEL_INFO, RTAG " readMemoryViaProcMem pid=%d addr=0x%zx->0x%zx 请求=%zu 实际=%zu",
         pid, (size_t)address, (size_t)realAddr, size, totalGot);
     return (ssize_t)totalGot;
 }

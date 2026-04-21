@@ -570,144 +570,105 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath,
         LOG(LOG_LEVEL_INFO, DTAG " PT_LOAD[%zu]: 读取 %zu / %zu bytes", si, got, readSize);
     }
 
-    // ── Step 4b: R-X 段全零页回填 (反 anti-dump) ──
+    // ── Step 4b: R-X 段全零页通过 /proc/<pid>/mem 重读 (反 anti-dump) ──
     //
     // 部分 anti-cheat (如 Tencent ACE) 会 hook process_vm_readv,
     // 让目标进程的 R-X (代码) 段返回全 0 而不是 EPERM, 导致 dump 出来的
     // .text/.plt/.rodata/.eh_frame 全是 0 — 看起来文件大小对, 但代码全丢。
     //
     // 缓解策略: 检测到 R-X (PF_X 且不含 PF_W) 段中存在全零 4KB 页时,
-    // 从磁盘上的源 SO 文件 (module.path, 通常是
-    // /data/app/<pkg>-XXX/lib/arm64/libUE4.so) 对应文件偏移读取并回填。
+    // 改用 MemReader::readMemoryViaProcMem (helper 'M' 命令, 走
+    // pread64('/proc/<pid>/mem')) 重读这一页。/proc/<pid>/mem 走的是 vfs
+    // 路径, 不经过 process_vm_readv 的 hook 点, 通常能拿到真实代码。
     //
-    // 局限性:
-    //   * 仅对未加密/未壳化的 SO 有效。如果 SO 在内存中被解密 (壳),
-    //     磁盘文件回填得到的是壳代码而不是真代码。
-    //   * 仅回填 R-X 段。R-W 段在运行时会被 linker / 程序修改,
-    //     用磁盘原始数据覆盖会得到错误结果 (例如丢失 vtable 的重定位)。
-    //   * module.path 必须是磁盘上真实存在的 ELF 文件; 若 maps 已被
-    //     anti-cheat 替换为 [anon] 之类则跳过。
+    // 不再使用磁盘文件回填: 磁盘上的 SO 可能是加密/加壳版本, 与运行时
+    // 实际指令不同, 回填得到的是壳代码而非真代码, 失去意义。
+    //
+    // 仅对 R-X (PF_X 且不含 PF_W) 段做重读; R-W 段保留原 dump (运行时数据)。
     do {
-        const std::string& srcPath = module.path;
-        if (srcPath.empty() || srcPath[0] != '/') {
-            LOG(LOG_LEVEL_INFO, DTAG " R-X 回填: module.path 非磁盘路径, 跳过 (%s)",
-                srcPath.c_str());
-            break;
-        }
-
-        // 1) 用 root shell 把源文件 cp 到 dumper 进程能读的位置 (输出目录旁).
-        //    base.apk 内的 lib/arm64/libUE4.so 通常 owner=system, app 进程无权读。
-        //    我们在 outPath 旁建一个临时副本, 修复完立即删除。
-        std::string tmpCopy;
-        {
-            // 取 outPath 所在目录
-            std::string dir = outPath;
-            size_t slash = dir.find_last_of('/');
-            if (slash != std::string::npos) dir.resize(slash);
-            else dir = ".";
-            // 随机后缀防冲突
-            char suf[32];
-            snprintf(suf, sizeof(suf), "/.orig_%d_%lx.tmp", (int)getpid(),
-                     (unsigned long)((uintptr_t)outBuf ^ (uintptr_t)pid));
-            tmpCopy = dir + suf;
-        }
-        char uidBuf[64];
-        snprintf(uidBuf, sizeof(uidBuf), "%u:%u", (unsigned)getuid(), (unsigned)getgid());
-        std::string cpCmd = "cp '" + srcPath + "' '" + tmpCopy +
-                            "' && chown " + uidBuf + " '" + tmpCopy +
-                            "' && chmod 644 '" + tmpCopy + "'";
-        if (!MemReader::runRootShell(cpCmd)) {
-            LOG(LOG_LEVEL_WARN, DTAG " R-X 回填: cp 源文件失败 src=%s", srcPath.c_str());
-            break;
-        }
-
-        // 2) 打开磁盘原文件
-        FILE* fp = fopen(tmpCopy.c_str(), "rb");
-        if (!fp) {
-            LOG(LOG_LEVEL_WARN, DTAG " R-X 回填: fopen 失败 errno=%d (%s)",
-                errno, tmpCopy.c_str());
-            // 清理
-            MemReader::runRootShell("rm -f '" + tmpCopy + "'");
-            break;
-        }
-        // 文件大小
-        fseek(fp, 0, SEEK_END);
-        long origSize = ftell(fp);
-        fseek(fp, 0, SEEK_SET);
-        if (origSize < 64) {
-            LOG(LOG_LEVEL_WARN, DTAG " R-X 回填: 源文件太小 size=%ld", origSize);
-            fclose(fp);
-            MemReader::runRootShell("rm -f '" + tmpCopy + "'");
-            break;
-        }
-
-        // 3) 校验磁盘文件是同一个 SO: ELF magic + e_type + e_machine
-        //    (避免错文件覆盖, 例如 path 被 anti-cheat 偷换)
-        unsigned char origHdr[64];
-        if (fread(origHdr, 1, sizeof(origHdr), fp) != sizeof(origHdr) ||
-            memcmp(origHdr, ELFMAG, SELFMAG) != 0) {
-            LOG(LOG_LEVEL_WARN, DTAG " R-X 回填: 源文件不是 ELF, 跳过");
-            fclose(fp);
-            MemReader::runRootShell("rm -f '" + tmpCopy + "'");
-            break;
-        }
-
-        // 4) 对每个 R-X (PF_X 且 !PF_W) 段做按页回填
         const size_t PAGE = 4096;
+        const size_t REREAD_BLOCK = 1024 * 1024;  // 一次最多 1MB (helper 内部上限)
+        std::vector<uint8_t> rbuf;
+
         size_t totalPagesScanned = 0;
         size_t totalPagesPatched = 0;
-        std::vector<uint8_t> pageBuf(PAGE);
+        size_t totalPagesStillZero = 0;
+
         for (size_t si = 0; si < loadSegs.size(); si++) {
             const auto& seg = loadSegs[si];
-            // 仅 R-X (含 PF_X, 不含 PF_W) 段; 也跳过完全不在文件里的 .bss 部分
             if (!(seg.flags & PF_X)) continue;
             if (seg.flags & PF_W) continue;
             if (seg.filesz == 0) continue;
 
-            // 可回填范围: 内存段在输出文件中的 [seg.vaddr, seg.vaddr+filesz),
-            // 对应磁盘文件 [seg.offset, seg.offset+filesz).
             size_t maxLen = seg.filesz;
             if (seg.vaddr + maxLen > outFileSize) maxLen = outFileSize - seg.vaddr;
-            if (seg.offset + maxLen > (size_t)origSize) maxLen = (size_t)origSize - seg.offset;
 
+            // 段内连续扫: 把连续的全零页合并成大块, 一次 readMemoryViaProcMem
+            // 拉回来, 减少 helper round-trip 次数 (.text 一段几百 MB 时显著)。
             size_t segPatched = 0;
-            for (size_t off = 0; off < maxLen; off += PAGE) {
+            size_t segStillZero = 0;
+            size_t off = 0;
+            while (off < maxLen) {
+                // 找到第一个全零页
                 size_t len = std::min(PAGE, maxLen - off);
                 uint8_t* dstPage = outBuf + seg.vaddr + off;
-
-                // 全零判定 (展开成简单循环, 避免 std::all_of 模板膨胀)
+                totalPagesScanned++;
                 bool allZero = true;
                 for (size_t k = 0; k < len; k++) {
                     if (dstPage[k] != 0) { allZero = false; break; }
                 }
-                totalPagesScanned++;
-                if (!allZero) continue;
+                if (!allZero) { off += PAGE; continue; }
 
-                if (fseek(fp, (long)(seg.offset + off), SEEK_SET) != 0) continue;
-                if (fread(pageBuf.data(), 1, len, fp) != len) continue;
-
-                // 源文件这一页若也全零则没必要回填 (省日志)
-                bool srcAllZero = true;
-                for (size_t k = 0; k < len; k++) {
-                    if (pageBuf[k] != 0) { srcAllZero = false; break; }
+                // 尽量把连续全零页合并到 ≤ REREAD_BLOCK
+                size_t blockEnd = off + PAGE;
+                while (blockEnd < maxLen && (blockEnd - off) < REREAD_BLOCK) {
+                    size_t plen = std::min(PAGE, maxLen - blockEnd);
+                    uint8_t* p2 = outBuf + seg.vaddr + blockEnd;
+                    bool z = true;
+                    for (size_t k = 0; k < plen; k++) {
+                        if (p2[k] != 0) { z = false; break; }
+                    }
+                    if (!z) break;
+                    totalPagesScanned++;
+                    blockEnd += PAGE;
                 }
-                if (srcAllZero) continue;
+                size_t blockLen = blockEnd - off;
+                uintptr_t memAddr = baseAddr + seg.vaddr + off;
 
-                memcpy(dstPage, pageBuf.data(), len);
-                segPatched++;
+                // 走 /proc/<pid>/mem 重读
+                ssize_t got = MemReader::readMemoryViaProcMem(pid, memAddr, blockLen, rbuf);
+                if (got > 0 && (size_t)got <= blockLen) {
+                    memcpy(outBuf + seg.vaddr + off, rbuf.data(), (size_t)got);
+                    // 统计仍然全零 / 成功回填的页数
+                    for (size_t bo = 0; bo < (size_t)got; bo += PAGE) {
+                        size_t plen = std::min(PAGE, (size_t)got - bo);
+                        const uint8_t* p2 = rbuf.data() + bo;
+                        bool z = true;
+                        for (size_t k = 0; k < plen; k++) {
+                            if (p2[k] != 0) { z = false; break; }
+                        }
+                        if (z) segStillZero++;
+                        else   segPatched++;
+                    }
+                    // 不足部分仍记为 stillZero
+                    size_t restPages = (blockLen - (size_t)got + PAGE - 1) / PAGE;
+                    segStillZero += restPages;
+                } else {
+                    // /proc/<pid>/mem 也没读到 — 整块按全零页计入 stillZero
+                    segStillZero += (blockLen + PAGE - 1) / PAGE;
+                }
+                off = blockEnd;
             }
-            if (segPatched > 0) {
-                LOG(LOG_LEVEL_INFO, DTAG " R-X 回填 PT_LOAD[%zu] vaddr=0x%lx flags=0x%x: 回填 %zu 页 (源=%s)",
-                    si, (unsigned long)seg.vaddr, seg.flags, segPatched, srcPath.c_str());
+            if (segPatched > 0 || segStillZero > 0) {
+                LOG(LOG_LEVEL_INFO, DTAG " R-X 重读 PT_LOAD[%zu] vaddr=0x%lx flags=0x%x: /proc/mem 回填 %zu 页, 仍全零 %zu 页",
+                    si, (unsigned long)seg.vaddr, seg.flags, segPatched, segStillZero);
                 totalPagesPatched += segPatched;
+                totalPagesStillZero += segStillZero;
             }
         }
 
-        fclose(fp);
-        MemReader::runRootShell("rm -f '" + tmpCopy + "'");
-
-        LOG(LOG_LEVEL_INFO, DTAG " R-X 回填完成: 扫描 %zu 页, 回填 %zu 页",
-            totalPagesScanned, totalPagesPatched);
+        LOG(LOG_LEVEL_INFO, DTAG " R-X /proc/mem 重读完成: 扫描 %zu 页, 回填 %zu 页, 仍全零 %zu 页",
+            totalPagesScanned, totalPagesPatched, totalPagesStillZero);
     } while (false);
 
     // ── Step 5: IDA 兼容 ELF 修复 (重建 section headers) ──

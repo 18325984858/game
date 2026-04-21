@@ -31,6 +31,16 @@ namespace MemReader {
                        std::vector<uint8_t>& out);
 
     /**
+     * 与 readMemory 相同, 但走 helper 的 'M' 命令: pread64('/proc/<pid>/mem')
+     * 而不是 process_vm_readv. 用于绕过 anti-cheat 对 process_vm_readv 的 hook
+     * (例如 Tencent ACE 让 R-X 段静默返回全 0 的情况).
+     * 比 readMemory 慢一些 (走 procfs, 每个 fd 还要切上下文), 仅在主路径
+     * 拿不到真实数据时由调用方显式调用。
+     */
+    ssize_t readMemoryViaProcMem(int pid, uintptr_t address, size_t size,
+                                 std::vector<uint8_t>& out);
+
+    /**
      * 查找地址所在的 /proc/PID/maps 区间
      */
     bool findRegion(int pid, uintptr_t address, RegionInfo& info);
