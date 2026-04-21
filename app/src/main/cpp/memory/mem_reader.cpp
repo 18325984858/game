@@ -207,6 +207,15 @@ private:
                 "(请打开 APatch/KernelSU manager → 超级用户 → 为本 app 授权 → 重启 app)");
             return false;
         }
+
+        // 关键: 把 root shell 自身从 app cgroup 迁出到 root cgroup.
+        // 双 fork 只能改 PPid, cgroup 是按 fork 时父进程继承的, 仍是
+        // /apps/uid_<app>/pid_<app>. ACE 沿 /proc/<dd>/cgroup 检查发现
+        // 在 app cgroup 内就把 /proc/<game>/mem 对应页 read 静默返零.
+        // 把自己 PID 写入 root cgroup.procs (su 已 root, 有写权限) 即可
+        // 迁出. 后续 fork 出来的 dd 自动继承 root cgroup.
+        // 静默失败兜底: 部分 ROM 可能拒绝写入, 但不影响主流程.
+        execLocked("echo $$ > /sys/fs/cgroup/cgroup.procs 2>/dev/null; echo $$ > /dev/cpuset/cgroup.procs 2>/dev/null; true", /*timeoutMs=*/2000);
         return true;
     }
 
