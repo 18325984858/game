@@ -223,7 +223,7 @@ void DfmOverlay::drawMenu(const dfm::DrawDfmData& data) {
             ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
                 "红十字=目标 绿+=预瞄点\n请手动对准, 系统不动准星");
         }
-
+//adb pull /sdcard/Android/data/com.example.dobbyproject/files/dfm_items.txt
         // ── 物资名注册表 (运行时积累 + 持久化) ──
         ImGui::Separator();
         size_t regCount = dfm::ItemRegistry::instance().size();

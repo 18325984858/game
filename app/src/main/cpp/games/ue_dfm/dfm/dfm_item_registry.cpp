@@ -34,6 +34,16 @@ std::string trim(const std::string& s) {
     return s.substr(a, b - a + 1);
 }
 
+// 尝试把 idName 解析成 itemId 数字。idName 通常就是纯数字串 (e.g. "10010101"),
+// 也可能是 FName ("BP_Wpn_AKM"). 解析失败返回 0 (不写反向索引)。
+int32_t parseItemId(const std::string& idName) {
+    if (idName.empty()) return 0;
+    for (char c : idName) {
+        if (c < '0' || c > '9') return 0;
+    }
+    try { return std::stoi(idName); } catch (...) { return 0; }
+}
+
 } // namespace
 
 ItemRegistry& ItemRegistry::instance() {
@@ -80,6 +90,9 @@ bool ItemRegistry::load() {
         }
         if (idName.empty() || disp.empty()) continue;
         m_map[idName] = Entry{disp, cls};
+        if (int32_t nid = parseItemId(idName); nid > 0) {
+            m_byId[nid] = disp;
+        }
     }
     m_lastSaveMs.store(nowMs(), std::memory_order_relaxed);
     return true;
@@ -104,6 +117,14 @@ void ItemRegistry::record(const std::string& idName,
             if (!className.empty()) it->second.className = className;
             changed = true;
         }
+        // 同步反向索引 (idName 是纯数字时才有意义)
+        if (int32_t nid = parseItemId(idName); nid > 0) {
+            auto rit = m_byId.find(nid);
+            if (rit == m_byId.end() || rit->second != display) {
+                m_byId[nid] = display;
+                changed = true;
+            }
+        }
     }
     if (changed) {
         m_dirty.store(true, std::memory_order_release);
@@ -116,6 +137,13 @@ std::string ItemRegistry::lookup(const std::string& idName) const {
     std::lock_guard<std::mutex> g(m_mtx);
     auto it = m_map.find(idName);
     return it == m_map.end() ? std::string{} : it->second.display;
+}
+
+std::string ItemRegistry::lookupById(int32_t numId) const {
+    if (numId <= 0) return {};
+    std::lock_guard<std::mutex> g(m_mtx);
+    auto it = m_byId.find(numId);
+    return it == m_byId.end() ? std::string{} : it->second;
 }
 
 size_t ItemRegistry::size() const {

@@ -44,6 +44,10 @@ public:
     // 查询: 返回 display 或空串。线程安全。
     std::string lookup(const std::string& idName) const;
 
+    // 按数字 itemId 查询 (用于容器内物品 — 那里只能拿到 cat*10000+seq, 拿不到 FName)。
+    // 注册表内若曾以同样数字 ID 的字符串 idName 记录过, 则命中。
+    std::string lookupById(int32_t numId) const;
+
     // 当前条目数。
     size_t size() const;
 
@@ -63,6 +67,7 @@ private:
 
     mutable std::mutex m_mtx;
     std::unordered_map<std::string, Entry> m_map;
+    std::unordered_map<int32_t, std::string> m_byId;   // numId → display (反向索引)
     std::string m_path;                // 完整文件路径 (含目录)
     std::atomic<bool> m_dirty{false};
     std::atomic<int64_t> m_lastSaveMs{0};

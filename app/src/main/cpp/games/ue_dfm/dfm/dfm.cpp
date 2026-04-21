@@ -1463,7 +1463,12 @@ std::vector<ContainerItem> DfmMatchMonitor::readContainerItems(uintptr_t actorPt
 
                 int32_t itemIdNum = static_cast<int32_t>(cat * 10000 + seq);
                 ContainerItem ci;
-                ci.name = getItemDisplayName(itemIdNum);
+                // 容器内 item 拿不到 actor 指针, 不能读 InteractorName。
+                // 改为: 注册表 (按 numId 反查, 之前帧地面 PickupBase 命中过的同 ID 直接复用)
+                //       → translateItemClassName(itemId 字符串无法用) 跳过
+                //       → getItemDisplayName 数字大类映射兜底
+                std::string fromReg = ItemRegistry::instance().lookupById(itemIdNum);
+                ci.name = !fromReg.empty() ? fromReg : getItemDisplayName(itemIdNum);
                 ci.itemId = itemIdNum;
                 ci.count = count;
                 ci.durability = dur;
