@@ -151,6 +151,7 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
         "games/ue_dfm/draw/DfmDraw.cpp"
         "games/ue_dfm/interface/interface.cpp"
         "games/ue_dfm/dfm/dfm.cpp"
+        "games/ue_dfm/dfm/dfm_item_registry.cpp"
 )
 
 # Specifies libraries CMake should link to your target library. You

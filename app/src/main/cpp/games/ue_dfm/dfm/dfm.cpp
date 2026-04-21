@@ -7,6 +7,7 @@
 #include "../../../core/log/log.h"
 #include "../engine/UE5DfmStruct.h"
 #include "../interface/interface.h"
+#include "dfm_item_registry.h"
 
 // IM_COL32 兼容宏 (避免引入 imgui.h)
 #ifndef IM_COL32
@@ -935,6 +936,12 @@ std::string DfmMatchMonitor::translateItemClassName(const std::string& className
 std::string DfmMatchMonitor::resolveItemDisplay(uintptr_t pickupActor,
                                                 const std::string& rawId,
                                                 int32_t numId) const {
+    // 0. 注册表优先 — 之前帧已成功解出过的本地化名直接命中, 极快, 还能跨场景沿用。
+    if (!rawId.empty()) {
+        std::string cached = ItemRegistry::instance().lookup(rawId);
+        if (!cached.empty()) return cached;
+    }
+
     if (!ok(pickupActor)) {
         if (numId > 0) return getItemDisplayName(numId);
         return rawId.empty() ? std::string("?") : rawId;
@@ -942,7 +949,12 @@ std::string DfmMatchMonitor::resolveItemDisplay(uintptr_t pickupActor,
 
     // 1. InteractorName FText (优先, 本地化)
     std::string fromText = readFText(pickupActor + m_off.Interactor_Name);
-    if (!fromText.empty()) return fromText;
+    if (!fromText.empty()) {
+        // 命中 → 写入注册表持久化, 下次直接走第 0 步快路径
+        std::string cn = readClassName(pickupActor);
+        ItemRegistry::instance().record(rawId, fromText, cn);
+        return fromText;
+    }
 
     // 2. InventoryType UClass* → 类名 → 翻译
     if (m_off.Pickup_InvType > 0) {
@@ -950,7 +962,11 @@ std::string DfmMatchMonitor::resolveItemDisplay(uintptr_t pickupActor,
         if (ok(invClass)) {
             std::string clsName = readObjName(invClass);
             std::string translated = translateItemClassName(clsName);
-            if (!translated.empty()) return translated;
+            if (!translated.empty()) {
+                // className 翻译只有规则命中才足够稳定, 也写入注册表。
+                ItemRegistry::instance().record(rawId, translated, clsName);
+                return translated;
+            }
         }
     }
 
@@ -1780,6 +1796,10 @@ DfmMatchMonitor::DfmMatchMonitor(uintptr_t moduleBase, uintptr_t moduleSize,
     , m_offNamePool(offNamePool), m_offGUObjectArrayNum(offGUObjectArrayNum)
     , m_offGUObjectArrayChunks(offGUObjectArrayChunks), m_offGWorld(offGWorld)
 {
+    // 初始化物资名注册表 — 加载已积累的 idName→display 映射, 后续运行时累积更新。
+    // 路径选 app 私有 external 目录, 无需运行时权限。包名/项目结构变了改这里即可。
+    ItemRegistry::instance().init(
+        "/storage/emulated/0/Android/data/com.example.dobbyproject/files");
 }
 
 DfmMatchMonitor::~DfmMatchMonitor() { stop(); }

@@ -5,6 +5,7 @@
  */
 #include "DfmDraw.h"
 #include "../../../core/log/log.h"
+#include "../dfm/dfm_item_registry.h"
 #include <imgui/imgui_internal.h>
 #include <android/log.h>
 #include <cmath>
@@ -222,6 +223,19 @@ void DfmOverlay::drawMenu(const dfm::DrawDfmData& data) {
             ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
                 "红十字=目标 绿+=预瞄点\n请手动对准, 系统不动准星");
         }
+
+        // ── 物资名注册表 (运行时积累 + 持久化) ──
+        ImGui::Separator();
+        size_t regCount = dfm::ItemRegistry::instance().size();
+        ImGui::TextColored(ImVec4(0.7f, 1.0f, 0.7f, 1.0f),
+            "物资名库: %zu 条", regCount);
+        if (ImGui::Button("立即导出物资名库", ImVec2(-1, 0))) {
+            bool ok = dfm::ItemRegistry::instance().save();
+            LOG(LOG_LEVEL_INFO, "[DfmDraw] 手动导出物资名库 ok=%d count=%zu",
+                ok ? 1 : 0, regCount);
+        }
+        ImGui::TextColored(ImVec4(0.55f, 0.55f, 0.55f, 1.0f),
+            "路径: /sdcard/Android/data/<pkg>/files/dfm_items.txt");
     }
 
     // [修复] ▲▼ 替换为 ASCII <</>>, 避免超出字体字形范围显示为 ?
