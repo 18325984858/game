@@ -776,6 +776,9 @@ ssize_t readMemoryViaProcMem(int pid, uintptr_t address, size_t size,
     out.resize(size);
     size_t totalGot = 0;
     const size_t CHUNK = 1024 * 1024;  // 一次最多 1MB, 与 helper 上限一致
+    const size_t PAGE  = 4096;
+    // 标记某段范围是否走"按页扫描跳哨兵页"模式 (大块 dd 遇到 PROT_NONE
+    // 哨兵页时, 整块 dd 只能读到哨兵之前的部分, 需要按 4KB 页继续).
     while (totalGot < size) {
         size_t want = std::min(CHUNK, size - totalGot);
         uintptr_t curAddr = realAddr + totalGot;
@@ -784,7 +787,6 @@ ssize_t readMemoryViaProcMem(int pid, uintptr_t address, size_t size,
         // 性能优化: 优先用 bs=4096 (页大小) 大块读. 要求 curAddr 4KB 对齐
         // 且 want 是 4KB 倍数. 否则退化到 bs=1 单字节读 (慢, 但兼容).
         // dumper 的 R-X 全零页重读全部是页对齐 + 1MB, 走快路径.
-        const size_t PAGE = 4096;
         char buf[640];
         if ((curAddr & (PAGE - 1)) == 0 && (want & (PAGE - 1)) == 0) {
             size_t skipPg = curAddr / PAGE;
@@ -804,29 +806,45 @@ ssize_t readMemoryViaProcMem(int pid, uintptr_t address, size_t size,
                      (size_t)curAddr, want, P.memTmp.c_str());
         }
 
-        if (!RootShell::I().exec(buf)) {
+        size_t r = 0;
+        if (RootShell::I().exec(buf)) {
+            FILE* fp = fopen(P.memTmp.c_str(), "rb");
+            if (fp) {
+                r = fread(out.data() + totalGot, 1, want, fp);
+                fclose(fp);
+            } else {
+                LOG(LOG_LEVEL_WARN, RTAG " readMemoryViaProcMem fopen memTmp 失败 errno=%d",
+                    errno);
+            }
+            truncate(P.memTmp.c_str(), 0);
+        } else {
             LOG(LOG_LEVEL_WARN, RTAG " readMemoryViaProcMem dd 命令失败 addr=0x%zx",
                 (size_t)curAddr);
-            break;
         }
 
-        FILE* fp = fopen(P.memTmp.c_str(), "rb");
-        if (!fp) {
-            LOG(LOG_LEVEL_WARN, RTAG " readMemoryViaProcMem fopen memTmp 失败 errno=%d",
-                errno);
-            break;
+        if (r == want) {
+            // 整块成功 — 继续下一块
+            totalGot += r;
+            continue;
         }
-        size_t r = fread(out.data() + totalGot, 1, want, fp);
-        fclose(fp);
-        // 立即清空 (truncate 0), 不留缓存
-        truncate(P.memTmp.c_str(), 0);
 
-        if (r == 0) {
-            // dd 读到 0 字节 - 该地址不可读 (target 已退出 / addr 越界 / 真零)
-            break;
+        // 部分成功 / 全失败. 接受已读到的部分, 然后跳过 1 页 PROT_NONE
+        // 哨兵, 再继续读后面 — ACE 在 .text 中段插入孤立 PROT_NONE 哨兵
+        // 页用于反 dd 扫描, dd 一遇到这种页就整体退出, 但下一页仍可读.
+        //
+        // 跳过策略: r 向上对齐到 4KB 边界, 然后再 +4KB 跳过 1 个哨兵页.
+        // 跳过的范围在 out 里保持 0 (memset+resize 已初始化).
+        size_t skipped = (r + PAGE - 1) & ~(PAGE - 1);   // r 对齐到下一页
+        if (skipped < want) skipped += PAGE;             // 再跳 1 页哨兵
+        if (skipped > want) skipped = want;              // 不超本块
+        totalGot += skipped;
+        if (r > 0) {
+            LOG(LOG_LEVEL_INFO, RTAG " readMemoryViaProcMem 段中遇哨兵 addr=0x%zx 已读=%zu 想要=%zu, 跳到 +%zu 继续",
+                (size_t)curAddr, r, want, skipped);
+        } else {
+            // 整块都读不到: 跳 1 页继续, 别死循环
+            // (skipped 已被设为 PAGE 或 want)
         }
-        totalGot += r;
-        if (r < want) break;  // 短读, 后续也读不到
     }
 
     if (totalGot == 0) {
