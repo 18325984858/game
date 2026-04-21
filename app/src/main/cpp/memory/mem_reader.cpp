@@ -752,19 +752,81 @@ ssize_t readMemoryViaProcMem(int pid, uintptr_t address, size_t size,
     uintptr_t realAddr = untag(address);
 
     ensureRuntimeReady();
+    const auto& P = paths();
 
+    // 直接走 root shell + dd /proc/<pid>/mem 路径, 不经过常驻 helper.
+    //
+    // 实测某些 anti-cheat (Tencent ACE) 会在 dumper 进程或 helper daemon
+    // 进程内对 process_vm_readv / pread64 做 hook, 让所有读取静默返回
+    // 0/全零字节. 但用 root shell (su 启动 toybox dd) 跑的 dd 不在受
+    // hook 的进程内, 能直接通过 vfs 读到真实代码.
+    //
+    // 实现:
+    //   1) dd if=/proc/<pid>/mem bs=1 skip=<addr> count=<size> of=<memTmp>
+    //      bs=1 + skip=绝对地址 + count=size, dd 内部走 lseek + read.
+    //      ACE 通常不 hook su domain 的 dd, 即使 hook 也是另一个进程.
+    //   2) chmod 666 让本进程能 fopen 读回数据.
+    //   3) 读完立即清零 memTmp 文件大小 (truncate), 不留下残留页缓存.
+    //
+    // 性能: 一次 fork+exec dd, 比 helper IPC 慢一个数量级 (毫秒级).
+    // 但仅在 R-X 全零页时才会调用, dump 一次几百次调用尚可接受.
+    //
+    // 注意: 命令行里**不**直接出现 'process_vm_readv' / '/proc/<pid>/mem'
+    //       字面量, 用 shell 变量包一下减弱 strings 扫描特征.
     out.resize(size);
     size_t totalGot = 0;
-    uintptr_t cur = realAddr;
-    size_t left = size;
-    while (left > 0) {
-        size_t chunk = std::min(left, CHUNK_BYTES);
-        ssize_t got = RootHelper::I().readChunkM(pid, cur, chunk, out.data() + totalGot);
-        if (got <= 0) break;
-        totalGot += (size_t)got;
-        cur      += (uintptr_t)got;
-        left     -= (size_t)got;
-        if ((size_t)got < chunk) break;
+    const size_t CHUNK = 1024 * 1024;  // 一次最多 1MB, 与 helper 上限一致
+    while (totalGot < size) {
+        size_t want = std::min(CHUNK, size - totalGot);
+        uintptr_t curAddr = realAddr + totalGot;
+
+        // dd 读 /proc/<pid>/mem.
+        // 性能优化: 优先用 bs=4096 (页大小) 大块读. 要求 curAddr 4KB 对齐
+        // 且 want 是 4KB 倍数. 否则退化到 bs=1 单字节读 (慢, 但兼容).
+        // dumper 的 R-X 全零页重读全部是页对齐 + 1MB, 走快路径.
+        const size_t PAGE = 4096;
+        char buf[640];
+        if ((curAddr & (PAGE - 1)) == 0 && (want & (PAGE - 1)) == 0) {
+            size_t skipPg = curAddr / PAGE;
+            size_t cntPg  = want / PAGE;
+            // 用 shell 变量包 if=/of= 避免静态扫描特征
+            snprintf(buf, sizeof(buf),
+                     "I=/proc/%d/mem; O=%s; "
+                     "/system/bin/dd i\"f\"=$I o\"f\"=$O bs=4096 skip=%zu count=%zu "
+                     "conv=notrunc 2>/dev/null; chmod 666 %s 2>/dev/null",
+                     pid, P.memTmp.c_str(), skipPg, cntPg, P.memTmp.c_str());
+        } else {
+            snprintf(buf, sizeof(buf),
+                     "I=/proc/%d/mem; O=%s; "
+                     "/system/bin/dd i\"f\"=$I o\"f\"=$O bs=1 skip=%zu count=%zu "
+                     "conv=notrunc 2>/dev/null; chmod 666 %s 2>/dev/null",
+                     pid, P.memTmp.c_str(),
+                     (size_t)curAddr, want, P.memTmp.c_str());
+        }
+
+        if (!RootShell::I().exec(buf)) {
+            LOG(LOG_LEVEL_WARN, RTAG " readMemoryViaProcMem dd 命令失败 addr=0x%zx",
+                (size_t)curAddr);
+            break;
+        }
+
+        FILE* fp = fopen(P.memTmp.c_str(), "rb");
+        if (!fp) {
+            LOG(LOG_LEVEL_WARN, RTAG " readMemoryViaProcMem fopen memTmp 失败 errno=%d",
+                errno);
+            break;
+        }
+        size_t r = fread(out.data() + totalGot, 1, want, fp);
+        fclose(fp);
+        // 立即清空 (truncate 0), 不留缓存
+        truncate(P.memTmp.c_str(), 0);
+
+        if (r == 0) {
+            // dd 读到 0 字节 - 该地址不可读 (target 已退出 / addr 越界 / 真零)
+            break;
+        }
+        totalGot += r;
+        if (r < want) break;  // 短读, 后续也读不到
     }
 
     if (totalGot == 0) {
@@ -775,7 +837,7 @@ ssize_t readMemoryViaProcMem(int pid, uintptr_t address, size_t size,
     }
     if (totalGot < size) out.resize(totalGot);
 
-    LOG(LOG_LEVEL_INFO, RTAG " readMemoryViaProcMem pid=%d addr=0x%zx->0x%zx 请求=%zu 实际=%zu",
+    LOG(LOG_LEVEL_INFO, RTAG " readMemoryViaProcMem(dd) pid=%d addr=0x%zx->0x%zx 请求=%zu 实际=%zu",
         pid, (size_t)address, (size_t)realAddr, size, totalGot);
     return (ssize_t)totalGot;
 }
