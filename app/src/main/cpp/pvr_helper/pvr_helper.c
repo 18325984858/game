@@ -17,8 +17,13 @@
  *
  * 单次 size 上限 = 1MB (内部缓冲), client 自行分块.
  *
- * 跨进程读路径: process_vm_readv(syscall 270). 不 attach, 不写 TracerPid,
- * 目标进程的 /proc/self/{maps,status} 完全无变化.
+ * 跨进程读路径 (按优先级):
+ *   1) process_vm_readv (syscall 270): 主路径, 不 attach, 不写 TracerPid,
+ *      目标进程的 /proc/self/{maps,status} 完全无变化.
+ *   2) pread64 on /proc/<pid>/mem: 当 (1) 失败或返回的数据全 0 时自动 fallback.
+ *      某些 anti-cheat (Tencent ACE) 会 hook process_vm_readv 让 R-X 段
+ *      静默返回全 0; 而 /proc/<pid>/mem 的 pread64 通常未被 hook, 能拿到真实
+ *      代码段。fd 按 pid 缓存, 避免每次重复 open。
  */
 #define _GNU_SOURCE
 #include <stdlib.h>
@@ -47,6 +52,53 @@ static inline ssize_t pvr(pid_t pid,
                           const struct iovec* rv, unsigned long rn,
                           unsigned long flags) {
     return (ssize_t)syscall(__NR_process_vm_readv, pid, lv, ln, rv, rn, flags);
+}
+
+/* /proc/<pid>/mem fd 缓存: 避免每次请求都 open 一次.
+ * 大多数会话只 dump 一个目标进程, 一个槽位足够。
+ * pid 变化时关闭旧 fd 后重 open。 */
+static int g_mem_pid = -1;
+static int g_mem_fd  = -1;
+
+static int open_proc_mem(pid_t pid) {
+    if (g_mem_pid == (int)pid && g_mem_fd >= 0) return g_mem_fd;
+    if (g_mem_fd >= 0) { close(g_mem_fd); g_mem_fd = -1; }
+    /* 路径运行时拼接 (避免静态 strings 扫到 "/proc/%d/mem" 字面量) */
+    static const unsigned char enc_pfx[] = {
+        /* "/proc/" 每字节 XOR 0x5A */
+        0x75,0x2A,0x28,0x39,0x39,0x75,0x5A
+    };
+    static const unsigned char enc_sfx[] = {
+        /* "/mem\0" 每字节 XOR 0x5A */
+        0x75,0x37,0x3F,0x29,0x5A
+    };
+    char pfx[sizeof(enc_pfx)], sfx[sizeof(enc_sfx)];
+    for (size_t i = 0; i < sizeof(enc_pfx); i++) pfx[i] = (char)(enc_pfx[i] ^ 0x5A);
+    for (size_t i = 0; i < sizeof(enc_sfx); i++) sfx[i] = (char)(enc_sfx[i] ^ 0x5A);
+    char path[64];
+    int n = snprintf(path, sizeof(path), "%s%d%s", pfx, (int)pid, sfx);
+    if (n <= 0 || n >= (int)sizeof(path)) return -1;
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    g_mem_pid = (int)pid;
+    g_mem_fd  = fd;
+    return fd;
+}
+
+/* fallback: 通过 /proc/<pid>/mem + pread64 读取.
+ * 返回成功读取字节数, <=0 表示失败。 */
+static ssize_t mem_pread(pid_t pid, uintptr_t addr, void* dst, size_t sz) {
+    int fd = open_proc_mem(pid);
+    if (fd < 0) return -1;
+    size_t done = 0;
+    while (done < sz) {
+        ssize_t r = pread64(fd, (char*)dst + done, sz - done, (off_t)(addr + done));
+        if (r > 0) { done += (size_t)r; continue; }
+        if (r < 0 && errno == EINTR) continue;
+        if (done == 0) return r;   /* 一字节没读到, 报告错误 */
+        break;                     /* 读了一部分, 返回已读量 */
+    }
+    return (ssize_t)done;
 }
 
 static void write_all(int fd, const void* p, size_t n) {
@@ -164,6 +216,33 @@ int main(int argc, char** argv) {
             .iov_len  = (size_t)sz
         };
         ssize_t r = pvr((pid_t)pidv, &local, 1, &remote, 1, 0);
+
+        /* fallback 触发条件:
+         *   (a) process_vm_readv 直接失败 (返回 <= 0)
+         *   (b) 读取成功但数据全 0 且块较大 — 大概率是 anti-cheat hook 了
+         *       process_vm_readv 让 R-X 段静默返回全 0。这里只对 >= 1KB 的块
+         *       做 fallback 校验, 避免 .bss 之类合法零页频繁触发额外 syscall。
+         * 任一条件命中时改用 /proc/<pid>/mem + pread64。 */
+        int needFallback = 0;
+        if (r <= 0) {
+            needFallback = 1;
+        } else if ((size_t)r >= 1024) {
+            /* 仅采样首尾 64 字节判断, 避免对每个 1MB 块全扫一遍 */
+            int allZero = 1;
+            const unsigned char* ub = (const unsigned char*)buf;
+            size_t headN = (size_t)r < 64 ? (size_t)r : 64;
+            for (size_t k = 0; k < headN; k++) if (ub[k]) { allZero = 0; break; }
+            if (allZero) {
+                size_t tailStart = (size_t)r > 64 ? (size_t)r - 64 : 0;
+                for (size_t k = tailStart; k < (size_t)r; k++) if (ub[k]) { allZero = 0; break; }
+            }
+            if (allZero) needFallback = 1;
+        }
+        if (needFallback) {
+            ssize_t r2 = mem_pread((pid_t)pidv, (uintptr_t)addr, buf, (size_t)sz);
+            if (r2 > 0) r = r2;   /* fallback 成功覆盖 r; 失败保留原 r */
+        }
+
         if (r <= 0) {
             char hdr[32];
             int hl = snprintf(hdr, sizeof(hdr), "E %d\n", errno);
@@ -176,6 +255,7 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (g_mem_fd >= 0) close(g_mem_fd);
     free(buf);
     return 0;
 }

@@ -436,6 +436,8 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath,
         uintptr_t vaddr;   // p_vaddr (相对于 ELF 基址 0)
         size_t offset;     // p_offset (原始文件偏移)
         size_t memsz;      // p_memsz
+        size_t filesz;     // p_filesz (磁盘上实际占用; .bss 部分不在文件里)
+        uint32_t flags;    // p_flags (PF_R/W/X), 用于判断段是否可写
     };
     std::vector<LoadSeg> loadSegs;
     size_t outFileSize = 0;
@@ -470,6 +472,8 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath,
                 seg.vaddr = phdr->p_vaddr;
                 seg.offset = phdr->p_offset;
                 seg.memsz = phdr->p_memsz;
+                seg.filesz = phdr->p_filesz;
+                seg.flags = phdr->p_flags;
                 loadSegs.push_back(seg);
                 // 使用 vaddr 布局输出文件 (file_offset == vaddr),
                 // 这样所有 d_ptr / sh_addr 在文件中的偏移与内存中一致, IDA/section
@@ -507,6 +511,8 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath,
                 seg.vaddr = phdr->p_vaddr;
                 seg.offset = phdr->p_offset;
                 seg.memsz = phdr->p_memsz;
+                seg.filesz = phdr->p_filesz;
+                seg.flags = phdr->p_flags;
                 loadSegs.push_back(seg);
                 // vaddr 布局输出文件 (与 64-bit 分支保持一致)
                 size_t segEnd = seg.vaddr + seg.memsz;
@@ -563,6 +569,146 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath,
         size_t got = readProcessMemory(pid, memAddr, readSize, outBuf + seg.vaddr);
         LOG(LOG_LEVEL_INFO, DTAG " PT_LOAD[%zu]: 读取 %zu / %zu bytes", si, got, readSize);
     }
+
+    // ── Step 4b: R-X 段全零页回填 (反 anti-dump) ──
+    //
+    // 部分 anti-cheat (如 Tencent ACE) 会 hook process_vm_readv,
+    // 让目标进程的 R-X (代码) 段返回全 0 而不是 EPERM, 导致 dump 出来的
+    // .text/.plt/.rodata/.eh_frame 全是 0 — 看起来文件大小对, 但代码全丢。
+    //
+    // 缓解策略: 检测到 R-X (PF_X 且不含 PF_W) 段中存在全零 4KB 页时,
+    // 从磁盘上的源 SO 文件 (module.path, 通常是
+    // /data/app/<pkg>-XXX/lib/arm64/libUE4.so) 对应文件偏移读取并回填。
+    //
+    // 局限性:
+    //   * 仅对未加密/未壳化的 SO 有效。如果 SO 在内存中被解密 (壳),
+    //     磁盘文件回填得到的是壳代码而不是真代码。
+    //   * 仅回填 R-X 段。R-W 段在运行时会被 linker / 程序修改,
+    //     用磁盘原始数据覆盖会得到错误结果 (例如丢失 vtable 的重定位)。
+    //   * module.path 必须是磁盘上真实存在的 ELF 文件; 若 maps 已被
+    //     anti-cheat 替换为 [anon] 之类则跳过。
+    do {
+        const std::string& srcPath = module.path;
+        if (srcPath.empty() || srcPath[0] != '/') {
+            LOG(LOG_LEVEL_INFO, DTAG " R-X 回填: module.path 非磁盘路径, 跳过 (%s)",
+                srcPath.c_str());
+            break;
+        }
+
+        // 1) 用 root shell 把源文件 cp 到 dumper 进程能读的位置 (输出目录旁).
+        //    base.apk 内的 lib/arm64/libUE4.so 通常 owner=system, app 进程无权读。
+        //    我们在 outPath 旁建一个临时副本, 修复完立即删除。
+        std::string tmpCopy;
+        {
+            // 取 outPath 所在目录
+            std::string dir = outPath;
+            size_t slash = dir.find_last_of('/');
+            if (slash != std::string::npos) dir.resize(slash);
+            else dir = ".";
+            // 随机后缀防冲突
+            char suf[32];
+            snprintf(suf, sizeof(suf), "/.orig_%d_%lx.tmp", (int)getpid(),
+                     (unsigned long)((uintptr_t)outBuf ^ (uintptr_t)pid));
+            tmpCopy = dir + suf;
+        }
+        char uidBuf[64];
+        snprintf(uidBuf, sizeof(uidBuf), "%u:%u", (unsigned)getuid(), (unsigned)getgid());
+        std::string cpCmd = "cp '" + srcPath + "' '" + tmpCopy +
+                            "' && chown " + uidBuf + " '" + tmpCopy +
+                            "' && chmod 644 '" + tmpCopy + "'";
+        if (!MemReader::runRootShell(cpCmd)) {
+            LOG(LOG_LEVEL_WARN, DTAG " R-X 回填: cp 源文件失败 src=%s", srcPath.c_str());
+            break;
+        }
+
+        // 2) 打开磁盘原文件
+        FILE* fp = fopen(tmpCopy.c_str(), "rb");
+        if (!fp) {
+            LOG(LOG_LEVEL_WARN, DTAG " R-X 回填: fopen 失败 errno=%d (%s)",
+                errno, tmpCopy.c_str());
+            // 清理
+            MemReader::runRootShell("rm -f '" + tmpCopy + "'");
+            break;
+        }
+        // 文件大小
+        fseek(fp, 0, SEEK_END);
+        long origSize = ftell(fp);
+        fseek(fp, 0, SEEK_SET);
+        if (origSize < 64) {
+            LOG(LOG_LEVEL_WARN, DTAG " R-X 回填: 源文件太小 size=%ld", origSize);
+            fclose(fp);
+            MemReader::runRootShell("rm -f '" + tmpCopy + "'");
+            break;
+        }
+
+        // 3) 校验磁盘文件是同一个 SO: ELF magic + e_type + e_machine
+        //    (避免错文件覆盖, 例如 path 被 anti-cheat 偷换)
+        unsigned char origHdr[64];
+        if (fread(origHdr, 1, sizeof(origHdr), fp) != sizeof(origHdr) ||
+            memcmp(origHdr, ELFMAG, SELFMAG) != 0) {
+            LOG(LOG_LEVEL_WARN, DTAG " R-X 回填: 源文件不是 ELF, 跳过");
+            fclose(fp);
+            MemReader::runRootShell("rm -f '" + tmpCopy + "'");
+            break;
+        }
+
+        // 4) 对每个 R-X (PF_X 且 !PF_W) 段做按页回填
+        const size_t PAGE = 4096;
+        size_t totalPagesScanned = 0;
+        size_t totalPagesPatched = 0;
+        std::vector<uint8_t> pageBuf(PAGE);
+        for (size_t si = 0; si < loadSegs.size(); si++) {
+            const auto& seg = loadSegs[si];
+            // 仅 R-X (含 PF_X, 不含 PF_W) 段; 也跳过完全不在文件里的 .bss 部分
+            if (!(seg.flags & PF_X)) continue;
+            if (seg.flags & PF_W) continue;
+            if (seg.filesz == 0) continue;
+
+            // 可回填范围: 内存段在输出文件中的 [seg.vaddr, seg.vaddr+filesz),
+            // 对应磁盘文件 [seg.offset, seg.offset+filesz).
+            size_t maxLen = seg.filesz;
+            if (seg.vaddr + maxLen > outFileSize) maxLen = outFileSize - seg.vaddr;
+            if (seg.offset + maxLen > (size_t)origSize) maxLen = (size_t)origSize - seg.offset;
+
+            size_t segPatched = 0;
+            for (size_t off = 0; off < maxLen; off += PAGE) {
+                size_t len = std::min(PAGE, maxLen - off);
+                uint8_t* dstPage = outBuf + seg.vaddr + off;
+
+                // 全零判定 (展开成简单循环, 避免 std::all_of 模板膨胀)
+                bool allZero = true;
+                for (size_t k = 0; k < len; k++) {
+                    if (dstPage[k] != 0) { allZero = false; break; }
+                }
+                totalPagesScanned++;
+                if (!allZero) continue;
+
+                if (fseek(fp, (long)(seg.offset + off), SEEK_SET) != 0) continue;
+                if (fread(pageBuf.data(), 1, len, fp) != len) continue;
+
+                // 源文件这一页若也全零则没必要回填 (省日志)
+                bool srcAllZero = true;
+                for (size_t k = 0; k < len; k++) {
+                    if (pageBuf[k] != 0) { srcAllZero = false; break; }
+                }
+                if (srcAllZero) continue;
+
+                memcpy(dstPage, pageBuf.data(), len);
+                segPatched++;
+            }
+            if (segPatched > 0) {
+                LOG(LOG_LEVEL_INFO, DTAG " R-X 回填 PT_LOAD[%zu] vaddr=0x%lx flags=0x%x: 回填 %zu 页 (源=%s)",
+                    si, (unsigned long)seg.vaddr, seg.flags, segPatched, srcPath.c_str());
+                totalPagesPatched += segPatched;
+            }
+        }
+
+        fclose(fp);
+        MemReader::runRootShell("rm -f '" + tmpCopy + "'");
+
+        LOG(LOG_LEVEL_INFO, DTAG " R-X 回填完成: 扫描 %zu 页, 回填 %zu 页",
+            totalPagesScanned, totalPagesPatched);
+    } while (false);
 
     // ── Step 5: IDA 兼容 ELF 修复 (重建 section headers) ──
     //
