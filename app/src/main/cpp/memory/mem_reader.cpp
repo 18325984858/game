@@ -18,6 +18,7 @@
 #include <fcntl.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <signal.h>
 #include <android/log.h>
 #include <sys/random.h>
 #include <sys/syscall.h>
@@ -118,6 +119,21 @@ public:
         return s;
     }
 
+    // 必须在任何 write(wfd_) 之前忽略 SIGPIPE: 持久 su 进程一旦被外部 kill
+    // (用户撤销 root 授权 / OOM / apatch 守护重启), 下一次 write 触发 SIGPIPE
+    // 默认会 silent-kill 整个 app (signal 13, 无 java 栈无 tombstone, 表现为
+    // 点按钮直接闪退). 忽略后 write 会正常返回 -1+EPIPE, 走已有的 killLocked
+    // 重启分支即可.
+    static void ensureSigpipeIgnored() {
+        static std::once_flag once;
+        std::call_once(once, []{
+            struct sigaction sa{};
+            sa.sa_handler = SIG_IGN;
+            sigemptyset(&sa.sa_mask);
+            sigaction(SIGPIPE, &sa, nullptr);
+        });
+    }
+
     bool isAuthDenied() {
         std::lock_guard<std::mutex> g(mtx_);
         return authDenied_;
@@ -134,6 +150,7 @@ public:
      * stdout/stderr 输出会被丢弃 (除非重定向到文件内再读).
      */
     bool exec(const std::string& cmd) {
+        ensureSigpipeIgnored();
         std::lock_guard<std::mutex> g(mtx_);
         // 授权被拒 → fast-fail, 不再费 15s 去重试 (调用者会连环出现
         // 在进程枚举/内存读取/按钮点击上)
