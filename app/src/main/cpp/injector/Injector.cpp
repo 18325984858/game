@@ -236,14 +236,18 @@ static pid_t waitForTargetProcessReady(const char* packageName, Injector::Inject
     constexpr int kDefaultWaitSeconds = 15;
     constexpr int kPubgWaitSeconds = 45;
     constexpr int kDfmWaitSeconds  = 90;   // DFM UE5.4 引擎初始化较慢, 需要更长等待
+    constexpr int kNrcWaitSeconds  = 60;   // NRC UE 4.26
     constexpr int kPubgStableSamples = 3;
     constexpr int kDfmStableSamples  = 5;  // DFM 要求连续 5 次检测到 libUE4.so 才视为稳定
+    constexpr int kNrcStableSamples  = 3;
 
     // DFM 和 PUBG 都需要等待 libUE4.so 加载
-    const bool needUe4Wait = (mode == Injector::MODE_PUBG || mode == Injector::MODE_DFM);
+    const bool needUe4Wait = (mode == Injector::MODE_PUBG || mode == Injector::MODE_DFM || mode == Injector::MODE_NRC);
     const int maxWaitSeconds = (mode == Injector::MODE_DFM) ? kDfmWaitSeconds :
+                               (mode == Injector::MODE_NRC) ? kNrcWaitSeconds :
                                (mode == Injector::MODE_PUBG) ? kPubgWaitSeconds : kDefaultWaitSeconds;
-    const int requiredStableSamples = (mode == Injector::MODE_DFM) ? kDfmStableSamples : kPubgStableSamples;
+    const int requiredStableSamples = (mode == Injector::MODE_DFM) ? kDfmStableSamples :
+                                      (mode == Injector::MODE_NRC) ? kNrcStableSamples : kPubgStableSamples;
     pid_t lastPid = -1;
     int stableSamples = 0;
 
@@ -271,7 +275,8 @@ static pid_t waitForTargetProcessReady(const char* packageName, Injector::Inject
             stableSamples = 0;
         }
 
-        const char* modeTag = (mode == Injector::MODE_DFM) ? "DFM" : "PUBG";
+        const char* modeTag = (mode == Injector::MODE_DFM) ? "DFM" :
+                              (mode == Injector::MODE_NRC) ? "NRC" : "PUBG";
         LOG(LOG_LEVEL_INFO,
             "[Injector] %s 就绪检查 pid=%d libUE4=%s stable=%d/%d (%d/%d)",
             modeTag,
@@ -422,7 +427,7 @@ static int ptrace_call(pid_t pid, uint64_t funcAddr, uint64_t* params, int param
 
 int Injector::injectRemote(pid_t pid, const char* soPath, InjectMode mode) {
     LOG(LOG_LEVEL_INFO, "[Injector] 开始注入 pid=%d so=%s mode=%s", pid, soPath,
-        mode == MODE_PUBG ? "PUBG" : (mode == MODE_DFM ? "DFM" : "LOL"));
+        mode == MODE_PUBG ? "PUBG" : (mode == MODE_DFM ? "DFM" : (mode == MODE_NRC ? "NRC" : "LOL")));
 
     // ── 1. Attach 到目标进程 ──
     if (ptrace(PTRACE_ATTACH, pid, nullptr, nullptr) < 0) {
@@ -532,9 +537,9 @@ int Injector::injectRemote(pid_t pid, const char* soPath, InjectMode mode) {
             //   GUObjectArray: +0x14706480 (结构体地址, 不解引用)
             //   GWorld:        +0x14988578 (需解引用)
             //
-            static constexpr uint32_t PUBG_OFF_GNAMES         = 0x146F9F30;
-            static constexpr uint32_t PUBG_OFF_GUOBJECTARRAY  = 0x14706480;
-            static constexpr uint32_t PUBG_OFF_GWORLD         = 0x14988578;
+            static constexpr uint32_t PUBG_OFF_GNAMES         = 0x154CE510;
+            static constexpr uint32_t PUBG_OFF_GUOBJECTARRAY  = 0x14CEC650;
+            static constexpr uint32_t PUBG_OFF_GWORLD         = 0x14CEE938;
 
             const char* funcName = "MyStartPointPUBG";
             if (ptrace_writedata(pid, remoteMem, funcName, strlen(funcName) + 1) < 0) {
@@ -665,6 +670,79 @@ int Injector::injectRemote(pid_t pid, const char* soPath, InjectMode mode) {
             LOG(LOG_LEVEL_INFO, "[Injector] ✓ MyStartPointDFM 返回: %lld", (long long)startRet);
             if (startRet == 0) {
                 LOG(LOG_LEVEL_ERROR, "[Injector] MyStartPointDFM 返回 0, 视为失败");
+                goto cleanup;
+            }
+            result = 0;
+        } else if (mode == MODE_NRC) {
+            // ═══ NRC (UE 4.26 洛克王国手游) 注入路径 ═══
+            //
+            // 全局偏移 (相对于 libUE4.so 基址, 来自 ue_dump_all.js):
+            //   NamePool:               +0x0D9A4B40
+            //   GUObjectArray base:     +0x0D9C06B8
+            //   GUObjectArray.Chunks:   +0x0D9C06C8 (= base + 0x10)
+            //   GUObjectArray.Num:      +0x0D9C06DC (= base + 0x24)
+            //   GWorld:                 +0x0DF3A198
+            //
+            static constexpr uint32_t NRC_OFF_NAMEPOOL             = 0x0D9A4B40;
+            static constexpr uint32_t NRC_OFF_GUOBJECTARRAY_NUM    = 0x0D9C06B8 + 0x24;
+            static constexpr uint32_t NRC_OFF_GUOBJECTARRAY_CHUNKS = 0x0D9C06B8 + 0x10;
+            static constexpr uint32_t NRC_OFF_GWORLD               = 0x0DF3A198;
+
+            const char* funcName = "MyStartPointNRC";
+            if (ptrace_writedata(pid, remoteMem, funcName, strlen(funcName) + 1) < 0) {
+                LOG(LOG_LEVEL_ERROR, "[Injector] 写入函数名失败");
+                goto cleanup;
+            }
+
+            uint64_t dlsymParams[2] = { dlopenResult, remoteMem };
+            uint64_t funcAddr = 0;
+            if (ptrace_call(pid, remoteDlsymAddr, dlsymParams, 2, &funcAddr) < 0 || funcAddr == 0) {
+                LOG(LOG_LEVEL_ERROR, "[Injector] dlsym 查找 MyStartPointNRC 失败");
+                goto cleanup;
+            }
+            LOG(LOG_LEVEL_INFO, "[Injector] MyStartPointNRC 地址: %llx", (unsigned long long)funcAddr);
+
+            uint64_t ue4Base = getRemoteModuleBase(pid, "libUE4.so");
+            if (ue4Base == 0) {
+                LOG(LOG_LEVEL_ERROR, "[Injector] 无法找到 libUE4.so 基址");
+                goto cleanup;
+            }
+            uint64_t ue4Size = getRemoteModuleSize(pid, "libUE4.so");
+            LOG(LOG_LEVEL_INFO, "[Injector] libUE4.so 基址: %llx 大小: 0x%llx",
+                (unsigned long long)ue4Base, (unsigned long long)ue4Size);
+            if (ue4Size == 0) {
+                LOG(LOG_LEVEL_ERROR, "[Injector] NRC ue4Size=0");
+                goto cleanup;
+            }
+
+            uint64_t pNamePool             = NRC_OFF_NAMEPOOL;
+            uint64_t pGUObjectArrayNum     = NRC_OFF_GUOBJECTARRAY_NUM;
+            uint64_t pGUObjectArrayChunks  = NRC_OFF_GUOBJECTARRAY_CHUNKS;
+            uint64_t pGWorld               = NRC_OFF_GWORLD;
+
+            LOG(LOG_LEVEL_INFO, "[Injector] NRC offsets: NP=0x%llx Num=0x%llx Chunks=0x%llx GW=0x%llx",
+                (unsigned long long)pNamePool, (unsigned long long)pGUObjectArrayNum,
+                (unsigned long long)pGUObjectArrayChunks, (unsigned long long)pGWorld);
+
+            // MyStartPointNRC(base, NamePool, GWorld, Num, Chunks, moduleSize, NULL)
+            uint64_t startParams[7] = {
+                ue4Base,
+                pNamePool,
+                pGWorld,
+                pGUObjectArrayNum,
+                pGUObjectArrayChunks,
+                ue4Size,
+                0
+            };
+            LOG(LOG_LEVEL_INFO, "[Injector] 调用 MyStartPointNRC...");
+            uint64_t startRet = 0;
+            if (ptrace_call(pid, funcAddr, startParams, 7, &startRet) < 0) {
+                LOG(LOG_LEVEL_ERROR, "[Injector] MyStartPointNRC 调用失败");
+                goto cleanup;
+            }
+            LOG(LOG_LEVEL_INFO, "[Injector] ✓ MyStartPointNRC 返回: %lld", (long long)startRet);
+            if (startRet == 0) {
+                LOG(LOG_LEVEL_ERROR, "[Injector] MyStartPointNRC 返回 0, 视为失败");
                 goto cleanup;
             }
             result = 0;
@@ -822,12 +900,12 @@ pid_t Injector::findPidByName(const char* packageName) {
 int Injector::injectByPackageName(const char* packageName, const char* soPath, InjectMode mode) {
     LOG(LOG_LEVEL_INFO, "[Injector] 开始注入 package=%s so=%s mode=%s",
         packageName, soPath,
-        mode == MODE_PUBG ? "PUBG" : (mode == MODE_DFM ? "DFM" : "LOL"));
+        mode == MODE_PUBG ? "PUBG" : (mode == MODE_DFM ? "DFM" : (mode == MODE_NRC ? "NRC" : "LOL")));
 
     pid_t pid = waitForTargetProcessReady(packageName, mode);
 
     if (pid <= 0) {
-        if (mode == MODE_PUBG || mode == MODE_DFM) {
+        if (mode == MODE_PUBG || mode == MODE_DFM || mode == MODE_NRC) {
             LOG(LOG_LEVEL_ERROR, "[Injector] %s 目标进程未在就绪窗口内稳定并加载 libUE4.so: %s",
                 mode == MODE_DFM ? "DFM" : "PUBG", packageName);
         } else {

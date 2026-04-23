@@ -760,9 +760,12 @@ std::string DfmMatchMonitor::getWeaponName(uintptr_t actorPtr) const {
 // =====================================================================
 
 bool DfmMatchMonitor::isPickupClass(const std::string& cn) {
+    // BlueprintGeneratedClass 命名千奇百怪 (BP_AKM_Pickup_C, Inv_Wpn_M4_Pickup_C ...),
+    // 用更宽的子串匹配, 排除箱子/尸体等容器类。
     static const char* keywords[] = {
         "InventoryPickup", "PickupBase", "DroppedItem",
-        "GroundItem", "WeaponPickup", "AmmoPickup"
+        "GroundItem", "WeaponPickup", "AmmoPickup",
+        "InteractorPickup", "_Pickup_", "_Pickup"
     };
     static const char* excludes[] = {
         "_Container", "_OpenBox", "_DeadBody", "RandomObj",
@@ -809,9 +812,10 @@ bool DfmMatchMonitor::isContainerClass(const std::string& cn) {
 //  物品名映射 (静态分类回退)
 // =====================================================================
 
-std::string DfmMatchMonitor::getItemDisplayName(int32_t itemId) const {
+std::string DfmMatchMonitor::getItemDisplayName(int64_t itemId) const {
     if (itemId <= 0) return "未知物品";
     // ItemID 格式: MMSSXXXXXXX (MM=大类, SS=子类, XXXXXXX=序号)
+    // 真实 ID 11 位最大 ~1.1e10, 必须用 int64 (int32 上限 ~2.1e9 会截断到 0)。
     std::string s = std::to_string(itemId);
     while (s.size() < 11) s = "0" + s;
     int main = std::stoi(s.substr(0, 2));
@@ -831,8 +835,11 @@ std::string DfmMatchMonitor::getItemDisplayName(int32_t itemId) const {
     if (it != subTypes.end()) return it->second;
 
     static const std::unordered_map<int, const char*> mainTypes = {
-        {10,"武器"},{11,"装备"},{13,"配件"},{14,"药品"},{15,"收集品"},
-        {16,"杂物"},{17,"箱子"},{21,"投掷物"},{37,"弹药"},{39,"载具"},
+        {10,"武器"},{11,"装备"},{12,"枪外观"},{13,"配件"},{14,"药品"},
+        {15,"收集品"},{16,"杂物"},{17,"箱子"},{18,"枪部件"},{19,"食物"},
+        {21,"投掷物"},{22,"天赋"},{24,"装置"},{25,"技能"},{28,"枪皮"},
+        {30,"时装"},{31,"低级枪"},{37,"弹药"},{38,"商品"},{39,"载具"},
+        {40,"车件"},{41,"车皮"},{88,"英雄"},
     };
     auto mt = mainTypes.find(main);
     return mt != mainTypes.end() ? std::string("[") + mt->second + "]" + std::to_string(itemId)
@@ -931,11 +938,133 @@ std::string DfmMatchMonitor::translateItemClassName(const std::string& className
 }
 
 // =====================================================================
+//  全量 Pickup CDO dump → ItemRegistry
+//  策略: 扫 GUObjectArray, 找所有 ClassPrivate==UClass 且 oname 命中 isPickupClass
+//        的 UClass 对象, 取其 ClassDefaultObject (UClass 内某个偏移处的 UObject*),
+//        从 CDO 上读 Pickup_InvIdName(FName) 与 Interactor_Name(FText), record() 入库。
+//  CDO 由 UE 在 cooked APK 加载时根据蓝图 default value 填充, 11 位 ItemID 与本地化中文名
+//  都已经 baked 进去, 跑这一次就能拿全所有物品名 (无需见到地面物品)。
+//
+//  CDO 偏移在不同包不一样, 用 Default__ 前缀的 oname 校验一次锁定, 后续复用。
+// =====================================================================
+int DfmMatchMonitor::dumpAllPickupCDOs() const {
+    if (m_moduleBase == 0 || m_offGUObjectArrayNum == 0
+        || m_offGUObjectArrayChunks == 0) {
+        return 0;
+    }
+
+    const uint32_t total = safeReadU32(m_moduleBase + m_offGUObjectArrayNum);
+    const uintptr_t chunkTable = safeReadPtr(m_moduleBase + m_offGUObjectArrayChunks);
+    if (!ok(chunkTable) || total == 0 || total > 0x800000) {
+        LOG(LOG_LEVEL_WARN, "[ItemDump] GUObjectArray invalid: total=%u chunks=%p",
+            total, reinterpret_cast<void*>(chunkTable));
+        return 0;
+    }
+
+    auto getobj = [&](uint32_t idx) -> uintptr_t {
+        const uintptr_t cp = safeReadPtr(chunkTable + static_cast<uintptr_t>(idx >> 16) * 8);
+        if (!ok(cp)) return 0;
+        FUObjectItem item{};
+        const uintptr_t itemAddr = cp + static_cast<uintptr_t>(idx & 0xFFFF) * sizeof(FUObjectItem);
+        if (!safeReadMemory(itemAddr, &item, sizeof(item))) return 0;
+        return reinterpret_cast<uintptr_t>(item.Object);
+    };
+
+    // FName "Class" UObject 的快速类名 (UObjectBase + ClassPrivate)→ UClass.oname
+    // 已有 readClassName, 直接复用。
+    int cdoOff = -1;
+    int added = 0;
+    int scanned = 0;
+    int classMatched = 0;
+    int cdoOk = 0;
+
+    for (uint32_t i = 0; i < total; ++i) {
+        const uintptr_t obj = getobj(i);
+        if (!ok(obj)) continue;
+        ++scanned;
+
+        // obj 必须本身是个 UClass。UClass 的 ClassPrivate 指向 UClass 元类自身。
+        // 简化: 只看类名是否匹配 Pickup, 然后再确认 obj 是 UClass — 通过 obj.ClassPrivate 的 oname 应该是 "BlueprintGeneratedClass" 或 "Class"。
+        const std::string objClsName = readClassName(obj);  // = ClassPrivate.oname
+        if (objClsName != "BlueprintGeneratedClass" && objClsName != "Class"
+            && objClsName != "DynamicClass") {
+            continue;
+        }
+
+        // obj 现在是个 UClass*。读 obj 自己的 oname (它是哪个蓝图类) — 这就是 cn。
+        // UClass 继承 UObjectBase, 所以 oname 等于 readFName(obj + UObject::FName=0x18 在标准 UE5)。
+        // 用 readClassName(CDO) 的方式不行 — 我们要的是 UClass 自己的名字。
+        // 复用 dumpFName 路径: UObjectBase.NamePrivate +0x18
+        const std::string cn = readObjName(obj);
+        if (cn.empty() || !isPickupClass(cn)) continue;
+        ++classMatched;
+
+        // 找 CDO: 第一次扫描锁定偏移
+        uintptr_t cdo = 0;
+        if (cdoOff >= 0) {
+            cdo = safeReadPtr(obj + static_cast<uintptr_t>(cdoOff));
+            if (!ok(cdo)) cdo = 0;
+        } else {
+            for (int off = 0xC0; off <= 0x260; off += 8) {
+                const uintptr_t cand = safeReadPtr(obj + static_cast<uintptr_t>(off));
+                if (!ok(cand)) continue;
+                // CDO.ClassPrivate 应回指 obj
+                const uintptr_t backCls = safeReadPtr(cand + offsetof(UObjectBase, ClassPrivate));
+                if (backCls != obj) continue;
+                const std::string cdoName = readObjName(cand);
+                if (cdoName.rfind("Default__", 0) == 0) {
+                    cdoOff = off;
+                    cdo = cand;
+                    LOG(LOG_LEVEL_INFO, "[ItemDump] CDO offset locked at UClass+0x%X (cn=%s)",
+                        off, cn.c_str());
+                    break;
+                }
+            }
+        }
+        if (!ok(cdo)) continue;
+        ++cdoOk;
+
+        // 从 CDO 读 InventoryIdName + InteractorName
+        const std::string idName = readFName(cdo + static_cast<uintptr_t>(m_off.Pickup_InvIdName));
+        if (idName.empty() || idName == "None" || idName == "?") continue;
+
+        const std::string display = readFText(cdo + static_cast<uintptr_t>(m_off.Interactor_Name));
+
+        // display 为空 → 仍 record 一个占位 (用类名 translateItemClassName), 至少把 numId 反向索引建起来。
+        // 后续运行时如果 InteractorName 有真实本地化名, record() 会覆盖。
+        std::string finalDisplay = display;
+        if (finalDisplay.empty()) {
+            finalDisplay = translateItemClassName(cn);
+            if (finalDisplay.empty()) finalDisplay = cn;
+        }
+
+        const bool isNew = ItemRegistry::instance().lookup(idName).empty();
+        ItemRegistry::instance().record(idName, finalDisplay, cn);
+        if (isNew) ++added;
+
+        // 前 5 条样本写日志, 方便人工对照确认
+        if (added <= 5 && isNew) {
+            LOG(LOG_LEVEL_INFO, "[ItemDump] 样本: idName=%s display=%s class=%s",
+                idName.c_str(), finalDisplay.c_str(), cn.c_str());
+        }
+    }
+
+    // 立即落盘
+    bool saved = ItemRegistry::instance().save();
+
+    LOG(LOG_LEVEL_INFO,
+        "[ItemDump] 完成: scanned=%d Pickup匹配=%d CDO读到=%d 新增=%d 总条目=%zu saved=%d",
+        scanned, classMatched, cdoOk, added,
+        ItemRegistry::instance().size(), saved ? 1 : 0);
+    return added;
+}
+
+// =====================================================================
 //  综合物品显示名解析 — 4 级回退
 // =====================================================================
 std::string DfmMatchMonitor::resolveItemDisplay(uintptr_t pickupActor,
                                                 const std::string& rawId,
-                                                int32_t numId) const {
+                                                int64_t numId) const {
     // 0. 注册表优先 — 之前帧已成功解出过的本地化名直接命中, 极快, 还能跨场景沿用。
     if (!rawId.empty()) {
         std::string cached = ItemRegistry::instance().lookup(rawId);
@@ -977,6 +1106,7 @@ std::string DfmMatchMonitor::resolveItemDisplay(uintptr_t pickupActor,
     }
 
     // 4. 兜底: 原始 FName
+    // [ROLLBACK] enqueueItemNameLookup 已移除 — ACE 行为指纹风险
     return rawId.empty() ? std::string("?") : rawId;
 }
 
@@ -1209,8 +1339,9 @@ void DfmMatchMonitor::scanActors(const std::vector<uintptr_t>& actors, DrawDfmDa
             std::string rawId = readFName(actor + m_off.Pickup_InvIdName);
             if (rawId.empty() || rawId == "None" || rawId == "?") continue;
 
-            int32_t numId = 0;
-            try { numId = std::stoi(rawId); } catch (...) {}
+            // ItemID 是 11 位数字, 用 int64 解析 (int32 会 throw out_of_range)
+            int64_t numId = 0;
+            try { numId = std::stoll(rawId); } catch (...) {}
 
             LootItem item;
             // 4 级回退: InteractorName(FText) → InventoryType(UClass) → 数字大类 → rawFName
@@ -1461,12 +1592,13 @@ std::vector<ContainerItem> DfmMatchMonitor::readContainerItems(uintptr_t actorPt
                 float dur = safeReadFloat(item + offsetof(InventoryItemInfo, ItemDurability));
                 float durMax = safeReadFloat(item + offsetof(InventoryItemInfo, ItemDurabilityMax));
 
-                int32_t itemIdNum = static_cast<int32_t>(cat * 10000 + seq);
+                // ItemID 完整编码: Category(4位 e.g. 1101) * 10^7 + Sequence(7位) = 11 位 FName
+                // 例: cat=1101 seq=301001 → 11010301001 (与地面 PickupBase 读出的 FName 一致)
+                // 原公式 cat*10000+seq 错误, 导致与注册表 numId 不匹配, 容器物品永远查不到名字。
+                int64_t itemIdNum = static_cast<int64_t>(cat) * 10000000LL + static_cast<int64_t>(seq);
                 ContainerItem ci;
                 // 容器内 item 拿不到 actor 指针, 不能读 InteractorName。
-                // 改为: 注册表 (按 numId 反查, 之前帧地面 PickupBase 命中过的同 ID 直接复用)
-                //       → translateItemClassName(itemId 字符串无法用) 跳过
-                //       → getItemDisplayName 数字大类映射兜底
+                // 按 numId 反查注册表 (之前帧地面 PickupBase 命中过的同 ID 直接复用) → 数字大类映射兜底
                 std::string fromReg = ItemRegistry::instance().lookupById(itemIdNum);
                 ci.name = !fromReg.empty() ? fromReg : getItemDisplayName(itemIdNum);
                 ci.itemId = itemIdNum;
@@ -1490,8 +1622,8 @@ std::vector<ContainerItem> DfmMatchMonitor::readContainerItems(uintptr_t actorPt
                 int32_t stackCount = safeReadS32(pickup + m_off.Pickup_StackCount);
 
                 ContainerItem ci;
-                int32_t numId = 0;
-                try { numId = std::stoi(idName); } catch (...) {}
+                int64_t numId = 0;
+                try { numId = std::stoll(idName); } catch (...) {}
                 // 4 级回退同 ground loot
                 ci.name = resolveItemDisplay(pickup, idName, numId);
                 ci.count = stackCount;
@@ -1801,10 +1933,11 @@ DfmMatchMonitor::DfmMatchMonitor(uintptr_t moduleBase, uintptr_t moduleSize,
     , m_offNamePool(offNamePool), m_offGUObjectArrayNum(offGUObjectArrayNum)
     , m_offGUObjectArrayChunks(offGUObjectArrayChunks), m_offGWorld(offGWorld)
 {
-    // 初始化物资名注册表 — 加载已积累的 idName→display 映射, 后续运行时累积更新。
-    // 路径选 app 私有 external 目录, 无需运行时权限。包名/项目结构变了改这里即可。
-    ItemRegistry::instance().init(
-        "/storage/emulated/0/Android/data/com.example.dobbyproject/files");
+    // [ROLLBACK 2026-04-21] 物资名注册表改为纯内存模式, 不再传文件目录。
+    // 在游戏进程私有目录创建 dfm_items.txt 触发了 ACE 的 inotify 检测 → 账号封禁。
+    // ItemRegistry 仍可用于运行时去重缓存, 进程退出即丢。
+    ItemRegistry::instance().init("");
+    LOG(LOG_LEVEL_INFO, "[DFM] [ItemRegistry] init in-memory only (file persistence disabled)");
 }
 
 DfmMatchMonitor::~DfmMatchMonitor() { stop(); }
@@ -3725,6 +3858,21 @@ void DfmMatchMonitor::pollLoop() {
             processOpenBoxRequests();
         }
 
+        // [ROLLBACK 2026-04-21] 以下两块已禁用 — 触发账号封禁:
+        //  * processItemNameRequests / enqueueItemNameLookup: 即便 SAFE-MODE
+        //    也会被 ACE 行为统计抓 (异常队列+反复读 InteractorName)
+        //  * dumpAllPickupCDOs: 全量 GUObjectArray 扫描 (~22 万对象) 是
+        //    最强指纹, 直接命中 ACE 异常 actor 访问检测; 还会与 GC 的
+        //    IncrementalPurgeGarbage 撞 race, 读到野指针。
+        // 物品名解析回退到原 4 级回退 (InteractorName→InvType→numId→rawId)。
+        // processItemNameRequests();
+        // if (SharedDfmData::getInstance().consumeItemDumpRequest()) {
+        //     int n = dumpAllPickupCDOs();
+        //     (void)n;
+        // }
+        // 仍然消费 flag 防止 GUI 反复请求堆积
+        (void)SharedDfmData::getInstance().consumeItemDumpRequest();
+
         // 大厅期心跳: 即使不在对局, 也每秒推一帧空数据, 防止 GUI 看门狗 (uestart.cpp
         // kStaleExitMs=10s) 把渲染线程清屏退出, 导致菜单消失
         if (!ms.inMatch) {
@@ -3976,6 +4124,136 @@ void DfmMatchMonitor::processOpenBoxRequests() {
         }
     }
     (void)sentAny;
+}
+
+// =====================================================================
+//  物品名 UFunction 调用 (PickupBase::GetItemName) — 阶段 1
+// =====================================================================
+//
+//  设计说明:
+//   * resolveItemDisplay 走完 4 级回退仍拿不到具体物品名时, 把
+//     (actor, rawId, numId) 入队; pollLoop 下个 tick 调
+//     processItemNameRequests, 用 ProcessEvent 调 PickupBase::GetItemName()
+//     拿 FText, 写入 ItemRegistry, 后续帧直接命中第 0 步快路径。
+//   * 与 OpenThisBox 共用 callUFunction 路径 (vtable[69] = ProcessEvent)。
+//   * 默认 kItemNameActuallyFireCall=false: 不真正触发 ProcessEvent, 仅日志,
+//     避免跨线程崩溃 (Monitor 线程非 UE GameThread, ACE 也 hook 着 PE)。
+//     仅在确认安全后改 true 实战。
+//   * GetItemName 是纯 getter (无 RPC, 无副作用), 比 OpenThisBox 安全得多,
+//     但仍受 GameThread/ACE hook 影响, 故保持 opt-in。
+
+constexpr bool kItemNameActuallyFireCall = false;
+
+// 把 (actor, rawId, numId) 加入队列, 同 rawId 仅排队一次 (in-flight 表去重)
+void DfmMatchMonitor::enqueueItemNameLookup(uintptr_t actor,
+                                            const std::string& rawId,
+                                            int64_t numId) const {
+    if (!ok(actor) || rawId.empty() || rawId == "None" || rawId == "?") return;
+    std::lock_guard<std::mutex> lock(m_itemNameQueueMu);
+    auto it = m_itemNameInFlight.find(rawId);
+    if (it != m_itemNameInFlight.end()) {
+        if (it->second >= 3) return;        // 重试上限
+    } else {
+        m_itemNameInFlight[rawId] = 0;
+    }
+    if (m_itemNameQueue.size() >= 64) return; // 防爆队列
+    m_itemNameQueue.push_back({actor, rawId, numId});
+}
+
+// 通过 interface 解析 PickupBase::GetItemName UFunction*
+static uintptr_t resolveGetItemNameUFunctionImpl(ue5dfminf::UE5DfmInterface* iface) {
+    if (!iface) return 0;
+    // 候选类: SDK dump 中带 GetItemName / GetItemNameByID 的几个基类
+    static const char* kCandClasses[] = {
+        "PickupBase",
+        "InteractorBase",
+        "InventoryItemBase",
+        "InventoryPickup",
+    };
+    for (const char* cls : kCandClasses) {
+        const auto* cd = iface->findClass(cls);
+        if (!cd) continue;
+        for (const auto& f : cd->functions) {
+            if (f.name == "GetItemName" && f.ufunctionPtr != 0) {
+                return f.ufunctionPtr;
+            }
+        }
+    }
+    return 0;
+}
+
+void DfmMatchMonitor::processItemNameRequests() {
+    // 取出本批
+    std::vector<ItemNameRequest> batch;
+    {
+        std::lock_guard<std::mutex> lock(m_itemNameQueueMu);
+        if (m_itemNameQueue.empty()) return;
+        batch.swap(m_itemNameQueue);
+    }
+
+    // Lazy resolve UFunction*
+    if (!m_getItemNameResolved) {
+        m_getItemNameUFunction = resolveGetItemNameUFunctionImpl(m_interface);
+        m_getItemNameResolved  = true;
+        LOG(LOG_LEVEL_INFO, TAG " [itemname] resolve GetItemName UFunction* = %p",
+            (void*)m_getItemNameUFunction);
+    }
+    if (!ok(m_getItemNameUFunction)) {
+        // 解析失败: 清 in-flight, 让后续不再无谓入队
+        std::lock_guard<std::mutex> lock(m_itemNameQueueMu);
+        for (const auto& r : batch) m_itemNameInFlight[r.rawId] = 99;
+        return;
+    }
+
+    // 每 tick 限量 (ProcessEvent 即便安全也按线程模型小步推进)
+    constexpr size_t kMaxPerTick = 4;
+    size_t processed = 0;
+    for (const auto& req : batch) {
+        if (processed >= kMaxPerTick) {
+            // 剩余的回滚到队列头
+            std::lock_guard<std::mutex> lock(m_itemNameQueueMu);
+            m_itemNameQueue.insert(m_itemNameQueue.begin(),
+                                   batch.begin() + processed, batch.end());
+            break;
+        }
+        ++processed;
+
+        // actor 仍存活 (校验 vtable + ClassPrivate 大致可用)
+        if (!ok(req.actor)) continue;
+        uintptr_t vt = safeReadPtr(req.actor);
+        if (!ok(vt)) continue;
+
+        // FText ReturnValue 0x18 字节 (UE5)
+        struct GetItemNameParams { uint8_t ReturnText[0x18]; } params{};
+
+        if (!kItemNameActuallyFireCall) {
+            LOG(LOG_LEVEL_INFO, TAG " [itemname] [SAFE-MODE] would call GetItemName actor=%p rawId=%s",
+                (void*)req.actor, req.rawId.c_str());
+            std::lock_guard<std::mutex> lock(m_itemNameQueueMu);
+            m_itemNameInFlight[req.rawId] = 99; // 安全模式直接放弃, 防止反复入队刷屏
+            continue;
+        }
+
+        bool ok2 = callUFunction(req.actor, m_getItemNameUFunction, &params);
+        if (!ok2) {
+            std::lock_guard<std::mutex> lock(m_itemNameQueueMu);
+            m_itemNameInFlight[req.rawId] += 1;
+            continue;
+        }
+        // 解析 FText
+        std::string name = readFText(reinterpret_cast<uintptr_t>(&params.ReturnText[0]));
+        LOG(LOG_LEVEL_INFO, TAG " [itemname] GetItemName actor=%p rawId=%s -> '%s'",
+            (void*)req.actor, req.rawId.c_str(), name.c_str());
+        if (!name.empty() && name != "None") {
+            std::string cn = readClassName(req.actor);
+            ItemRegistry::instance().record(req.rawId, name, cn);
+            std::lock_guard<std::mutex> lock(m_itemNameQueueMu);
+            m_itemNameInFlight[req.rawId] = 99; // 已落库, 不再重试
+        } else {
+            std::lock_guard<std::mutex> lock(m_itemNameQueueMu);
+            m_itemNameInFlight[req.rawId] += 1;
+        }
+    }
 }
 
 } // namespace dfm

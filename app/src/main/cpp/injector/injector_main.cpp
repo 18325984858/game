@@ -29,8 +29,10 @@ int main(int argc, char* argv[]) {
         mode = Injector::MODE_LOL;
     } else if (strcmp(argv[3], "dfm") == 0) {
         mode = Injector::MODE_DFM;
+    } else if (strcmp(argv[3], "nrc") == 0) {
+        mode = Injector::MODE_NRC;
     } else {
-        fprintf(stderr, "[Injector] 未知模式: %s (支持: lol, pubg, dfm)\n", argv[3]);
+        fprintf(stderr, "[Injector] 未知模式: %s (支持: lol, pubg, dfm, nrc)\n", argv[3]);
         return 1;
     }
 
@@ -38,7 +40,8 @@ int main(int argc, char* argv[]) {
     fprintf(stdout, "[Injector] SO: %s\n", soPath);
     fprintf(stdout, "[Injector] 模式: %s\n",
             mode == Injector::MODE_PUBG ? "PUBG" :
-            mode == Injector::MODE_DFM  ? "DFM"  : "LOL");
+            mode == Injector::MODE_DFM  ? "DFM"  :
+            mode == Injector::MODE_NRC  ? "NRC"  : "LOL");
 
     int ret = Injector::injectByPackageName(packageName, soPath, mode);
     fprintf(stdout, "[Injector] 结果: %d\n", ret);

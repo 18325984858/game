@@ -113,7 +113,8 @@ public class MainActivity extends AppCompatActivity {
     private CheckBox cbPubgHeader;
     private CheckBox cbDfmDumper;
     private CheckBox cbDfmHeader;
-
+    private CheckBox cbNrcDumper;
+    private CheckBox cbNrcHeader;
     private static final String UE4_OVERLAY_STATUS = "UE4 公开 Overlay 已启动";
 
     @Override
@@ -134,6 +135,8 @@ public class MainActivity extends AppCompatActivity {
         cbPubgHeader = findViewById(R.id.cb_pubg_header);
         cbDfmDumper = findViewById(R.id.cb_dfm_dumper);
         cbDfmHeader = findViewById(R.id.cb_dfm_header);
+        cbNrcDumper = findViewById(R.id.cb_nrc_dumper);
+        cbNrcHeader = findViewById(R.id.cb_nrc_header);
 
         // ── 日志开关: 启动时从 C++ 端读取默认值, 改动时主动同步到 C++ ──
         try {
@@ -189,12 +192,26 @@ public class MainActivity extends AppCompatActivity {
             }
         });
 
+        // ── 折叠区域: 洛克王国手游 (NRC) ──
+        TextView tvNrcHeader = findViewById(R.id.tv_section_nrc_header);
+        LinearLayout layoutNrcContent = findViewById(R.id.layout_nrc_content);
+        tvNrcHeader.setOnClickListener(v -> {
+            if (layoutNrcContent.getVisibility() == View.VISIBLE) {
+                layoutNrcContent.setVisibility(View.GONE);
+                tvNrcHeader.setText("▶ 洛克王国手游");
+            } else {
+                layoutNrcContent.setVisibility(View.VISIBLE);
+                tvNrcHeader.setText("▼ 洛克王国手游");
+            }
+        });
+
         Button btnSelinux = findViewById(R.id.btn_selinux);
         Button btnInputPerm = findViewById(R.id.btn_input_perm);
         Button btnFont = findViewById(R.id.btn_deploy_font);
         Button btnLaunch = findViewById(R.id.btn_launch);
         Button btnPubgLaunch = findViewById(R.id.btn_pubg_launch);
         Button btnDfmLaunch = findViewById(R.id.btn_dfm_launch);
+        Button btnNrcLaunch = findViewById(R.id.btn_nrc_launch);
         Button btnSoDumper = findViewById(R.id.btn_so_dumper);
 
         // ── SO Dumper 入口 ──
@@ -289,6 +306,41 @@ public class MainActivity extends AppCompatActivity {
             Toast.makeText(this, "正在启动三角洲并注入..." + options2, Toast.LENGTH_SHORT).show();
         });
 
+        // ── 洛克王国手游 (NRC) 启动按钮 ──
+        btnNrcLaunch.setOnClickListener(v -> {
+            if (!selinuxDone) {
+                Toast.makeText(this, "请先设置宽容模式", Toast.LENGTH_SHORT).show();
+                return;
+            }
+
+            if ("⚠ 游戏未安装".equals(btnNrcLaunch.getText().toString())) {
+                Toast.makeText(this, "洛克王国手游未安装，请先安装游戏", Toast.LENGTH_SHORT).show();
+                return;
+            }
+
+            if (!ensureOverlayPermission()) {
+                updateStatus("请授予悬浮窗权限后重试");
+                return;
+            }
+
+            startUe4OverlayService();
+            btnNrcLaunch.setEnabled(false);
+
+            boolean enableUeDumper = cbNrcDumper.isChecked();
+            boolean enableUeHeader = cbNrcHeader.isChecked();
+            boolean enableLog = cbLog.isChecked();
+
+            clearDumpMarkers();
+            writeFiletoTargetNrc();
+            launchAndInjectNrc(enableUeDumper, enableUeHeader, enableLog);
+
+            String options3 = "";
+            if (enableUeDumper) options3 += " [UE4 Dumper]";
+            btnNrcLaunch.setText("✅ 游戏已启动" + options3);
+            updateStatus(UE4_OVERLAY_STATUS + " | 洛克王国手游启动中..." + options3);
+            Toast.makeText(this, "正在启动洛克王国手游并注入..." + options3, Toast.LENGTH_SHORT).show();
+        });
+
         // ── 启动时初始化检测 ──
         updateStatus("正在检测环境...");
         new Thread(() -> {
@@ -332,6 +384,7 @@ public class MainActivity extends AppCompatActivity {
             boolean gameInstalled = checkGameInstalled();
             boolean pubgInstalled = checkPackageInstalled(PUBG_PACKAGE);
             boolean dfmInstalled = checkPackageInstalled(DFM_PACKAGE);
+            boolean nrcInstalled = checkPackageInstalled(NRC_PACKAGE);
 
             runOnUiThread(() -> {
                 StringBuilder sb = new StringBuilder();
@@ -370,9 +423,16 @@ public class MainActivity extends AppCompatActivity {
                 if (!dfmInstalled) {
                     btnDfmLaunch.setEnabled(false);
                     btnDfmLaunch.setText("⚠ 游戏未安装");
-                    sb.append("三角洲未安装 ✗");
+                    sb.append("三角洲未安装 ✗  ");
                 } else {
-                    sb.append("三角洲已安装 ✓");
+                    sb.append("三角洲已安装 ✓  ");
+                }
+                if (!nrcInstalled) {
+                    btnNrcLaunch.setEnabled(false);
+                    btnNrcLaunch.setText("⚠ 游戏未安装");
+                    sb.append("洛克王国手游未安装 ✗");
+                } else {
+                    sb.append("洛克王国手游已安装 ✓");
                 }
                 updateStatus(sb.length() > 0 ? sb.toString().trim() : "就绪");
             });
@@ -1308,6 +1368,14 @@ public class MainActivity extends AppCompatActivity {
     private static final String DFM_INJECTOR_TRACE = "/data/local/tmp/dfm_injector_trace.txt";
     private static final String DFM_UE4_GUI_TRACE = "/data/data/" + DFM_PACKAGE + "/cache/ue4_gui_trace.txt";
 
+    // ═══════════════════════════════════════════════════════════════════
+    //  洛克王国手游 (NRC) 注入流程
+    // ═══════════════════════════════════════════════════════════════════
+
+    private static final String NRC_PACKAGE = "com.tencent.nrc";
+    private static final String NRC_INJECTOR_TRACE = "/data/local/tmp/nrc_injector_trace.txt";
+    private static final String NRC_UE4_GUI_TRACE = "/data/data/" + NRC_PACKAGE + "/cache/ue4_gui_trace.txt";
+
     /**
      * 拷贝 SO 到和平精英目标目录
      */
@@ -1563,6 +1631,114 @@ public class MainActivity extends AppCompatActivity {
                 runOnUiThread(() -> {
                     stopUe4OverlayService();
                     updateStatus("三角洲注入异常");
+                });
+            }
+        }).start();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  洛克王国手游 (NRC) 注入方法
+    // ═══════════════════════════════════════════════════════════════════
+
+    public void writeFiletoTargetNrc() {
+        String srcFile = g_nativeLibPath + (g_nativeLibPath.endsWith("/") ? "" : "/") + "libdobbyproject.so";
+        String dstDir = "/data/data/" + NRC_PACKAGE + "/files";
+        String dstFile = dstDir + "/libdobbyproject.so";
+
+        LogUtil.i("[NRC] 源文件: " + srcFile);
+        LogUtil.i("[NRC] 拷贝 SO -> " + dstFile);
+
+        String cmd = "mkdir -p " + dstDir + "\n" +
+                "cp -f " + srcFile + " " + dstFile + "\n" +
+                "chmod 777 " + dstFile + "\n" +
+                "sync\nexit\n";
+
+        String[] suVariants = {"su -M", "su -mm", "su"};
+        for (String suCmd : suVariants) {
+            try {
+                Process p = Runtime.getRuntime().exec(suCmd);
+                DataOutputStream os = new DataOutputStream(p.getOutputStream());
+                os.writeBytes(cmd);
+                os.flush();
+                int exitCode = p.waitFor();
+                if (exitCode == 0) {
+                    LogUtil.i("[NRC] ✓ " + suCmd + " 拷贝成功");
+                    return;
+                }
+            } catch (Exception e) {
+                LogUtil.i("[NRC] " + suCmd + " 不可用");
+            }
+        }
+        LogUtil.e("[NRC] 所有 su 方式均失败", null);
+    }
+
+    public void launchAndInjectNrc(boolean enableUeDumper, boolean enableUeHeader, boolean enableLog) {
+        String soPath = "/data/data/" + NRC_PACKAGE + "/files/libdobbyproject.so";
+        String injectorDst = "/data/local/tmp/injector";
+
+        new Thread(() -> {
+            try {
+                LogUtil.i("[NRC] 部署 injector");
+                Process deployP = Runtime.getRuntime().exec("su");
+                DataOutputStream deployOs = new DataOutputStream(deployP.getOutputStream());
+                deployOs.writeBytes("cp -f " + g_nativeLibPath + "/libinjector.so " + injectorDst + "\n");
+                deployOs.writeBytes("chmod 755 " + injectorDst + "\n");
+                deployOs.writeBytes("exit\n");
+                deployOs.flush();
+                deployP.waitFor();
+
+                LogUtil.i("[NRC] 启动洛克王国手游");
+                Process launchP = Runtime.getRuntime().exec("su");
+                DataOutputStream launchOs = new DataOutputStream(launchP.getOutputStream());
+                launchOs.writeBytes("monkey -p " + NRC_PACKAGE + " -c android.intent.category.LAUNCHER 1 2>/dev/null\n");
+                launchOs.writeBytes("exit\n");
+                launchOs.flush();
+                launchP.waitFor();
+
+                LogUtil.i("[NRC] 等待 12 秒游戏初始化...");
+                Thread.sleep(12000);
+
+                Process cfgP = Runtime.getRuntime().exec("su");
+                DataOutputStream cfgOs = new DataOutputStream(cfgP.getOutputStream());
+                String cfgContent = "ue_dumper=" + (enableUeDumper ? "1" : "0") + "\n"
+                                  + "ue_header=" + (enableUeHeader ? "1" : "0") + "\n"
+                                  + "log=" + (enableLog ? "1" : "0") + "\n";
+                cfgOs.writeBytes("echo '" + cfgContent + "' > /data/local/tmp/dobby_config.txt\n");
+                cfgOs.writeBytes("chmod 644 /data/local/tmp/dobby_config.txt\n");
+                cfgOs.writeBytes("rm -f " + NRC_INJECTOR_TRACE + " " + NRC_UE4_GUI_TRACE + "\n");
+                cfgOs.writeBytes("exit\n");
+                cfgOs.flush();
+                cfgP.waitFor();
+
+                LogUtil.i("[NRC] 执行注入: " + injectorDst + " " + NRC_PACKAGE + " " + soPath + " nrc");
+                Process p = Runtime.getRuntime().exec("su");
+                DataOutputStream os = new DataOutputStream(p.getOutputStream());
+                os.writeBytes(injectorDst + " " + NRC_PACKAGE + " " + soPath + " nrc 2>&1\n");
+                os.writeBytes("exit $?\n");
+                os.flush();
+
+                BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream()));
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    LogUtil.i("[NRC] " + line);
+                }
+                int exitCode = p.waitFor();
+                LogUtil.i("[NRC] 注入完成, exitCode=" + exitCode);
+
+                runOnUiThread(() -> {
+                    if (exitCode == 0) {
+                        updateStatus("洛克王国手游注入成功");
+                    } else {
+                        stopUe4OverlayService();
+                        updateStatus("洛克王国手游注入失败 (code=" + exitCode + ")");
+                    }
+                });
+
+            } catch (Exception e) {
+                LogUtil.e("[NRC] 注入异常: " + e.getMessage(), e);
+                runOnUiThread(() -> {
+                    stopUe4OverlayService();
+                    updateStatus("洛克王国手游注入异常");
                 });
             }
         }).start();

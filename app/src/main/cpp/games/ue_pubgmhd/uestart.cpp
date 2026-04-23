@@ -752,17 +752,26 @@ static void UE4WorkerThread(void* plibUE4ModeBase, void* pGNames,
 
         // 等待游戏引擎完成初始化, GNames/GWorld/GUObjectArray 尚未稳定时直接访问会崩溃
         // 通过 /proc/self/mem 安全探测 (不安装信号处理器, 不与 UE4Dumper 冲突)
+        //
+        // PUBG 注意: Injector 传入的 pGUObjectArray = base + 0x14CEC650 是一个 *指针变量* 的地址,
+        // 真正的 FUObjectArray 内部结构体在 *(uintptr_t*)pGUObjectArray.
+        // (IDA 反汇编确认: 引擎 IndexToObject 总是先 `LDR X9, [X9]` 再访问 +0xC8/+0xE8 等字段)
+        // 这里在引擎就绪后做一次解引用, 后续所有消费者都拿到真正的结构体地址.
         LOG(LOG_LEVEL_INFO, "[UE4Worker] 等待游戏引擎就绪...");
+        uintptr_t gUObjArrayInner = 0; // 解引用后的真实 FUObjectArray 内部结构体地址
         {
-            uintptr_t gNamesAddr = reinterpret_cast<uintptr_t>(pGNames);
-            uintptr_t gWorldAddr = reinterpret_cast<uintptr_t>(pGWorld);
+            uintptr_t gNamesAddr   = reinterpret_cast<uintptr_t>(pGNames);
+            uintptr_t gWorldAddr   = reinterpret_cast<uintptr_t>(pGWorld);
+            uintptr_t gUObjAddr    = reinterpret_cast<uintptr_t>(pGUObjectArray);
             constexpr int kMaxWaitSeconds = 120;
             int memFd = open("/proc/self/mem", O_RDONLY);
             bool ready = false;
             for (int i = 0; i < kMaxWaitSeconds * 2; i++) {
                 int32_t numNames = 0;
                 uintptr_t worldPtr = 0;
-                bool namesOk = false, worldOk = false;
+                uintptr_t innerPtr = 0;
+                int32_t innerTotal = 0;
+                bool namesOk = false, worldOk = false, objOk = false;
                 if (memFd >= 0 && gNamesAddr >= 0x10000) {
                     // TNameEntryArray.NumElements @ +0x1400
                     if (pread(memFd, &numNames, sizeof(numNames), static_cast<off_t>(gNamesAddr + 0x1400)) == sizeof(numNames)) {
@@ -774,9 +783,23 @@ static void UE4WorkerThread(void* plibUE4ModeBase, void* pGNames,
                         worldOk = (worldPtr >= 0x10000);
                     }
                 }
-                if (namesOk && worldOk) {
-                    LOG(LOG_LEVEL_INFO, "[UE4Worker] 引擎就绪! numNames=%d worldPtr=%p (等待了 %.1fs)",
-                        numNames, (void*)worldPtr, i * 0.5f);
+                if (memFd >= 0 && gUObjAddr >= 0x10000) {
+                    // 1. 读 GUObjectArray 指针变量 -> 内部结构体地址
+                    if (pread(memFd, &innerPtr, sizeof(innerPtr), static_cast<off_t>(gUObjAddr)) == sizeof(innerPtr)
+                        && innerPtr >= 0x10000) {
+                        // 2. 读内部结构体 +0x100 (NumElements) 校验
+                        if (pread(memFd, &innerTotal, sizeof(innerTotal),
+                                  static_cast<off_t>(innerPtr + 0x100)) == sizeof(innerTotal)
+                            && innerTotal > 100 && innerTotal < 5000000) {
+                            objOk = true;
+                            gUObjArrayInner = innerPtr;
+                        }
+                    }
+                }
+                if (namesOk && worldOk && objOk) {
+                    LOG(LOG_LEVEL_INFO,
+                        "[UE4Worker] 引擎就绪! numNames=%d worldPtr=%p UObjInner=%p NumObjects=%d (等待 %.1fs)",
+                        numNames, (void*)worldPtr, (void*)gUObjArrayInner, innerTotal, i * 0.5f);
                     ready = true;
                     break;
                 }
@@ -792,13 +815,16 @@ static void UE4WorkerThread(void* plibUE4ModeBase, void* pGNames,
         // 额外等待 5 秒让引擎完全稳定 (避免 GUObjectArray 正在扩容)
         std::this_thread::sleep_for(std::chrono::seconds(5));
 
+        // 后续所有 GUObjectArray 消费者使用解引用后的内部结构体地址
+        void* pGUObjectArrayInner = reinterpret_cast<void*>(gUObjArrayInner);
+
         // ---- UE4Dumper 导出 / UE4Header 生成 (复用引擎等待, 不另起线程) ----
         if (readUeDumperEnabled()) {
             LOG(LOG_LEVEL_INFO, "[UE4Worker] ue_dumper 已启用, 开始 dump");
             ue4::UE4Dumper dumpOnly(
                 reinterpret_cast<uintptr_t>(plibUE4ModeBase),
                 reinterpret_cast<uint64_t>(pGNames),
-                reinterpret_cast<uint64_t>(pGUObjectArray),
+                reinterpret_cast<uint64_t>(pGUObjectArrayInner),
                 reinterpret_cast<uint64_t>(pGWorld),
                 static_cast<uintptr_t>(moduleSize),
                 "/data/data/com.tencent.tmgp.pubgmhd/cache/ue4_dump/"
@@ -822,7 +848,7 @@ static void UE4WorkerThread(void* plibUE4ModeBase, void* pGNames,
             ue4::UE4Dumper headerDumper(
                 reinterpret_cast<uintptr_t>(plibUE4ModeBase),
                 reinterpret_cast<uint64_t>(pGNames),
-                reinterpret_cast<uint64_t>(pGUObjectArray),
+                reinterpret_cast<uint64_t>(pGUObjectArrayInner),
                 reinterpret_cast<uint64_t>(pGWorld),
                 static_cast<uintptr_t>(moduleSize),
                 "/data/data/com.tencent.tmgp.pubgmhd/cache/ue4_dump/"
@@ -841,7 +867,7 @@ static void UE4WorkerThread(void* plibUE4ModeBase, void* pGNames,
         auto* dumper = new ue4::UE4Dumper(
             reinterpret_cast<uintptr_t>(plibUE4ModeBase),
             reinterpret_cast<uint64_t>(pGNames),
-            reinterpret_cast<uint64_t>(pGUObjectArray),
+            reinterpret_cast<uint64_t>(pGUObjectArrayInner),
             reinterpret_cast<uint64_t>(pGWorld),
             static_cast<uintptr_t>(moduleSize),
             "/data/data/com.tencent.tmgp.pubgmhd/cache/ue4_dump/"
@@ -860,11 +886,12 @@ static void UE4WorkerThread(void* plibUE4ModeBase, void* pGNames,
 
         // 3. 创建 MatchMonitor, 通过 interface 动态解析偏移
         // pGWorld 即 GWorld 全局变量地址 (由 Injector 传入 base+offset)
+        // pGUObjectArrayInner 是已解引用的 FUObjectArray 内部结构体地址
         auto* monitor = new pubgmhd::MatchMonitor(
             reinterpret_cast<uintptr_t>(plibUE4ModeBase),
             reinterpret_cast<uintptr_t>(pGNames),
             reinterpret_cast<uintptr_t>(pGWorld),
-            reinterpret_cast<uintptr_t>(pGUObjectArray),
+            reinterpret_cast<uintptr_t>(pGUObjectArrayInner),
             moduleSize,
             *interface
         );

@@ -34,14 +34,15 @@ std::string trim(const std::string& s) {
     return s.substr(a, b - a + 1);
 }
 
-// 尝试把 idName 解析成 itemId 数字。idName 通常就是纯数字串 (e.g. "10010101"),
+// 尝试把 idName 解析成 itemId 数字。idName 通常就是纯数字串 (e.g. "11010301001"),
 // 也可能是 FName ("BP_Wpn_AKM"). 解析失败返回 0 (不写反向索引)。
-int32_t parseItemId(const std::string& idName) {
+// 用 int64: ItemID 11 位 (~1.1e10) 远超 int32_t 上限 (~2.1e9), stoi 会抛 out_of_range。
+int64_t parseItemId(const std::string& idName) {
     if (idName.empty()) return 0;
     for (char c : idName) {
         if (c < '0' || c > '9') return 0;
     }
-    try { return std::stoi(idName); } catch (...) { return 0; }
+    try { return std::stoll(idName); } catch (...) { return 0; }
 }
 
 } // namespace
@@ -66,6 +67,9 @@ void ItemRegistry::init(const std::string& dir) {
 }
 
 bool ItemRegistry::load() {
+    // [ROLLBACK 2026-04-21] 已禁用磁盘加载, 见 save() 注释。
+    return false;
+#if 0
     std::lock_guard<std::mutex> g(m_mtx);
     std::ifstream ifs(m_path);
     if (!ifs.is_open()) return false;
@@ -90,12 +94,13 @@ bool ItemRegistry::load() {
         }
         if (idName.empty() || disp.empty()) continue;
         m_map[idName] = Entry{disp, cls};
-        if (int32_t nid = parseItemId(idName); nid > 0) {
+        if (int64_t nid = parseItemId(idName); nid > 0) {
             m_byId[nid] = disp;
         }
     }
     m_lastSaveMs.store(nowMs(), std::memory_order_relaxed);
     return true;
+#endif
 }
 
 void ItemRegistry::record(const std::string& idName,
@@ -118,7 +123,7 @@ void ItemRegistry::record(const std::string& idName,
             changed = true;
         }
         // 同步反向索引 (idName 是纯数字时才有意义)
-        if (int32_t nid = parseItemId(idName); nid > 0) {
+        if (int64_t nid = parseItemId(idName); nid > 0) {
             auto rit = m_byId.find(nid);
             if (rit == m_byId.end() || rit->second != display) {
                 m_byId[nid] = display;
@@ -139,7 +144,7 @@ std::string ItemRegistry::lookup(const std::string& idName) const {
     return it == m_map.end() ? std::string{} : it->second.display;
 }
 
-std::string ItemRegistry::lookupById(int32_t numId) const {
+std::string ItemRegistry::lookupById(int64_t numId) const {
     if (numId <= 0) return {};
     std::lock_guard<std::mutex> g(m_mtx);
     auto it = m_byId.find(numId);
@@ -152,33 +157,13 @@ size_t ItemRegistry::size() const {
 }
 
 bool ItemRegistry::save() {
-    std::string tmpPath;
-    std::ostringstream oss;
-    {
-        std::lock_guard<std::mutex> g(m_mtx);
-        if (m_path.empty()) return false;
-        tmpPath = m_path + ".tmp";
-        oss << "# DFM item registry (auto-generated)\n";
-        oss << "# format: idName<TAB>display<TAB>className\n";
-        oss << "# entries=" << m_map.size() << "\n";
-        for (const auto& kv : m_map) {
-            oss << kv.first << '\t' << kv.second.display << '\t'
-                << kv.second.className << '\n';
-        }
-    }
-    {
-        std::ofstream ofs(tmpPath, std::ios::trunc);
-        if (!ofs.is_open()) return false;
-        ofs << oss.str();
-        if (!ofs.good()) return false;
-    }
-    if (::rename(tmpPath.c_str(), m_path.c_str()) != 0) {
-        ::remove(tmpPath.c_str());
-        return false;
-    }
+    // [ROLLBACK 2026-04-21] 文件持久化已禁用 — 触发账号封禁。
+    // 在游戏私有目录创建非游戏注册的文件 (dfm_items.txt) 会被 ACE 的
+    // inotify/syscall hook 抓到 open(O_CREAT) 行为指纹。注册表保留为
+    // 内存模式 (进程退出即丢), 不再落盘。
     m_dirty.store(false, std::memory_order_release);
     m_lastSaveMs.store(nowMs(), std::memory_order_relaxed);
-    return true;
+    return false;
 }
 
 void ItemRegistry::maybeAutoSave() {

@@ -291,6 +291,63 @@
 
     </LinearLayout>
 
+    <!-- 可折叠区域: 洛克王国手游 (NRC) -->
+    <LinearLayout
+        android:id="@+id/section_nrc"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:background="#1AFFFFFF"
+        android:padding="12dp"
+        android:layout_marginBottom="16dp">
+
+        <TextView
+            android:id="@+id/tv_section_nrc_header"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="▶ 洛克王国手游"
+            android:textSize="16sp"
+            android:textStyle="bold"
+            android:textColor="#FFFFFF"
+            android:clickable="true"
+            android:focusable="true"
+            android:padding="4dp" />
+
+        <LinearLayout
+            android:id="@+id/layout_nrc_content"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:visibility="gone"
+            android:paddingTop="8dp">
+
+            <CheckBox
+                android:id="@+id/cb_nrc_dumper"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="启用 ueDumper (导出 dump)"
+                android:checked="false"
+                android:layout_marginBottom="4dp" />
+
+            <CheckBox
+                android:id="@+id/cb_nrc_header"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="启用 ueHeader (尚未适配)"
+                android:enabled="false"
+                android:checked="false"
+                android:layout_marginBottom="8dp" />
+
+            <Button
+                android:id="@+id/btn_nrc_launch"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="启动游戏" />
+
+        </LinearLayout>
+
+    </LinearLayout>
+
     <!-- 分隔线 -->
     <View
         android:layout_width="match_parent"

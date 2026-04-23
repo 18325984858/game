@@ -53,6 +53,7 @@ namespace Injector {
         MODE_LOL  = 0,   // lol手游 (il2cpp, 调用 MyStartPoint)
         MODE_PUBG = 1,   // 和平精英 (UE4, 调用 MyStartPointPUBG)
         MODE_DFM  = 2,   // 三角洲 (UE5.4, 调用 MyStartPointDFM)
+        MODE_NRC  = 3,   // 洛克王国手游 (UE 4.26, 调用 MyStartPointNRC)
     };
 
     /**

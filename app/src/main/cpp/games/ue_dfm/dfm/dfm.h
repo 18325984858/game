@@ -278,7 +278,7 @@ struct HealthInfo {
 struct LootItem {
     std::string itemName;
     std::string className;
-    int32_t     itemId = 0;
+    int64_t     itemId = 0;   // 11 位 (e.g. 11010301001 ~1.1e10), 必须 int64
     int32_t     stackCount = 0;
     FVector3    pos;
 };
@@ -288,7 +288,7 @@ struct LootItem {
 // =====================================================================
 struct ContainerItem {
     std::string name;
-    int32_t     itemId = 0;
+    int64_t     itemId = 0;   // 11 位 FName (cat*1e7+seq), 必须 int64
     int32_t     count = 0;
     float       durability = 0.0f;
     float       durabilityMax = 0.0f;
@@ -396,6 +396,11 @@ public:
     void enqueueOpenBox(uintptr_t actorPtr);
     std::vector<uintptr_t> drainOpenBoxQueue();
 
+    // ── 远程 dump 物品名命令 (GUI → Monitor) ──
+    // GUI 点按钮设 true; Monitor 在 pollLoop 检测到后调 dumpAllPickupCDOs() 并清除 flag。
+    void requestItemDump() { m_dumpItemsRequested.store(true, std::memory_order_release); }
+    bool consumeItemDumpRequest() { return m_dumpItemsRequested.exchange(false, std::memory_order_acq_rel); }
+
 private:
     SharedDfmData() = default;
     std::mutex m_mutex;
@@ -406,6 +411,7 @@ private:
 
     std::mutex m_cmdMutex;
     std::vector<uintptr_t> m_openBoxQueue;
+    std::atomic<bool> m_dumpItemsRequested{false};
 };
 
 // =====================================================================
@@ -499,7 +505,8 @@ private:
     static bool isAICharacter(const std::string& cn);
 
     // ── 物品名映射 ──
-    std::string getItemDisplayName(int32_t itemId) const;
+    // 注意: itemId 11 位 (e.g. 11010301001 = 1.1e10), 远超 int32_t (~2.1e9), 必须用 int64。
+    std::string getItemDisplayName(int64_t itemId) const;
 
     // 综合物品名解析 (4 级回退):
     //   1. InteractorName (FText, 本地化, +0x790) — 通常运行时为空, 由 UMG 异步填充
@@ -507,10 +514,16 @@ private:
     //   3. ItemID 数字大类映射 (上面 getItemDisplayName)
     //   4. 原始 InventoryIdName FName 字符串 — 兜底
     // pickupActor 既可以是地面 PickupBase, 也可以是箱内 sub-pickup (同 InteractorBase + PickupBase 布局)
-    std::string resolveItemDisplay(uintptr_t pickupActor, const std::string& rawId, int32_t numId) const;
+    std::string resolveItemDisplay(uintptr_t pickupActor, const std::string& rawId, int64_t numId) const;
 
     // 把 UE 类名 (e.g. "Inventory_Wpn_AKM_C", "BP_Item_FirstAidKit_C") 转成可读名 (中文优先)
     static std::string translateItemClassName(const std::string& className);
+
+    // 全量 dump 物品名: 扫 GUObjectArray 找所有 Pickup UClass, 读其 CDO (Class Default Object)
+    // 上的 InteractorName(FText) + InventoryIdName(FName), 一次性写入 ItemRegistry。
+    // 比起对局中累积法, 启动一次即可拿到全部本地化名称, 无需见到地面物品。
+    // 返回新增/更新的条目数。线程安全, 多次调用幂等。
+    int dumpAllPickupCDOs() const;
 
     // ── 本地玩家位置 + 相机 ──
     FVector3 getMyPosition() const;
@@ -594,6 +607,21 @@ private:
     // 启动时通过 interface 解析得到的 OpenThisBox UFunction* (类: InventoryPickup_OpenBox)
     mutable uintptr_t m_openThisBoxUFunction = 0;
     mutable bool      m_openThisBoxResolved  = false;
+
+    // ── 物品名 UFunction 调用 (PickupBase::GetItemName) ──
+    // 当 resolveItemDisplay 4 级回退后仍拿不到本地化名时, 把 (actor, rawId)
+    // 入队, 在 pollLoop 的下一个 tick 调 PickupBase::GetItemName() UFunction
+    // 拿 FText. 默认安全模式下不真正发起调用 (跨线程 ProcessEvent 风险),
+    // 仅写日志; 改 kItemNameActuallyFireCall=true 后才真正调。
+    mutable uintptr_t m_getItemNameUFunction = 0;
+    mutable bool      m_getItemNameResolved  = false;
+    mutable std::mutex m_itemNameQueueMu;
+    struct ItemNameRequest { uintptr_t actor; std::string rawId; int64_t numId; };
+    mutable std::vector<ItemNameRequest> m_itemNameQueue;
+    mutable std::unordered_map<std::string, uint8_t> m_itemNameInFlight; // rawId -> tries
+
+    void enqueueItemNameLookup(uintptr_t actor, const std::string& rawId, int64_t numId) const;
+    void processItemNameRequests();
 
     std::atomic<bool> m_running{false};
     std::thread m_pollThread;

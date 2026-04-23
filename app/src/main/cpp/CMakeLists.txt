@@ -152,6 +152,12 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
         "games/ue_dfm/interface/interface.cpp"
         "games/ue_dfm/dfm/dfm.cpp"
         "games/ue_dfm/dfm/dfm_item_registry.cpp"
+
+        # ── games/ue_nrc (UE 4.26 / 洛克王国手游 NRC) ──
+        "games/ue_nrc/uestart.cpp"
+        "games/ue_nrc/engine/UE4NrcStruct.cpp"
+        "games/ue_nrc/engine/UE4NrcDumper.cpp"
+        "games/ue_nrc/nrc/nrc.cpp"
 )
 
 # Specifies libraries CMake should link to your target library. You
@@ -176,6 +182,8 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
         AndroidSurfaceImgui/third_party/imgui
         games/ue_dfm
         games/ue_dfm/engine
+        games/ue_nrc
+        games/ue_nrc/engine
 )
 
 target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE

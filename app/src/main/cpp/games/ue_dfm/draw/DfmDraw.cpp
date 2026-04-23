@@ -223,19 +223,15 @@ void DfmOverlay::drawMenu(const dfm::DrawDfmData& data) {
             ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
                 "红十字=目标 绿+=预瞄点\n请手动对准, 系统不动准星");
         }
-//adb pull /sdcard/Android/data/com.example.dobbyproject/files/dfm_items.txt
-        // ── 物资名注册表 (运行时积累 + 持久化) ──
+        // ── 物资名注册表 (运行时积累, 仅内存) ──
+        // [ROLLBACK 2026-04-21] 已禁用磁盘持久化与全量 CDO 扫描 — 触发账号封禁。
+        // 名库仍在内存累积 (InteractorName 自然命中), 进程退出即丢, 不再落盘。
         ImGui::Separator();
         size_t regCount = dfm::ItemRegistry::instance().size();
         ImGui::TextColored(ImVec4(0.7f, 1.0f, 0.7f, 1.0f),
-            "物资名库: %zu 条", regCount);
-        if (ImGui::Button("立即导出物资名库", ImVec2(-1, 0))) {
-            bool ok = dfm::ItemRegistry::instance().save();
-            LOG(LOG_LEVEL_INFO, "[DfmDraw] 手动导出物资名库 ok=%d count=%zu",
-                ok ? 1 : 0, regCount);
-        }
-        ImGui::TextColored(ImVec4(0.55f, 0.55f, 0.55f, 1.0f),
-            "路径: /sdcard/Android/data/<pkg>/files/dfm_items.txt");
+            "物资名库: %zu 条 (内存)", regCount);
+        ImGui::TextColored(ImVec4(0.85f, 0.45f, 0.45f, 1.0f),
+            "导出/全量扫描已禁用 (ACE 风险)");
     }
 
     // [修复] ▲▼ 替换为 ASCII <</>>, 避免超出字体字形范围显示为 ?
@@ -862,14 +858,14 @@ void DfmOverlay::drawLootESP(const dfm::DrawDfmData& data, float screenW, float 
     ImDrawList* dl = ImGui::GetForegroundDrawList();
 
     // 物资颜色分类 (基于 ItemID 大类)
-    auto lootColor = [](int32_t itemId) -> ImU32 {
+    auto lootColor = [](int64_t itemId) -> ImU32 {
         if (itemId <= 0) return IM_COL32(200, 200, 200, 200);
         int mainType = 0;
         if (itemId >= 10000000) {
             // MMSSXXXXXXX 格式: 前2位为大类
-            int tmp = itemId;
+            int64_t tmp = itemId;
             while (tmp >= 100) tmp /= 10;
-            mainType = tmp;
+            mainType = static_cast<int>(tmp);
         }
         switch (mainType) {
             case 10: return IM_COL32(255, 80, 80, 230);    // 武器 - 红
@@ -890,9 +886,9 @@ void DfmOverlay::drawLootESP(const dfm::DrawDfmData& data, float screenW, float 
         if (item.itemId > 0) {
             int mainType = 0;
             if (item.itemId >= 10000000) {
-                int tmp = item.itemId;
+                int64_t tmp = item.itemId;
                 while (tmp >= 100) tmp /= 10;
-                mainType = tmp;
+                mainType = static_cast<int>(tmp);
             }
             if (m_filterAmmo && mainType == 37) continue;   // 过滤弹药
             if (m_filterJunk && mainType == 16) continue;   // 过滤杂物

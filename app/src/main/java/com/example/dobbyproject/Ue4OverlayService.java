@@ -41,7 +41,8 @@ public class Ue4OverlayService extends Service {
     private static final long OVERLAY_LAYOUT_SYNC_INTERVAL_MS = 500L;
     private static final String[] GAME_PACKAGES = {
         "com.tencent.tmgp.pubgmhd",
-        "com.tencent.tmgp.dfm"
+        "com.tencent.tmgp.dfm",
+        "com.tencent.nrc"
     };
     private static final long GAME_ALIVE_CHECK_INTERVAL_MS = 2000L;
 
