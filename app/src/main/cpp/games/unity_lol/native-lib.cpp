@@ -14,7 +14,9 @@ struct CommandResult {
 
 CommandResult run_as_root(const char* cmd) {
     CommandResult res;
-    // 使用 su -c 'cmd'
+    // APatch 兼容: 裸 `su -c '...'` 不加 -G/-Z, 三家都收.
+    // 主要用于启动阶段调试探测 root, 业务路径已迁移到
+    // MemReader::runRootShellCapture (持久 RootShell + sh 探测 -G).
     std::string full = "su -c '";
     full += cmd;
     full += "'";

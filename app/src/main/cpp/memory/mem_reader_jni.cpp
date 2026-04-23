@@ -10,6 +10,7 @@
 #include <mutex>
 #include <unistd.h>
 #include <unordered_map>
+#include <sstream>
 #include <android/log.h>
 
 #include "mem_reader.h"
@@ -115,12 +116,21 @@ Java_com_example_dobbyproject_MemoryReaderActivity_nativeListAllRegions(
         JNIEnv* env, jobject, jint pid) {
 
     std::vector<std::string> items;
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "su -c 'cat /proc/%d/maps 2>/dev/null'", (int)pid);
-    FILE* fp = popen(cmd, "r");
-    if (fp) {
-        char line[1024];
-        while (fgets(line, sizeof(line), fp)) {
+    // ─── APatch 兼容: 不再 popen("su -c ...") 拉短生命周期子进程 ───
+    // 改用 MemReader::runRootShellCapture, 它内部用持久化 RootShell
+    // (sh 探测 `su -G 3009`, 失败回退裸 `su`), 兼容 APatch (不识别 -G)
+    // 与 KernelSU/Magisk (识别 -G), 同时减少反作弊对 "频繁拉 su" 的打分.
+    std::string mapsOut;
+    {
+        char cmd[64];
+        snprintf(cmd, sizeof(cmd), "cat /proc/%d/maps 2>/dev/null", (int)pid);
+        if (MemReader::runRootShellCapture(cmd, mapsOut)) {
+            std::istringstream iss(mapsOut);
+            std::string lineStr;
+            while (std::getline(iss, lineStr)) {
+                char line[1024];
+                strncpy(line, lineStr.c_str(), sizeof(line) - 1);
+                line[sizeof(line) - 1] = '\0';
             uintptr_t start, end;
             char perms[8], path[512];
             unsigned long offset, dev1, dev2, inode;
@@ -153,8 +163,8 @@ Java_com_example_dobbyproject_MemoryReaderActivity_nativeListAllRegions(
                      (unsigned long)start, (unsigned long)end,
                      (size_t)(end - start));
             items.emplace_back(std::string(buf) + name + ":" + pathStr + ":" + perms);
+            }
         }
-        pclose(fp);
     }
 
     jclass stringClass = env->FindClass("java/lang/String");
@@ -317,15 +327,21 @@ Java_com_example_dobbyproject_MemoryReaderActivity_nativeGlobalSearch(
     std::unordered_map<std::string, uintptr_t> moduleBase; // path -> min start
 
     {
-        char cmd[256];
-        snprintf(cmd, sizeof(cmd), "su -c 'cat /proc/%d/maps 2>/dev/null'", (int)pid);
-        FILE* fp = popen(cmd, "r");
-        if (!fp) {
+        // ─── APatch 兼容: 改用 MemReader::runRootShellCapture 走持久 RootShell ───
+        // (sh 探测 `su -G 3009` → 失败回退裸 `su`), 不再每次拉 popen("su -c ...").
+        char cmd[64];
+        snprintf(cmd, sizeof(cmd), "cat /proc/%d/maps 2>/dev/null", (int)pid);
+        std::string mapsOut;
+        if (!MemReader::runRootShellCapture(cmd, mapsOut)) {
             jclass sc = env->FindClass("java/lang/String");
             return env->NewObjectArray(0, sc, nullptr);
         }
-        char line[1024];
-        while (fgets(line, sizeof(line), fp)) {
+        std::istringstream iss(mapsOut);
+        std::string lineStr;
+        while (std::getline(iss, lineStr)) {
+            char line[1024];
+            strncpy(line, lineStr.c_str(), sizeof(line) - 1);
+            line[sizeof(line) - 1] = '\0';
             uintptr_t st, en;
             char pr[8]; unsigned long off, d1, d2, ino;
             char pa[512]; pa[0] = '\0';
@@ -359,7 +375,6 @@ Java_com_example_dobbyproject_MemoryReaderActivity_nativeGlobalSearch(
             }
             regions.push_back(std::move(r));
         }
-        pclose(fp);
     }
 
     LOG(LOG_LEVEL_INFO, MTAG " global search: pid=%d regions=%zu pat=%zd onlyW=%d skipBigRo=%d",

@@ -705,6 +705,9 @@ namespace touch_input {
             LOG(LOG_LEVEL_INFO, "[Touch]   adb shell su -c \"chmod 666 /dev/input/event*\"");
 
             // 尝试自动提权 (需要设备已 root)
+            // APatch 兼容: 裸 `su -c` 不带 -G/-Z, 三者 (APatch/KSU/Magisk) 都收. 
+            // setenforce 对 Permissive 设备安全幂; chmod 666 输入设备 仅在
+            // 原生调用路径需要, 如今高级路径走 dispatchInputEvent + supercall.
             system("su -c 'setenforce 0' 2>/dev/null");
             int ret = system("su -c 'chmod 666 /dev/input/event*' 2>/dev/null");
             if (ret == 0) {
