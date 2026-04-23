@@ -265,17 +265,23 @@ private:
             dup2(out[1], STDOUT_FILENO);
             dup2(out[1], STDERR_FILENO);
             close(in[0]); close(in[1]); close(out[0]); close(out[1]);
-            // 关键: 必须 -G 3009 让 su 进程的 supplementary group 含 readproc.
-            // Android 13+ 默认 procfs 挂载选项: gid=3009,hidepid=invisible (=2).
-            // hidepid=2 时, 即使 uid=0 的 root, 若进程的 任一 group 不包含 3009(readproc),
-            // 也无法读取其它 uid 的 /proc/PID/{maps,mem,status,...} (返回 EACCES).
+            // 优先用 -G 3009 (KernelSU/Magisk 支持) 让 supplementary group 含 readproc,
+            // 这样在 Android 13+ procfs hidepid=invisible (=2) 下也能读其它 uid 的
+            // /proc/PID/{maps,mem,status,...} (否则即便 uid=0 也 EACCES).
             //
-            // 用 -G(--supp-group) 而非 -g(--group): 保留 primary gid=0,
-            // 只把 3009 加入 supplementary groups. 这样两边都得:
-            //   * 能读 /data/adb/ksu/.tmp/superkey (root:root 0600) 之类 root-only 文件
-            //   * 能读 /proc/<other_pid>/{maps,mem} (procfs hidepid 检查会遭到 readproc)
-            execlp("su", "su", "-G", "3009", (char*)nullptr);
-            // 退化方案: 部分 root 实现可能不支持 -G, 直接拉裸 su.
+            // 但 APatch 的 su 不支持 -G, 直接打印 "unknown option" 并 exit(1),
+            // 导致管道立刻 EOF, 父进程把 authDenied_ 误判为 true.
+            // 用 sh -c 包一层尝试: 先 -G, 失败再裸 su; 在 root shell 里再用
+            // setpriv/groupadd 之类是没法的 (sh 还在 app uid). 所以在裸 su 的
+            // 路径下我们接受 hidepid 限制, 至少 ps -A / 主线功能仍可用.
+            const char* shCmd =
+                "if su -G 3009 -c true 2>/dev/null; then "
+                "  exec su -G 3009; "
+                "else "
+                "  exec su; "
+                "fi";
+            execlp("sh", "sh", "-c", shCmd, (char*)nullptr);
+            // sh 都拉不起来 → 最后退化, 直接裸 su (无 -G).
             execlp("su", "su", (char*)nullptr);
             _exit(127);
         }
