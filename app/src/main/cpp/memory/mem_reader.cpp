@@ -525,11 +525,17 @@ private:
             }
             close(in[0]); close(in[1]); close(out[0]); close(out[1]);
 
-            // su -G 3009 -c <helperPath>: helper 进程是 su 的 child, 继承
-            // primary gid=0 + supplementary 3009. exec 后由 helper 进程取代,
-            // /proc/<pid>/comm 由 helper 内 prctl 改名.
-            execlp("su", "su", "-G", "3009", "-c", P.ddBin.c_str(), (char*)nullptr);
-            // 退化: 不支持 -G
+            // 优先 -G 3009 (KernelSU/Magisk), 失败回退裸 su (APatch 不识别 -G).
+            // APatch 走裸 su 时无 supp gid 3009, 设备 hidepid=2 下读其它 uid 的
+            // /proc/PID/{maps,mem} 可能 EACCES, 但 Permissive / hidepid<2 设备无碍.
+            std::string shStr =
+                "if su -G 3009 -c true 2>/dev/null; then "
+                "  exec su -G 3009 -c '" + P.ddBin + "'; "
+                "else "
+                "  exec su -c '" + P.ddBin + "'; "
+                "fi";
+            execlp("sh", "sh", "-c", shStr.c_str(), (char*)nullptr);
+            // sh 也失败 → 退化: 直接裸 su.
             execlp("su", "su", "-c", P.ddBin.c_str(), (char*)nullptr);
             _exit(127);
         }
