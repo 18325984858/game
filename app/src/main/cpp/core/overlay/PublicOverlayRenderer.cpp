@@ -176,3 +176,4 @@ Java_com_example_dobbyproject_PublicOverlayBridge_nativeIsRendererRunning(
         jclass) {
     return g_overlayRunning.load(std::memory_order_acquire) ? JNI_TRUE : JNI_FALSE;
 }
+OBFU_ATTRS_END

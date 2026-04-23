@@ -174,3 +174,5 @@ void ItemRegistry::maybeAutoSave() {
 }
 
 } // namespace dfm
+
+OBFU_ATTRS_END

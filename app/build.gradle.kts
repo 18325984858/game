@@ -21,6 +21,18 @@ val enableWindowsLlvmObfuscation = providers.gradleProperty("enableWindowsLlvmOb
     .orElse(useWindowsLlvmFrontend)
     .get()
 
+val enableAntiDebug = providers.gradleProperty("enableAntiDebug")
+    .orElse(providers.environmentVariable("ENABLE_ANTI_DEBUG"))
+    .map { it.equals("true", ignoreCase = true) || it == "1" }
+    .orElse(true)
+    .get()
+
+val enableVisibilityHidden = providers.gradleProperty("enableVisibilityHidden")
+    .orElse(providers.environmentVariable("ENABLE_VISIBILITY_HIDDEN"))
+    .map { it.equals("true", ignoreCase = true) || it == "1" }
+    .orElse(false)
+    .get()
+
 val windowsLlvmClang = windowsLlvmRoot?.let { File(it, "bin/clang.exe") }
 val windowsLlvmClangxx = windowsLlvmRoot?.let { File(it, "bin/clang++.exe") }
 val windowsLlvmLauncher = rootProject.file("tools/windows_llvm_launcher.cmd")
@@ -51,6 +63,10 @@ android {
         externalNativeBuild {
             cmake {
                 abiFilters.addAll(listOf("arm64-v8a"))//, "armeabi-v7a", "x86", "x86_64"))
+                arguments += listOf(
+                    "-DENABLE_ANTI_DEBUG=${if (enableAntiDebug) "ON" else "OFF"}",
+                    "-DENABLE_VISIBILITY_HIDDEN=${if (enableVisibilityHidden) "ON" else "OFF"}"
+                )
                 if (enableWindowsLlvmFrontend) {
                     val cmakeLlvmRoot = windowsLlvmRoot!!.replace('\\', '/')
                     arguments += listOf(

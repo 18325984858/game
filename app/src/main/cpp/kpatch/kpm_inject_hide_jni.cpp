@@ -26,6 +26,9 @@
 #include "../kpatch/kp_ctl.h"
 #include "../so_dumper/so_dumper.h"
 #include "../core/log/log.h"
+#if defined(ENABLE_ANTI_DEBUG)
+#include "../core/anti_debug/anti_debug.h"
+#endif
 
 #define KTAG "[KpmInjectHideJNI]"
 
@@ -97,6 +100,9 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
     if (vm && vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK) {
         // 拿不�?env 也不影响后续逻辑
     }
+#if defined(ENABLE_ANTI_DEBUG)
+    StartAntiDebugWatcher();
+#endif
     self_cached_pkg = read_self_pkg();
     if (!self_cached_pkg.empty() && KpCtl::isModuleLoaded()) {
         std::string out;
@@ -139,6 +145,14 @@ JNI_METHOD(void, nativeSetSuperkey)(JNIEnv* env, jobject, jstring jKey) {
         bool ok = KpCtl::rawCtl("add_hide_pkg:" + self_cached_pkg, &out);
         LOG(LOG_LEVEL_INFO, KTAG " setSuperkey �?auto add_hide_pkg '%s' ok=%d resp='%s'",
             self_cached_pkg.c_str(), (int)ok, out.c_str());
+
+        // 同时把自己加入 RootHide UID 豁免名单，避免 root_hide 启用后
+        // 自家进程被 168 个 root 关键字误伤导致 su 等检测失败。
+        // KPM 在内核态读 current->cred->uid，所以这里不用传 uid。
+        std::string out2;
+        bool ok2 = KpCtl::rawCtl("add_exempt_self", &out2);
+        LOG(LOG_LEVEL_INFO, KTAG " setSuperkey -> auto add_exempt_self ok=%d resp='%s'",
+            (int)ok2, out2.c_str());
     }
 }
 
@@ -302,4 +316,87 @@ JNI_METHOD(jboolean, nativeUnhideSelf)(JNIEnv*, jobject) {
     return KpCtl::unhideSelf() ? JNI_TRUE : JNI_FALSE;
 }
 
+// ─── Root 痕迹隐藏 (RootHide 模块) ──────────────────────────
+// 对应 FrideHide-kpm/kpms/inject-hide/Root/RootHide.{h,c}
+// 所有命令通过 control0 rawCtl 透传，无需新增 KpCtl 成员函数
+JNI_METHOD(jboolean, nativeEnableRootHide)(JNIEnv*, jobject) {
+    std::string out;
+    return KpCtl::rawCtl("enable_root_hide", &out) ? JNI_TRUE : JNI_FALSE;
+}
+JNI_METHOD(jboolean, nativeDisableRootHide)(JNIEnv*, jobject) {
+    std::string out;
+    return KpCtl::rawCtl("disable_root_hide", &out) ? JNI_TRUE : JNI_FALSE;
+}
+// 返回 root_hide 子状态: "root_hide=0/1\nfile_hide=0/1\nroot_kw_count=N\n"
+JNI_METHOD(jstring, nativeGetStatusRoot)(JNIEnv* env, jobject) {
+    std::string out;
+    bool ok = KpCtl::rawCtl("status_root", &out);
+    if (!ok) out = "unreachable";
+    return env->NewStringUTF(out.c_str());
+}
+JNI_METHOD(jstring, nativeListHideRoot)(JNIEnv* env, jobject) {
+    std::string out;
+    KpCtl::rawCtl("list_hide_root", &out);
+    return env->NewStringUTF(out.c_str());
+}
+JNI_METHOD(jboolean, nativeAddHideRoot)(JNIEnv* env, jobject, jstring jName) {
+    std::string name = jstr(env, jName);
+    if (name.empty()) return JNI_FALSE;
+    std::string out;
+    return KpCtl::rawCtl("add_hide_root:" + name, &out) ? JNI_TRUE : JNI_FALSE;
+}
+JNI_METHOD(jboolean, nativeRemoveHideRoot)(JNIEnv* env, jobject, jstring jName) {
+    std::string name = jstr(env, jName);
+    if (name.empty()) return JNI_FALSE;
+    std::string out;
+    return KpCtl::rawCtl("remove_hide_root:" + name, &out) ? JNI_TRUE : JNI_FALSE;
+}
+JNI_METHOD(jboolean, nativeClearHideRoot)(JNIEnv*, jobject) {
+    std::string out;
+    return KpCtl::rawCtl("clear_hide_root", &out) ? JNI_TRUE : JNI_FALSE;
+}
+JNI_METHOD(jboolean, nativeResetHideRoot)(JNIEnv*, jobject) {
+    std::string out;
+    return KpCtl::rawCtl("reset_hide_root", &out) ? JNI_TRUE : JNI_FALSE;
+}
+
+// ─── 系统进程豁免 (sys_exempt) ─────────────────────────────
+// 默认启用：UID < sys_exempt_uid_max (缺省 10000) 的调用方被 KPM
+// 视为 trusted，避免 installd / system_server 等系统链路被误拦
+// (例如启用 root_hide/file_hide 时 adb install/am start 卡住)。
+JNI_METHOD(jboolean, nativeEnableSysExempt)(JNIEnv*, jobject) {
+    std::string out;
+    return KpCtl::rawCtl("enable_sys_exempt", &out) ? JNI_TRUE : JNI_FALSE;
+}
+JNI_METHOD(jboolean, nativeDisableSysExempt)(JNIEnv*, jobject) {
+    std::string out;
+    return KpCtl::rawCtl("disable_sys_exempt", &out) ? JNI_TRUE : JNI_FALSE;
+}
+JNI_METHOD(jboolean, nativeSetSysExemptUid)(JNIEnv*, jobject, jint uidMax) {
+    std::string out;
+    std::string cmd = "set_sys_exempt_uid:" + std::to_string((int)uidMax);
+    return KpCtl::rawCtl(cmd, &out) ? JNI_TRUE : JNI_FALSE;
+}
+
+// ─── 日志总开关 (kpm_log) ────────────────────────────────
+// 控制 KPM 里所有 klog()/klog_dbg() 的输出，klog_err 与 klog_always
+// 不受影响。默认开启；生产环境可关闭以降低 dmesg 噪声。
+JNI_METHOD(jboolean, nativeEnableLog)(JNIEnv*, jobject) {
+    std::string out;
+    return KpCtl::rawCtl("enable_log", &out) ? JNI_TRUE : JNI_FALSE;
+}
+JNI_METHOD(jboolean, nativeDisableLog)(JNIEnv*, jobject) {
+    std::string out;
+    return KpCtl::rawCtl("disable_log", &out) ? JNI_TRUE : JNI_FALSE;
+}
+// 返回 "log_enabled=<0/1>\n"
+JNI_METHOD(jstring, nativeGetStatusLog)(JNIEnv* env, jobject) {
+    std::string out;
+    bool ok = KpCtl::rawCtl("status_log", &out);
+    if (!ok) out = "unreachable";
+    return env->NewStringUTF(out.c_str());
+}
+
 } // extern "C"
+
+OBFU_ATTRS_END

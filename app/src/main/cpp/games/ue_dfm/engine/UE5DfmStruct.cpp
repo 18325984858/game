@@ -78,3 +78,5 @@ FNameEntryHandle FNameEntryHandle::fromId(uint32_t id, uint32_t offsetBits) {
 }
 
 } // namespace ue5dfm
+
+OBFU_ATTRS_END

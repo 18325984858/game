@@ -245,3 +245,5 @@ bool verifyKey(const std::string& key) {
 }
 
 } // namespace KpCtl
+
+OBFU_ATTRS_END

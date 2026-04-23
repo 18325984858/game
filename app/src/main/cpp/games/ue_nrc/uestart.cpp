@@ -289,3 +289,5 @@ bool MyStartPointNRC(void* plibUE4ModeBase, void* pNamePool, void* pGWorld,
     std::thread(NrcWorkerThread, params).detach();
     return true;
 }
+
+OBFU_ATTRS_END

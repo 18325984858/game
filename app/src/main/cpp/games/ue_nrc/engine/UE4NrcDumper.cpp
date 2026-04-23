@@ -1079,3 +1079,5 @@ bool UE4NrcDumper::dumpAll() {
 }
 
 } // namespace ue4nrc
+
+OBFU_ATTRS_END

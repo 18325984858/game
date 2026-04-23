@@ -72,6 +72,13 @@ public class InjectHideActivity extends AppCompatActivity {
     private TextView tvStatus, tvRawResp;
     private EditText etSo, etRaw, etProcSearch, etPkg, etComm;
     private Button   btnToggleProc, btnToggleFile, btnToggleComm;
+    // Root 痕迹隐藏（RootHide 模块）总开关按钮
+    private Button   btnToggleRoot;
+    // 系统进程豁免开关按钮：默认开启，避免 installd/system_server
+    // 等 UID<10000 的系统链路被隐藏规则误拦
+    private Button   btnToggleSysExempt;
+    // KPM 日志总开关按钮：控制 klog()/klog_dbg() 输出（不影响 klog_err）
+    private Button   btnToggleLog;
     private Spinner  spProcMatch;
     private ListView lvSoList, lvPkgList, lvCommList;
 
@@ -85,6 +92,12 @@ public class InjectHideActivity extends AppCompatActivity {
     private int curProcHide = -1;
     private int curFileHide = -1;
     private int curCommHide = -1;
+    // Root 痕迹隐藏当前状态（-1=未知, 0=关, 1=开）。由 status_root 解析
+    private int curRootHide = -1;
+    // 系统进程豁免状态（解析自 status 的 sys_exempt 字段）
+    private int curSysExempt = -1;
+    // KPM 日志总开关状态（解析自 status 的 log_enabled 字段）
+    private int curLogEnabled = -1;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -101,6 +114,9 @@ public class InjectHideActivity extends AppCompatActivity {
         btnToggleProc  = findViewById(R.id.ih_btn_toggle_proc);
         btnToggleFile  = findViewById(R.id.ih_btn_toggle_file);
         btnToggleComm  = findViewById(R.id.ih_btn_toggle_comm);
+        btnToggleRoot  = findViewById(R.id.ih_btn_toggle_root);
+        btnToggleSysExempt = findViewById(R.id.ih_btn_toggle_sys_exempt);
+        btnToggleLog       = findViewById(R.id.ih_btn_toggle_log);
         spProcMatch    = findViewById(R.id.ih_sp_proc_match);
         lvSoList       = findViewById(R.id.ih_lv_so_list);
         lvPkgList      = findViewById(R.id.ih_lv_pkg_list);
@@ -124,6 +140,13 @@ public class InjectHideActivity extends AppCompatActivity {
         btnToggleProc.setOnClickListener(v -> toggleProcHide());
         btnToggleFile.setOnClickListener(v -> toggleFileHide());
         btnToggleComm.setOnClickListener(v -> toggleCommHide());
+        // Root 痕迹隐藏：按当前 curRootHide 反向操作；启用时 KPM 内部会
+        // 自动把默认关键词注入 hide_so 并打开 file_hide。
+        btnToggleRoot.setOnClickListener(v -> toggleRootHide());
+        // 系统进程豁免切换：开启时 UID<10000 直接 trusted，不拦截。
+        btnToggleSysExempt.setOnClickListener(v -> toggleSysExempt());
+        // KPM 日志开关：关闭后内核不再输出 klog/klog_dbg（错误日志保留）
+        btnToggleLog.setOnClickListener(v -> toggleKpmLog());
 
         // ── 进程名模糊搜索 (用于选包名) ──
         findViewById(R.id.ih_btn_proc_refresh).setOnClickListener(v -> refreshProcMatches());
@@ -251,6 +274,29 @@ public class InjectHideActivity extends AppCompatActivity {
         runNativeAsync((target ? "enable" : "disable") + "_comm_hide",
                 () -> target ? nativeEnableCommHide() : nativeDisableCommHide());
     }
+    // Root 痕迹隐藏总开关：开启后 KPM 的 RootHide 模块会把默认 root 关键词
+    //（su/magisk/kernelsu/apatch/zygisk/…）注入 hide_so，并启用 file_hide，
+    // 从而让 openat/faccessat 对这些路径返回 -ENOENT。关闭时则撤销这些
+    // 注入项（不影响用户自行添加的其它 hide_so 关键词）。
+    private void toggleRootHide() {
+        final boolean target = !(curRootHide == 1);
+        runNativeAsync((target ? "enable" : "disable") + "_root_hide",
+                () -> target ? nativeEnableRootHide() : nativeDisableRootHide());
+    }
+    // 系统进程豁免切换：豁免开启时，installd/system_server 等系统
+    // UID 直接放行，避免 adb install / am start 被隐藏规则误拦。默认开启。
+    private void toggleSysExempt() {
+        final boolean target = !(curSysExempt == 1);
+        runNativeAsync((target ? "enable" : "disable") + "_sys_exempt",
+                () -> target ? nativeEnableSysExempt() : nativeDisableSysExempt());
+    }
+    // KPM 日志总开关切换：关闭后内核不会因 hook 拦截等频繁操作
+    // 合行产生 dmesg 噪声，也可减少日志侧信道泄露。
+    private void toggleKpmLog() {
+        final boolean target = !(curLogEnabled == 1);
+        runNativeAsync((target ? "enable" : "disable") + "_log",
+                () -> target ? nativeEnableLog() : nativeDisableLog());
+    }
     // ── 通用 native 执行 ─────────────────────────────────────
     private interface BoolOp { boolean run(); }
 
@@ -273,6 +319,10 @@ public class InjectHideActivity extends AppCompatActivity {
             try { loaded = nativeIsModuleLoaded(); } catch (Throwable ignored) {}
             String st = "";
             try { st = nativeGetStatus(); } catch (Throwable ignored) {}
+            // Root 痕迹隐藏状态由独立命令 status_root 返回，格式固定为：
+            //   root_hide=<0/1>\nfile_hide=<0/1>\nroot_kw_count=<N>\n
+            String stRoot = "";
+            try { stRoot = nativeGetStatusRoot(); } catch (Throwable ignored) {}
             String soListRaw = "";
             try { soListRaw = nativeListHideSo(); } catch (Throwable ignored) {}
             String pkgListRaw = "";
@@ -285,6 +335,12 @@ public class InjectHideActivity extends AppCompatActivity {
             final int proc = parseKvInt(st, "proc_hide", -1);
             final int file = parseKvInt(st, "file_hide", -1);
             final int comm = parseKvInt(st, "comm_hide", -1);
+            final int sysExempt = parseKvInt(st, "sys_exempt", -1);
+            final int sysExemptUid = parseKvInt(st, "sys_exempt_uid_max", -1);
+            // KPM 日志总开关：从 status 的 log_enabled 字段解析
+            final int logEnabled = parseKvInt(st, "log_enabled", -1);
+            final int rootHide = parseKvInt(stRoot, "root_hide", -1);
+            final int rootKwCount = parseKvInt(stRoot, "root_kw_count", -1);
             final List<String> soItems  = parseListItems(soListRaw);
             final List<String> commItems= parseListItems(commListRaw);
             List<String> pkgNames = parseListItems(pkgListRaw);
@@ -392,6 +448,9 @@ public class InjectHideActivity extends AppCompatActivity {
                 curProcHide = proc;
                 curFileHide = file;
                 curCommHide = comm;
+                curRootHide = rootHide;
+                curSysExempt = sysExempt;
+                curLogEnabled = logEnabled;
 
                 StringBuilder bar = new StringBuilder();
                 bar.append(fLoaded ? "✅ KPM 已加载" : "❌ KPM 未加载");
@@ -399,11 +458,20 @@ public class InjectHideActivity extends AppCompatActivity {
                 bar.append("  |  pid(kernel)=").append(kernelHidePidCount);
                 bar.append("  |  so=").append(soItems.size());
                 bar.append("  |  comm=").append(commItems.size());
+                if (rootKwCount >= 0) bar.append("  |  root_kw=").append(rootKwCount);
                 tvStatus.setText(bar.toString());
 
                 applyToggleUi(btnToggleProc, "PID隐藏", proc);
                 applyToggleUi(btnToggleFile, "文件隐藏", file);
                 applyToggleUi(btnToggleComm, "线程名隐藏", comm);
+                // Root 按钮追加当前关键词数量，一眼看清是否已注入
+                applyToggleUi(btnToggleRoot,
+                        "Root痕迹隐藏" + (rootKwCount >= 0 ? "(kw=" + rootKwCount + ")" : ""),
+                        rootHide);
+                applyToggleUi(btnToggleSysExempt,
+                        "系统进程豁免" + (sysExemptUid > 0 ? "(<" + sysExemptUid + ")" : ""),
+                        sysExempt);
+                applyToggleUi(btnToggleLog, "KPM日志", logEnabled);
 
                 soAdapter.clear();
                 soAdapter.addAll(soItems);
@@ -660,4 +728,30 @@ public class InjectHideActivity extends AppCompatActivity {
 
     // 进程枚举 (root 读 ps -A, 复用 SoDumper 的实现)
     public native String[] nativeListRunningApps(@NonNull String filter);
+
+    // ── Root 痕迹隐藏 (RootHide 模块) ─────────────────────
+    // enable/disable 切换总开关；KPM 会自动同步 file_hide 与 hide_so 注入
+    public native boolean nativeEnableRootHide();
+    public native boolean nativeDisableRootHide();
+    // 返回 status_root 文本 (root_hide=.., file_hide=.., root_kw_count=..)
+    public native String  nativeGetStatusRoot();
+    // Root 关键词列表读写（与 hide_so 共享底层存储，但独立管理注入状态）
+    public native String  nativeListHideRoot();
+    public native boolean nativeAddHideRoot(@NonNull String name);
+    public native boolean nativeRemoveHideRoot(@NonNull String name);
+    public native boolean nativeClearHideRoot();
+    public native boolean nativeResetHideRoot();
+
+    // ── 系统进程豁免 (sys_exempt) ───────────────────────
+    // 启用后 UID < sys_exempt_uid_max 的调用方被视为 trusted，避免
+    // installd/system_server/zygote 等系统链路被 file_hide/root_hide 误拦。
+    public native boolean nativeEnableSysExempt();
+    public native boolean nativeDisableSysExempt();
+    public native boolean nativeSetSysExemptUid(int uidMax);
+
+    // ── KPM 日志总开关 ─────────────────────────────
+    // 控制内核侧 klog/klog_dbg 的输出；klog_err/klog_always 不受影响。
+    public native boolean nativeEnableLog();
+    public native boolean nativeDisableLog();
+    public native String  nativeGetStatusLog();
 }

@@ -7,9 +7,13 @@ cmake_minimum_required(VERSION 3.22.1)
 
 option(USE_WINDOWS_LLVM_FRONTEND "Use custom Windows LLVM clang frontend binaries" OFF)
 option(ENABLE_WINDOWS_LLVM_OBFUSCATION "Enable Polaris/OLLVM compile passes when using the Windows LLVM frontend" OFF)
+option(ENABLE_ANTI_DEBUG "Compile and start the anti-debug / anti-frida watcher in JNI_OnLoad" ON)
+option(ENABLE_VISIBILITY_HIDDEN "Hide all symbols by default; only JNIEXPORT entries are exported. Strip release builds." OFF)
+# Pass presets (override at -D... time if needed)
+# Avoid 'gvenc' (crashed start.cpp / lolm.cpp / interface.cpp on this Windows-llvm build).
 set(WINDOWS_LLVM_BASE_PASSES "sub,strcry" CACHE STRING "Base obfuscation passes for all frontend-enabled native targets" FORCE)
-set(WINDOWS_LLVM_MEDIUM_PASSES "bcf,sub,strcry" CACHE STRING "Extra obfuscation passes for medium-sensitivity sources" FORCE)
-set(WINDOWS_LLVM_HEAVY_PASSES "bcf,sub,strcry" CACHE STRING "Extra obfuscation passes for high-sensitivity sources" FORCE)
+set(WINDOWS_LLVM_MEDIUM_PASSES "bcf,sub,strcry,indbr" CACHE STRING "Extra obfuscation passes for medium-sensitivity sources" FORCE)
+set(WINDOWS_LLVM_HEAVY_PASSES "fla,bcf,sub,strcry,indbr,indcall" CACHE STRING "Extra obfuscation passes for high-sensitivity sources" FORCE)
 
 # Declares the project name. The project name can be accessed via ${ PROJECT_NAME},
 # Since this is the top level CMakeLists.txt, the project name is also accessible
@@ -158,7 +162,14 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
         "games/ue_nrc/engine/UE4NrcStruct.cpp"
         "games/ue_nrc/engine/UE4NrcDumper.cpp"
         "games/ue_nrc/nrc/nrc.cpp"
+
+        # ── core/anti_debug (反调试 / 反 Frida 自检线程) ──
+        $<$<BOOL:${ENABLE_ANTI_DEBUG}>:core/anti_debug/anti_debug.cpp>
 )
+
+if(ENABLE_ANTI_DEBUG)
+        target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE ENABLE_ANTI_DEBUG)
+endif()
 
 # Specifies libraries CMake should link to your target library. You
 # can link libraries from various origins, such as libraries defined in this
@@ -208,17 +219,62 @@ if(USE_WINDOWS_LLVM_FRONTEND AND ENABLE_WINDOWS_LLVM_OBFUSCATION)
                 "games/unity_lol/draw/Draw.cpp"
                 "games/unity_lol/symbol/Symbol.cpp"
                 "games/unity_lol/il2cpp_dumper/il2cpp_dumper.cpp"
+                "games/unity_lol/il2cpp_header/il2cppHeader.cpp"
+                "games/unity_lol/unity_api/unityapi.cpp"
                 "games/ue_pubgmhd/engine/UE4Struct.cpp"
                 "games/ue_pubgmhd/engine/UE4Dumper.cpp"
+                "games/ue_pubgmhd/engine/UE4Header.cpp"
+                "games/ue_pubgmhd/draw/UE4Draw.cpp"
+                "games/ue_dfm/engine/UE5DfmStruct.cpp"
+                "games/ue_dfm/engine/UE5DfmDumper.cpp"
+                "games/ue_dfm/engine/UE5Header.cpp"
+                "games/ue_dfm/draw/DfmDraw.cpp"
+                "games/ue_nrc/engine/UE4NrcStruct.cpp"
+                "games/ue_nrc/engine/UE4NrcDumper.cpp"
+                "core/overlay/PublicOverlayRenderer.cpp"
+                "memory/mem_reader.cpp"
+                "memory/mem_reader_jni.cpp"
+                "so_dumper/so_dumper.cpp"
+                "so_dumper/so_dumper_jni.cpp"
                 PROPERTIES COMPILE_OPTIONS "-mllvm;-passes=${WINDOWS_LLVM_MEDIUM_PASSES}"
         )
 
         set_source_files_properties(
-                games/unity_lol/unitystart.cpp
+                "games/unity_lol/unitystart.cpp"
                 "games/unity_lol/lol/lolm.cpp"
                 "games/unity_lol/interface/interface.cpp"
+                "games/ue_pubgmhd/uestart.cpp"
+                "games/ue_pubgmhd/interface/interface.cpp"
+                "games/ue_pubgmhd/pubgmhd/pubgmhd.cpp"
+                "games/ue_dfm/uestart.cpp"
+                "games/ue_dfm/interface/interface.cpp"
+                "games/ue_dfm/dfm/dfm.cpp"
+                "games/ue_dfm/dfm/dfm_item_registry.cpp"
+                "games/ue_nrc/uestart.cpp"
+                "games/ue_nrc/nrc/nrc.cpp"
+                "kpatch/kp_ctl.cpp"
+                "kpatch/kpm_inject_hide_jni.cpp"
+                "injector/Injector.cpp"
                 PROPERTIES COMPILE_OPTIONS "-mllvm;-passes=${WINDOWS_LLVM_HEAVY_PASSES}"
         )
+endif()
+
+######################################################################################################
+# 可选: 符号可见性收紧 + release strip
+# 默认 OFF (开启前请确保所有从 Java 调用的本地方法都带 JNIEXPORT,
+# 且没有用 dlsym 在自身 .so 内查找非 JNI 符号).
+######################################################################################################
+if(ENABLE_VISIBILITY_HIDDEN)
+        message(STATUS "Visibility hardening enabled (hidden + gc-sections + exclude-libs ALL)")
+        target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE
+                -fvisibility=hidden -fvisibility-inlines-hidden
+                -ffunction-sections -fdata-sections)
+        target_link_options(${CMAKE_PROJECT_NAME} PRIVATE
+                "-Wl,--gc-sections"
+                "-Wl,--exclude-libs,ALL")
+        if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "MinSizeRel")
+                target_link_options(${CMAKE_PROJECT_NAME} PRIVATE "-Wl,-s")
+        endif()
 endif()
 
 ######################################################################################################

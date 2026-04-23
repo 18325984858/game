@@ -948,3 +948,5 @@ bool UE5DfmDumper::dumpAll() {
 }
 
 } // namespace ue5dfm
+
+OBFU_ATTRS_END

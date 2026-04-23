@@ -111,3 +111,5 @@ Java_com_example_dobbyproject_SoDumperActivity_nativeDumpSo(
 }
 
 } // extern "C"
+
+OBFU_ATTRS_END

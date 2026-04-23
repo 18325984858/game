@@ -1496,3 +1496,5 @@ void DfmOverlay::drawAimAssist(const dfm::DrawDfmData& data, float screenW, floa
 }
 
 } // namespace dfmdraw
+
+OBFU_ATTRS_END

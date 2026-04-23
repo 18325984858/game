@@ -55,6 +55,51 @@
                 android:text="线程名隐藏：未知" />
         </LinearLayout>
 
+        <!-- Root 痕迹隐藏总开关（单独一行，强调高危开关；对应 RootHide 模块） -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginBottom="8dp">
+            <Button
+                android:id="@+id/ih_btn_toggle_root"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:text="Root痕迹隐藏：未知  (点击切换)" />
+        </LinearLayout>
+
+        <!-- 系统进程豁免开关：UID<10000 的系统链路(installd/system_server 等)
+             直接被视为 trusted，避免启用隐藏后 adb install/am start 被误拦。
+             默认开启；只有在对抗测试需要 100% 隐藏时才关闭。 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginBottom="8dp">
+            <Button
+                android:id="@+id/ih_btn_toggle_sys_exempt"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:text="系统进程豁免：未知  (点击切换)" />
+        </LinearLayout>
+
+        <!-- 日志总开关：控制 KPM 内所有 klog() 输出（klog_err/always 不受影响）。
+             默认开启；生产/对抗测试时可关闭以降低 dmesg 噪声与侧信道泄露。 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginBottom="8dp">
+            <Button
+                android:id="@+id/ih_btn_toggle_log"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:text="KPM日志：未知  (点击切换)" />
+        </LinearLayout>
+
         <View
             android:layout_width="match_parent"
             android:layout_height="1dp"

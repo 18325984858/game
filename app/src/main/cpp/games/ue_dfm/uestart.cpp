@@ -504,3 +504,5 @@ bool MyStartPointDFM(void* plibUE5ModeBase, void* pGNames,
 
     return true;
 }
+
+OBFU_ATTRS_END

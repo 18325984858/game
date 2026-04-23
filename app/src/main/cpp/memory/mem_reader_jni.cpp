@@ -437,3 +437,5 @@ Java_com_example_dobbyproject_MemoryReaderActivity_nativeGlobalSearch(
 }
 
 } // extern "C"
+
+OBFU_ATTRS_END

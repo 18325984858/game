@@ -77,3 +77,5 @@ void NrcMatchMonitor::threadMain() {
 }
 
 } // namespace nrc
+
+OBFU_ATTRS_END

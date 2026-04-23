@@ -1454,3 +1454,5 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath,
 }
 
 } // namespace SoDumper
+
+OBFU_ATTRS_END

@@ -626,16 +626,38 @@ public class MainActivity extends AppCompatActivity {
     }
 
     /**
-     * 检测设备是否已授予 Root 权限
+     * 检测设备是否已授予 Root 权限。
+     *
+     * 不同 root 方案 / 反检测配置下, su 二进制可能被改名:
+     *   - 标准: /system/bin/su
+     *   - APatch 防检测: /system/bin/kp (或用户自定义)
+     *   - KernelSU: /system/bin/ksu (少见)
+     *
+     * 因此遍历候选列表, 任意一个返回 uid=0 即认为 root 可用。
+     * 命中后把名字缓存到 sRootBinary 供后续 exec 复用。
      */
+    private static volatile String sRootBinary = null;
+    static String getRootBinary() { return sRootBinary != null ? sRootBinary : "su"; }
     private boolean checkRootAccess() {
-        try {
-            Process p = Runtime.getRuntime().exec("su -c id");
-            BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream()));
-            String line = reader.readLine();
-            int exitCode = p.waitFor();
-            return exitCode == 0 && line != null && line.contains("uid=0");
-        } catch (Exception ignored) {}
+        // 先尝试缓存的, 再尝试常见候选
+        String[] candidates = sRootBinary != null
+                ? new String[]{ sRootBinary }
+                : new String[]{ "su", "kp", "/system/bin/su", "/system/bin/kp",
+                                "/system/xbin/su", "ksu", "magisk" };
+        for (String bin : candidates) {
+            try {
+                Process p = Runtime.getRuntime().exec(new String[]{ bin, "-c", "id" });
+                BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream()));
+                String line = reader.readLine();
+                int exitCode = p.waitFor();
+                if (exitCode == 0 && line != null && line.contains("uid=0")) {
+                    sRootBinary = bin;
+                    android.util.Log.i("RootCheck", "root via: " + bin + " -> " + line);
+                    return true;
+                }
+            } catch (Exception ignored) {}
+        }
+        android.util.Log.w("RootCheck", "no working su binary among candidates");
         return false;
     }
 

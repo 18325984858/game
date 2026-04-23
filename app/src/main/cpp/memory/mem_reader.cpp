@@ -1150,3 +1150,5 @@ ssize_t writeMemory(int pid, uintptr_t address,
 }
 
 } // namespace MemReader
+
+OBFU_ATTRS_END

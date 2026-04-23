@@ -428,3 +428,5 @@ void UE5Header::saveToScriptJson(const std::string& path) {
 }
 
 } // namespace ue5dfm
+
+OBFU_ATTRS_END
