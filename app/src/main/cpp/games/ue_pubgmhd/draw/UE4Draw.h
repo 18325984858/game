@@ -155,7 +155,7 @@ private:
     std::array<DrawGameData, 2> m_buffers{};
     int m_frontIndex = 0;
     std::atomic<bool> m_inMatch{false};
-    std::atomic<bool> m_aimbotEnabled{true};
+    std::atomic<bool> m_aimbotEnabled{false};
     std::atomic<bool> m_restoreRequested{false};
     std::atomic<bool> m_memoryRestored{false};
     std::atomic<int64_t> m_lastPushTime{0};  // Clock::duration::count()
@@ -182,7 +182,7 @@ private:
     bool m_enableFallbackESP = true;   // 投影失败时绘制屏边箭头
     bool m_enablePlayerList = true;    // 玩家坐标/血量调试面板
     bool m_enableTouchPoint = true;    // 手指按下绘制触点
-    bool m_enableAimbot     = true;     // 自瞄锁定目标
+    bool m_enableAimbot     = false;    // 自瞄锁定目标 (默认关闭)
     float m_minimapSize    = 200.0f;   // 小地图大小
     float m_minimapRangeMeters = 180.0f; // 小地图半径对应的现实距离 (米)
     float m_espMaxDist     = 500.0f;   // ESP 最大显示距离 (米)

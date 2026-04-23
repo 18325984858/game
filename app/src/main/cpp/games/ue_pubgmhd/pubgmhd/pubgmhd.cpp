@@ -559,17 +559,19 @@ bool MatchMonitor::initOffsets() {
     RESOLVE_OFFSET(m_off.World_AuthorityGameMode,  "World", "AuthorityGameMode");
 
     // GameState / GameStateBase — MatchState 声明在 GameState 而非 GameStateBase
-    RESOLVE_OFFSET_MULTI(m_off.GS_MatchState,      "MatchState",         "GameState", "GameStateBase", "UAEGameState");
-    RESOLVE_OFFSET_MULTI(m_off.GS_bHasBegunPlay,   "bHasBegunPlay",      "GameStateBase", "GameState", "UAEGameState");
-    RESOLVE_OFFSET_MULTI(m_off.GS_ElapsedTime,     "ElapsedTime",        "GameStateBase", "GameState", "UAEGameState");
-    RESOLVE_OFFSET_MULTI(m_off.GS_PlayerArray,     "PlayerArray",        "GameStateBase", "GameState", "UAEGameState");
+    // 注: 腾讯版字段实际类名为 STExtraGameStateBase (IDA + dump.cs 验证),
+    //     bHasBegunPlay 已被 bReplicatedHasBegunPlay 取代 (GameStateBase+0x5F8)
+    RESOLVE_OFFSET_MULTI(m_off.GS_MatchState,      "MatchState",              "GameState", "GameStateBase", "UAEGameState", "STExtraGameStateBase");
+    RESOLVE_OFFSET_MULTI(m_off.GS_bHasBegunPlay,   "bReplicatedHasBegunPlay", "GameStateBase", "GameState", "UAEGameState", "STExtraGameStateBase");
+    RESOLVE_OFFSET_MULTI(m_off.GS_ElapsedTime,     "ElapsedTime",             "GameStateBase", "GameState", "UAEGameState", "STExtraGameStateBase");
+    RESOLVE_OFFSET_MULTI(m_off.GS_PlayerArray,     "PlayerArray",             "GameStateBase", "GameState", "UAEGameState", "STExtraGameStateBase");
 
-    // UAEGameState — 字段可能在父类或子类上
-    RESOLVE_OFFSET_MULTI(m_off.GS_PlayerNum,       "PlayerNum",          "UAEGameState", "GameState", "STExtraGameState");
-    RESOLVE_OFFSET_MULTI(m_off.GS_TotalPlayerNum,  "TotalPlayerNum",     "UAEGameState", "GameState", "STExtraGameState");
-    RESOLVE_OFFSET_MULTI(m_off.GS_GameType,        "GameType",           "UAEGameState", "GameState", "STExtraGameState");
-    RESOLVE_OFFSET_MULTI(m_off.GS_AlivePlayerNum,  "AlivePlayerNum",     "UAEGameState", "STExtraGameState");
-    RESOLVE_OFFSET_MULTI(m_off.GS_AliveRealPlayerNum, "AliveRealPlayerNum", "UAEGameState", "STExtraGameState");
+    // STExtraGameStateBase — 计数字段 (PlayerNum=0xD3C, AlivePlayerNum=0x12AC 等)
+    RESOLVE_OFFSET_MULTI(m_off.GS_PlayerNum,       "PlayerNum",          "STExtraGameStateBase", "UAEGameState", "GameState");
+    RESOLVE_OFFSET_MULTI(m_off.GS_TotalPlayerNum,  "TotalPlayerNum",     "STExtraGameStateBase", "UAEGameState", "GameState");
+    RESOLVE_OFFSET_MULTI(m_off.GS_GameType,        "GameType",           "STExtraGameStateBase", "UAEGameState", "GameState");
+    RESOLVE_OFFSET_MULTI(m_off.GS_AlivePlayerNum,  "AlivePlayerNum",     "STExtraGameStateBase", "UAEGameState");
+    RESOLVE_OFFSET_MULTI(m_off.GS_AliveRealPlayerNum, "AliveRealPlayerNum", "STExtraGameStateBase", "UAEGameState");
 
     // PlayerState
     RESOLVE_OFFSET_MULTI(m_off.PS_PlayerName,      "PlayerName",         "PlayerState", "UAEPlayerState");
@@ -687,8 +689,10 @@ bool MatchMonitor::initOffsets() {
     RESOLVE_OFFSET_MULTI(m_off.BTC_AccVerticalRecoilTarget, "AccVerticalRecoilTarget", "BulletTrackComponent");
 
     // Weapon — 当前武器 (弹道预测需要)
-    RESOLVE_OFFSET_MULTI(m_off.Char_CurWeapon,           "CurWeapon",           "STExtraBaseCharacter", "STExtraCharacter", "UAECharacter");
-    RESOLVE_OFFSET_MULTI(m_off.Weapon_BulletTrackComp,   "BulletTrackComp",     "STExtraShootWeapon", "STExtraWeapon");
+    // 腾讯版字段已重命名: CurWeapon -> CurEquipWeapon, BulletTrackComp -> CachedBulletTrackComponent
+    // (IDA libUE4.so 字符串验证: STExtraShootWeapon+0x1F60 = CachedBulletTrackComponent)
+    RESOLVE_OFFSET_MULTI(m_off.Char_CurWeapon,           "CurEquipWeapon",             "STExtraBaseCharacter", "STExtraCharacter", "UAECharacter");
+    RESOLVE_OFFSET_MULTI(m_off.Weapon_BulletTrackComp,   "CachedBulletTrackComponent", "STExtraShootWeapon", "STExtraWeapon");
 
     LOG(LOG_LEVEL_INFO, "[InitOffsets] 解析完成, isValid=%d", m_off.isValid());
     LOG(LOG_LEVEL_INFO, "[InitOffsets] World.GameState=0x%X GS.PlayerArray=0x%X PS.PlayerKey=0x%X",
@@ -2197,11 +2201,16 @@ WeaponBulletParams MatchMonitor::getLocalWeaponBulletParams() {
         }
 
         // 通过反射查找弹速/重力字段
+        // 候选名根据 dump.cs 实际存在性筛选 (移除全部死候选):
+        //   弹速:   BulletFireSpeed (ShootWeaponEntity), BulletSpeed (CG36MusicGameBulletActor)
+        //   重力:   GravityScale, ProjectileGravityScale, UniversalProjectileGravityScale,
+        //           LaunchGravityScale, BulletGravityModifier
+        //   无重力: MaxNoGravityRange (子弹基类)
         const std::string weaponClass = readClassName(weaponPtr);
         if (!weaponClass.empty() && weaponClass[0] != '<') {
             // 查找弹速
-            for (const char* fieldName : {"BulletInitSpeed", "FireBulletInitSpeed",
-                                          "BulletSpeed", "InitBulletSpeed", "BulletFireSpeed"}) {
+            for (const char* fieldName : {"BulletFireSpeed", "BulletSpeed",
+                                          "BulletFireSpeedModifier"}) {
                 const auto* fi = m_interface.findFieldInHierarchy(weaponClass, fieldName);
                 if (fi && fi->offset > 0) {
                     float speed = safeReadFloat(weaponPtr + fi->offset);
@@ -2216,8 +2225,8 @@ WeaponBulletParams MatchMonitor::getLocalWeaponBulletParams() {
             }
 
             // 查找重力缩放
-            for (const char* fieldName : {"BulletGravityScale", "GravityScale",
-                                          "ProjectileGravityScale", "BulletGravity"}) {
+            for (const char* fieldName : {"UniversalProjectileGravityScale", "ProjectileGravityScale",
+                                          "LaunchGravityScale", "BulletGravityModifier", "GravityScale"}) {
                 const auto* fi = m_interface.findFieldInHierarchy(weaponClass, fieldName);
                 if (fi && fi->offset > 0) {
                     float grav = safeReadFloat(weaponPtr + fi->offset);
@@ -2231,7 +2240,7 @@ WeaponBulletParams MatchMonitor::getLocalWeaponBulletParams() {
             }
 
             // 查找无重力范围
-            for (const char* fieldName : {"MaxNoGravityRange", "NoGravityRange"}) {
+            for (const char* fieldName : {"MaxNoGravityRange"}) {
                 const auto* fi = m_interface.findFieldInHierarchy(weaponClass, fieldName);
                 if (fi && fi->offset > 0) {
                     float range = safeReadFloat(weaponPtr + fi->offset);
@@ -2933,7 +2942,7 @@ void MatchMonitor::pollMatchStateLoop() {
                     m_memoryRestored.store(false, std::memory_order_release);
                     ue4draw::SharedUE4Data::getInstance().setMemoryRestored(false);
                     ue4draw::SharedUE4Data::getInstance().clearRestoreRequest();
-                    ue4draw::SharedUE4Data::getInstance().setAimbotEnabled(true);
+                    ue4draw::SharedUE4Data::getInstance().setAimbotEnabled(false);
                     m_myTeamID = -1;
                     m_myPlayerKey = 0;
                     m_lastReportedArrayNum = -1;
