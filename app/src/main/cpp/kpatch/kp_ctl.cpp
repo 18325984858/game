@@ -115,20 +115,21 @@ static bool sc_hello_ok() {
 
 static bool sc_kpm_ctl(const std::string& cmd, std::string* out) {
     const std::string& key = get_key();
-    char resp[256] = {0};
+    constexpr size_t RESP_CAP = 16 * 1024;
+    std::vector<char> resp(RESP_CAP, 0);
     long ret = syscall(KP_NR_SUPERCALL,
                        key.c_str(),
                        ver_and_cmd(KP_SUPERCALL_KPM_CONTROL),
                        MODULE_NAME,
                        cmd.c_str(),
-                       resp,
-                       (long)sizeof(resp));
+                       resp.data(),
+                       (long)resp.size());
     if (out) {
-        resp[sizeof(resp) - 1] = '\0';
-        *out = resp;
+        resp[resp.size() - 1] = '\0';
+        *out = resp.data();
     }
     LOG(LOG_LEVEL_INFO, HTAG " ctl <- %s | ret=%ld out=%s",
-        cmd.c_str(), ret, resp);
+        cmd.c_str(), ret, resp.data());
     return ret == 0;
 }
 

@@ -315,6 +315,7 @@ public class InjectHideActivity extends AppCompatActivity {
     // ── 统一刷新：状态 + 按钮 + 两个 ListView ───────────────
     private void refreshAll() {
         new Thread(() -> {
+            try {
             boolean loaded = false;
             try { loaded = nativeIsModuleLoaded(); } catch (Throwable ignored) {}
             String st = "";
@@ -348,6 +349,64 @@ public class InjectHideActivity extends AppCompatActivity {
 
             // 通过 JNI (root ps -A) 拿到全进程快照：pid -> 包基名
             // 每条形如 "<pid>:<pkgBase>"
+            //
+            // ⚠️ 关键：listRunningApps 走 mem_reader 的持久 root shell
+            // 跑 "ps -A"。该 shell 在某些 hook 配置下可能 hang（例如
+            // 子进程 fork 后 openat /proc/self/* 被新加的 stat hook 拦
+            // 死返回 -ENOENT 让 ps 启动失败，或 shell 自己被 P0
+            // before_execve 拦下）。一旦 hang 整个 refreshAll 后台线程
+            // 就永远 blocking，UI 永远停在 layout 默认 "模块状态检测中..."。
+            //
+            // 因此采用 "两阶段刷新"：
+            //   1) 先用 status / list_hide_* 数据立即更新 UI
+            //   2) 再异步跑 ps 枚举做 "失效清理 + pkg→pids 显示"
+            // 即便阶段 2 卡死，UI 至少不会一直 "未知"。
+            final boolean fLoaded0 = loaded;
+            final List<String> pkgNamesStage1 = new ArrayList<>(pkgNames);
+            final int pidLinesSizeStage1 = pidLines.size();
+            runOnUiThread(() -> {
+                curProcHide = proc;
+                curFileHide = file;
+                curCommHide = comm;
+                curRootHide = rootHide;
+                curSysExempt = sysExempt;
+                curLogEnabled = logEnabled;
+
+                StringBuilder bar = new StringBuilder();
+                bar.append(fLoaded0 ? "✅ KPM 已加载" : "❌ KPM 未加载");
+                bar.append("  |  pkg=").append(pkgNamesStage1.size());
+                bar.append("  |  pid(kernel)=").append(pidLinesSizeStage1);
+                bar.append("  |  so=").append(soItems.size());
+                bar.append("  |  comm=").append(commItems.size());
+                if (rootKwCount >= 0) bar.append("  |  root_kw=").append(rootKwCount);
+                tvStatus.setText(bar.toString());
+
+                applyToggleUi(btnToggleProc, "PID隐藏", proc);
+                applyToggleUi(btnToggleFile, "文件隐藏", file);
+                applyToggleUi(btnToggleComm, "线程名隐藏", comm);
+                applyToggleUi(btnToggleRoot,
+                        "Root痕迹隐藏" + (rootKwCount >= 0 ? "(kw=" + rootKwCount + ")" : ""),
+                        rootHide);
+                applyToggleUi(btnToggleSysExempt,
+                        "系统进程豁免" + (sysExemptUid > 0 ? "(<" + sysExemptUid + ")" : ""),
+                        sysExempt);
+                applyToggleUi(btnToggleLog, "KPM日志", logEnabled);
+
+                soAdapter.clear();
+                soAdapter.addAll(soItems);
+                soAdapter.notifyDataSetChanged();
+
+                // pkg 列表先按"无运行中进程"占位渲染，阶段 2 完成后再覆盖
+                pkgAdapter.clear();
+                pkgAdapter.addAll(pkgNamesStage1);
+                pkgAdapter.notifyDataSetChanged();
+
+                commAdapter.clear();
+                commAdapter.addAll(commItems);
+                commAdapter.notifyDataSetChanged();
+            });
+
+            // ───── 阶段 2：异步跑 ps -A 做清理 + pkg→pids 富化 ─────
             String[] runningArr = null;
             try { runningArr = nativeListRunningApps(""); } catch (Throwable ignored) {}
             final java.util.Map<Integer, String> livePidToName = new java.util.HashMap<>();
@@ -439,56 +498,35 @@ public class InjectHideActivity extends AppCompatActivity {
                 }
             }
 
-            final boolean fLoaded = loaded;
-            final int kernelHidePidCount = pidLines.size();
-            final int fPkgSize = pkgNames.size();
             final int fRemovedPkg = removedPkg, fRemovedPid = removedPid;
 
+            // 阶段 2 收尾：仅覆盖 pkg 列表（已带 →pids 富化）+ 失效清理 toast
             runOnUiThread(() -> {
-                curProcHide = proc;
-                curFileHide = file;
-                curCommHide = comm;
-                curRootHide = rootHide;
-                curSysExempt = sysExempt;
-                curLogEnabled = logEnabled;
-
-                StringBuilder bar = new StringBuilder();
-                bar.append(fLoaded ? "✅ KPM 已加载" : "❌ KPM 未加载");
-                bar.append("  |  pkg=").append(fPkgSize);
-                bar.append("  |  pid(kernel)=").append(kernelHidePidCount);
-                bar.append("  |  so=").append(soItems.size());
-                bar.append("  |  comm=").append(commItems.size());
-                if (rootKwCount >= 0) bar.append("  |  root_kw=").append(rootKwCount);
-                tvStatus.setText(bar.toString());
-
-                applyToggleUi(btnToggleProc, "PID隐藏", proc);
-                applyToggleUi(btnToggleFile, "文件隐藏", file);
-                applyToggleUi(btnToggleComm, "线程名隐藏", comm);
-                // Root 按钮追加当前关键词数量，一眼看清是否已注入
-                applyToggleUi(btnToggleRoot,
-                        "Root痕迹隐藏" + (rootKwCount >= 0 ? "(kw=" + rootKwCount + ")" : ""),
-                        rootHide);
-                applyToggleUi(btnToggleSysExempt,
-                        "系统进程豁免" + (sysExemptUid > 0 ? "(<" + sysExemptUid + ")" : ""),
-                        sysExempt);
-                applyToggleUi(btnToggleLog, "KPM日志", logEnabled);
-
-                soAdapter.clear();
-                soAdapter.addAll(soItems);
-                soAdapter.notifyDataSetChanged();
-
                 pkgAdapter.clear();
                 pkgAdapter.addAll(pkgItemsShow);
                 pkgAdapter.notifyDataSetChanged();
-
-                commAdapter.clear();
-                commAdapter.addAll(commItems);
-                commAdapter.notifyDataSetChanged();
 
                 if (fRemovedPkg > 0 || fRemovedPid > 0) {
                     toast("已清理失效  pkg=" + fRemovedPkg + "  pid=" + fRemovedPid);
                 }
             });
+            } catch (final Throwable t) {
+                // 任何未被内层捕获的异常都会让 refreshAll 后台线程
+                // 静默死掉，造成 UI 永远停在“模块状态检测中...”。
+                // 这里把错误打出并包括栈顶三帧贴到状态栏，方便定位。
+                android.util.Log.e("InjectHide", "refreshAll crashed", t);
+                runOnUiThread(() -> {
+                    StringBuilder msg = new StringBuilder();
+                    msg.append("❌ refreshAll 崩溃: ");
+                    msg.append(t.getClass().getSimpleName()).append(": ");
+                    msg.append(String.valueOf(t.getMessage()));
+                    StackTraceElement[] st = t.getStackTrace();
+                    for (int i = 0; i < Math.min(3, st.length); i++) {
+                        msg.append("\n  at ").append(st[i].toString());
+                    }
+                    if (tvStatus != null) tvStatus.setText(msg.toString());
+                });
+            }
         }).start();
     }
 
