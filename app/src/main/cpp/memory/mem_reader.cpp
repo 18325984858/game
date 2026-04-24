@@ -292,7 +292,7 @@ private:
             // setpriv/groupadd 之类是没法的 (sh 还在 app uid). 所以在裸 su 的
             // 路径下我们接受 hidepid 限制, 至少 ps -A / 主线功能仍可用.
             const char* shCmd =
-                "if su -G 3009 -c true 2>/dev/null; then "
+                "if su -G 3009 -c true >/dev/null 2>&1; then "
                 "  exec su -G 3009; "
                 "else "
                 "  exec su; "
@@ -526,10 +526,11 @@ private:
             close(in[0]); close(in[1]); close(out[0]); close(out[1]);
 
             // 优先 -G 3009 (KernelSU/Magisk), 失败回退裸 su (APatch 不识别 -G).
-            // APatch 走裸 su 时无 supp gid 3009, 设备 hidepid=2 下读其它 uid 的
-            // /proc/PID/{maps,mem} 可能 EACCES, 但 Permissive / hidepid<2 设备无碍.
+            // 注意: APatch 的 su 会把 "Unrecognized option" + 帮助文本打到 STDOUT
+            // (不是 stderr), 探测必须 >/dev/null 2>&1 双重定向, 否则这些垃圾会
+            // 污染 helper 的 stdout pipe, 导致父进程把第一行读成协议错.
             std::string shStr =
-                "if su -G 3009 -c true 2>/dev/null; then "
+                "if su -G 3009 -c true >/dev/null 2>&1; then "
                 "  exec su -G 3009 -c '" + P.ddBin + "'; "
                 "else "
                 "  exec su -c '" + P.ddBin + "'; "

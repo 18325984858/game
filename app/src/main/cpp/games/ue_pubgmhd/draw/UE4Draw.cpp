@@ -569,12 +569,15 @@ void UE4Overlay::drawOverlay(const DrawGameData& data) {
 //  控制菜单
 // =====================================================================
 void UE4Overlay::drawMenu(const DrawGameData& data) {
+    // 与 DFM 一致: FirstUseEver — Always 会每帧强制覆盖位置,
+    // 让 ImGui widget 的 active-id 命中测试出现一帧错位 (菜单看似可见但点不动).
+    // AImGui 已设置 IniFilename=nullptr, 不存在 ini 持久化的屏外坐标问题.
     ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(320, 0), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowBgAlpha(0.8f);
 
-    ImGuiWindowFlags flags = ImGuiWindowFlags_NoResize | ImGuiWindowFlags_AlwaysAutoResize;
-
-    if (ImGui::Begin("PUBG 绘制", &m_menuExpanded, flags)) {
+    // 注: p_open=nullptr 去掉关闭按钮, 防止用户误点导致菜单永久消失
+    if (ImGui::Begin("PUBG 绘制", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
         bool settingsChanged = false;
 
         // 对局状态

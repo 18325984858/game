@@ -170,7 +170,6 @@ public:
 
 private:
     // ---- 菜单状态 ----
-    bool m_menuExpanded    = true;
     bool m_enableESP       = true;     // ESP 方框
     bool m_enableSkeleton  = true;     // 骨架线
     bool m_enableSnapline  = true;     // 射线

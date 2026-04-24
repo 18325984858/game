@@ -120,6 +120,10 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
         "so_dumper/so_dumper.cpp"
         "so_dumper/so_dumper_jni.cpp"
 
+        # ── parasite (D 方案 / 寄生执行骨架) ──
+        "parasite/parasite.cpp"
+        "parasite/parasite_test.cpp"
+
         # ── kpatch (KernelPatch / KPM 控制 + JNI) ──
         "kpatch/kp_ctl.cpp"
         "kpatch/kpm_inject_hide_jni.cpp"
@@ -236,6 +240,8 @@ if(USE_WINDOWS_LLVM_FRONTEND AND ENABLE_WINDOWS_LLVM_OBFUSCATION)
                 "memory/mem_reader_jni.cpp"
                 "so_dumper/so_dumper.cpp"
                 "so_dumper/so_dumper_jni.cpp"
+                "parasite/parasite.cpp"
+                "parasite/parasite_test.cpp"
                 PROPERTIES COMPILE_OPTIONS "-mllvm;-passes=${WINDOWS_LLVM_MEDIUM_PASSES}"
         )
 

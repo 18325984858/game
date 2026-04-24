@@ -2,6 +2,7 @@
 #include "../../core/log/log.h"
 #include "engine/UE4Dumper.h"
 #include "engine/UE4Header.h"
+#include "engine/UE4Struct.h"
 #include "interface/interface.h"
 #include "pubgmhd/pubgmhd.h"
 #include "draw/UE4Draw.h"
@@ -15,6 +16,7 @@
 #include <unistd.h>
 #include <cstring>
 #include <cstdio>
+#include <cerrno>
 #include <string>
 #include <dlfcn.h>
 #include <jni.h>
@@ -579,8 +581,18 @@ public:
 static void UE4GuiThread() {
     UE4GuiThreadResetGuard resetGuard;
 
-    GLOG("GUI 线程已启动, 等待 10 秒...");
-    std::this_thread::sleep_for(std::chrono::seconds(10));
+    // 检测游戏目标进程是否存活 (cmdline 含 "pubgmhd")
+    auto isGameProcessAlive = []() -> bool {
+        char cmdline[256] = {};
+        int fd = open("/proc/self/cmdline", O_RDONLY);
+        if (fd < 0) return false;
+        ssize_t n = read(fd, cmdline, sizeof(cmdline) - 1);
+        close(fd);
+        if (n <= 0) return false;
+        return strstr(cmdline, "pubgmhd") != nullptr;
+    };
+
+    GLOG("GUI 线程启动, 无限重试连接 Overlay 服务 (每 3 秒)...");
 
     JavaDisplayInfo displayInfo;
     if (!resolveDisplayInfo(displayInfo)) {
@@ -608,8 +620,13 @@ static void UE4GuiThread() {
 
     GLOG("AImGui RenderClient 选项已准备: width=%d height=%d rotate=%d", imguiOptions.screenWidth, imguiOptions.screenHeight, imguiOptions.rotateTheta);
 
+    // 无限重试连接 — 用户可能先启动游戏再启动 app overlay 服务
     std::unique_ptr<android::AImGui> imgui;
-    for (int attempt = 1; attempt <= 20; ++attempt) {
+    for (int attempt = 1; ; ++attempt) {
+        if (!isGameProcessAlive()) {
+            GLOG("RenderClient: 游戏进程已退出, 放弃连接");
+            return;
+        }
         try {
             imgui = std::make_unique<android::AImGui>(imguiOptions);
             GLOG("AImGui RenderClient 构造已返回: attempt=%d state=%d", attempt, *imgui ? 1 : 0);
@@ -620,52 +637,21 @@ static void UE4GuiThread() {
             GERR("AImGui RenderClient 构造异常: attempt=%d error=unknown", attempt);
             imgui.reset();
         }
-
-        if (imgui && *imgui) {
-            break;
+        if (imgui && *imgui) break;
+        if (attempt % 10 == 1) {
+            GLOG("等待公开 Overlay 服务: attempt=%d (每 3 秒重试)", attempt);
         }
-
-        GLOG("等待公开 Overlay 服务就绪: attempt=%d/20", attempt);
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        std::this_thread::sleep_for(std::chrono::seconds(3));
     }
 
-    if (!imgui || !(*imgui)) {
-        GERR("AImGui RenderClient 初始化失败: 无法连接公开 Overlay 服务");
-        return;
-    }
+    GLOG("AImGui RenderClient 初始化完成, 开始渲染循环");
 
-    GLOG("AImGui RenderClient 初始化完成");
-
-    // RenderClient 的输入线程: ProcessInputEvent 通过 TCP 阻塞读取输入事件,
-    // 不能放在渲染线程中 (poll 最长 1s 会阻塞帧循环)。
-    std::atomic<bool> inputThreadRunning{true};
-    std::thread inputThread([imguiPtr = imgui.get(), &inputThreadRunning]() {
-        GLOG("RenderClient 输入线程启动");
-        while (inputThreadRunning.load(std::memory_order_acquire)) {
-            // ProcessInputEvent 内部: ReadData(poll) → AddMousePosEvent 等
-            imguiPtr->ProcessInputEvent();
-        }
-        GLOG("RenderClient 输入线程退出");
-    });
+    // 注意: ProcessInputEvent 必须与 BeginFrame/EndFrame 在同一线程调用,
+    // 否则 ImGui::IO 的 InputEventsQueue 会多线程竞争导致 ImVector 越界崩溃
 
     ue4draw::DrawGameData gameData;
     ue4draw::UE4Overlay overlay;
     Clock::time_point lastHeartbeatLog;
-    Clock::time_point lastDisplayRefresh;
-    JavaDisplayInfo activeDisplayInfo = displayInfo;
-
-    // 检测游戏目标进程是否存活 (每 2 秒检查一次)
-    auto isGameProcessAlive = []() -> bool {
-        // 检查自身进程的 cmdline 是否还包含游戏包名
-        // 如果进程被 kill, 这个函数不会执行, 但如果是温和退出可以检测到
-        char cmdline[256] = {};
-        int fd = open("/proc/self/cmdline", O_RDONLY);
-        if (fd < 0) return false;
-        ssize_t n = read(fd, cmdline, sizeof(cmdline) - 1);
-        close(fd);
-        if (n <= 0) return false;
-        return strstr(cmdline, "pubgmhd") != nullptr;
-    };
     Clock::time_point lastAliveCheck;
 
     // 渲染主循环
@@ -674,8 +660,7 @@ static void UE4GuiThread() {
         if (shouldLogEvery(lastAliveCheck, std::chrono::milliseconds(2000))) {
             if (!isGameProcessAlive()) {
                 GLOG("RenderClient: 游戏进程已退出, 发送空帧清除 overlay");
-                inputThreadRunning.store(false, std::memory_order_release);
-                for (int i = 0; i < 3; i++) {
+                for (int i = 0; i < 5; i++) {
                     imgui->BeginFrame();
                     imgui->EndFrame();
                     std::this_thread::sleep_for(std::chrono::milliseconds(16));
@@ -685,56 +670,44 @@ static void UE4GuiThread() {
             }
         }
 
+        // 注: 不再用 staleMs 退出 —— pubgmhd 的 MatchMonitor 只在对局期间 pushData,
+        // 大厅/主菜单时 msSinceLastPush() 会持续增长, 一旦超过阈值就会让 GUI 线程退出
+        // 导致菜单消失 (用户感觉为"崩溃"). 游戏死亡由 isGameProcessAlive 单独负责.
+        const int64_t staleMs = ue4draw::SharedUE4Data::getInstance().msSinceLastPush();
+
+        // 非阻塞地处理所有待处理输入事件 (同线程, 避免竞态)
+        while (imgui->PollInputReady(0)) {
+            imgui->ProcessInputEvent();
+        }
+
         imgui->BeginFrame();
 
-        if (shouldLogEvery(lastDisplayRefresh, std::chrono::milliseconds(1000))) {
-            JavaDisplayInfo refreshedDisplayInfo;
-            if (resolveDisplayInfo(refreshedDisplayInfo)) {
-                normalizePublicOverlayDisplayInfo(refreshedDisplayInfo);
-                if (refreshedDisplayInfo.width != activeDisplayInfo.width
-                    || refreshedDisplayInfo.height != activeDisplayInfo.height
-                    || refreshedDisplayInfo.rotateTheta != activeDisplayInfo.rotateTheta) {
-                    GLOG("RenderClient 显示尺寸刷新: %dx%d r%d -> %dx%d r%d",
-                         activeDisplayInfo.width,
-                         activeDisplayInfo.height,
-                         activeDisplayInfo.rotateTheta,
-                         refreshedDisplayInfo.width,
-                         refreshedDisplayInfo.height,
-                         refreshedDisplayInfo.rotateTheta);
-                    activeDisplayInfo = refreshedDisplayInfo;
-                }
-            }
-        }
+        // 注意: 不要在 BeginFrame 后覆盖 io.DisplaySize —— AImGui 框架已经按
+        // 服务端实际帧尺寸设置好了, 客户端强行覆盖会让 ImGui 的命中测试坐标系
+        // 与服务端 ATouchEvent 传过来的坐标系错位, 导致菜单可见但无法触摸.
 
-        {
-            ImGuiIO& io = ImGui::GetIO();
-            if (activeDisplayInfo.width > 0 && activeDisplayInfo.height > 0) {
-                io.DisplaySize = ImVec2(static_cast<float>(activeDisplayInfo.width), static_cast<float>(activeDisplayInfo.height));
-                io.DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
-            }
-        }
-
+        // drawOverlay 每帧都跑 — 菜单必须每帧绘制 (即使没数据也要显示菜单).
+        // drawOverlay 内部已有 5 秒陈旧检查, 会自动清空 ESP/玩家列表 (但保留菜单),
+        // 所以这里不再外层 gate 否则大厅期间 staleMs>3s 会把菜单一起隐藏.
         ue4draw::SharedUE4Data::getInstance().getData(gameData);
         overlay.drawOverlay(gameData);
 
         if (shouldLogEvery(lastHeartbeatLog, std::chrono::milliseconds(3000))) {
             const ImGuiIO& io = ImGui::GetIO();
-            GLOG("RenderClient 心跳: display=%.0fx%.0f fps=%.1f inMatch=%d alive=%d/%d tracked=%zu",
+            GLOG("RenderClient 心跳: display=%.0fx%.0f fps=%.1f inMatch=%d alive=%d/%d tracked=%zu staleMs=%lld",
                  io.DisplaySize.x,
                  io.DisplaySize.y,
                  io.Framerate,
                  gameData.inMatch ? 1 : 0,
                  gameData.aliveCount,
                  gameData.totalCount,
-                 gameData.players.size());
+                 gameData.players.size(),
+                 (long long)staleMs);
         }
 
         imgui->EndFrame();
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        // 不额外 sleep, 由 TCP 传输和 GPU 自然限速实现最低延迟
     }
-
-    inputThreadRunning.store(false, std::memory_order_release);
-    if (inputThread.joinable()) inputThread.join();
 }
 
 static void UE4WorkerThread(void* plibUE4ModeBase, void* pGNames,
@@ -764,33 +737,39 @@ static void UE4WorkerThread(void* plibUE4ModeBase, void* pGNames,
             uintptr_t gWorldAddr   = reinterpret_cast<uintptr_t>(pGWorld);
             uintptr_t gUObjAddr    = reinterpret_cast<uintptr_t>(pGUObjectArray);
             constexpr int kMaxWaitSeconds = 120;
-            int memFd = open("/proc/self/mem", O_RDONLY);
             bool ready = false;
+            // 注: GNames/GWorld/GUObjectArray 都在 libUE4.so 的 BSS 段, 模块加载完成时
+            // 这些虚拟地址已映射, 直接 deref 不会 SIGSEGV. 不使用 /proc/self/mem
+            // (PUBG ACE 反作弊会拦截 open("/proc/self/mem") 返回 EACCES, DFM 因没此保护可用).
+            //
+            // 类型安全访问: GNames 直接是 TNameEntryArray (BSS 内嵌, 与 DFM FNameEntryAllocator
+            // 同样模式), 但 GUObjectArray/GWorld 是 *指针变量*, 需先解引用一次.
+            //
+            // 注: Injector 已先解引用 GNames 一次, 所以 pGNames 直接指向 TNameEntryArray.
             for (int i = 0; i < kMaxWaitSeconds * 2; i++) {
                 int32_t numNames = 0;
                 uintptr_t worldPtr = 0;
                 uintptr_t innerPtr = 0;
                 int32_t innerTotal = 0;
                 bool namesOk = false, worldOk = false, objOk = false;
-                if (memFd >= 0 && gNamesAddr >= 0x10000) {
-                    // TNameEntryArray.NumElements @ +0x1400
-                    if (pread(memFd, &numNames, sizeof(numNames), static_cast<off_t>(gNamesAddr + 0x1400)) == sizeof(numNames)) {
-                        namesOk = (numNames > 100);
-                    }
+
+                if (gNamesAddr >= 0x10000) {
+                    auto* names = reinterpret_cast<volatile ue4::TNameEntryArray*>(gNamesAddr);
+                    numNames = names->NumElements;
+                    namesOk = (numNames > 100);
                 }
-                if (memFd >= 0 && gWorldAddr >= 0x10000) {
-                    if (pread(memFd, &worldPtr, sizeof(worldPtr), static_cast<off_t>(gWorldAddr)) == sizeof(worldPtr)) {
-                        worldOk = (worldPtr >= 0x10000);
-                    }
+                if (gWorldAddr >= 0x10000) {
+                    worldPtr = *reinterpret_cast<volatile uintptr_t*>(gWorldAddr);
+                    worldOk = (worldPtr >= 0x10000);
                 }
-                if (memFd >= 0 && gUObjAddr >= 0x10000) {
-                    // 1. 读 GUObjectArray 指针变量 -> 内部结构体地址
-                    if (pread(memFd, &innerPtr, sizeof(innerPtr), static_cast<off_t>(gUObjAddr)) == sizeof(innerPtr)
-                        && innerPtr >= 0x10000) {
-                        // 2. 读内部结构体 +0x100 (NumElements) 校验
-                        if (pread(memFd, &innerTotal, sizeof(innerTotal),
-                                  static_cast<off_t>(innerPtr + 0x100)) == sizeof(innerTotal)
-                            && innerTotal > 100 && innerTotal < 5000000) {
+                if (gUObjAddr >= 0x10000) {
+                    // 1. 解引用指针变量 -> FUObjectArray 内部结构体
+                    innerPtr = *reinterpret_cast<volatile uintptr_t*>(gUObjAddr);
+                    if (innerPtr >= 0x10000) {
+                        // 2. 用结构体字段访问 TotalNumElements
+                        auto* uobj = reinterpret_cast<volatile ue4::FUObjectArray*>(innerPtr);
+                        innerTotal = uobj->TotalNumElements;
+                        if (innerTotal > 100 && innerTotal < 5000000) {
                             objOk = true;
                             gUObjArrayInner = innerPtr;
                         }
@@ -803,9 +782,15 @@ static void UE4WorkerThread(void* plibUE4ModeBase, void* pGNames,
                     ready = true;
                     break;
                 }
+                if ((i % 20) == 0) {
+                    LOG(LOG_LEVEL_WARN,
+                        "[UE4Worker] 等待引擎中 t=%.1fs namesOk=%d numNames=%d | worldOk=%d worldPtr=%p | objOk=%d innerPtr=%p innerTotal=%d",
+                        i * 0.5f, namesOk ? 1 : 0, numNames,
+                        worldOk ? 1 : 0, (void*)worldPtr,
+                        objOk ? 1 : 0, (void*)innerPtr, innerTotal);
+                }
                 std::this_thread::sleep_for(std::chrono::milliseconds(500));
             }
-            if (memFd >= 0) close(memFd);
             if (!ready) {
                 LOG(LOG_LEVEL_ERROR, "[UE4Worker] 引擎等待超时 (%ds), 放弃启动监控", kMaxWaitSeconds);
                 return;

@@ -72,10 +72,10 @@ struct ResolvedOffsets {
     int32_t World_AuthorityGameMode     = -1;
 
     // GameStateBase
-    int32_t GS_MatchState               = -1;
     int32_t GS_bHasBegunPlay            = -1;
     int32_t GS_ElapsedTime              = -1;
     int32_t GS_PlayerArray              = -1;
+    int32_t GS_MatchState               = -1;  // FName, dump.cs: GameState.MatchState
 
     // UAEGameState
     int32_t GS_PlayerNum                = -1;
@@ -461,6 +461,11 @@ private:
     // ---- 对局状态 ----
     MatchState getMatchState();
 
+    // 通过遍历 GUObjectArray 定位真实 GameState 实例
+    // (腾讯 PUBG 的 World+0xAC0 不指向真 GameState; 必须扫对象表按类匹配)
+    // 命中后缓存; 缓存失效或首次/未命中时全表扫, 空扫结果 2s 内不再重复.
+    uintptr_t findCurrentGameStateInstance();
+
     // ---- Actor 位置 ----
     bool getActorLocation(uintptr_t actorPtr, FVector3& outLoc);
     bool fillPlayerSkeleton(uintptr_t characterPtr, ue4draw::DrawPlayerInfo& outPlayer);
@@ -545,6 +550,11 @@ private:
 
     std::atomic<bool> m_running{false};
     std::thread   m_pollThread;         // 轮询线程 (joinable, 非 detach)
+
+    // GameState 实例发现缓存
+    uintptr_t m_cachedGSPtr = 0;                          // 上次命中的 GameState UObject
+    std::unordered_map<uintptr_t,bool> m_gsClassSet;      // UClass* -> isSubclassOf(GameStateBase)
+    uint64_t  m_lastEmptyGSScanMs = 0;                    // 最近一次空扫时间戳, 用于节流
     std::string   m_lastMatchState;
     std::string   m_currentMatchState;   // 当前对局状态 (InProgress/WaitingToStart/Aircraft 等)
     bool          m_isInMatch = false;

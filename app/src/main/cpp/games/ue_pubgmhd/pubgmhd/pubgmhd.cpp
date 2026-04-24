@@ -3,6 +3,9 @@
 #include "../interface/interface.h"
 #include "../draw/UE4Draw.h"
 #include "../../../core/log/log.h"
+#include <sys/system_properties.h>
+
+extern "C" bool selfTestParasite();
 
 #include <thread>
 #include <chrono>
@@ -561,10 +564,11 @@ bool MatchMonitor::initOffsets() {
     // GameState / GameStateBase — MatchState 声明在 GameState 而非 GameStateBase
     // 注: 腾讯版字段实际类名为 STExtraGameStateBase (IDA + dump.cs 验证),
     //     bHasBegunPlay 已被 bReplicatedHasBegunPlay 取代 (GameStateBase+0x5F8)
-    RESOLVE_OFFSET_MULTI(m_off.GS_MatchState,      "MatchState",              "GameState", "GameStateBase", "UAEGameState", "STExtraGameStateBase");
     RESOLVE_OFFSET_MULTI(m_off.GS_bHasBegunPlay,   "bReplicatedHasBegunPlay", "GameStateBase", "GameState", "UAEGameState", "STExtraGameStateBase");
     RESOLVE_OFFSET_MULTI(m_off.GS_ElapsedTime,     "ElapsedTime",             "GameStateBase", "GameState", "UAEGameState", "STExtraGameStateBase");
     RESOLVE_OFFSET_MULTI(m_off.GS_PlayerArray,     "PlayerArray",             "GameStateBase", "GameState", "UAEGameState", "STExtraGameStateBase");
+    // MatchState (FName) — 直接读字段, 不进入 libUE4.so 代码段, 避免 ACE 反作弊扫到调用栈
+    RESOLVE_OFFSET_MULTI(m_off.GS_MatchState,      "MatchState",              "GameState", "GameStateBase", "UAEGameState", "STExtraGameStateBase");
 
     // STExtraGameStateBase — 计数字段 (PlayerNum=0xD3C, AlivePlayerNum=0x12AC 等)
     RESOLVE_OFFSET_MULTI(m_off.GS_PlayerNum,       "PlayerNum",          "STExtraGameStateBase", "UAEGameState", "GameState");
@@ -718,9 +722,23 @@ bool MatchMonitor::initOffsets() {
 // =====================================================================
 //  安全内存读取
 // =====================================================================
+//
+// 防御性检查 (B): safeReadPtr 拿到的值如果不像有效用户态指针 (太小 / 太大 /
+// 明显是 NameIndex / ObjectID / float bit pattern 等), 返回 0. 后续任何
+// 链式 safeReadPtr(0) 都会被 < 0x10000 拦截, 不会再越界 memcpy.
+// 0x6d8504... 之前的崩溃就是某处把 32-bit 字段 0x6cb52 当指针 memcpy(...,4) 抓的.
+static inline bool looksLikeUserPtr(uintptr_t p) {
+    // arm64 用户态地址通常 < 0x80_0000_0000 (不到 512GB), 且页对齐起步,
+    // 至少要落在 mmap 范围, 拒绝 < 0x10000 的明显小整数.
+    if (p < 0x10000) return false;
+    if (p >= 0x0000800000000000ULL) return false; // 上半区是内核
+    return true;
+}
+
 uintptr_t MatchMonitor::safeReadPtr(uintptr_t addr) {
     uintptr_t val = 0;
-    safeReadMemory(addr, &val, sizeof(val));
+    if (!safeReadMemory(addr, &val, sizeof(val))) return 0;
+    if (!looksLikeUserPtr(val)) return 0;
     return val;
 }
 
@@ -905,6 +923,82 @@ std::string MatchMonitor::readFString(uintptr_t addr) {
 // =====================================================================
 //  对局状态读
 // =====================================================================
+
+// 通过 GUObjectArray 全表扫定位真实 GameState 实例.
+//
+// 背景: Frida 验证证明腾讯 PUBG 的 World+0xAC0 不指向真 GameState (该位置常
+//   是垃圾指针), 直接用其调 HasMatchStarted thunk 会读到非零脏字节产生假阳,
+//   或直接 segfault. 唯一可靠路径是按 ClassPrivate 在对象表里找一个真实
+//   GameStateBase 子类实例, 再调 thunk.
+//
+// 缓存策略: 命中后缓存对象指针 + 类指针白名单. 后续调用 O(1) 验证缓存对象
+//   的 ClassPrivate 仍是已知 GameState 子类即可复用; 缓存失效再触发全表扫.
+//   未命中时 2s 节流避免大厅期间空转.
+uintptr_t MatchMonitor::findCurrentGameStateInstance() {
+    // ---- 快路径: 缓存的 GS 仍存活 + 类未变 ----
+    if (m_cachedGSPtr != 0) {
+        uintptr_t cls = safeReadPtr(m_cachedGSPtr + kUObjectClassPrivateOffset);
+        if (cls != 0 && cls >= 0x10000) {
+            auto it = m_gsClassSet.find(cls);
+            bool isGS = false;
+            if (it != m_gsClassSet.end()) {
+                isGS = it->second;
+            } else {
+                isGS = isSubclassOf(cls, "GameStateBase");
+                m_gsClassSet[cls] = isGS;
+            }
+            if (isGS) return m_cachedGSPtr;
+        }
+        m_cachedGSPtr = 0;
+    }
+
+    // ---- 空扫节流: 上次没找到时, 2s 内不再重复扫 ----
+    const uint64_t nowMs = nowMonotonicMs();
+    if (m_lastEmptyGSScanMs != 0 && nowMs - m_lastEmptyGSScanMs < 2000) {
+        return 0;
+    }
+
+    // ---- 慢路径: 全表扫 GUObjectArray ----
+    const uintptr_t arr = m_gUObjectArray;
+    const int numChunks = safeReadS32(arr + 0xF8);
+    const int totalNum  = safeReadS32(arr + 0x100);
+    if (numChunks <= 0 || numChunks > 1000 || totalNum <= 0 || totalNum > 5000000) {
+        m_lastEmptyGSScanMs = nowMs;
+        return 0;
+    }
+    static constexpr size_t kFUObjectItemSize = 24;
+    for (int ci = 0; ci < numChunks; ++ci) {
+        const uintptr_t chunkBase = safeReadPtr(arr + 0xC8 + static_cast<uintptr_t>(ci) * 8);
+        const int cnt = safeReadS32(arr + 0xE8 + static_cast<uintptr_t>(ci) * 4);
+        if (chunkBase == 0 || chunkBase < 0x10000 || cnt <= 0) continue;
+        for (int i = 0; i < cnt; ++i) {
+            const uintptr_t obj = safeReadPtr(chunkBase + static_cast<uintptr_t>(i) * kFUObjectItemSize);
+            if (obj == 0 || obj < 0x10000) continue;
+            const uintptr_t cls = safeReadPtr(obj + kUObjectClassPrivateOffset);
+            if (cls == 0 || cls < 0x10000) continue;
+            auto it = m_gsClassSet.find(cls);
+            bool isGS;
+            if (it != m_gsClassSet.end()) {
+                isGS = it->second;
+            } else {
+                isGS = isSubclassOf(cls, "GameStateBase");
+                m_gsClassSet[cls] = isGS;
+            }
+            if (!isGS) continue;
+            // 排除 CDO (Default__XXX): NamePrivate 以 Default__ 开头
+            const std::string objName = readObjName(obj);
+            if (objName.compare(0, 9, "Default__") == 0) continue;
+            m_cachedGSPtr = obj;
+            m_lastEmptyGSScanMs = 0;
+            LOG(LOG_LEVEL_INFO, "[MatchCall] GameState instance found @ %p name=%s class=%s",
+                (void*)obj, objName.c_str(), readObjName(cls).c_str());
+            return obj;
+        }
+    }
+    m_lastEmptyGSScanMs = nowMs;
+    return 0;
+}
+
 MatchState MatchMonitor::getMatchState() {
     MatchState ms;
     uintptr_t worldPtr = safeReadPtr(m_gWorld);
@@ -913,30 +1007,56 @@ MatchState MatchMonitor::getMatchState() {
         return ms;
     }
     ms.worldName = readObjName(worldPtr);
-    if (m_off.World_GameState < 0) { ms.state = "Unknown"; return ms; }
-    uintptr_t gsPtr = safeReadPtr(worldPtr + m_off.World_GameState);
+
+    // 唯一 GameState 来源: 扫 GUObjectArray, 不再读 World+0xAC0 (腾讯版指向垃圾).
+    const uintptr_t gsPtr = findCurrentGameStateInstance();
     ms.gameStatePtr = gsPtr;
 
-    if (gsPtr != 0 && gsPtr > 0x10000 && m_off.GS_MatchState >= 0) {
-        ms.state = readFName(gsPtr + m_off.GS_MatchState);
-    } else {
-        ms.state = "Unknown";
+    if (gsPtr == 0) {
+        ms.state = "NoGameState";
+        ms.inMatch = false;
+        // 周期诊断 (3s 一次): 帮助定位为何对局中仍找不到 GS 实例
+        static uint64_t s_lastNoGSLogMs = 0;
+        const uint64_t nowMs = nowMonotonicMs();
+        if (nowMs - s_lastNoGSLogMs > 3000) {
+            s_lastNoGSLogMs = nowMs;
+            LOG(LOG_LEVEL_WARN, "[MatchRead] 未找到 GameState 实例 (world=%s, gsClassSet.size=%zu)",
+                ms.worldName.c_str(), m_gsClassSet.size());
+        }
+        return ms;
     }
 
-    if (gsPtr != 0 && gsPtr > 0x10000 && m_off.GS_ElapsedTime >= 0) {
+    if (m_off.GS_ElapsedTime >= 0) {
         const int32_t elapsedTime = safeReadS32(gsPtr + m_off.GS_ElapsedTime);
         if (elapsedTime >= 0 && elapsedTime < 7200) {
             ms.elapsedTimeSeconds = elapsedTime;
         }
     }
 
-    // 判断是否在对局: 排除大厅/UI 地图
-    ms.inMatch = ms.worldName.find("Editor_login") == std::string::npos
-              && ms.worldName.find("UImap") == std::string::npos
-              && ms.worldName.find("Lobby") == std::string::npos
-              && ms.worldName != "None"
-              && ms.worldName.find("invalid") == std::string::npos
-              && gsPtr != 0;
+    // 唯一 inMatch 判定: 直接读 GameState.MatchState (FName) 字段.
+    // 不调 HasMatchStarted thunk —— 进入 libUE4.so 代码段会被腾讯 ACE 反作弊
+    // 扫到调用栈, 大约 30-50 秒后会被 SI_TKILL SIGBUS 杀掉 UE 主线程.
+    // 直接读字段是纯读, ACE 难以区分.
+    if (m_off.GS_MatchState >= 0) {
+        const std::string mst = readFName(gsPtr + m_off.GS_MatchState);
+        ms.state = mst;
+        // 等价 UE 源码 AGameState::HasMatchStarted: MatchState != EnteringMap
+        // 下游 (pollPlayers / patchActorNetCull) 按 state=="InProgress" 字面 gating
+        ms.inMatch = (mst == "InProgress");
+    } else {
+        ms.state = "MatchStateOffsetMissing";
+        ms.inMatch = false;
+    }
+    // 周期诊断 (3s 一次): 打印 inMatch + state 给排障使用
+    static uint64_t s_lastStateLogMs = 0;
+    static int s_lastInMatch = -1;
+    const uint64_t nowMs2 = nowMonotonicMs();
+    if (s_lastInMatch != (int)ms.inMatch || nowMs2 - s_lastStateLogMs > 3000) {
+        s_lastStateLogMs = nowMs2;
+        s_lastInMatch = ms.inMatch ? 1 : 0;
+        LOG(LOG_LEVEL_INFO, "[MatchRead] gs=%p inMatch=%d state=%s elapsed=%d",
+            (void*)gsPtr, ms.inMatch ? 1 : 0, ms.state.c_str(), ms.elapsedTimeSeconds);
+    }
     return ms;
 }
 
@@ -1833,7 +1953,7 @@ void MatchMonitor::fillCameraSnapshot(ue4draw::DrawGameData& drawData) {
         return;
     }
 
-    const uintptr_t pcm = safeReadPtr(pc + 0x658);  // PlayerController.PlayerCameraManager
+    const uintptr_t pcm = safeReadPtr(pc + 0x660);  // PlayerController.PlayerCameraManager (dump.cs: 0x660, 不是 0x658)
     if (pcm == 0) {
         return;
     }
@@ -1884,7 +2004,7 @@ void MatchMonitor::fillCameraSnapshot(ue4draw::DrawGameData& drawData) {
     }
 
     if (!hasValidFov(camFov)) {
-        camFov = safeReadFloat(pcm + 0x5E0);
+        camFov = safeReadFloat(pcm + 0x5E8);  // PlayerCameraManager.DefaultFOV (dump.cs: 0x5E8)
     }
 
     if (hasFiniteCameraPose(camLocX, camLocY, camLocZ, camPitch, camYaw, camRoll)) {
@@ -2425,11 +2545,11 @@ void MatchMonitor::aimAtNearestEnemy() {
     if (!std::isfinite(curPitch) || !std::isfinite(curYaw)) return;
 
     // 读取当前相机位置作为射线起点
-    const int32_t pcmOff2 = (m_off.PC_PlayerCameraManager >= 0) ? m_off.PC_PlayerCameraManager : 0x658;
+    const int32_t pcmOff2 = (m_off.PC_PlayerCameraManager >= 0) ? m_off.PC_PlayerCameraManager : 0x660;  // dump.cs PlayerController.PlayerCameraManager
     const uintptr_t pcm = safeReadPtr(pc + pcmOff2);
     if (pcm == 0) return;
 
-    const int32_t camCacheOff = (m_off.PCM_CameraCache >= 0) ? m_off.PCM_CameraCache : 0x640;
+    const int32_t camCacheOff = (m_off.PCM_CameraCache >= 0) ? m_off.PCM_CameraCache : 0x640;  // dump.cs PlayerCameraManager.CameraCache
     const int32_t camPovOff = camCacheOff + 0x10;
     const float camX = safeReadFloat(pcm + camPovOff + 0x0);
     const float camY = safeReadFloat(pcm + camPovOff + 0x4);
@@ -3052,6 +3172,19 @@ bool MatchMonitor::start() {
         return true;
     }
 
+    // 防御性 kill switch (A): 通过 system property 一键禁用 MatchMonitor.
+    //   adb shell setprop debug.pubgmhd.nohook 1   后重启 app -> 不启动 hook.
+    //   adb shell setprop debug.pubgmhd.nohook 0   恢复.
+    // 用于现场二分: 关掉后若仍崩 = 与 hook 无关; 若不崩 = hook 是肇事者.
+    {
+        char propVal[8] = {0};
+        __system_property_get("debug.pubgmhd.nohook", propVal);
+        if (propVal[0] == '1') {
+            LOG(LOG_LEVEL_WARN, "[KillSwitch] debug.pubgmhd.nohook=1, 跳过 MatchMonitor::start");
+            return false;
+        }
+    }
+
     // 验证 GNames (NumElements @ m_gNames + 0x1400)
     m_numNames = safeReadS32(m_gNames + 0x1400);
     if (m_numNames <= 0) {
@@ -3060,6 +3193,13 @@ bool MatchMonitor::start() {
     }
     LOG(LOG_LEVEL_INFO, "Base=%p GNames=%p numNames=%d GWorld=%p GUObjectArray=%p",
         (void*)m_moduleBase, (void*)m_gNames, m_numNames, (void*)m_gWorld, (void*)m_gUObjectArray);
+
+    // ── D 方案 (寄生执行) 自检 ──
+    // 此时 libUE4.so 已完全初始化, 可安全扫描 .text padding cave.
+    {
+        bool ok = ::selfTestParasite();
+        LOG(LOG_LEVEL_INFO, "[Parasite] selfTest=%d", (int)ok);
+    }
 
     // 验证 entry[0] == "None"
     std::string entry0 = getNameByIndex(0);

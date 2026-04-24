@@ -1463,7 +1463,12 @@ namespace android
 
         while (packetReaded < readSize)
         {
-            auto pollResult = poll(&pfd, 1, 1000); // Wait for 1s
+            // Wait up to 60s. Client 端调用前已经用 PollInputReady(0) 检查过 POLLIN,
+            // 不会真的等 60s; Server 端这边等下一个 packet, 1s 太短 — client 第一帧
+            // BeginFrame/EndFrame 需要 ~1.4s 完成 (ImGui 第一帧字体 atlas 上传等),
+            // 1s timeout 会让 server 在 client 写第一个 frame packet 前就 break+close,
+            // 引发 client 后续 WriteData broken pipe, 菜单永远绘不出来。
+            auto pollResult = poll(&pfd, 1, 60000);
             if (0 >= pollResult)
                 return pollResult;
 
