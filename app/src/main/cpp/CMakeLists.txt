@@ -111,6 +111,7 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
         "core/log/log.cpp"
         "core/file/file.cpp"
         "core/overlay/PublicOverlayRenderer.cpp"
+        "core/stealth/stealth_hooks.cpp"
 
         # ── memory (跨进程内存读取 + JNI) ──
         "memory/mem_reader.cpp"

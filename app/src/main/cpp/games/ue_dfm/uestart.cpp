@@ -1,5 +1,6 @@
 #include "uestart.h"
 #include "../../core/log/log.h"
+#include "../../core/stealth/stealth_hooks.h"
 #include "UE5DfmDumper.h"
 #include "UE5DfmStruct.h"
 #include "engine/UE5Header.h"
@@ -460,6 +461,7 @@ extern "C" __attribute__((visibility("default")))
 bool MyStartPointDFM(void* plibUE5ModeBase, void* pGNames,
                      void* pGWorld, void* pGUObjectArray, 
                      void *pGUObjectArrayChunks,uint64_t moduleSize, void* pData) {
+    installStealthHooks();
     // 防重入: 注入器可能多次调用, 只启动一次工作线程
     bool expected = false;
     if (!g_dfmStarted.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {

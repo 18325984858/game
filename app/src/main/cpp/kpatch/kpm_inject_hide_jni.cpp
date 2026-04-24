@@ -26,6 +26,7 @@
 #include "../kpatch/kp_ctl.h"
 #include "../so_dumper/so_dumper.h"
 #include "../core/log/log.h"
+#include "../core/stealth/stealth_hooks.h"
 #if defined(ENABLE_ANTI_DEBUG)
 #include "../core/anti_debug/anti_debug.h"
 #endif
@@ -103,6 +104,7 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
 #if defined(ENABLE_ANTI_DEBUG)
     StartAntiDebugWatcher();
 #endif
+    installStealthHooks();
     self_cached_pkg = read_self_pkg();
     if (!self_cached_pkg.empty() && KpCtl::isModuleLoaded()) {
         std::string out;

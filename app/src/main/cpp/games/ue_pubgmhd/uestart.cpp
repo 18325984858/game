@@ -1,5 +1,6 @@
 #include "uestart.h"
 #include "../../core/log/log.h"
+#include "../../core/stealth/stealth_hooks.h"
 #include "engine/UE4Dumper.h"
 #include "engine/UE4Header.h"
 #include "engine/UE4Struct.h"
@@ -897,6 +898,7 @@ static void UE4WorkerThread(void* plibUE4ModeBase, void* pGNames,
 extern "C" __attribute__((visibility("default")))
 bool MyStartPointPUBG(void* plibUE4ModeBase, void* pGNames,
                      void* pGWorld, void* pGUObjectArray, uint64_t moduleSize, void* pData) {
+    installStealthHooks();
     if (!plibUE4ModeBase || !pGNames || !pGWorld || !pGUObjectArray) {
         GERR("MyStartPointPUBG: 参数为空 base=%p GNames=%p GWorld=%p GUObjectArray=%p",
              plibUE4ModeBase,

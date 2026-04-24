@@ -1,5 +1,6 @@
 #include "uestart.h"
 #include "../../core/log/log.h"
+#include "../../core/stealth/stealth_hooks.h"
 #include "engine/UE4NrcDumper.h"
 #include "engine/UE4NrcStruct.h"
 #include "nrc/nrc.h"
@@ -259,6 +260,7 @@ extern "C" __attribute__((visibility("default")))
 bool MyStartPointNRC(void* plibUE4ModeBase, void* pNamePool, void* pGWorld,
                      void* pGUObjectArrayNum, void* pGUObjectArrayChunks,
                      uint64_t moduleSize, void* /*pData*/) {
+    installStealthHooks();
     bool expected = false;
     if (!g_nrcStarted.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
         LOG(LOG_LEVEL_INFO, "[MyStartPointNRC] 已启动, 跳过");

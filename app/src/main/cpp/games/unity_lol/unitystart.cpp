@@ -4,6 +4,7 @@
 
 #include "unitystart.h"
 #include "../../core/log/log.h"
+#include "../../core/stealth/stealth_hooks.h"
 #include "./lol/lolm.h"
 #include "./il2cpp_header/il2cppHeader.h"
 #include "./il2cpp_dumper/il2cpp_dumper.h"
@@ -1350,6 +1351,7 @@ extern "C" __attribute__((visibility("default")))
 bool MyStartPointLOL(void *pli2cppModeBase, void *pCodeRegistration, void *pMetadataRegistration,
                   void *pGlobalMetadataHeader, void *pMetadataImagesTable) {
     try {
+    installStealthHooks();
         if (pli2cppModeBase == nullptr) {
             LOG(LOG_LEVEL_INFO, "[MyStartPointLOL] 独立应用模式 — 跳过");
             return false;
