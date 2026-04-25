@@ -725,8 +725,45 @@ public class MainActivity extends AppCompatActivity {
         return false;
     }
 
+    private String runSuFirstLine(String cmd) {
+        try {
+            Process p = Runtime.getRuntime().exec("su");
+            DataOutputStream os = new DataOutputStream(p.getOutputStream());
+            os.writeBytes(cmd + "\n");
+            os.writeBytes("exit\n");
+            os.flush();
+            BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream()));
+            String line = reader.readLine();
+            p.waitFor();
+            if (line == null) return null;
+            line = line.trim();
+            return line.isEmpty() ? null : line;
+        } catch (Exception e) {
+            LogUtil.i("runSuFirstLine failed: " + e.getMessage());
+            return null;
+        }
+    }
+
+    private String resolvePackageNativeLibDir(String packageName) {
+        String dir = runSuFirstLine("dumpsys package " + packageName + " 2>/dev/null | sed -n 's/.*nativeLibraryDir=//p' | head -n 1");
+        if (dir != null && dir.startsWith("/")) return dir;
+
+        dir = runSuFirstLine("apk=$(pm path " + packageName + " 2>/dev/null | sed -n 's/package://p' | head -n 1); " +
+                "if [ -n \"$apk\" ]; then d=$(dirname \"$apk\")/lib/arm64; [ -d \"$d\" ] && echo \"$d\"; fi");
+        return (dir != null && dir.startsWith("/")) ? dir : null;
+    }
+
+    private String resolvePubgInjectSoPath() {
+        String path = runSuFirstLine("cat " + PUBG_INJECT_SO_PATH_FILE + " 2>/dev/null");
+        if (path != null && path.startsWith("/")) return path;
+        String dir = resolvePackageNativeLibDir(PUBG_PACKAGE);
+        if (dir == null || dir.isEmpty()) dir = "/data/data/" + PUBG_PACKAGE + "/files";
+        return dir + "/" + PUBG_INJECT_SO_NAME;
+    }
+
     public native String stringFromJNI();
     public native int injectSoToTarget(String packageName, String soPath);
+    public native String nativeKpmRawCtl(String cmd);
 
     /**
      * 校验 KernelPatch superkey：空串表示用 /data/local/tmp/.kp_key 等文件里的 key。
@@ -1381,6 +1418,8 @@ public class MainActivity extends AppCompatActivity {
     private static final String PUBG_PACKAGE = "com.tencent.tmgp.pubgmhd";
     private static final String PUBG_INJECTOR_TRACE = "/data/local/tmp/injector_trace.txt";
     private static final String PUBG_UE4_GUI_TRACE = "/data/data/" + PUBG_PACKAGE + "/cache/ue4_gui_trace.txt";
+    private static final String PUBG_INJECT_SO_NAME = "libpre.so";
+    private static final String PUBG_INJECT_SO_PATH_FILE = "/data/local/tmp/pubg_inject_so_path";
 
     // ═══════════════════════════════════════════════════════════════════
     //  三角洲 (Delta Force Mobile) 注入流程
@@ -1403,15 +1442,22 @@ public class MainActivity extends AppCompatActivity {
      */
     public void writeFiletoTargetPubg() {
         String srcFile = g_nativeLibPath + (g_nativeLibPath.endsWith("/") ? "" : "/") + "libdobbyproject.so";
-        String dstDir = "/data/data/" + PUBG_PACKAGE + "/files";
-        String dstFile = dstDir + "/libdobbyproject.so";
+        String dstDir = resolvePackageNativeLibDir(PUBG_PACKAGE);
+        if (dstDir == null || dstDir.isEmpty()) {
+            dstDir = "/data/data/" + PUBG_PACKAGE + "/files";
+        }
+        String dstFile = dstDir + "/" + PUBG_INJECT_SO_NAME;
 
         LogUtil.i("[PUBG] 源文件: " + srcFile);
         LogUtil.i("[PUBG] 拷贝 SO -> " + dstFile);
 
+        try { nativeKpmRawCtl("remove_hide_so:" + PUBG_INJECT_SO_NAME); } catch (Throwable ignored) {}
+
         String cmd = "mkdir -p " + dstDir + "\n" +
                 "cp -f " + srcFile + " " + dstFile + "\n" +
-                "chmod 777 " + dstFile + "\n" +
+                "chmod 755 " + dstFile + "\n" +
+                "chcon u:object_r:apk_data_file:s0 " + dstFile + " 2>/dev/null || true\n" +
+                "echo " + dstFile + " > " + PUBG_INJECT_SO_PATH_FILE + "\n" +
                 "sync\nexit\n";
 
         String[] suVariants = {"su -M", "su -mm", "su"};
@@ -1437,17 +1483,25 @@ public class MainActivity extends AppCompatActivity {
      * 启动和平精英并注入 (PUBG 模式)
      */
     public void launchAndInjectPubg(boolean enableUeDumper, boolean enableUeHeader, boolean enableLog) {
-        String soPath = "/data/data/" + PUBG_PACKAGE + "/files/libdobbyproject.so";
+        String soPath = resolvePubgInjectSoPath();
+        String soDir = soPath.substring(0, soPath.lastIndexOf('/'));
         String injectorDst = "/data/local/tmp/injector";
 
         new Thread(() -> {
             try {
+                try { nativeKpmRawCtl("remove_hide_so:" + PUBG_INJECT_SO_NAME); } catch (Throwable ignored) {}
+
                 // 1. 部署 injector
                 LogUtil.i("[PUBG] 部署 injector");
                 Process deployP = Runtime.getRuntime().exec("su");
                 DataOutputStream deployOs = new DataOutputStream(deployP.getOutputStream());
                 deployOs.writeBytes("cp -f " + g_nativeLibPath + "/libinjector.so " + injectorDst + "\n");
                 deployOs.writeBytes("chmod 755 " + injectorDst + "\n");
+                deployOs.writeBytes("mkdir -p " + soDir + "\n");
+                deployOs.writeBytes("cp -f " + g_nativeLibPath + "/libdobbyproject.so " + soPath + "\n");
+                deployOs.writeBytes("chmod 755 " + soPath + "\n");
+                deployOs.writeBytes("chcon u:object_r:apk_data_file:s0 " + soPath + " 2>/dev/null || true\n");
+                deployOs.writeBytes("echo " + soPath + " > " + PUBG_INJECT_SO_PATH_FILE + "\n");
                 deployOs.writeBytes("exit\n");
                 deployOs.flush();
                 deployP.waitFor();
@@ -1519,6 +1573,9 @@ public class MainActivity extends AppCompatActivity {
                 }
                 int exitCode = p.waitFor();
                 LogUtil.i("[PUBG] 注入完成, exitCode=" + exitCode);
+                if (exitCode == 0) {
+                    try { nativeKpmRawCtl("add_hide_so:" + PUBG_INJECT_SO_NAME); } catch (Throwable ignored) {}
+                }
 
                 runOnUiThread(() -> {
                     if (exitCode == 0) {

@@ -165,6 +165,14 @@ JNI_METHOD(jstring, nativeRawCtl)(JNIEnv* env, jobject, jstring jCmd) {
     return env->NewStringUTF(r.c_str());
 }
 
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_example_dobbyproject_MainActivity_nativeKpmRawCtl(JNIEnv* env, jobject, jstring jCmd) {
+    std::string out;
+    bool ok = KpCtl::rawCtl(jstr(env, jCmd), &out);
+    std::string r = (ok ? "OK: " : "FAIL: ") + out;
+    return env->NewStringUTF(r.c_str());
+}
+
 // ─── proc_hide (PID �? ──────────────────────────────────
 JNI_METHOD(jboolean, nativeEnableProcHide)(JNIEnv*, jobject) {
     return KpCtl::enableProcHide() ? JNI_TRUE : JNI_FALSE;

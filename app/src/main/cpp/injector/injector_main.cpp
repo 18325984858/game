@@ -8,6 +8,9 @@
 #include <cstring>
 
 int main(int argc, char* argv[]) {
+    setvbuf(stdout, nullptr, _IONBF, 0);
+    setvbuf(stderr, nullptr, _IONBF, 0);
+
     if (argc < 3) {
         fprintf(stderr, "用法: %s <package_name> <so_path> <lol|pubg|dfm>\n", argv[0]);
         fprintf(stderr, "  必须指定注入模式 (lol, pubg 或 dfm)\n");

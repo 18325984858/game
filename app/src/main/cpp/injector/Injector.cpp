@@ -62,6 +62,7 @@
 #include <unistd.h>
 #include <dirent.h>
 #include <dlfcn.h>
+#include <signal.h>
 #include <sys/ptrace.h>
 #include <sys/wait.h>
 #include <sys/mman.h>
@@ -142,6 +143,84 @@ static int ptrace_setregs(pid_t pid, const pt_regs_arch* regs) {
 #error "Unsupported architecture for Injector"
 #endif
 
+#ifndef __WALL
+#define __WALL 0x40000000
+#endif
+
+#ifndef PTRACE_SEIZE
+#define PTRACE_SEIZE 0x4206
+#endif
+
+#ifndef PTRACE_INTERRUPT
+#define PTRACE_INTERRUPT 0x4207
+#endif
+
+static int wait_for_trace_stop(pid_t pid, int* status, const char* stage, int timeoutMs) {
+    if (!status) return -1;
+    constexpr int kStepUs = 20 * 1000;
+    int waitedMs = 0;
+    *status = 0;
+
+    while (waitedMs <= timeoutMs) {
+        int ret = waitpid(-1, status, WUNTRACED | __WALL | WNOHANG);
+        if (ret > 0) {
+            if (ret != pid) {
+                LOG(LOG_LEVEL_WARN, "[Injector] %s wait got pid=%d, expect=%d status=0x%x",
+                    stage, ret, pid, *status);
+                continue;
+            }
+            if (WIFSTOPPED(*status)) {
+                LOG(LOG_LEVEL_INFO, "[Injector] %s wait stop ok sig=%d status=0x%x",
+                    stage, WSTOPSIG(*status), *status);
+                return 0;
+            }
+            LOG(LOG_LEVEL_ERROR, "[Injector] %s wait unexpected status=0x%x", stage, *status);
+            return -1;
+        }
+        if (ret < 0) {
+            if (errno == EINTR) continue;
+            LOG(LOG_LEVEL_ERROR, "[Injector] %s waitpid failed: %s", stage, strerror(errno));
+            return -1;
+        }
+        usleep(kStepUs);
+        waitedMs += kStepUs / 1000;
+    }
+
+    LOG(LOG_LEVEL_ERROR, "[Injector] %s wait timeout pid=%d timeout=%dms", stage, pid, timeoutMs);
+    return -1;
+}
+
+static int ptrace_attach_and_wait(pid_t pid, int* status) {
+    if (ptrace(PTRACE_ATTACH, pid, nullptr, nullptr) == 0) {
+        if (wait_for_trace_stop(pid, status, "attach", 8000) == 0) {
+            return 0;
+        }
+        LOG(LOG_LEVEL_ERROR, "[Injector] PTRACE_ATTACH 后等待目标停止失败, 尝试 detach pid=%d", pid);
+        ptrace(PTRACE_DETACH, pid, nullptr, nullptr);
+        usleep(50 * 1000);
+    } else {
+        LOG(LOG_LEVEL_ERROR, "[Injector] PTRACE_ATTACH 失败 (pid=%d): %s", pid, strerror(errno));
+    }
+
+    LOG(LOG_LEVEL_WARN, "[Injector] 尝试 PTRACE_SEIZE/PTRACE_INTERRUPT pid=%d", pid);
+    if (ptrace(PTRACE_SEIZE, pid, nullptr, nullptr) < 0) {
+        LOG(LOG_LEVEL_ERROR, "[Injector] PTRACE_SEIZE 失败 (pid=%d): %s", pid, strerror(errno));
+        return -1;
+    }
+    if (ptrace(PTRACE_INTERRUPT, pid, nullptr, nullptr) < 0) {
+        LOG(LOG_LEVEL_ERROR, "[Injector] PTRACE_INTERRUPT 失败 (pid=%d): %s", pid, strerror(errno));
+        ptrace(PTRACE_DETACH, pid, nullptr, nullptr);
+        return -1;
+    }
+    if (wait_for_trace_stop(pid, status, "seize", 8000) == 0) {
+        return 0;
+    }
+
+    LOG(LOG_LEVEL_ERROR, "[Injector] PTRACE_SEIZE 后等待目标停止失败, 尝试 detach pid=%d", pid);
+    ptrace(PTRACE_DETACH, pid, nullptr, nullptr);
+    return -1;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // 远程内存读写
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -186,6 +265,28 @@ static uint64_t ptrace_peekptr(pid_t pid, uint64_t addr) {
         return 0;
     }
     return val;
+}
+
+static bool ptrace_read_string(pid_t pid, uint64_t addr, char* out, size_t outSize) {
+    if (!out || outSize == 0 || addr == 0) return false;
+    size_t written = 0;
+    while (written + 1 < outSize) {
+        errno = 0;
+        uint64_t word = (uint64_t)ptrace(PTRACE_PEEKDATA, pid, (void*)(addr + written), nullptr);
+        if (errno != 0) {
+            LOG(LOG_LEVEL_ERROR, "[Injector] PEEKDATA string failed at %llx: %s",
+                (unsigned long long)(addr + written), strerror(errno));
+            break;
+        }
+
+        for (size_t i = 0; i < sizeof(word) && written + 1 < outSize; ++i) {
+            char ch = (char)((word >> (i * 8)) & 0xff);
+            out[written++] = ch;
+            if (ch == '\0') return true;
+        }
+    }
+    out[outSize - 1] = '\0';
+    return written > 0;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -397,7 +498,9 @@ static int ptrace_call(pid_t pid, uint64_t funcAddr, uint64_t* params, int param
 
     // 等待目标进程停止 (返回地址 0 触发 SIGSEGV)
     int status = 0;
-    waitpid(pid, &status, WUNTRACED);
+    if (wait_for_trace_stop(pid, &status, "remote-call", 10000) < 0) {
+        return -1;
+    }
 
     if (WIFSTOPPED(status)) {
         if (ptrace_getregs(pid, &regs) < 0) {
@@ -430,13 +533,10 @@ int Injector::injectRemote(pid_t pid, const char* soPath, InjectMode mode) {
         mode == MODE_PUBG ? "PUBG" : (mode == MODE_DFM ? "DFM" : (mode == MODE_NRC ? "NRC" : "LOL")));
 
     // ── 1. Attach 到目标进程 ──
-    if (ptrace(PTRACE_ATTACH, pid, nullptr, nullptr) < 0) {
-        LOG(LOG_LEVEL_ERROR, "[Injector] PTRACE_ATTACH 失败 (pid=%d): %s", pid, strerror(errno));
+    int status = 0;
+    if (ptrace_attach_and_wait(pid, &status) < 0) {
         return -1;
     }
-
-    int status = 0;
-    waitpid(pid, &status, WUNTRACED);
     LOG(LOG_LEVEL_INFO, "[Injector] 已附加到进程 %d", pid);
 
     // ── 2. 保存原始寄存器 ──
@@ -516,6 +616,12 @@ int Injector::injectRemote(pid_t pid, const char* soPath, InjectMode mode) {
                 uint64_t errStrAddr = 0;
                 ptrace_call(pid, remoteDlerrorAddr, nullptr, 0, &errStrAddr);
                 LOG(LOG_LEVEL_ERROR, "[Injector] dlerror 地址: %llx", (unsigned long long)errStrAddr);
+                char errBuf[512] = {0};
+                if (ptrace_read_string(pid, errStrAddr, errBuf, sizeof(errBuf)) && errBuf[0] != '\0') {
+                    LOG(LOG_LEVEL_ERROR, "[Injector] dlerror: %s", errBuf);
+                } else {
+                    LOG(LOG_LEVEL_ERROR, "[Injector] dlerror 内容为空或读取失败");
+                }
             }
             goto detach;
         }
