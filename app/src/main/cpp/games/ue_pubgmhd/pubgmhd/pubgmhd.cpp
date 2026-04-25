@@ -3194,12 +3194,12 @@ bool MatchMonitor::start() {
     LOG(LOG_LEVEL_INFO, "Base=%p GNames=%p numNames=%d GWorld=%p GUObjectArray=%p",
         (void*)m_moduleBase, (void*)m_gNames, m_numNames, (void*)m_gWorld, (void*)m_gUObjectArray);
 
-    // ── D 方案 (寄生执行) 自检 ──
-    // 此时 libUE4.so 已完全初始化, 可安全扫描 .text padding cave.
-    {
-        bool ok = ::selfTestParasite();
-        LOG(LOG_LEVEL_INFO, "[Parasite] selfTest=%d", (int)ok);
-    }
+    // ── D 方案 (寄生执行) 自检 — 已停用 ──
+    // 用户要求停掉 parasite 接入. 如需重新启用, 取消下方注释即可.
+    // {
+    //     bool ok = ::selfTestParasite();
+    //     LOG(LOG_LEVEL_INFO, "[Parasite] selfTest=%d", (int)ok);
+    // }
 
     // 验证 entry[0] == "None"
     std::string entry0 = getNameByIndex(0);
