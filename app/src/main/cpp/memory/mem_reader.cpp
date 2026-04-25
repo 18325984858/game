@@ -346,6 +346,22 @@ private:
     RootShell() { spawnLocked(); }
 };
 
+static bool readMapsViaOneShotSu(int pid, std::string& out) {
+    out.clear();
+    if (pid <= 0) return false;
+    char cmd[160];
+    snprintf(cmd, sizeof(cmd),
+             "timeout 6 su -c 'cat /proc/%d/maps 2>/dev/null' 2>/dev/null",
+             pid);
+    FILE* fp = popen(cmd, "r");
+    if (!fp) return false;
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) out.append(buf, n);
+    int rc = pclose(fp);
+    return rc >= 0 && !out.empty();
+}
+
 /**
  * 持久化跨进程内存读 daemon 客户端: 负责跟 libpvrhelper.so 经 root su
  * 启动并保持的 stdin/stdout pipe 通信.
@@ -945,12 +961,20 @@ bool readMaps(int pid, std::string& out) {
         pid, P.mapsTmp.c_str());
     if (!RootShell::I().exec(cmd)) {
         LOG(LOG_LEVEL_WARN, RTAG " readMaps: RootShell exec 失败 pid=%d", pid);
+        if (readMapsViaOneShotSu(pid, out)) {
+            LOG(LOG_LEVEL_WARN, RTAG " readMaps: fallback one-shot su 成功 pid=%d bytes=%zu", pid, out.size());
+            return true;
+        }
         return false;
     }
 
     FILE* fp = fopen(P.mapsTmp.c_str(), "r");
     if (!fp) {
         LOG(LOG_LEVEL_WARN, RTAG " readMaps: fopen tmp 失败 pid=%d errno=%d", pid, errno);
+        if (readMapsViaOneShotSu(pid, out)) {
+            LOG(LOG_LEVEL_WARN, RTAG " readMaps: fallback one-shot su 成功 pid=%d bytes=%zu", pid, out.size());
+            return true;
+        }
         return false;
     }
     char buf[4096];
@@ -961,6 +985,10 @@ bool readMaps(int pid, std::string& out) {
     fclose(fp);
     if (out.empty()) {
         LOG(LOG_LEVEL_WARN, RTAG " readMaps: maps 为空 pid=%d (进程可能已退出或无权限)", pid);
+        if (readMapsViaOneShotSu(pid, out)) {
+            LOG(LOG_LEVEL_WARN, RTAG " readMaps: fallback one-shot su 成功 pid=%d bytes=%zu", pid, out.size());
+            return true;
+        }
         return false;
     }
     return true;
