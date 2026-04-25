@@ -79,23 +79,20 @@ static bool fuzzyMatch(const std::string& packageName, const std::string& filter
     return lower_pkg.find(lower_filter) != std::string::npos;
 }
 
-// ─── 进程枚举 (通过 su 以 root 身份读取所有进程) ────────────────────
+static bool popenCapture(const char* cmd, std::string& out) {
+    out.clear();
+    FILE* fp = popen(cmd, "r");
+    if (!fp) return false;
+    char buf[4096];
+    while (fgets(buf, sizeof(buf), fp)) out += buf;
+    int rc = pclose(fp);
+    return rc >= 0 && !out.empty();
+}
 
-std::vector<ProcessInfo> listRunningApps(const std::string& filter) {
-    std::vector<ProcessInfo> result;
-    std::set<std::string> seen;
-
-    // 不再 popen("su -c ps -A"): 复用 MemReader 已启动的持久 root shell
-    // (避免反复用拉 su 子进程, 减少游戏反作弊对
-    // "同设备出现多个 su 调用者" 的打分).
-    std::string psOut;
-    if (!MemReader::runRootShellCapture(
-            "ps -A 2>/dev/null || ps -e 2>/dev/null || ps 2>/dev/null",
-            psOut)) {
-        LOG(LOG_LEVEL_ERROR, DTAG " runRootShellCapture(ps) 失败");
-        return result;
-    }
-
+static void parsePsOutput(const std::string& psOut,
+                          const std::string& filter,
+                          std::vector<ProcessInfo>& result,
+                          std::set<std::string>& seen) {
     char line[1024];
     bool firstLine = true;
     size_t linePos = 0;
@@ -109,8 +106,6 @@ std::vector<ProcessInfo> listRunningApps(const std::string& filter) {
         strncpy(line, lineStr.c_str(), sizeof(line) - 1);
         line[sizeof(line) - 1] = '\0';
 
-        // ps 输出格式: USER PID PPID VSZ RSS WCHAN ADDR S NAME
-        // PID 始终为第2列, NAME 始终为最后一列
         std::vector<const char*> tokens;
         char* tok = strtok(line, " \t\n\r");
         while (tok) {
@@ -120,15 +115,14 @@ std::vector<ProcessInfo> listRunningApps(const std::string& filter) {
 
         if (tokens.size() < 2) continue;
 
-        int pid = atoi(tokens[1]);        // 第2列 = PID
-        const char* name = tokens.back(); // 最后一列 = NAME
+        int pid = atoi(tokens[1]);
+        const char* name = tokens.back();
 
         if (pid <= 0) continue;
 
         std::string cmdline(name);
         if (!isAppProcess(cmdline)) continue;
 
-        // 同包名可能存在多个子进程, 不能简单折叠成 baseName, 否则容易选错 PID。
         std::string baseName = cmdline;
         size_t colonPos = baseName.find(':');
         if (colonPos != std::string::npos) {
@@ -145,6 +139,46 @@ std::vector<ProcessInfo> listRunningApps(const std::string& filter) {
         info.pid = pid;
         info.packageName = cmdline;
         result.push_back(info);
+    }
+}
+
+// ─── 进程枚举 (通过 su 以 root 身份读取所有进程) ────────────────────
+
+std::vector<ProcessInfo> listRunningApps(const std::string& filter) {
+    std::vector<ProcessInfo> result;
+    std::set<std::string> seen;
+
+    // 不再 popen("su -c ps -A"): 复用 MemReader 已启动的持久 root shell
+    // (避免反复用拉 su 子进程, 减少游戏反作弊对
+    // "同设备出现多个 su 调用者" 的打分).
+    const char* psCmd = "ps -A 2>/dev/null || ps -e 2>/dev/null || ps 2>/dev/null";
+    std::string psOut;
+    if (!MemReader::runRootShellCapture(psCmd, psOut) || psOut.empty()) {
+        LOG(LOG_LEVEL_WARN, DTAG " runRootShellCapture(ps) 失败或为空, fallback local ps");
+        if (!popenCapture(psCmd, psOut)) {
+            LOG(LOG_LEVEL_WARN, DTAG " local ps 失败或为空, fallback one-shot su ps");
+            popenCapture("timeout 2 su -c 'ps -A 2>/dev/null || ps -e 2>/dev/null || ps 2>/dev/null' 2>/dev/null", psOut);
+        }
+    }
+    if (psOut.empty()) {
+        LOG(LOG_LEVEL_ERROR, DTAG " 所有 ps 枚举方式均失败");
+        return result;
+    }
+
+    parsePsOutput(psOut, filter, result, seen);
+    if (result.empty()) {
+        std::string localPsOut;
+        if (popenCapture(psCmd, localPsOut)) {
+            LOG(LOG_LEVEL_WARN, DTAG " root ps 解析为 0, retry local ps");
+            parsePsOutput(localPsOut, filter, result, seen);
+        }
+    }
+    if (result.empty()) {
+        std::string suPsOut;
+        if (popenCapture("timeout 2 su -c 'ps -A 2>/dev/null || ps -e 2>/dev/null || ps 2>/dev/null' 2>/dev/null", suPsOut)) {
+            LOG(LOG_LEVEL_WARN, DTAG " local ps 解析为 0, retry one-shot su ps");
+            parsePsOutput(suPsOut, filter, result, seen);
+        }
     }
 
     std::sort(result.begin(), result.end(),
