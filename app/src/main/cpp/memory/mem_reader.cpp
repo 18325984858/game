@@ -362,6 +362,46 @@ static bool readMapsViaOneShotSu(int pid, std::string& out) {
     return rc >= 0 && !out.empty();
 }
 
+static ssize_t readProcMemViaOneShotSu(int pid, uintptr_t addr, size_t size,
+                                       std::vector<uint8_t>& out) {
+    out.clear();
+    if (pid <= 0 || size == 0) return -1;
+    if (size > 1024 * 1024) size = 1024 * 1024;
+
+    const size_t PAGE = 4096;
+    char cmd[256];
+    if ((addr & (PAGE - 1)) == 0 && (size & (PAGE - 1)) == 0) {
+        snprintf(cmd, sizeof(cmd),
+                 "timeout 8 su -c '/system/bin/dd if=/proc/%d/mem bs=4096 skip=%zu count=%zu 2>/dev/null' 2>/dev/null",
+                 pid, (size_t)(addr / PAGE), size / PAGE);
+    } else {
+        snprintf(cmd, sizeof(cmd),
+                 "timeout 8 su -c '/system/bin/dd if=/proc/%d/mem bs=1 skip=%zu count=%zu 2>/dev/null' 2>/dev/null",
+                 pid, (size_t)addr, size);
+    }
+
+    FILE* fp = popen(cmd, "r");
+    if (!fp) return -1;
+    out.resize(size);
+    size_t total = 0;
+    while (total < size) {
+        size_t n = fread(out.data() + total, 1, size - total, fp);
+        if (n > 0) {
+            total += n;
+            continue;
+        }
+        if (feof(fp)) break;
+        if (ferror(fp)) break;
+    }
+    int rc = pclose(fp);
+    if (total == 0) {
+        out.clear();
+        return rc >= 0 ? 0 : -1;
+    }
+    out.resize(total);
+    return (ssize_t)total;
+}
+
 /**
  * 持久化跨进程内存读 daemon 客户端: 负责跟 libpvrhelper.so 经 root su
  * 启动并保持的 stdin/stdout pipe 通信.
@@ -766,6 +806,9 @@ bool runRootShellCapture(const std::string& cmd, std::string& out) {
     return true;
 }
 
+ssize_t readMemoryViaProcMem(int pid, uintptr_t address, size_t size,
+                             std::vector<uint8_t>& out);
+
 ssize_t readMemory(int pid, uintptr_t address, size_t size,
                    std::vector<uint8_t>& out) {
     out.clear();
@@ -805,6 +848,14 @@ ssize_t readMemory(int pid, uintptr_t address, size_t size,
     }
 
     if (totalGot == 0) {
+        std::vector<uint8_t> fallback;
+        ssize_t fallbackGot = readMemoryViaProcMem(pid, realAddr, size, fallback);
+        if (fallbackGot > 0) {
+            out.swap(fallback);
+            LOG(LOG_LEVEL_WARN, RTAG " readMemory helper 失败, fallback /proc/mem 成功 pid=%d addr=0x%zx size=%zu got=%zd",
+                pid, (size_t)realAddr, size, fallbackGot);
+            return fallbackGot;
+        }
         out.clear();
         LOG(LOG_LEVEL_WARN, RTAG " 读取失败: pid=%d addr=0x%zx->0x%zx size=%zu",
             pid, (size_t)address, (size_t)realAddr, size);
@@ -902,6 +953,17 @@ ssize_t readMemoryViaProcMem(int pid, uintptr_t address, size_t size,
         } else {
             LOG(LOG_LEVEL_WARN, RTAG " readMemoryViaProcMem dd 命令失败 addr=0x%zx",
                 (size_t)curAddr);
+        }
+
+        if (r != want) {
+            std::vector<uint8_t> oneShot;
+            ssize_t got = readProcMemViaOneShotSu(pid, curAddr, want, oneShot);
+            if (got > 0) {
+                memcpy(out.data() + totalGot, oneShot.data(), (size_t)got);
+                r = (size_t)got;
+                LOG(LOG_LEVEL_WARN, RTAG " readMemoryViaProcMem fallback one-shot su 成功 pid=%d addr=0x%zx want=%zu got=%zu",
+                    pid, (size_t)curAddr, want, r);
+            }
         }
 
         if (r == want) {

@@ -357,6 +357,19 @@ static bool hasElfMagicAt(int pid, uintptr_t addr) {
     return got == sizeof(magic) && memcmp(magic, ELFMAG, SELFMAG) == 0;
 }
 
+static size_t readFileBytes(const std::string& path, size_t offset, size_t size, uint8_t* dst) {
+    if (path.empty() || path[0] != '/' || !dst || size == 0) return 0;
+    FILE* fp = fopen(path.c_str(), "rb");
+    if (!fp) return 0;
+    if (fseeko(fp, (off_t)offset, SEEK_SET) != 0) {
+        fclose(fp);
+        return 0;
+    }
+    size_t got = fread(dst, 1, size, fp);
+    fclose(fp);
+    return got;
+}
+
 static uintptr_t resolveElfBaseFromMaps(int pid, const ModuleInfo& module) {
     std::vector<uintptr_t> candidates;
     auto addCandidate = [&](uintptr_t addr) {
@@ -426,13 +439,22 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath,
                         module.perms.c_str(),
                         module.size);
 
+    bool headerFromFile = false;
     uintptr_t baseAddr = resolveElfBaseFromMaps(pid, module);
     if (baseAddr == 0) {
-        LOG(LOG_LEVEL_ERROR, DTAG " 无法定位有效 ELF 基址: map_base=0x%lx off=0x%lx path=%s",
-                            (unsigned long)module.baseAddr,
-                            (unsigned long)module.fileOffset,
-                            module.path.c_str());
-        return -2;
+        if (!module.path.empty() && module.path[0] == '/' &&
+            module.fileOffset <= module.baseAddr) {
+            baseAddr = module.baseAddr - module.fileOffset;
+            headerFromFile = true;
+            LOG(LOG_LEVEL_WARN, DTAG " 内存 ELF 头不可用, 使用磁盘 ELF 头解析: base=0x%lx path=%s",
+                (unsigned long)baseAddr, module.path.c_str());
+        } else {
+            LOG(LOG_LEVEL_ERROR, DTAG " 无法定位有效 ELF 基址: map_base=0x%lx off=0x%lx path=%s",
+                                (unsigned long)module.baseAddr,
+                                (unsigned long)module.fileOffset,
+                                module.path.c_str());
+            return -2;
+        }
     }
 
     LOG(LOG_LEVEL_INFO, DTAG " 最终使用 ELF 基址: 0x%lx",
@@ -448,7 +470,9 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath,
     if (!headerBuf) return -3;
     memset(headerBuf, 0, headerReadSize);
 
-    size_t headerGot = readProcessMemory(pid, baseAddr, headerReadSize, headerBuf);
+    size_t headerGot = headerFromFile
+            ? readFileBytes(module.path, 0, headerReadSize, headerBuf)
+            : readProcessMemory(pid, baseAddr, headerReadSize, headerBuf);
     if (headerGot < sizeof(Elf64_Ehdr)) {
         LOG(LOG_LEVEL_ERROR, DTAG " 读取 ELF 头失败, got=%zu", headerGot);
         delete[] headerBuf;
@@ -491,8 +515,10 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath,
             headerReadSize = phdrEnd;
             // 读取剩余部分
             if (phdrEnd > headerGot) {
-                size_t extra = readProcessMemory(pid, baseAddr + headerGot, phdrEnd - headerGot,
-                                                 headerBuf + headerGot);
+                size_t extra = headerFromFile
+                        ? readFileBytes(module.path, headerGot, phdrEnd - headerGot, headerBuf + headerGot)
+                        : readProcessMemory(pid, baseAddr + headerGot, phdrEnd - headerGot,
+                                            headerBuf + headerGot);
                 headerGot += extra;
             }
             ehdr = reinterpret_cast<Elf64_Ehdr*>(headerBuf);
@@ -530,8 +556,10 @@ int dumpAndFixSo(int pid, const ModuleInfo& module, const std::string& outPath,
             headerBuf = newBuf;
             headerReadSize = phdrEnd;
             if (phdrEnd > headerGot) {
-                size_t extra = readProcessMemory(pid, baseAddr + headerGot, phdrEnd - headerGot,
-                                                 headerBuf + headerGot);
+                size_t extra = headerFromFile
+                        ? readFileBytes(module.path, headerGot, phdrEnd - headerGot, headerBuf + headerGot)
+                        : readProcessMemory(pid, baseAddr + headerGot, phdrEnd - headerGot,
+                                            headerBuf + headerGot);
                 headerGot += extra;
             }
             ehdr = reinterpret_cast<Elf32_Ehdr*>(headerBuf);
