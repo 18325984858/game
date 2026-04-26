@@ -23,6 +23,8 @@ extern "C" bool selfTestParasite();
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <unordered_set>
+#include <mutex>
 
 namespace pubgmhd {
 
@@ -827,6 +829,30 @@ bool MatchMonitor::initOffsets() {
     RESOLVE_OFFSET_MULTI(m_off.Char_CurWeapon,           "CurEquipWeapon",             "STExtraBaseCharacter", "STExtraCharacter", "UAECharacter");
     RESOLVE_OFFSET_MULTI(m_off.Weapon_BulletTrackComp,   "CachedBulletTrackComponent", "STExtraShootWeapon", "STExtraWeapon");
 
+    // PickUpWrapperActor — 地面物资 (DefineID/Count/bHasBeenPickedUp)
+    RESOLVE_OFFSET_MULTI(m_off.PickUp_DefineID,         "DefineID",          "PickUpWrapperActor");
+    RESOLVE_OFFSET_MULTI(m_off.PickUp_Count,            "Count",             "PickUpWrapperActor");
+    RESOLVE_OFFSET_MULTI(m_off.PickUp_bHasBeenPickedUp, "bHasBeenPickedUp",  "PickUpWrapperActor");
+    RESOLVE_OFFSET_MULTI(m_off.PickUp_bIsInBox,         "bIsInBox",          "PickUpWrapperActor");
+    if (m_off.PickUp_DefineID < 0)         m_off.PickUp_DefineID = 0x6F0;
+    if (m_off.PickUp_Count < 0)            m_off.PickUp_Count = 0x708;
+    if (m_off.PickUp_bHasBeenPickedUp < 0) m_off.PickUp_bHasBeenPickedUp = 0x70C;
+    if (m_off.PickUp_bIsInBox < 0)         m_off.PickUp_bIsInBox = 0x70E;
+
+    // STExtraVehicleBase — 载具
+    RESOLVE_OFFSET_MULTI(m_off.Vehicle_VehicleType,        "VehicleType",        "STExtraVehicleBase");
+    RESOLVE_OFFSET_MULTI(m_off.Vehicle_VehicleHealthState, "VehicleHealthState", "STExtraVehicleBase");
+    RESOLVE_OFFSET_MULTI(m_off.Vehicle_TeamID,             "TeamID",             "STExtraVehicleBase");
+    RESOLVE_OFFSET_MULTI(m_off.Vehicle_Fuel,               "CommonComponent_Fuel","STExtraVehicleBase");
+    if (m_off.Vehicle_VehicleType < 0)        m_off.Vehicle_VehicleType = 0x7AE;
+    if (m_off.Vehicle_VehicleHealthState < 0) m_off.Vehicle_VehicleHealthState = 0xB84;
+    if (m_off.Vehicle_TeamID < 0)             m_off.Vehicle_TeamID = 0x1594;
+    if (m_off.Vehicle_Fuel < 0)               m_off.Vehicle_Fuel = 0x3374;
+
+    // PickUpListWrapperActor.PickUpDataList @ 0xD98 (TArray<PickUpItemData>, stride 0x38)
+    RESOLVE_OFFSET_MULTI(m_off.PickUpList_DataList, "PickUpDataList", "PickUpListWrapperActor");
+    if (m_off.PickUpList_DataList < 0) m_off.PickUpList_DataList = 0xD98;
+
     LOG(LOG_LEVEL_INFO, "[InitOffsets] 解析完成, isValid=%d", m_off.isValid());
     LOG(LOG_LEVEL_INFO, "[InitOffsets] World.GameState=0x%X GS.PlayerArray=0x%X PS.PlayerKey=0x%X",
         m_off.World_GameState, m_off.GS_PlayerArray, m_off.PS_PlayerKey);
@@ -1295,8 +1321,10 @@ bool MatchMonitor::resolveTrackedBoneIndices(uintptr_t skeletalMeshAssetPtr, Bon
         }
     }
 
-    // 方法1: SkeletalMesh+0x238 FReferenceSkeleton (全身骨骼, stride=16)
-    constexpr uintptr_t kRefBoneInfoOffset = 0x238;
+    // 方法1: SkeletalMesh+0x220 FReferenceSkeleton.RawRefBoneInfo
+    //   ※ 此 build (PUBGm HD) 该字段实际位于 0x220, dump.cs 显示的 0x238 是离线 padding 差异;
+    //     运行时 [SkelScan] 多资产一致命中 0x220 (num=61~68, stride=16, FName@+0)。
+    constexpr uintptr_t kRefBoneInfoOffset = 0x220;
     const uintptr_t boneInfoData = safeReadPtr(skeletalMeshAssetPtr + kRefBoneInfoOffset);
     const int32_t boneInfoNum = safeReadS32(skeletalMeshAssetPtr + kRefBoneInfoOffset + 8);
     if (boneInfoData >= 0x10000 && boneInfoNum > 0 && boneInfoNum <= kMaxBoneNameCount) {
@@ -1329,6 +1357,146 @@ bool MatchMonitor::resolveTrackedBoneIndices(uintptr_t skeletalMeshAssetPtr, Bon
 
     m_boneAssetCache[skeletalMeshAssetPtr] = entry;
     outEntry = entry;
+
+    // 当 matchedCount 很低时, dump 该资产前 25 个原始骨骼名, 用于扩展别名表.
+    // 每个资产指针只 dump 一次 (静态 set 去重, 上限 32 条).
+    if (entry.matchedCount < kMinRenderableBoneMatches) {
+        static std::unordered_set<uintptr_t> s_dumpedAssets;
+        static std::mutex s_dumpMutex;
+        bool firstTime = false;
+        {
+            std::lock_guard<std::mutex> g(s_dumpMutex);
+            if (s_dumpedAssets.size() < 32 && s_dumpedAssets.insert(skeletalMeshAssetPtr).second) {
+                firstTime = true;
+            }
+        }
+        if (firstTime) {
+            // ---- 诊断: 把每个候选偏移的原始 (Data, Num) 都打印出来 ----
+            // SkeletalMesh.RefBoneNames @0x3E8
+            ue4::TArray<ue4::FName> rawSkMeshRBN{};
+            safeReadMemory(skeletalMeshAssetPtr + (skMeshRefBoneNamesOff >= 0 ? skMeshRefBoneNamesOff : 0x3E8),
+                           &rawSkMeshRBN, sizeof(rawSkMeshRBN));
+            // SkeletalMesh→Skeleton @0x48 → Skeleton.RefBoneNames @0x2D0
+            const uintptr_t skeletonDbg = safeReadPtr(skeletalMeshAssetPtr + skelOff);
+            ue4::TArray<ue4::FName> rawSkelRBN{};
+            if (skeletonDbg >= 0x10000)
+                safeReadMemory(skeletonDbg + refOff, &rawSkelRBN, sizeof(rawSkelRBN));
+            // FReferenceSkeleton.RawRefBoneInfo @0x220 (PUBGm HD 实测)
+            const uintptr_t rawBIData = safeReadPtr(skeletalMeshAssetPtr + 0x220);
+            const int32_t  rawBINum  = safeReadS32(skeletalMeshAssetPtr + 0x220 + 8);
+
+            char dbg[384];
+            snprintf(dbg, sizeof(dbg),
+                "[BoneDump] asset=%p cls=%s  off3E8(num=%d data=%p max=%d)  skel=%p off2D0(num=%d data=%p max=%d)  off220(num=%d data=%p)",
+                (void*)skeletalMeshAssetPtr, readObjName(safeReadPtr(skeletalMeshAssetPtr)).c_str(),
+                rawSkMeshRBN.Num, rawSkMeshRBN.Data, rawSkMeshRBN.Max,
+                (void*)skeletonDbg,
+                rawSkelRBN.Num, rawSkelRBN.Data, rawSkelRBN.Max,
+                rawBINum, (void*)rawBIData);
+            writeSkeletonLog(dbg);
+
+            // ---- 关键扫描: 找到该资产里哪个 8B 槽是真正的 USkeleton 指针 ----
+            // 标准: 该指针 +0x2D0 上有 TArray<FName> RefBoneNames, Num 在 [40,300] 且 Data 是 heap.
+            // 也尝试 +0x238 (FReferenceSkeleton.RawRefBoneInfo, stride 16) 的合理 Num.
+            uint8_t buf[0x800];
+            if (safeReadMemory(skeletalMeshAssetPtr, buf, sizeof(buf))) {
+                std::string scanLine;
+                int scanHits = 0;
+                for (int off = 0x40; off + 8 <= (int)sizeof(buf); off += 8) {
+                    uint64_t cand;
+                    memcpy(&cand, buf + off, 8);
+                    if (cand < 0x10000ULL || cand > 0x7fffffffffffULL) continue;
+                    // 试 +0x2D0 RefBoneNames
+                    ue4::TArray<ue4::FName> rbn{};
+                    if (safeReadMemory(cand + 0x2D0, &rbn, sizeof(rbn))
+                        && rbn.Num >= 40 && rbn.Num <= 300 && rbn.Max >= rbn.Num
+                        && reinterpret_cast<uintptr_t>(rbn.Data) >= 0x10000) {
+                        char tmp[80];
+                        snprintf(tmp, sizeof(tmp), " off=0x%X->skel=%p num2D0=%d", off, (void*)cand, rbn.Num);
+                        scanLine += tmp;
+                        if (++scanHits >= 6) break;
+                    }
+                }
+                if (!scanLine.empty()) {
+                    char hdr[64];
+                    snprintf(hdr, sizeof(hdr), "[SkelScan] asset=%p hits:", (void*)skeletalMeshAssetPtr);
+                    writeSkeletonLog((std::string(hdr) + scanLine).c_str());
+                }
+                // 同时扫资产自身 +0x100..+0x500 上是否直接挂着合理的 RawRefBoneInfo (stride 16)
+                std::string riLine;
+                int riHits = 0;
+                for (int off = 0x100; off + 16 <= (int)sizeof(buf); off += 8) {
+                    uint64_t data; int32_t num;
+                    memcpy(&data, buf + off, 8);
+                    memcpy(&num, buf + off + 8, 4);
+                    if (data < 0x10000ULL || data > 0x7fffffffffffULL) continue;
+                    if (num < 40 || num > 300) continue;
+                    // 验证 +0 处是合理 FName (ComparisonIndex 在 m_numNames 范围)
+                    ue4::FName fn{};
+                    if (!safeReadMemory(data, &fn, sizeof(fn))) continue;
+                    if (fn.ComparisonIndex <= 0 || fn.ComparisonIndex >= m_numNames) continue;
+                    char tmp[80];
+                    snprintf(tmp, sizeof(tmp), " off=0x%X(num=%d data=%p fn0=%d)", off, num, (void*)data, fn.ComparisonIndex);
+                    riLine += tmp;
+                    if (++riHits >= 4) break;
+                }
+                if (!riLine.empty()) {
+                    char hdr[64];
+                    snprintf(hdr, sizeof(hdr), "[SkelScan] asset=%p arrayHits:", (void*)skeletalMeshAssetPtr);
+                    writeSkeletonLog((std::string(hdr) + riLine).c_str());
+                }
+            }
+
+            // 选取最大 transformsCount 的来源做 dump (优先 RefBoneNames)
+            ue4::TArray<ue4::FName> dumpArr{};
+            uintptr_t arrPtr = 0; int arrCount = 0;
+            if (skMeshRefBoneNamesOff >= 0
+                && safeReadMemory(skeletalMeshAssetPtr + skMeshRefBoneNamesOff, &dumpArr, sizeof(dumpArr))
+                && isUsableRemoteArray(dumpArr, kMaxBoneNameCount)) {
+                arrPtr = reinterpret_cast<uintptr_t>(dumpArr.Data);
+                arrCount = dumpArr.Num;
+            } else if (skeletonDbg >= 0x10000
+                       && isUsableRemoteArray(rawSkelRBN, kMaxBoneNameCount)) {
+                arrPtr = reinterpret_cast<uintptr_t>(rawSkelRBN.Data);
+                arrCount = rawSkelRBN.Num;
+            } else if (rawBIData >= 0x10000 && rawBINum > 0 && rawBINum < 1024) {
+                // FMeshBoneInfo: FName 在 +0, stride 16  (仅在 Num 看起来合理时才尝试)
+                char header[128];
+                snprintf(header, sizeof(header), "[BoneDump] asset=%p (BoneInfo@0x220) names follow (n=%d):",
+                         (void*)skeletalMeshAssetPtr, rawBINum);
+                writeSkeletonLog(header);
+                int dumpN = rawBINum > 25 ? 25 : rawBINum;
+                std::string line = "  ";
+                for (int i = 0; i < dumpN; ++i) {
+                    ue4::FName bn{};
+                    if (!safeReadMemory(rawBIData + static_cast<uintptr_t>(i) * 16, &bn, sizeof(bn))) break;
+                    if (bn.ComparisonIndex < 0 || bn.ComparisonIndex >= m_numNames) continue;
+                    line += getNameByIndex(bn.ComparisonIndex);
+                    line += "|";
+                    if (line.size() > 200) { writeSkeletonLog(line.c_str()); line = "  "; }
+                }
+                if (line.size() > 2) writeSkeletonLog(line.c_str());
+            }
+            if (arrPtr) {
+                char header[128];
+                snprintf(header, sizeof(header), "[BoneDump] asset=%p (RefBoneNames) names follow (n=%d):",
+                         (void*)skeletalMeshAssetPtr, arrCount);
+                writeSkeletonLog(header);
+                int dumpN = arrCount > 25 ? 25 : arrCount;
+                std::string line = "  ";
+                for (int i = 0; i < dumpN; ++i) {
+                    ue4::FName bn{};
+                    if (!safeReadMemory(arrPtr + static_cast<uintptr_t>(i) * sizeof(ue4::FName), &bn, sizeof(bn))) break;
+                    if (bn.ComparisonIndex < 0 || bn.ComparisonIndex >= m_numNames) continue;
+                    line += getNameByIndex(bn.ComparisonIndex);
+                    line += "|";
+                    if (line.size() > 200) { writeSkeletonLog(line.c_str()); line = "  "; }
+                }
+                if (line.size() > 2) writeSkeletonLog(line.c_str());
+            }
+        }
+    }
+
     return entry.matchedCount > 0;
 }
 
@@ -1485,7 +1653,33 @@ bool MatchMonitor::fillPlayerSkeleton(uintptr_t characterPtr, ue4draw::DrawPlaye
             tryAdd(safeReadPtr(fppAvatar + oMasterB));
     }
 
-    if (candidates.empty()) return false;
+    // (4. 已移除暴力扫描: 每帧每玩家发 ~200 次 process_vm_readv 触发 CrashSight 反作弊检测.)
+
+    if (candidates.empty()) {
+        // per-class 节流 (不同 cls 独立计时, 避免 BP_TrainPlayerPawn_C 坠占诊断名额)
+        static std::unordered_map<std::string, Clock::time_point> s_classFailLog;
+        static std::mutex s_classFailMutex;
+        bool emit = false;
+        {
+            std::lock_guard<std::mutex> g(s_classFailMutex);
+            auto it = s_classFailLog.find(characterClassName);
+            auto now = Clock::now();
+            if (it == s_classFailLog.end() ||
+                std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second).count() >= 5000) {
+                s_classFailLog[characterClassName] = now;
+                emit = true;
+            }
+        }
+        if (emit) {
+            char buf[256];
+            snprintf(buf, sizeof(buf), "[SkeletonFail] key=%u stage=NoCandidates cls='%s' charMesh=%p avatar=%p oMesh=0x%x oAvatar=0x%x",
+                outPlayer.playerKey, characterClassName.c_str(),
+                (void*)charMesh, (void*)avatar, oMesh, oAvatar);
+            LOG(LOG_LEVEL_INFO, "%s", buf);
+            writeSkeletonLog(buf);
+        }
+        return false;
+    }
 
     // ---- 按 transformCount 降序 ----
     std::sort(candidates.begin(), candidates.end(),
@@ -1539,6 +1733,31 @@ bool MatchMonitor::fillPlayerSkeleton(uintptr_t characterPtr, ue4draw::DrawPlaye
     }
 
     if (bestMatched < kMinRenderableBoneMatches || !bestCopied) {
+        // per-class 节流
+        static std::unordered_map<std::string, Clock::time_point> s_classFailLog;
+        static std::mutex s_classFailMutex;
+        bool emit = false;
+        {
+            std::lock_guard<std::mutex> g(s_classFailMutex);
+            auto it = s_classFailLog.find(characterClassName);
+            auto now = Clock::now();
+            if (it == s_classFailLog.end() ||
+                std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second).count() >= 5000) {
+                s_classFailLog[characterClassName] = now;
+                emit = true;
+            }
+        }
+        if (emit) {
+            int topCount = candidates.empty() ? 0 : candidates.front().count;
+            char buf[384];
+            snprintf(buf, sizeof(buf),
+                "[SkeletonFail] key=%u stage=NoMatch cls='%s' candidates=%zu topTransforms=%d assets=%zu bestMatched=%d bestCopied=%d oCached=0x%x oCachedBone=0x%x",
+                outPlayer.playerKey, characterClassName.c_str(),
+                candidates.size(), topCount, assets.size(),
+                bestMatched, (int)bestCopied, oCached, oCachedBone);
+            LOG(LOG_LEVEL_INFO, "%s", buf);
+            writeSkeletonLog(buf);
+        }
         return false;
     }
 
@@ -1941,6 +2160,14 @@ int MatchMonitor::scanCharacters() {
             if (!classIt->second) return false;
         } else {
             bool isChar = isSubclassOf(classPtr, "Character") || isSubclassOf(classPtr, "Pawn");
+            // 排除载具 (STExtraVehicleBase 也继承自 Pawn) 与无人机, 否则自行车/摩托等会被
+            // 误识别成训练人偶并画出 ESP 方框
+            if (isChar && (isSubclassOf(classPtr, "STExtraVehicleBase")
+                        || isSubclassOf(classPtr, "VehicleBase")
+                        || isSubclassOf(classPtr, "AirDropBoxActor")
+                        || isSubclassOf(classPtr, "PlayerTombBox"))) {
+                isChar = false;
+            }
             m_characterClassSet[classPtr] = isChar;
             if (!isChar) return false;
         }
@@ -2287,16 +2514,20 @@ int MatchMonitor::updatePlayerList(uintptr_t gameStatePtr) {
                     }
                 }
             }
-            // AcknowledgedPawn 兜底: 从自己角色读 PlayerKey/TeamID
-            if (m_myPlayerKey == 0 && m_off.PC_AcknowledgedPawn >= 0) {
+            // 始终缓存 AcknowledgedPawn —— 即便已通过 PlayerState 拿到 key,
+            // 也用 pawn 指针做"绘制时排除自己"的兜底 (m_myPlayerKey 偶发=0 时仍能过滤)
+            if (m_off.PC_AcknowledgedPawn >= 0) {
                 uintptr_t myPawn = safeReadPtr(pc + m_off.PC_AcknowledgedPawn);
-                if (myPawn >= 0x10000 && m_off.Char_PlayerKey >= 0) {
-                    uint32_t key = safeReadU32(myPawn + m_off.Char_PlayerKey);
-                    if (key != 0) {
-                        m_myPlayerKey = key;
-                        if (m_off.Char_TeamID >= 0) {
-                            int32_t tid = safeReadS32(myPawn + m_off.Char_TeamID);
-                            if (tid > 0) m_myTeamID = tid;
+                if (myPawn >= 0x10000) {
+                    m_myPawn = myPawn;
+                    if (m_myPlayerKey == 0 && m_off.Char_PlayerKey >= 0) {
+                        uint32_t key = safeReadU32(myPawn + m_off.Char_PlayerKey);
+                        if (key != 0) {
+                            m_myPlayerKey = key;
+                            if (m_off.Char_TeamID >= 0) {
+                                int32_t tid = safeReadS32(myPawn + m_off.Char_TeamID);
+                                if (tid > 0) m_myTeamID = tid;
+                            }
                         }
                     }
                 }
@@ -2324,6 +2555,547 @@ int MatchMonitor::updatePlayerList(uintptr_t gameStatePtr) {
     scanCharacters();
 
     return updated;
+}
+
+// =====================================================================
+//  载具/物资名称映射 (基于 ESTExtraVehicleType 枚举 + EItemType 经验值)
+// =====================================================================
+static std::string lookupVehicleName(uint8_t vt) {
+    // 索引来自 dump.cs ESTExtraVehicleType 枚举 (155=Deer, 156=Max), 见游戏 SDK
+    static const char* kNames[] = {
+        /*  0*/ "未知载具",
+        /*  1*/ "摩托",        /*  2*/ "摩托",        /*  3*/ "三轮摩托",  /*  4*/ "三轮摩托",
+        /*  5*/ "达契亚",      /*  6*/ "达契亚",      /*  7*/ "达契亚",    /*  8*/ "达契亚",
+        /*  9*/ "吉普 UAZ",    /* 10*/ "吉普 UAZ",    /* 11*/ "吉普 UAZ",
+        /* 12*/ "蹦蹦",        /* 13*/ "蹦蹦",        /* 14*/ "蹦蹦",
+        /* 15*/ "汽艇 PG117",  /* 16*/ "水上摩托",
+        /* 17*/ "面包车",      /* 18*/ "面包车",      /* 19*/ "面包车",
+        /* 20*/ "皮卡",        /* 21*/ "皮卡",        /* 22*/ "皮卡",      /* 23*/ "皮卡",
+        /* 24*/ "皮卡",        /* 25*/ "皮卡",        /* 26*/ "皮卡",      /* 27*/ "皮卡",
+        /* 28*/ "皮卡",        /* 29*/ "皮卡",
+        /* 30*/ "蹦蹦",        /* 31*/ "蹦蹦",        /* 32*/ "蹦蹦",
+        /* 33*/ "Mirado",      /* 34*/ "Mirado",      /* 35*/ "Mirado",    /* 36*/ "Mirado",
+        /* 37*/ "Mirado开",    /* 38*/ "Mirado开",    /* 39*/ "Mirado开",  /* 40*/ "Mirado开",
+        /* 41*/ "UAZ04",
+        /* 42*/ "Rony",        /* 43*/ "Rony",        /* 44*/ "Rony",
+        /* 45*/ "电动滑板",    /* 46*/ "冲浪板",
+        /* 47*/ "直升机 UH60",
+        /* 48*/ "两栖车",
+        /* 49*/ "TUK",
+        /* 50*/ "雪板",
+        /* 51*/ "无人机 UAV",
+        /* 52*/ "电话亭车",
+        /* 53*/ "无人战车",
+        /* 54*/ "坦克",
+        /* 55*/ "龙舟",
+        /* 56*/ "特斯拉",
+        /* 57*/ "坐骑",
+        /* 58*/ "滑翔翼",
+        /* 59*/ "战舰",
+        /* 60*/ "运输车",
+        /* 61*/ "Coupe RB",
+        /* 62*/ "情人节气球",
+        /* 63*/ "ATG摩托",
+        /* 64*/ "激光帆船",
+        /* 65*/ "空中出租",
+        /* 66*/ "皮划艇",
+        /* 67*/ "黑猫摩托",
+        /* 68*/ "鸡蛋坦克",
+        /* 69*/ "新年雪板",
+        /* 70*/ "重力雪板",
+        /* 71*/ "马",
+        /* 72*/ "舞狮",
+        /* 73*/ "龙车",
+        /* 74*/ "叉车",
+        /* 75*/ "科幻摩托",
+        /* 76*/ "自行车",
+        /* 77*/ "旅行车",
+        /* 78*/ "FRC赛车",
+        /* 79*/ "ATG赛车",
+        /* 80*/ "风筝飞行器",
+        /* 81*/ "漂移车",
+        /* 82*/ "拼接列车",
+        /* 83*/ "手推车",
+        /* 84*/ "ATV",
+        /* 85*/ "四座跑车",
+        /* 86*/ "磁悬浮飞行器",
+        /* 87*/ "战车",
+        /* 88*/ "灯笼竞速",
+        /* 89*/ "六翼",
+        /* 90*/ "大脚车",
+        /* 91*/ "拉达",
+        /* 92*/ "雪地摩托",
+        /* 93*/ "雪地摩托",
+        /* 94*/ "武装达契亚",
+        /* 95*/ "武装蹦蹦",
+        /* 96*/ "武装皮卡",
+        /* 97*/ "武装吉普",
+        /* 98*/ "武装直升机",
+        /* 99*/ "武装边三轮",
+        /*100*/ "履带车",
+        /*101*/ "FPV无人机",
+        /*102*/ "炸弹无人机",
+        /*103*/ "AH6",
+        /*104*/ "UH60",
+        /*105*/ "BF吉普",
+        /*106*/ "皮卡艇",
+        /*107*/ "进攻坦克",
+        /*108*/ "防御坦克",
+        /*109*/ "Mi28",
+        /*110*/ "侦察无人机",
+        /*111*/ "BF ATV",
+        /*112*/ "BRDM",
+        /*113*/ "月饼船",
+        /*114*/ "月饼气球",
+        /*115*/ "沙漠车",
+        /*116*/ "气垫",
+        /*117*/ "雪豹",
+        /*118*/ "猛犸象",
+        /*119*/ "基地车",
+        /*120*/ "两栖坦克",
+        /*121*/ "迷失移动",
+        /*122*/ "突击车",
+        /*123*/ "导弹",
+        /*124*/ "挖掘机",
+        /*125*/ "风筝",
+        /*126*/ "门机",
+        /*127*/ "巨口喷气",
+        /*128*/ "Blanc",
+        /*129*/ "Pico巴士",
+        /*130*/ "AI车",
+        /*131*/ "翻斗车",
+        /*132*/ "BFV突击车",
+        /*133*/ "BFV防空坦克",
+        /*134*/ "RD挖掘机",
+        /*135*/ "PELAI车",
+        /*136*/ "锤头鲨",
+        /*137*/ "哪吒莲花",
+        /*138*/ "超级模式UAV",
+        /*139*/ "雪橇",
+        /*140*/ "气垫船",
+        /*141*/ "冰马车",
+        /*142*/ "BB车",
+        /*143*/ "海上飞机",
+        /*144*/ "雪球",
+        /*145*/ "飞马",
+        /*146*/ "EV3F4",
+        /*147*/ "黑鹰运输",
+        /*148*/ "滑翔伞",
+        /*149*/ "沙漠艇",
+        /*150*/ "骆驼车队",
+        /*151*/ "冰马车",
+        /*152*/ "企鹅",
+        /*153*/ "九色鹿",
+        /*154*/ "飞马",
+        /*155*/ "六船",
+        /*156*/ "鹿",
+    };
+    constexpr int kCount = sizeof(kNames) / sizeof(kNames[0]);
+    if (vt < kCount && kNames[vt]) return kNames[vt];
+    char buf[24]; snprintf(buf, sizeof(buf), "载具#%u", vt);
+    return buf;
+}
+
+// EItemType (PUBG 经验值): 1=Weapon 2=Attachment 3=Ammo 4=Med 5=Throwing
+// 6=Armor 7=Helmet 8=Backpack 9=Cloth 10=Other
+// TypeSpecificID 命名表 — 基于 PUBGm 社区已知的 ItemDefineID 配置.
+// 找不到的会落到 "类别#ID" 兜底, 同时通过日志吐一次未知 ID 方便补全.
+static std::string lookupItemName(int32_t typeId, int32_t subId) {
+    // ---- 武器 (PUBGm 常见 ItemDefineID 对照) ----
+    if (typeId == 1) {
+        switch (subId) {
+            // 步枪 / 突击枪
+            case 1: case 101: return "AKM";
+            case 2: case 102: return "M16A4";
+            case 3: case 103: return "SCAR-L";
+            case 4: case 104: return "M416";
+            case 5: case 105: return "Groza";
+            case 6: case 106: return "AUG";
+            case 17: case 117: return "G36C";
+            case 18: case 118: return "QBZ";
+            case 19: case 119: return "Mk47";
+            case 20: case 120: return "DP-28";
+            // 精确射手枪 (DMR)
+            case 8:  case 108: return "Mk14";
+            case 12: case 112: return "SLR";
+            case 13: case 113: return "Mini14";
+            case 14: case 114: return "SKS";
+            case 15: case 115: return "VSS";
+            case 16: case 116: return "QBU";
+            // 狙击枪
+            case 9:  case 109: return "AWM";
+            case 10: case 110: return "Kar98K";
+            case 11: case 111: return "M24";
+            // 轻机枪
+            case 7:  case 107: return "M249";
+            // 手枪
+            case 21: case 201: return "P92";
+            case 22: case 202: return "P1911";
+            case 23: case 203: return "P18C";
+            case 24: case 204: return "R1895";
+            case 25: case 205: return "R45";
+            // 霰弹枪
+            case 30: case 301: return "S686";
+            case 31: case 302: return "S1897";
+            case 32: case 303: return "S12K";
+            case 33: case 304: return "DBS";
+            // 冲锋枪
+            case 40: case 401: return "UZI";
+            case 41: case 402: return "UMP45";
+            case 42: case 403: return "Vector";
+            case 43: case 404: return "Tommy";
+            case 44: case 405: return "PP-19";
+            case 45: case 406: return "MP5K";
+            case 46: case 407: return "MP9";
+            // 近战 / 特殊
+            case 50: case 501: return "弩";
+            case 51: case 502: return "平底锅";
+            case 52: case 503: return "镰刀";
+            case 53: case 504: return "砍刀";
+            case 54: case 505: return "撬棍";
+            default: break;
+        }
+    }
+    // ---- 配件 ----
+    if (typeId == 2) {
+        switch (subId) {
+            case 1: case 101: return "红点";
+            case 2: case 102: return "全息";
+            case 3: case 103: return "2倍镜";
+            case 4: case 104: return "3倍镜";
+            case 5: case 105: return "4倍镜";
+            case 6: case 106: return "6倍镜";
+            case 7: case 107: return "8倍镜";
+            case 8: case 108: return "15倍镜";
+            // 握把
+            case 20: case 201: return "垂直握把";
+            case 21: case 202: return "水平握把";
+            case 22: case 203: return "拇指握把";
+            case 23: case 204: return "轻型握把";
+            case 24: case 205: return "半截握把";
+            // 枪口
+            case 30: case 301: return "补偿器";
+            case 31: case 302: return "消音器";
+            case 32: case 303: return "消焰器";
+            // 弹匣
+            case 40: case 401: return "扩容弹匣";
+            case 41: case 402: return "快速弹匣";
+            case 42: case 403: return "扩容快速弹匣";
+            // 枪托
+            case 50: case 501: return "战术枪托";
+            // 子弹环
+            case 60: case 601: return "子弹袋";
+            default: break;
+        }
+    }
+    // ---- 防具/箱子三级体系 ----
+    if (typeId == 7) {  // 头盔
+        switch (subId) {
+            case 1: case 501: return "1级头盔";
+            case 2: case 502: return "2级头盔";
+            case 3: case 503: return "3级头盔";
+            case 504:        return "3级特种头盔";
+            default: break;
+        }
+    } else if (typeId == 6) {  // 防弹衣
+        switch (subId) {
+            case 1: case 701: return "1级防弹衣";
+            case 2: case 702: return "2级防弹衣";
+            case 3: case 703: return "3级防弹衣";
+            case 704:        return "3级特种防弹衣";
+            default: break;
+        }
+    } else if (typeId == 8) {  // 背包
+        switch (subId) {
+            case 1: case 801: return "1级背包";
+            case 2: case 802: return "2级背包";
+            case 3: case 803: return "3级背包";
+            default: break;
+        }
+    } else if (typeId == 4) {  // 药品
+        switch (subId) {
+            case 1: return "绷带";
+            case 2: return "急救包";
+            case 3: return "医疗箱";
+            case 10: return "急救包";
+            case 11: return "医疗箱";
+            case 12: return "绷带";
+            case 13: return "止痛药";
+            case 14: return "肾上腺素";
+            case 20: return "能量饮料";
+            case 21: return "能量饮料";
+            default: break;
+        }
+    } else if (typeId == 5) {  // 投掷物
+        switch (subId) {
+            case 1: return "手雷";
+            case 2: return "烟雾弹";
+            case 3: return "燃烧弹";
+            case 4: return "震爆弹";
+            case 5: return "诱饵手雷";
+            default: break;
+        }
+    } else if (typeId == 3) {  // 弹药
+        switch (subId) {
+            case 1: return "9mm";
+            case 2: return ".45ACP";
+            case 3: return "5.56mm";
+            case 4: return "7.62mm";
+            case 5: return "12号弹";
+            case 6: return "300马格南";
+            case 7: return "弩矢";
+            default: break;
+        }
+    }
+
+    // 未知 ID: 首次出现时打日志, 方便用户回传后扩展表
+    static std::unordered_set<uint64_t> s_loggedUnknown;
+    static std::mutex s_logMutex;
+    {
+        std::lock_guard<std::mutex> g(s_logMutex);
+        uint64_t key = (uint64_t(uint32_t(typeId)) << 32) | uint32_t(subId);
+        if (s_loggedUnknown.insert(key).second && s_loggedUnknown.size() < 256) {
+            LOG(LOG_LEVEL_INFO, "[ItemNameMissing] type=%d subId=%d", typeId, subId);
+        }
+    }
+
+    const char* category = nullptr;
+    switch (typeId) {
+        case 1: category = "枪";   break;
+        case 2: category = "配件"; break;
+        case 3: category = "弹药"; break;
+        case 4: category = "药品"; break;
+        case 5: category = "投掷"; break;
+        case 6: category = "护甲"; break;
+        case 7: category = "头盔"; break;
+        case 8: category = "背包"; break;
+        case 9: category = "服饰"; break;
+        default: break;
+    }
+    char buf[40];
+    if (category) snprintf(buf, sizeof(buf), "%s#%d", category, subId);
+    else          snprintf(buf, sizeof(buf), "物#%d-%d", typeId, subId);
+    return buf;
+}
+
+// =====================================================================
+//  GUObjectArray 扫描场景物体: 物资 / 载具 / 空投 / 死亡箱
+//
+//  分片扫描: 每次 poll 处理 kScanBudget 条, 完成一轮后才整体替换前台缓存,
+//  避免在主轮询线程一次性遍历百万级 GUObjectArray 引发渲染卡顿.
+//  完整一轮结束 + kRefreshMs 冷却到期后才开启下一轮.
+// =====================================================================
+int MatchMonitor::scanWorldObjects(std::vector<ue4draw::DrawWorldObject>& outObjects) {
+    constexpr uint64_t kRefreshMs   = 1500;  // 一轮结束后多久才允许重启 (反作弊压力 vs 实时性)
+    constexpr int      kScanBudget  = 6000;  // 每次 poll 最多遍历多少 GUObjectArray 条目
+    constexpr int      kMaxObjects  = 512;   // 输出上限 (含箱内 PickUp)
+
+    const uint64_t nowMs = nowMonotonicMs();
+
+    auto returnCached = [&]() {
+        outObjects = m_cachedWorldObjects;
+        return static_cast<int>(outObjects.size());
+    };
+
+    // 没有进行中的扫描 + 冷却未到 → 直接复用缓存
+    if (!m_worldObjScanInProgress) {
+        if (m_lastWorldObjScanMs != 0 && nowMs - m_lastWorldObjScanMs < kRefreshMs) {
+            return returnCached();
+        }
+        // 启动新一轮分片扫描
+        m_worldObjScanInProgress = true;
+        m_worldObjScanIndex = 0;
+        m_worldObjScanBuffer.clear();
+        m_worldObjScanBuffer.reserve(m_cachedWorldObjects.size() + 16);
+    }
+
+    UObjectArrayLayout layout{};
+    if (!detectUObjectArrayLayout(m_gUObjectArray, layout)) {
+        m_worldObjScanInProgress = false;
+        m_worldObjScanBuffer.clear();
+        return returnCached();
+    }
+    const int totalNum = layout.totalNum;
+    if (totalNum <= 0 || totalNum > 4'000'000) {
+        m_worldObjScanInProgress = false;
+        m_worldObjScanBuffer.clear();
+        return returnCached();
+    }
+
+    auto classifyClass = [&](uintptr_t classPtr) -> uint8_t {
+        if (classPtr < 0x10000) return 0;
+        auto it = m_worldObjClassSet.find(classPtr);
+        if (it != m_worldObjClassSet.end()) return it->second;
+        uint8_t kind = 0;
+        if (isSubclassOf(classPtr, "STExtraVehicleBase")) kind = 2;
+        else if (isSubclassOf(classPtr, "AirDropBoxActor")) kind = 3;
+        else if (isSubclassOf(classPtr, "PlayerTombBox")) kind = 4;
+        // PickUpListWrapperActor 派生自 PickUpWrapperActor; 必须先判断 List 子类,
+        // 否则会被基类匹配抢走, 错过 PickUpDataList 内嵌物品列表
+        else if (isSubclassOf(classPtr, "PickUpListWrapperActor")) kind = 5;
+        else if (isSubclassOf(classPtr, "PickUpWrapperActor")) kind = 1;
+        m_worldObjClassSet[classPtr] = kind;
+        return kind;
+    };
+
+    int processed = 0;
+    int endIdx = m_worldObjScanIndex + kScanBudget;
+    if (endIdx > totalNum) endIdx = totalNum;
+
+    for (int idx = m_worldObjScanIndex;
+         idx < endIdx && static_cast<int>(m_worldObjScanBuffer.size()) < kMaxObjects;
+         ++idx) {
+        processed++;
+        uintptr_t objPtr = readUObjectAt(m_gUObjectArray, layout, idx);
+        if (objPtr < 0x10000) continue;
+        uintptr_t classPtr = safeReadPtr(objPtr + kUObjectClassPrivateOffset);
+        if (classPtr < 0x10000) continue;
+        const uint8_t kind = classifyClass(classPtr);
+        if (kind == 0) continue;  // 缓存命中 → 单次哈希查表即可
+
+        FVector3 loc{};
+        if (!getActorLocation(objPtr, loc)) continue;
+        if (!std::isfinite(loc.x) || !std::isfinite(loc.y) || !std::isfinite(loc.z)) continue;
+        if (std::fabs(loc.x) < 1.0f && std::fabs(loc.y) < 1.0f && std::fabs(loc.z) < 1.0f) continue;
+        if (std::fabs(loc.x) > 2.0e6f || std::fabs(loc.y) > 2.0e6f || std::fabs(loc.z) > 2.0e6f) continue;
+
+        ue4draw::DrawWorldObject obj{};
+        obj.posX = loc.x; obj.posY = loc.y; obj.posZ = loc.z;
+
+        if (kind == 1) {
+            if (m_off.PickUp_bHasBeenPickedUp >= 0
+                && (safeReadU8(objPtr + m_off.PickUp_bHasBeenPickedUp) & 1) != 0) continue;
+            // 不再跳过 bIsInBox 物品 - 透传 inBox 标记给 UI, 由菜单开关决定是否绘制
+            bool isInBox = false;
+            if (m_off.PickUp_bIsInBox >= 0) {
+                isInBox = (safeReadU8(objPtr + m_off.PickUp_bIsInBox) & 1) != 0;
+            }
+
+            int32_t typeId = 0, subId = 0;
+            if (m_off.PickUp_DefineID >= 0) {
+                typeId = safeReadS32(objPtr + m_off.PickUp_DefineID + 0);
+                subId  = safeReadS32(objPtr + m_off.PickUp_DefineID + 4);
+            }
+            obj.typeId = typeId;
+            obj.subTypeId = subId;
+            obj.inBox = isInBox;
+            obj.kind = (typeId == 1) ? ue4draw::DrawWorldObjectKind::Weapon
+                                      : ue4draw::DrawWorldObjectKind::Item;
+            obj.label = lookupItemName(typeId, subId);
+        } else if (kind == 2) {
+            obj.kind = ue4draw::DrawWorldObjectKind::Vehicle;
+            uint8_t vt = 0;
+            if (m_off.Vehicle_VehicleType >= 0) {
+                vt = safeReadU8(objPtr + m_off.Vehicle_VehicleType);
+                obj.typeId = vt;
+            }
+            if (m_off.Vehicle_VehicleHealthState >= 0) {
+                obj.healthState = safeReadU8(objPtr + m_off.Vehicle_VehicleHealthState);
+            }
+            if (obj.healthState >= 4) continue;
+            if (m_off.Vehicle_Fuel >= 0) {
+                float f = safeReadFloat(objPtr + m_off.Vehicle_Fuel);
+                if (std::isfinite(f) && f >= 0.0f && f <= 1000.0f) obj.fuel = f;
+            }
+            obj.label = lookupVehicleName(vt);
+        } else if (kind == 3) {
+            obj.kind = ue4draw::DrawWorldObjectKind::Airdrop;
+            obj.label = "空投";
+        } else if (kind == 4) {
+            obj.kind = ue4draw::DrawWorldObjectKind::DeathBox;
+            obj.label = "死亡箱";
+        } else if (kind == 5) {
+            // PickUpListWrapperActor: 多物品箱
+            obj.kind = ue4draw::DrawWorldObjectKind::DeathBox;
+            obj.label = "物资堆";
+        }
+
+        // 三种容器 (Airdrop/DeathBox/PickUpListWrapper) 共用 PickUpDataList @ 0xD98
+        // 之前只在 kind==5 内联处理, 但实战中 PickUpListWrapperActor 几乎不出现在 GUObjectArray,
+        // 真正存在的是 AirDropBoxActor / PlayerTombBox; 它们派生自 PickUpListWrapperActor → 同样布局.
+        if ((kind == 3 || kind == 4 || kind == 5) && m_off.PickUpList_DataList >= 0) {
+            // 先 push 父项
+            m_worldObjScanBuffer.push_back(obj);
+
+            const uintptr_t listAddr = objPtr + m_off.PickUpList_DataList;
+            const uintptr_t arrData  = safeReadPtr(listAddr);
+            const int32_t   arrNum   = safeReadS32(listAddr + 8);
+            if (arrData >= 0x10000 && arrNum > 0 && arrNum <= 64) {
+                constexpr uintptr_t kStride = 0x38;
+                for (int32_t i = 0; i < arrNum; ++i) {
+                    const uintptr_t itemAddr = arrData + static_cast<uintptr_t>(i) * kStride;
+                    int32_t typeId = safeReadS32(itemAddr + 0);
+                    int32_t subId  = safeReadS32(itemAddr + 4);
+                    int32_t count  = safeReadS32(itemAddr + 0x18);
+                    if (typeId <= 0 || typeId > 0x1000) continue;
+                    if (count <= 0 || count > 100000) count = 1;
+
+                    // 强制日志: 每个新出现的 (type,subId) 都打一次, 便于扩展物品名表
+                    static std::unordered_set<uint64_t> s_seenIds;
+                    static std::mutex s_seenMu;
+                    {
+                        std::lock_guard<std::mutex> g(s_seenMu);
+                        uint64_t k = (uint64_t(uint32_t(typeId)) << 32) | uint32_t(subId);
+                        if (s_seenIds.insert(k).second && s_seenIds.size() < 500) {
+                            LOG(LOG_LEVEL_INFO, "[BoxItem] type=%d subId=%d count=%d kind=%d",
+                                typeId, subId, count, (int)kind);
+                        }
+                    }
+
+                    ue4draw::DrawWorldObject child{};
+                    child.posX = loc.x; child.posY = loc.y; child.posZ = loc.z;
+                    child.typeId = typeId;
+                    child.subTypeId = subId;
+                    child.inBox = true;
+                    child.kind = (typeId == 1) ? ue4draw::DrawWorldObjectKind::Weapon
+                                                : ue4draw::DrawWorldObjectKind::Item;
+                    char nameBuf[64];
+                    std::string nm = lookupItemName(typeId, subId);
+                    if (count > 1) snprintf(nameBuf, sizeof(nameBuf), "%s x%d", nm.c_str(), count);
+                    else           snprintf(nameBuf, sizeof(nameBuf), "%s", nm.c_str());
+                    child.label = nameBuf;
+                    m_worldObjScanBuffer.push_back(std::move(child));
+                    if (static_cast<int>(m_worldObjScanBuffer.size()) >= kMaxObjects) break;
+                }
+            }
+            continue;  // 父项已 push
+        }
+
+        m_worldObjScanBuffer.push_back(std::move(obj));
+    }
+
+    m_worldObjScanIndex = endIdx;
+
+    const bool reachedEnd = (m_worldObjScanIndex >= totalNum)
+        || (static_cast<int>(m_worldObjScanBuffer.size()) >= kMaxObjects);
+
+    if (reachedEnd) {
+        // 一轮完成 → 整体替换前台缓存
+        m_cachedWorldObjects = std::move(m_worldObjScanBuffer);
+        m_worldObjScanBuffer.clear();
+        m_worldObjScanInProgress = false;
+        m_worldObjScanIndex = 0;
+        m_lastWorldObjScanMs = nowMs;
+
+        static Clock::time_point s_lastWorldObjLog;
+        if (shouldLogEvery(s_lastWorldObjLog, std::chrono::milliseconds(2000))) {
+            int items = 0, weapons = 0, vehicles = 0, airdrops = 0, deathboxes = 0;
+            for (const auto& o : m_cachedWorldObjects) {
+                switch (o.kind) {
+                    case ue4draw::DrawWorldObjectKind::Item:     items++; break;
+                    case ue4draw::DrawWorldObjectKind::Weapon:   weapons++; break;
+                    case ue4draw::DrawWorldObjectKind::Vehicle:  vehicles++; break;
+                    case ue4draw::DrawWorldObjectKind::Airdrop:  airdrops++; break;
+                    case ue4draw::DrawWorldObjectKind::DeathBox: deathboxes++; break;
+                }
+            }
+            LOG(LOG_LEVEL_INFO, "[WorldObj] total=%zu items=%d weapons=%d vehicles=%d airdrops=%d deathboxes=%d classes=%zu processed=%d",
+                m_cachedWorldObjects.size(), items, weapons, vehicles, airdrops, deathboxes,
+                m_worldObjClassSet.size(), processed);
+        }
+    }
+
+    return returnCached();
 }
 
 void MatchMonitor::refreshTrackedPlayersFast() {
@@ -3405,6 +4177,21 @@ void MatchMonitor::pollPlayers() {
         return;
     }
 
+    // 进入 InProgress 后再额外延迟 10 秒, 等游戏自身完成 SkeletalMesh / Avatar / 物资生成,
+    // 避免我们和游戏自身初始化抢占 process_vm_readv 流量, 导致 CrashSight 检测崩溃.
+    if (m_matchEnterTickMs != 0) {
+        const uint64_t elapsedMs = nowMonotonicMs() - m_matchEnterTickMs;
+        constexpr uint64_t kPostMatchDelayMs = 10000;
+        if (elapsedMs < kPostMatchDelayMs) {
+            static Clock::time_point s_lastDelayLogTime;
+            if (shouldLogEvery(s_lastDelayLogTime, std::chrono::milliseconds(2000))) {
+                LOG(LOG_LEVEL_INFO, "[Grace] InProgress 后延迟 10s 等待游戏初始化 (剩余 %llu ms)",
+                    static_cast<unsigned long long>(kPostMatchDelayMs - elapsedMs));
+            }
+            return;
+        }
+    }
+
     const LoadThrottlePhase loadPhase = getLoadThrottlePhase(m_currentMatchElapsedSeconds);
     const int loadPhaseValue = static_cast<int>(loadPhase);
     if (loadPhaseValue != m_lastLoadThrottlePhase) {
@@ -3458,6 +4245,9 @@ void MatchMonitor::pollPlayers() {
     }
     fillCameraSnapshot(drawData);
 
+    // 场景物资 / 载具 / 空投扫描 (内部 500ms 节流)
+    scanWorldObjects(drawData.worldObjects);
+
     // 自瞄: 在刷新位置和相机数据后执行 (恢复模式下跳过)
     if (!m_memoryRestored.load(std::memory_order_acquire)) {
         // 检查 GUI 恢复请求
@@ -3487,10 +4277,16 @@ void MatchMonitor::pollPlayers() {
             continue;
         }
 
-        // 自己 (本地玩家) 也归入 "显示队友" 开关控制范围:
-        // 单人/训练场下 m_myTeamID 可能是 -1, teamID 比较失效, 必须用 playerKey 兜底.
-        const bool isSelf = (m_myPlayerKey != 0 && cur->playerKey == m_myPlayerKey);
-        const bool isTeammate = isSelf || (m_myTeamID > 0 && cur->teamID == m_myTeamID);
+        // 自己 (本地玩家): 用 playerKey + pawn 双重判定, 任一命中即视为自己,
+        // 永远不绘制. 之前仅靠 m_myPlayerKey,偶发为 0 时第三人称视角下
+        // 自己角色会被错画成红色敌人方框.
+        const bool isSelf = (m_myPlayerKey != 0 && cur->playerKey == m_myPlayerKey)
+                         || (m_myPawn != 0 && cur->characterPtr == m_myPawn);
+        if (isSelf) {
+            cur = cur->next;
+            continue;
+        }
+        const bool isTeammate = (m_myTeamID > 0 && cur->teamID == m_myTeamID);
         aliveCount++;
         if (isTeammate) {
             aliveTeam++;
@@ -3519,7 +4315,14 @@ void MatchMonitor::pollPlayers() {
         dp.isTeammate = isTeammate;
 
         // 骨骼: 尝试从活数据填充, 失败则用缓存 (防闪烁, 支持骑马)
-        bool freshBones = fillPlayerSkeleton(cur->characterPtr, dp);
+        // 节流: 每个玩家每 SKELETON_RESOLVE_INTERVAL_MS 毫秒最多尝试一次, 大幅降低
+        // process_vm_readv 调用总量, 避免反作弊侦测.
+        const uint64_t skelNowMs = nowMonotonicMs();
+        bool freshBones = false;
+        if (skelNowMs - cur->lastSkeletonAttemptMs >= SKELETON_RESOLVE_INTERVAL_MS) {
+            cur->lastSkeletonAttemptMs = skelNowMs;
+            freshBones = fillPlayerSkeleton(cur->characterPtr, dp);
+        }
         if (freshBones) {
             // 只在新数据骨骼数 >= 缓存时才更新 (防止部分数据覆盖完整缓存)
             int newBoneCount = 0;
@@ -3730,7 +4533,21 @@ void MatchMonitor::pollMatchStateLoop() {
         if (m_isInMatch && (lastPlayerPollTime.time_since_epoch().count() == 0
             || now - lastPlayerPollTime >= std::chrono::milliseconds(PLAYER_POLL_INTERVAL_MS))) {
             lastPlayerPollTime = now;
-            pollPlayers();
+            // 进入对局后等待 10 秒再开始遍历, 避免 ACE 反作弊在加载期检测到扫描行为
+            constexpr uint64_t kPostEnterWarmupMs = 10000;
+            if (m_matchEnterTickMs != 0
+                && (nowMonotonicMs() - m_matchEnterTickMs) < kPostEnterWarmupMs) {
+                static uint64_t s_lastWarmupLogMs = 0;
+                const uint64_t nowLogMs = nowMonotonicMs();
+                if (nowLogMs - s_lastWarmupLogMs > 2000) {
+                    s_lastWarmupLogMs = nowLogMs;
+                    const uint64_t leftMs = kPostEnterWarmupMs - (nowLogMs - m_matchEnterTickMs);
+                    LOG(LOG_LEVEL_INFO, "[Warmup] entered match, waiting %llums before traversal",
+                        (unsigned long long)leftMs);
+                }
+            } else {
+                pollPlayers();
+            }
         }
 
         if (stateChanged || shouldLogEvery(lastStateLogTime, std::chrono::milliseconds(STATE_LOG_INTERVAL_MS))) {

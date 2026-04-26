@@ -4,6 +4,12 @@
 #include <cmath>
 #include <algorithm>
 #include <chrono>
+#include <unordered_map>
+
+#if defined(AI_OVERLAY_AVAILABLE)
+#include "../../../ai_overlay/AIDetection.h"
+#include "../../../ai_overlay/AimAssist.h"
+#endif
 
 #define DLOG(level, fmt, ...) LOG(level, fmt, ##__VA_ARGS__)
 
@@ -378,7 +384,10 @@ int drawPlayerSkeleton(ImDrawList* drawList,
                        const DrawPlayerInfo& player,
                        ImU32 color,
                        float screenW,
-                       float screenH) {
+                       float screenH,
+                       float lineThickness,
+                       float jointRadius,
+                       ImU32 jointColor) {
     // 至少需要 3 个骨骼点才绘制
     if (countTrackedBones(player) < 3) return 0;
 
@@ -392,15 +401,17 @@ int drawPlayerSkeleton(ImDrawList* drawList,
         float dx = toX - fromX, dy = toY - fromY;
         if (dx * dx + dy * dy > screenH * screenH) continue;
 
-        drawList->AddLine(ImVec2(fromX, fromY), ImVec2(toX, toY), color, 1.5f);
+        drawList->AddLine(ImVec2(fromX, fromY), ImVec2(toX, toY), color, lineThickness);
         segmentCount++;
     }
 
-    for (size_t boneIndex = 0; boneIndex < kTrackedBoneCount; ++boneIndex) {
-        float px, py;
-        if (!projectBonePoint(data, player, static_cast<DrawBoneId>(boneIndex), screenW, screenH, px, py))
-            continue;
-        drawList->AddCircleFilled(ImVec2(px, py), 3.0f, IM_COL32(80, 255, 255, 200));
+    if (jointRadius >= 0.5f) {
+        for (size_t boneIndex = 0; boneIndex < kTrackedBoneCount; ++boneIndex) {
+            float px, py;
+            if (!projectBonePoint(data, player, static_cast<DrawBoneId>(boneIndex), screenW, screenH, px, py))
+                continue;
+            drawList->AddCircleFilled(ImVec2(px, py), jointRadius, jointColor);
+        }
     }
 
     return segmentCount;
@@ -611,6 +622,9 @@ void UE4Overlay::drawOverlay(const DrawGameData& data) {
         if (m_enableESP) {
             espDrawCount = drawESP(renderData, screenW, screenH);
         }
+        if (m_enableItemESP || m_enableWeaponESP || m_enableVehicleESP || m_enableAirdropESP || m_enableDeathBoxESP) {
+            drawWorldObjects(renderData, screenW, screenH);
+        }
         if (m_enableMinimap) {
             minimapDrawCount = drawMinimap(renderData, screenW, screenH);
         }
@@ -643,6 +657,15 @@ void UE4Overlay::drawOverlay(const DrawGameData& data) {
 
     drawTouchPointOverlay(m_enableTouchPoint, screenW, screenH);
 
+    // AI 屏幕检测 (始终运行, 与对局状态无关)
+    if (m_enableAIDetect) {
+        static int s_aiCallCnt = 0;
+        if ((++s_aiCallCnt % 120) == 1) {
+            LOG(LOG_LEVEL_INFO, "[AI/Draw] drawAIDetections call#%d screen=%.0fx%.0f", s_aiCallCnt, screenW, screenH);
+        }
+        drawAIDetections(screenW, screenH);
+    }
+
     // 控制菜单始终显示
     drawMenu(renderData);
 }
@@ -654,12 +677,53 @@ void UE4Overlay::drawMenu(const DrawGameData& data) {
     // 与 DFM 一致: FirstUseEver — Always 会每帧强制覆盖位置,
     // 让 ImGui widget 的 active-id 命中测试出现一帧错位 (菜单看似可见但点不动).
     // AImGui 已设置 IniFilename=nullptr, 不存在 ini 持久化的屏外坐标问题.
-    ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
+    // 折叠↔展开切换时使用 m_menuLastPos 强制定位, 保证两窗口位置完全一致 (用户拖动后位置也保留).
+    if (m_menuPosCaptured) {
+        ImGui::SetNextWindowPos(m_menuLastPos, ImGuiCond_Always);
+    } else {
+        ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
+    }
     ImGui::SetNextWindowSize(ImVec2(320, 0), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowBgAlpha(0.8f);
 
+    // 收起态: 仅渲染一个小标题条 + 展开按钮 (类似 DFM)
+    if (m_menuCollapsed) {
+        ImGuiWindowFlags fl = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                              ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_AlwaysAutoResize;
+        if (ImGui::Begin("##PubgMenuMini", nullptr, fl)) {
+            // 实时记录拖动后的位置, 下次展开/重新折叠都跟随
+            m_menuLastPos = ImGui::GetWindowPos();
+            m_menuPosCaptured = true;
+
+            ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.4f, 1.0f), "PUBG");
+            ImGui::SameLine();
+            // 当前人数 (折叠态简化显示)
+            if (data.inMatch) {
+                ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%d/%d", data.aliveCount, data.totalCount);
+            } else {
+                ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "--");
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("展开 ▼")) {
+                m_menuCollapsed = false;
+            }
+        }
+        ImGui::End();
+        return;
+    }
+
     // 注: p_open=nullptr 去掉关闭按钮, 防止用户误点导致菜单永久消失
     if (ImGui::Begin("PUBG 绘制", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        // 实时记录展开态位置, 折叠时小窗口出现在同位置
+        m_menuLastPos = ImGui::GetWindowPos();
+        m_menuPosCaptured = true;
+
+        // 标题栏旁的收起按钮 (DFM 风格)
+        if (ImGui::SmallButton("收起 ▲")) {
+            m_menuCollapsed = true;
+            ImGui::End();
+            return;
+        }
         bool settingsChanged = false;
 
         // 对局状态
@@ -677,6 +741,15 @@ void UE4Overlay::drawMenu(const DrawGameData& data) {
         // 功能开关
         settingsChanged |= ImGui::Checkbox("ESP 方框", &m_enableESP);
         settingsChanged |= ImGui::Checkbox("骨架线", &m_enableSkeleton);
+        if (m_enableSkeleton) {
+            settingsChanged |= ImGui::ColorEdit3("骨架颜色", m_skeletonColor,
+                                                 ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel);
+            ImGui::SameLine();
+            ImGui::TextUnformatted("颜色");
+            settingsChanged |= ImGui::SliderFloat("骨架粗细", &m_skeletonThickness, 0.5f, 5.0f, "%.1f");
+            settingsChanged |= ImGui::SliderFloat("关节大小", &m_skelJointRadius, 0.0f, 8.0f, "%.1f");
+            settingsChanged |= ImGui::Checkbox("远距离自动加粗", &m_skeletonAutoScale);
+        }
         settingsChanged |= ImGui::Checkbox("射线", &m_enableSnapline);
         settingsChanged |= ImGui::Checkbox("血条", &m_enableHP);
         settingsChanged |= ImGui::Checkbox("名字", &m_enableName);
@@ -684,14 +757,129 @@ void UE4Overlay::drawMenu(const DrawGameData& data) {
         settingsChanged |= ImGui::Checkbox("显示队友", &m_enableTeammate);
         ImGui::Separator();
 
+#if defined(AI_OVERLAY_AVAILABLE)
+        if (ImGui::Checkbox("AI 屏幕检测", &m_enableAIDetect)) {
+            settingsChanged = true;
+            ai_overlay::AISharedData::getInstance().setEnabled(m_enableAIDetect);
+        }
+        if (m_enableAIDetect) {
+            auto& shd = ai_overlay::AISharedData::getInstance();
+            if (!shd.ready()) {
+                ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f),
+                                   "● 模型未就绪 (%s)",
+                                   shd.lastError().empty() ? "等待加载" : shd.lastError().c_str());
+            } else {
+                int64_t age = shd.msSinceLastPush();
+                int64_t us  = shd.lastInferUs();
+                if (age < 0 || age > 1500) {
+                    ImGui::TextColored(ImVec4(0.9f, 0.7f, 0.2f, 1.0f),
+                                       "● 等待截屏 (%lldms)", (long long)age);
+                } else {
+                    ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.4f, 1.0f),
+                                       "● 推理 %.1f ms / 帧龄 %lldms",
+                                       us / 1000.0f, (long long)age);
+                }
+            }
+            settingsChanged |= ImGui::SliderFloat("置信度阈值", &m_aiScoreThr, 0.10f, 0.90f, "%.2f");
+            settingsChanged |= ImGui::SliderInt("推理间隔", &m_aiIntervalMs, 60, 500, "%d ms");
+            settingsChanged |= ImGui::Checkbox("只看人物", &m_aiOnlyPerson);
+            settingsChanged |= ImGui::ColorEdit3("AI框颜色", m_aiBoxColor,
+                                                 ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel);
+            ImGui::SameLine();
+            ImGui::TextUnformatted("AI 框颜色");
+            settingsChanged |= ImGui::SliderFloat("AI框粗细", &m_aiBoxThickness, 1.0f, 5.0f, "%.1f");
+            settingsChanged |= ImGui::Checkbox("显示置信度", &m_aiDrawScore);
+        }
+
+        // ── AI 辅助瞄准 ──
+        if (ImGui::Checkbox("AI 辅助瞄准", &m_aiAimEnable)) {
+            settingsChanged = true;
+            ai_overlay::AimAssist::getInstance().setEnabled(m_aiAimEnable);
+        }
+        if (m_aiAimEnable) {
+            if (ImGui::Checkbox("仅视觉锁定 (不注入触屏)", &m_aiAimVisualOnly)) {
+                settingsChanged = true;
+                // 切换 visual <-> inject 模式需要重启 AimAssist 注入线程
+                ai_overlay::AimAssist::getInstance().setEnabled(false);
+                ai_overlay::AimAssist::getInstance().setVisualOnly(m_aiAimVisualOnly);
+                ai_overlay::AimAssist::getInstance().setEnabled(true);
+            }
+            if (!m_aiAimVisualOnly) {
+                bool ready = ai_overlay::AimAssist::getInstance().injectorReady();
+                if (ready) {
+                    ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.4f, 1.0f), "● 触屏注入器就绪");
+                } else {
+                    auto err = ai_overlay::AimAssist::getInstance().injectorError();
+                    ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.3f, 1.0f),
+                                       "● 注入器未就绪: %s", err.empty() ? "等待初始化" : err.c_str());
+                }
+            }
+            settingsChanged |= ImGui::SliderFloat("FOV 半径", &m_aiAimFovRadius, 50.0f, 600.0f, "%.0f px");
+            settingsChanged |= ImGui::SliderFloat("头部位置", &m_aiAimHeadRatio, 0.0f, 0.5f, "%.2f");
+            settingsChanged |= ImGui::SliderInt("最低置信度%", &m_aiAimMinScore, 10, 90);
+            settingsChanged |= ImGui::Checkbox("只锁定人物##aim", &m_aiAimOnlyPerson);
+            if (!m_aiAimVisualOnly) {
+                settingsChanged |= ImGui::SliderFloat("X 灵敏度", &m_aiAimSensitivityX, 0.1f, 3.0f, "%.2f");
+                settingsChanged |= ImGui::SliderFloat("Y 灵敏度", &m_aiAimSensitivityY, 0.1f, 3.0f, "%.2f");
+                settingsChanged |= ImGui::SliderFloat("平滑", &m_aiAimSmoothing, 0.0f, 0.95f, "%.2f");
+                settingsChanged |= ImGui::Checkbox("需要按住触发键", &m_aiAimRequireTrigger);
+                if (m_aiAimRequireTrigger) {
+                    ImVec2 sz(80, 26);
+                    ImGui::Button("按住开火", sz);
+                    bool held = ImGui::IsItemActive();
+                    ai_overlay::AimAssist::getInstance().setTrigger(held);
+                    ImGui::SameLine();
+                    ImGui::TextUnformatted(held ? "瞄准中" : "(松开)");
+                } else {
+                    ai_overlay::AimAssist::getInstance().setTrigger(true);
+                }
+            }
+        }
+        ImGui::Separator();
+#endif
+
         settingsChanged |= ImGui::Checkbox("小地图", &m_enableMinimap);
         if (m_enableMinimap) {
             settingsChanged |= ImGui::SliderFloat("地图大小", &m_minimapSize, 100.0f, 400.0f, "%.0f");
             settingsChanged |= ImGui::SliderFloat("雷达范围", &m_minimapRangeMeters, 60.0f, 500.0f, "%.0f m");
+            settingsChanged |= ImGui::Checkbox("锁定雷达位置", &m_minimapLocked);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("重置")) {
+                m_minimapPosX = ue4draw::kMinimapPosUnset;
+                m_minimapPosY = ue4draw::kMinimapPosUnset;
+                settingsChanged = true;
+            }
+            if (!m_minimapLocked) {
+                const ImGuiIO& io = ImGui::GetIO();
+                // 滑块允许负数: 雷达可部分移出屏幕 (例如贴左上贴边或溢出)
+                // 范围 = [-mapSize+50, displaySize-50]: 至少保留 50px 在屏内可见
+                float minX = -m_minimapSize + 50.0f;
+                float minY = -m_minimapSize + 50.0f;
+                float maxX = std::max(io.DisplaySize.x - 50.0f, minX + 1.0f);
+                float maxY = std::max(io.DisplaySize.y - 50.0f, minY + 1.0f);
+                float curX = (m_minimapPosX <= ue4draw::kMinimapPosUnset) ? (io.DisplaySize.x - m_minimapSize - 15.0f) : m_minimapPosX;
+                float curY = (m_minimapPosY <= ue4draw::kMinimapPosUnset) ? 15.0f : m_minimapPosY;
+                if (ImGui::SliderFloat("雷达X", &curX, minX, maxX, "%.0f")) { m_minimapPosX = curX; settingsChanged = true; }
+                if (ImGui::SliderFloat("雷达Y", &curY, minY, maxY, "%.0f")) { m_minimapPosY = curY; settingsChanged = true; }
+                ImGui::TextDisabled("提示: 解锁后可直接拖拽雷达, 也可用 X/Y 滑块; 锁定后位置固定");
+            }
         }
         settingsChanged |= ImGui::Checkbox("边缘箭头", &m_enableFallbackESP);
         settingsChanged |= ImGui::Checkbox("玩家列表", &m_enablePlayerList);
         settingsChanged |= ImGui::Checkbox("触点", &m_enableTouchPoint);
+
+        ImGui::Separator();
+        ImGui::TextUnformatted("场景物件");
+        settingsChanged |= ImGui::Checkbox("场景物资", &m_enableItemESP);
+        settingsChanged |= ImGui::Checkbox("地面枪械", &m_enableWeaponESP);
+        settingsChanged |= ImGui::Checkbox("载具显示", &m_enableVehicleESP);
+        settingsChanged |= ImGui::Checkbox("空投显示", &m_enableAirdropESP);
+        settingsChanged |= ImGui::Checkbox("死亡箱显示", &m_enableDeathBoxESP);
+        settingsChanged |= ImGui::Checkbox("透视箱内物品", &m_enableBoxContentESP);
+        if (m_enableItemESP || m_enableWeaponESP || m_enableVehicleESP || m_enableAirdropESP || m_enableDeathBoxESP) {
+            settingsChanged |= ImGui::SliderFloat("物件距离", &m_worldObjMaxDist, 50.0f, 800.0f, "%.0f m");
+        }
+        ImGui::Separator();
         {
             bool aimbotOn = m_enableAimbot;
             if (ImGui::Checkbox("锁定目标 (开镜自瞄)", &aimbotOn)) {
@@ -883,7 +1071,26 @@ int UE4Overlay::drawESP(const DrawGameData& data, float screenW, float screenH) 
         bool preciseRendered = false;
 
         if (hasPreciseCamera && m_enableSkeleton && p.boneMask != 0) {
-            if (drawPlayerSkeleton(dl, data, p, boxColor, screenW, screenH) > 0) {
+            // 骨架颜色 (用户在菜单设置)
+            const ImU32 skelLineColor = IM_COL32(
+                std::clamp(int(m_skeletonColor[0] * 255.0f + 0.5f), 0, 255),
+                std::clamp(int(m_skeletonColor[1] * 255.0f + 0.5f), 0, 255),
+                std::clamp(int(m_skeletonColor[2] * 255.0f + 0.5f), 0, 255),
+                235);
+            const ImU32 skelJointColor = (skelLineColor & 0x00FFFFFF) | (200u << 24);
+            // 远距离自动加粗: 100m 用基础粗细, 300m+ 加 1.5 倍, 500m+ 加 2 倍
+            float thickness = m_skeletonThickness;
+            float jointR    = m_skelJointRadius;
+            if (m_skeletonAutoScale) {
+                float scale = 1.0f;
+                if      (dist >= 500.0f) scale = 2.2f;
+                else if (dist >= 300.0f) scale = 1.7f;
+                else if (dist >= 150.0f) scale = 1.3f;
+                thickness = std::max(1.0f, m_skeletonThickness * scale);
+                jointR    = std::max(2.0f, m_skelJointRadius   * scale);
+            }
+            if (drawPlayerSkeleton(dl, data, p, skelLineColor, screenW, screenH,
+                                   thickness, jointR, skelJointColor) > 0) {
                 rendered = true;
                 preciseRendered = true;
             }
@@ -1039,18 +1246,144 @@ int UE4Overlay::drawESP(const DrawGameData& data, float screenW, float screenH) 
 }
 
 // =====================================================================
+//  场景物件绘制 (物资 / 枪械 / 载具 / 空投)
+// =====================================================================
+int UE4Overlay::drawWorldObjects(const DrawGameData& data, float screenW, float screenH) {
+    if (data.worldObjects.empty()) return 0;
+
+    ImGui::SetNextWindowPos(ImVec2(0, 0));
+    ImGui::SetNextWindowSize(ImVec2(screenW, screenH));
+    ImGui::Begin("##UE4WorldObjs", nullptr,
+        ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoDecoration |
+        ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+        ImGuiWindowFlags_NoBringToFrontOnFocus);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+
+    int rendered = 0;
+    const float maxDistCm = m_worldObjMaxDist * 100.0f;
+    const float camX = data.camLocX, camY = data.camLocY, camZ = data.camLocZ;
+
+    // 用于堆叠相同位置的标签 (透视箱内物品时一个箱子里的所有 PickUp 重叠在同一屏幕坐标)
+    std::unordered_map<int64_t, int> stackSlot;
+
+    for (const auto& obj : data.worldObjects) {
+        // 箱内物品: 只在透视开关开启时显示
+        if (obj.inBox && !m_enableBoxContentESP) continue;
+
+        bool enabled = false;
+        ImU32 color = IM_COL32(255, 255, 255, 255);
+        const char* prefix = "";
+        switch (obj.kind) {
+            case ue4draw::DrawWorldObjectKind::Item:
+                if (!m_enableItemESP && !obj.inBox) continue;
+                enabled = true; color = IM_COL32(0, 220, 255, 230); prefix = "物"; break;
+            case ue4draw::DrawWorldObjectKind::Weapon:
+                if (!m_enableWeaponESP && !obj.inBox) continue;
+                enabled = true; color = IM_COL32(255, 215, 0, 240); prefix = "枪"; break;
+            case ue4draw::DrawWorldObjectKind::Vehicle:
+                if (!m_enableVehicleESP) continue;
+                enabled = true; color = IM_COL32(255, 140, 0, 240); prefix = "车"; break;
+            case ue4draw::DrawWorldObjectKind::Airdrop:
+                if (!m_enableAirdropESP) continue;
+                enabled = true; color = IM_COL32(255, 60, 60, 250); prefix = "空"; break;
+            case ue4draw::DrawWorldObjectKind::DeathBox:
+                if (!m_enableDeathBoxESP) continue;
+                enabled = true; color = IM_COL32(220, 60, 220, 250); prefix = "死"; break;
+        }
+        if (!enabled) continue;
+
+        const float dx = obj.posX - camX;
+        const float dy = obj.posY - camY;
+        const float dz = obj.posZ - camZ;
+        const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+        if (dist > maxDistCm) continue;
+
+        float sx = 0.0f, sy = 0.0f;
+        if (!worldToScreen(data, obj.posX, obj.posY, obj.posZ, screenW, screenH, sx, sy)) continue;
+        if (sx < -50.0f || sx > screenW + 50.0f || sy < -50.0f || sy > screenH + 50.0f) continue;
+
+        // 距离自适应大小: 远处更小
+        float r = 6.0f;
+        if (dist > 5000.0f) r = 4.0f;
+        if (dist > 15000.0f) r = 3.0f;
+
+        // 标签堆叠 key (8x8 像素桶)
+        const int64_t bucketKey = (static_cast<int64_t>(static_cast<int>(sx) >> 3) << 32)
+                                  | (static_cast<int64_t>(static_cast<int>(sy) >> 3) & 0xFFFFFFFF);
+        const int slot = stackSlot[bucketKey]++;
+
+        // 圆点只在该位置首次出现时绘制
+        if (slot == 0) {
+            dl->AddCircleFilled(ImVec2(sx, sy), r, color);
+            dl->AddCircle(ImVec2(sx, sy), r + 1.0f, IM_COL32(0, 0, 0, 180), 0, 1.5f);
+        }
+
+        char text[96];
+        if (obj.kind == ue4draw::DrawWorldObjectKind::Vehicle && obj.fuel >= 0.0f) {
+            snprintf(text, sizeof(text), "%s %s 油%.0f%% %.0fm",
+                     prefix, obj.label.c_str(), obj.fuel, dist / 100.0f);
+        } else if (obj.inBox) {
+            // 箱内物品: 不显示距离 (与箱子相同), 加 ▸ 表示子项
+            snprintf(text, sizeof(text), "  ▸ %s %s", prefix, obj.label.c_str());
+        } else {
+            snprintf(text, sizeof(text), "%s %s %.0fm", prefix, obj.label.c_str(), dist / 100.0f);
+        }
+        ImVec2 ts = ImGui::CalcTextSize(text);
+        float tx = sx + r + 4.0f;
+        float ty = sy - ts.y * 0.5f + slot * (ts.y + 1.0f);
+        dl->AddText(ImVec2(tx + 1, ty + 1), IM_COL32(0, 0, 0, 200), text);
+        dl->AddText(ImVec2(tx, ty), color, text);
+        rendered++;
+    }
+
+    ImGui::End();
+    return rendered;
+}
+
+// =====================================================================
 //  小地图绘制
 // =====================================================================
 int UE4Overlay::drawMinimap(const DrawGameData& data, float screenW, float screenH) {
     float mapSize = m_minimapSize;
-    float mapX = screenW - mapSize - 15.0f;
-    float mapY = 15.0f;
+    // 默认位置: 屏幕右上角; 否则使用用户保存的坐标 (并夹紧在屏幕内)
+    float defaultX = screenW - mapSize - 15.0f;
+    float defaultY = 15.0f;
+    float mapX = (m_minimapPosX <= ue4draw::kMinimapPosUnset) ? defaultX : m_minimapPosX;
+    float mapY = (m_minimapPosY <= ue4draw::kMinimapPosUnset) ? defaultY : m_minimapPosY;
+    // 允许负坐标: 雷达可超出屏幕边界, 仅保留至少 50px 在屏内
+    const float minVisible = 50.0f;
+    float clampMinX = -mapSize + minVisible;
+    float clampMinY = -mapSize + minVisible;
+    float clampMaxX = std::max(screenW - minVisible, clampMinX + 1.0f);
+    float clampMaxY = std::max(screenH - minVisible, clampMinY + 1.0f);
+    mapX = std::max(clampMinX, std::min(mapX, clampMaxX));
+    mapY = std::max(clampMinY, std::min(mapY, clampMaxY));
+    // 持久化夹紧后的值, 确保锁定/解锁切换时不会被默认值覆盖
+    m_minimapPosX = mapX;
+    m_minimapPosY = mapY;
 
-    ImGui::SetNextWindowPos(ImVec2(mapX, mapY));
-    ImGui::SetNextWindowSize(ImVec2(mapSize, mapSize));
-    ImGui::Begin("##UE4Minimap", nullptr,
-        ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs |
-        ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoBringToFrontOnFocus);
+    // 锁定时强制对齐 m_minimapPos*; 解锁时仅首次设置位置, 让 ImGui 自由拖拽
+    ImGuiCond posCond = m_minimapLocked ? ImGuiCond_Always : ImGuiCond_Once;
+    ImGui::SetNextWindowPos(ImVec2(mapX, mapY), posCond);
+    ImGui::SetNextWindowSize(ImVec2(mapSize, mapSize), ImGuiCond_Always);
+
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration |
+                             ImGuiWindowFlags_NoNav |
+                             ImGuiWindowFlags_NoBringToFrontOnFocus |
+                             ImGuiWindowFlags_NoSavedSettings;
+    if (m_minimapLocked) {
+        flags |= ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoInputs;
+    }
+    ImGui::Begin("##UE4Minimap", nullptr, flags);
+
+    if (!m_minimapLocked) {
+        // 同步 ImGui 拖拽后的窗口位置回 m_minimapPos*, 锁定时不会回弹
+        ImVec2 wp = ImGui::GetWindowPos();
+        m_minimapPosX = wp.x;
+        m_minimapPosY = wp.y;
+        mapX = wp.x;
+        mapY = wp.y;
+    }
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 origin(mapX, mapY);
@@ -1119,6 +1452,120 @@ int UE4Overlay::drawMinimap(const DrawGameData& data, float screenW, float scree
 
     ImGui::End();
     return renderedCount;
+}
+
+// =====================================================================
+//  AI 屏幕检测绘制 (NCNN NanoDet 通过 screencap 旁路截屏, 不使用 Hook)
+//  - 检测线程独立运行 (ai_overlay::AIPipeline)
+//  - 此函数仅从 AISharedData 读最新一帧结果, 缩放映射到当前屏幕坐标
+// =====================================================================
+int UE4Overlay::drawAIDetections(float screenW, float screenH) {
+#if defined(AI_OVERLAY_AVAILABLE)
+    auto& shared = ai_overlay::AISharedData::getInstance();
+    {
+        static int s_dbg = 0;
+        if ((++s_dbg % 120) == 1) {
+            LOG(LOG_LEVEL_INFO, "[AI/Draw] entry valid=%d enabled=%d ready=%d",
+                shared.valid()?1:0, shared.enabled()?1:0, shared.ready()?1:0);
+        }
+    }
+    if (!shared.enabled() || !shared.ready()) return 0;
+
+    // 同步 GUI 状态到 pipeline
+    shared.setScoreThreshold(m_aiScoreThr);
+    shared.setTargetClassFilter(m_aiOnlyPerson ? 0 : -1);
+
+    std::vector<ai_overlay::DetectionBox> dets;
+    int srcW = 0, srcH = 0;
+    shared.getDetections(dets, srcW, srcH);
+    if (dets.empty() || srcW <= 0 || srcH <= 0) return 0;
+
+    // 截屏帧大小 → 当前 ImGui 屏幕大小
+    const float sx = screenW / static_cast<float>(srcW);
+    const float sy = screenH / static_cast<float>(srcH);
+
+    // 与 drawESP 一致: 使用全屏透明窗口而非 BackgroundDrawList
+    // (AImGui 转发不收 Background/Foreground draw list, 只转发 named window draw lists)
+    ImGui::SetNextWindowPos(ImVec2(0, 0));
+    ImGui::SetNextWindowSize(ImVec2(screenW, screenH));
+    ImGui::Begin("##UE4AI", nullptr,
+        ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoDecoration |
+        ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+        ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoSavedSettings);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImU32 boxCol = IM_COL32(
+        static_cast<int>(m_aiBoxColor[0] * 255),
+        static_cast<int>(m_aiBoxColor[1] * 255),
+        static_cast<int>(m_aiBoxColor[2] * 255),
+        230);
+    const ImU32 textCol = IM_COL32(255, 255, 255, 230);
+    const ImU32 textBgCol = IM_COL32(0, 0, 0, 160);
+
+    int drawn = 0;
+    for (const auto& b : dets) {
+        if (b.score < m_aiScoreThr) continue;
+        const float x0 = b.x * sx;
+        const float y0 = b.y * sy;
+        const float x1 = (b.x + b.w) * sx;
+        const float y1 = (b.y + b.h) * sy;
+        dl->AddRect(ImVec2(x0, y0), ImVec2(x1, y1), boxCol, 0.0f, 0, m_aiBoxThickness);
+        if (m_aiDrawScore) {
+            char buf[24];
+            snprintf(buf, sizeof(buf), "%d %.0f%%", b.classId, b.score * 100.f);
+            ImVec2 ts = ImGui::CalcTextSize(buf);
+            dl->AddRectFilled(ImVec2(x0, y0 - ts.y - 2),
+                              ImVec2(x0 + ts.x + 4, y0),
+                              textBgCol);
+            dl->AddText(ImVec2(x0 + 2, y0 - ts.y - 1), textCol, buf);
+        }
+        ++drawn;
+    }
+
+    // ── AI 辅助瞄准: 视觉锁定 + (可选)注入触屏 ──
+    if (m_aiAimEnable) {
+        auto& aim = ai_overlay::AimAssist::getInstance();
+        // 同步 UI 配置 -> AimAssist
+        aim.setVisualOnly(m_aiAimVisualOnly);
+        aim.setFovRadius(m_aiAimFovRadius * srcW / std::max(1.f, screenW));
+        aim.setHeadRatio(m_aiAimHeadRatio);
+        aim.setMinScore(m_aiAimMinScore / 100.0f);
+        aim.setOnlyPerson(m_aiAimOnlyPerson);
+        aim.setSensitivity(m_aiAimSensitivityX, m_aiAimSensitivityY);
+        aim.setRequireTrigger(m_aiAimRequireTrigger);
+
+        // FOV 圆 (屏幕中心)
+        ImVec2 center(screenW * 0.5f, screenH * 0.5f);
+        dl->AddCircle(center, m_aiAimFovRadius,
+                      IM_COL32(255, 255, 255, 70), 64, 1.0f);
+        dl->AddCircleFilled(center, 2.5f, IM_COL32(255, 255, 255, 220));
+
+        // 选最优目标 (在源帧坐标系下)
+        ai_overlay::AimTarget tgt;
+        if (aim.pickTarget(srcW * 0.5f, srcH * 0.5f, tgt)) {
+            float tx = tgt.screenX * sx;
+            float ty = tgt.screenY * sy;
+            float bx0 = tgt.boxX * sx;
+            float by0 = tgt.boxY * sy;
+            float bx1 = (tgt.boxX + tgt.boxW) * sx;
+            float by1 = (tgt.boxY + tgt.boxH) * sy;
+            const ImU32 lockCol = IM_COL32(50, 255, 80, 230);
+            // 锁定框加粗
+            dl->AddRect(ImVec2(bx0, by0), ImVec2(bx1, by1), lockCol, 0, 0, 3.0f);
+            // 准星到目标连线
+            dl->AddLine(center, ImVec2(tx, ty), IM_COL32(50, 255, 80, 200), 1.5f);
+            // 目标十字
+            dl->AddCircle(ImVec2(tx, ty), 8.0f, lockCol, 0, 2.0f);
+            dl->AddLine(ImVec2(tx - 12, ty), ImVec2(tx + 12, ty), lockCol, 1.5f);
+            dl->AddLine(ImVec2(tx, ty - 12), ImVec2(tx, ty + 12), lockCol, 1.5f);
+        }
+    }
+
+    ImGui::End();
+    return drawn;
+#else
+    (void)screenW; (void)screenH;
+    return 0;
+#endif
 }
 
 } // namespace ue4draw

@@ -12,10 +12,11 @@
 #include <algorithm>
 #include <cstring>
 #include "../engine/UE4Struct.h"
+#include "../draw/UE4Draw.h"
 
 // 前向声明
 namespace ue4inf { class UE4Interface; }
-namespace ue4draw { struct DrawGameData; struct DrawPlayerInfo; }
+namespace ue4draw { struct DrawGameData; struct DrawPlayerInfo; struct DrawWorldObject; }
 
 // =====================================================================
 //  PUBG Mobile 和平精英 — 对局状态监控 + 玩家坐标采集 (C++ 原生实现)
@@ -56,10 +57,14 @@ namespace pubgmhd {
 //  引擎常量
 // =====================================================================
 static constexpr int POLL_INTERVAL_MS         = 250;
-static constexpr int PLAYER_POLL_INTERVAL_MS  = 8;
-static constexpr int MONITOR_IDLE_SLEEP_MS    = 1;
+// PLAYER_POLL_INTERVAL_MS: 玩家列表轮询间隔. 8ms (~125Hz) 会让 process_vm_readv
+// 频次过高被反作弊判断为非常规进程, 触发踢线. 30ms (~33Hz) 仍能保证 ESP 流畅.
+static constexpr int PLAYER_POLL_INTERVAL_MS  = 30;
+static constexpr int MONITOR_IDLE_SLEEP_MS    = 2;
 static constexpr int STATE_LOG_INTERVAL_MS    = 1000;
 static constexpr int PLAYER_LOG_INTERVAL_MS   = 1000;
+// 骨架抓取节流 (per-player): 骨架解析每个玩家每帧上百次跨进程读, 降到 200ms 大幅减压
+static constexpr int SKELETON_RESOLVE_INTERVAL_MS = 200;
 static constexpr size_t TRACKED_BONE_COUNT    = 17;
 
 // =====================================================================
@@ -216,6 +221,24 @@ struct ResolvedOffsets {
     int32_t Char_CurWeapon                = -1;  // STExtraBaseCharacter.CurWeapon
     int32_t Weapon_BulletTrackComp        = -1;  // STExtraShootWeapon.BulletTrackComp
 
+    // PickUpWrapperActor — 地面物资
+    int32_t PickUp_DefineID            = -1;   // 0x6F0 ItemDefineID (Type+0, SpecID+4, bValid+8)
+    int32_t PickUp_Count               = -1;   // 0x708 int32
+    int32_t PickUp_bHasBeenPickedUp    = -1;   // 0x70C bool
+    int32_t PickUp_bIsInBox            = -1;   // 0x70E bool
+
+    // STExtraVehicleBase — 载具
+    int32_t Vehicle_VehicleType         = -1;  // 0x7AE uint8 ESTExtraVehicleType
+    int32_t Vehicle_VehicleHealthState  = -1;  // 0xB84 uint8 ESTExtraVehicleHealthState
+    int32_t Vehicle_TeamID              = -1;  // 0x1594 int32
+    int32_t Vehicle_Fuel                = -1;  // 0x3374 float CommonComponent_Fuel
+
+    // PickUpListWrapperActor — 多物品箱 (PickUpWrapperActor 派生)
+    int32_t PickUpList_DataList         = -1;  // 0xD98 TArray<PickUpItemData>; stride 0x38
+                                                //   - +0x00 ItemDefineID (Type@+0, SubID@+4)
+                                                //   - +0x18 int32 Count
+                                                //   - +0x30 int32 InstanceID
+
     /// 所有关键偏移是否已成功解析
     bool isValid() const;
 };
@@ -330,6 +353,7 @@ struct PlayerNode {
     std::array<CachedBone, 17> cachedBones{};
     uint32_t    cachedBoneMask = 0;
     uint64_t    cachedBoneTimestampMs = 0;  // 最后有效骨骼的时间戳
+    uint64_t    lastSkeletonAttemptMs = 0;  // 上次尝试 fillPlayerSkeleton 的时间 (节流)
 
     PlayerNode* prev = nullptr;
     PlayerNode* next = nullptr;
@@ -510,6 +534,9 @@ private:
     // ---- GUObjectArray 扫描 Character ----
     int scanCharacters();
 
+    // ---- GUObjectArray 扫描场景物体 (物资/载具/空投) ----
+    int scanWorldObjects(std::vector<ue4draw::DrawWorldObject>& outObjects);
+
     // ---- PlayerArray 遍历更新 ----
     int updatePlayerList(uintptr_t gameStatePtr);
 
@@ -586,6 +613,7 @@ private:
     bool          m_isInMatch = false;
     int32_t       m_myTeamID = -1;
     uint32_t      m_myPlayerKey = 0;
+    uintptr_t     m_myPawn = 0;        // 本地玩家 Pawn (AcknowledgedPawn), 兜底自我识别
     int           m_lastReportedArrayNum = -1;
     int           m_lastReportedTotal = -1;
     int32_t       m_currentMatchElapsedSeconds = -1;
@@ -611,6 +639,15 @@ private:
     std::unordered_map<int, std::string> m_nameCache;
     std::unordered_map<uintptr_t, BoneAssetCacheEntry> m_boneAssetCache;
     uint64_t m_lastBoneCacheClearMs = 0;  // 上次清理骨骼缓存的时间
+
+    // 场景物体扫描缓存 (UClass* -> kind, 0=ignore, 1=PickUp, 2=Vehicle, 3=Airdrop)
+    std::unordered_map<uintptr_t, uint8_t> m_worldObjClassSet;
+    uint64_t m_lastWorldObjScanMs = 0;
+    std::vector<ue4draw::DrawWorldObject> m_cachedWorldObjects;
+    // 分片扫描状态: 把全表扫描拆到多次 poll 调用避免阻塞线程
+    int32_t m_worldObjScanIndex = 0;
+    std::vector<ue4draw::DrawWorldObject> m_worldObjScanBuffer;
+    bool    m_worldObjScanInProgress = false;
 
     // Aimbot (统一使用 SharedUE4Data::isAimbotEnabled() 作为开关)
     int           m_aimbotTargetBone = 3;  // 默认瞄脖子 (TRACKED_BONE_COUNT 索引: 3=neck, 4=head)

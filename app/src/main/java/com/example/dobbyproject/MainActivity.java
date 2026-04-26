@@ -124,6 +124,24 @@ public class MainActivity extends AppCompatActivity {
 
         g_nativeLibPath = getApplicationContext().getApplicationInfo().nativeLibraryDir;
 
+        // ── AI 屏幕检测: 解压模型并启动后台线程 (默认 disabled, 通过 ImGui 菜单开启) ──
+        try {
+            AIScreenDetect.init(getApplicationContext());
+            AIScreenDetect.setUseGpu(true);
+            AIScreenDetect.setUseSu(true);           // screencap 在 app uid 下被 SELinux 拒绝, 必须走 su
+            AIScreenDetect.setIntervalMs(120);
+            AIScreenDetect.setScoreThreshold(0.25f);
+            AIScreenDetect.prepareSharedDets();      // 先创建跨进程共享文件
+            AIScreenDetect.start();
+            // 提前 chmod /dev/uinput, 启用 "AI 辅助瞄准(注入)" 时不再需要等待
+            AIScreenDetect.prepareTouchInjection();
+            // 临时: 启动即开启 AI 检测, 便于验证 screencap+infer 链路
+            AIScreenDetect.setEnabled(true);
+            LogUtil.i("[AI] AIScreenDetect 已启动 (默认开启, 用于诊断)");
+        } catch (Throwable t) {
+            LogUtil.e("AIScreenDetect 启动失败", t);
+        }
+
         TextView tv = findViewById(R.id.sample_text);
         tv.setText(stringFromJNI());
         tvStatus = findViewById(R.id.tv_status);

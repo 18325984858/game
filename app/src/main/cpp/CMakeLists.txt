@@ -61,6 +61,21 @@ option(DOBBY_BUILD_TEST "Build test" OFF)
 add_subdirectory(Dobby)
 add_subdirectory(AndroidSurfaceImgui)
 
+######################################################################################################
+# NCNN (Tencent ncnn-android-vulkan release; per-ABI prebuilt static libs)
+set(NCNN_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/ncnn/${ANDROID_ABI}")
+if(EXISTS "${NCNN_ROOT}/lib/cmake/ncnn/ncnnConfig.cmake")
+    set(ncnn_DIR "${NCNN_ROOT}/lib/cmake/ncnn")
+    find_package(ncnn REQUIRED)
+    # ncnn 的 INTERFACE_COMPILE_OPTIONS 含 -fno-rtti -fno-exceptions, 会污染到主 target 的所有源 (其中
+    # unity_lol 等 TU 使用 try/catch). 这里清空, 仅保留 include + link.
+    set_property(TARGET ncnn PROPERTY INTERFACE_COMPILE_OPTIONS "")
+    message(STATUS "[ai_overlay] ncnn found at ${NCNN_ROOT}")
+    set(AI_OVERLAY_AVAILABLE TRUE)
+else()
+    message(WARNING "[ai_overlay] ncnn not found for ABI=${ANDROID_ABI}; AI detection disabled")
+    set(AI_OVERLAY_AVAILABLE FALSE)
+endif()
 
 ######################################################################################################
 
@@ -170,6 +185,14 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
 
         # ── core/anti_debug (反调试 / 反 Frida 自检线程) ──
         $<$<BOOL:${ENABLE_ANTI_DEBUG}>:core/anti_debug/anti_debug.cpp>
+
+        # ── ai_overlay (NCNN 屏幕检测 - 旁路截屏 + NanoDet 推理, 不使用任何 Hook) ──
+        $<$<BOOL:${AI_OVERLAY_AVAILABLE}>:ai_overlay/ScreenCapture.cpp>
+        $<$<BOOL:${AI_OVERLAY_AVAILABLE}>:ai_overlay/NanoDetInfer.cpp>
+        $<$<BOOL:${AI_OVERLAY_AVAILABLE}>:ai_overlay/AIPipeline.cpp>
+        $<$<BOOL:${AI_OVERLAY_AVAILABLE}>:ai_overlay/AIPipelineJni.cpp>
+        $<$<BOOL:${AI_OVERLAY_AVAILABLE}>:ai_overlay/AimAssist.cpp>
+        $<$<BOOL:${AI_OVERLAY_AVAILABLE}>:ai_overlay/AimAssistJni.cpp>
 )
 
 if(ENABLE_ANTI_DEBUG)
@@ -190,6 +213,11 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
         ${log-lib}
         ${dl-lib}
 )
+
+if(AI_OVERLAY_AVAILABLE)
+    target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE AI_OVERLAY_AVAILABLE=1)
+    target_link_libraries(${CMAKE_PROJECT_NAME} ncnn)
+endif()
 
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
         AndroidSurfaceImgui/includes
