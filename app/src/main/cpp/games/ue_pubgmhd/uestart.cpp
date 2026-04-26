@@ -767,10 +767,22 @@ static void UE4WorkerThread(void* plibUE4ModeBase, void* pGNames,
                     // 1. 解引用指针变量 -> FUObjectArray 内部结构体
                     innerPtr = *reinterpret_cast<volatile uintptr_t*>(gUObjAddr);
                     if (innerPtr >= 0x10000) {
-                        // 2. 用结构体字段访问 TotalNumElements
+                        // 2. 兼容两种对象表布局: 当前 PUBGMHD 是 ModernFlat(+0xB8/+0xC8), 老版本是 chunked(+0xF8/+0x100)
+                        const int32_t flatNum = *reinterpret_cast<volatile int32_t*>(innerPtr + 0xB8);
+                        const int32_t flatMax = *reinterpret_cast<volatile int32_t*>(innerPtr + 0xC0);
+                        const uintptr_t flatItems = *reinterpret_cast<volatile uintptr_t*>(innerPtr + 0xC8);
+                        const int32_t flatChunks = *reinterpret_cast<volatile int32_t*>(innerPtr + 0xD0);
+                        const bool modernFlatOk = flatNum > 100 && flatNum <= flatMax && flatMax < 5000000
+                            && flatItems >= 0x10000 && flatChunks > 0 && flatChunks < 4096;
+
                         auto* uobj = reinterpret_cast<volatile ue4::FUObjectArray*>(innerPtr);
-                        innerTotal = uobj->TotalNumElements;
-                        if (innerTotal > 100 && innerTotal < 5000000) {
+                        const int32_t chunkedTotal = uobj->TotalNumElements;
+                        const int32_t chunkedChunks = uobj->NumChunks;
+                        const bool chunkedOk = chunkedTotal > 100 && chunkedTotal < 5000000
+                            && chunkedChunks > 0 && chunkedChunks < 4096;
+
+                        if (modernFlatOk || chunkedOk) {
+                            innerTotal = modernFlatOk ? flatNum : chunkedTotal;
                             objOk = true;
                             gUObjArrayInner = innerPtr;
                         }

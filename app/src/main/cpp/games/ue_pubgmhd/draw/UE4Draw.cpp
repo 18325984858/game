@@ -22,6 +22,9 @@ namespace ue4draw {
 namespace {
 using Clock = std::chrono::steady_clock;
 
+bool isValidNumber(float value);
+float sanitizeFov(float value);
+
 struct ViewPoint {
     float x = 0.0f;
     float y = 0.0f;
@@ -33,6 +36,78 @@ struct CameraSpacePoint {
     float y = 0.0f;
     float z = 0.0f;
 };
+
+struct ProjectionViewport {
+    float left = 0.0f;
+    float top = 0.0f;
+    float width = 0.0f;
+    float height = 0.0f;
+};
+
+struct ProjectionBasis {
+    ProjectionViewport viewport{};
+    float focalLength = 0.0f;
+    float projectionWidth = 0.0f;
+};
+
+ProjectionViewport getProjectionViewport(float screenW, float screenH) {
+    ProjectionViewport viewport{0.0f, 0.0f, screenW, screenH};
+    if (!std::isfinite(screenW) || !std::isfinite(screenH) || screenW <= 0.0f || screenH <= 0.0f) {
+        return viewport;
+    }
+
+    // UI/HUD safe bounds can be inset on cutout devices, but the UE4 SurfaceView
+    // itself is full-screen. 3D projection must use the render surface, otherwise
+    // off-center targets drift as the forced viewport center moves.
+    return viewport;
+}
+
+bool buildProjectionBasis(const DrawGameData& data,
+                          float screenW,
+                          float screenH,
+                          ProjectionBasis& outBasis) {
+    constexpr float DEG2RAD = 3.14159265358979f / 180.0f;
+    constexpr float kUE4ReferenceAspect = 16.0f / 9.0f;
+    constexpr float kAspectSlack = 0.01f;
+
+    const ProjectionViewport viewport = getProjectionViewport(screenW, screenH);
+    if (!std::isfinite(viewport.width) || !std::isfinite(viewport.height)
+        || viewport.width <= 0.0f || viewport.height <= 0.0f) {
+        return false;
+    }
+
+    const float tanHalfFov = std::tan(sanitizeFov(data.camFOV) * 0.5f * DEG2RAD);
+    if (!isValidNumber(tanHalfFov) || tanHalfFov < 0.01f) {
+        return false;
+    }
+
+    // PUBG mobile 在 21:9 设备 (2400x1080) 上直接全屏渲染, FOV 是横向 FOV 应用到
+    // 整个 surface 宽度. 之前强制用 16:9 参考宽度 (1920) 算 focal 会导致 X 坐标
+    // 被等比拉向中心 (1920/2400=0.8x), 屏幕上目标越偏离中心, ESP 越往中心偏.
+    // 必须用 viewport 真实宽度计算 focal.
+    (void)kUE4ReferenceAspect; (void)kAspectSlack;
+    const float projectionWidth = viewport.width;
+
+    outBasis.viewport = viewport;
+    outBasis.projectionWidth = projectionWidth;
+    outBasis.focalLength = projectionWidth * 0.5f / tanHalfFov;
+    return isValidNumber(outBasis.focalLength) && outBasis.focalLength > 1.0f;
+}
+
+bool projectCameraPoint(const ProjectionBasis& basis,
+                        const CameraSpacePoint& cameraPoint,
+                        float& sx,
+                        float& sy) {
+    constexpr float kNearDepth = 1.0f;
+    if (cameraPoint.z <= kNearDepth) {
+        return false;
+    }
+
+    const ProjectionViewport& viewport = basis.viewport;
+    sx = viewport.left + viewport.width * 0.5f + cameraPoint.x * basis.focalLength / cameraPoint.z;
+    sy = viewport.top + viewport.height * 0.5f - cameraPoint.y * basis.focalLength / cameraPoint.z;
+    return isValidNumber(sx) && isValidNumber(sy);
+}
 
 bool shouldLogEvery(Clock::time_point& lastLogTime, std::chrono::milliseconds interval) {
     const auto now = Clock::now();
@@ -284,23 +359,18 @@ bool projectBonePoint(const DrawGameData& data,
     }
 
     const DrawBonePoint& point = player.bones[toBoneIndex(bone)];
-    constexpr float DEG2RAD = 3.14159265358979f / 180.0f;
-    constexpr float kNearDepth = 1.0f;
 
     CameraSpacePoint cameraPoint;
-    if (!transformWorldToCamera(data, point.x, point.y, point.z, cameraPoint) || cameraPoint.z <= kNearDepth) {
+    if (!transformWorldToCamera(data, point.x, point.y, point.z, cameraPoint)) {
         return false;
     }
 
-    const float tanHalfFov = std::tan(sanitizeFov(data.camFOV) * 0.5f * DEG2RAD);
-    if (!isValidNumber(tanHalfFov) || tanHalfFov < 0.01f) {
+    ProjectionBasis basis;
+    if (!buildProjectionBasis(data, screenW, screenH, basis)) {
         return false;
     }
 
-    const float focalLength = screenW * 0.5f / tanHalfFov;
-    sx = screenW * 0.5f + cameraPoint.x * focalLength / cameraPoint.z;
-    sy = screenH * 0.5f - cameraPoint.y * focalLength / cameraPoint.z;
-    return isValidNumber(sx) && isValidNumber(sy);
+    return projectCameraPoint(basis, cameraPoint, sx, sy);
 }
 
 int drawPlayerSkeleton(ImDrawList* drawList,
@@ -428,22 +498,21 @@ bool projectFallbackArrow(const DrawGameData& data,
         return false;
     }
 
-    constexpr float DEG2RAD = 3.14159265358979f / 180.0f;
     constexpr float kNearDepth = 1.0f;
     constexpr float kMarginX = 40.0f;
     constexpr float kMarginY = 60.0f;
 
-    const float tanHalfFov = std::tan(sanitizeFov(data.camFOV) * 0.5f * DEG2RAD);
-    if (!isValidNumber(tanHalfFov) || tanHalfFov < 0.01f) {
+    ProjectionBasis basis;
+    if (!buildProjectionBasis(data, screenW, screenH, basis)) {
         return false;
     }
 
     const bool behindCamera = cameraPoint.z <= kNearDepth;
     const float safeDepth = std::max(std::fabs(cameraPoint.z), kNearDepth);
-    const float focalLength = screenW * 0.5f / tanHalfFov;
+    const ProjectionViewport& viewport = basis.viewport;
 
-    float screenDx = cameraPoint.x * focalLength / safeDepth;
-    float screenDy = -cameraPoint.y * focalLength / safeDepth;
+    float screenDx = cameraPoint.x * basis.focalLength / safeDepth;
+    float screenDy = -cameraPoint.y * basis.focalLength / safeDepth;
     if (behindCamera) {
         screenDx = -screenDx;
         screenDy = -screenDy;
@@ -456,12 +525,16 @@ bool projectFallbackArrow(const DrawGameData& data,
         screenDy = behindCamera ? 1.0f : -1.0f;
     }
 
-    const float halfW = std::max(screenW * 0.5f - kMarginX, 1.0f);
-    const float halfH = std::max(screenH * 0.5f - kMarginY, 1.0f);
+    const float halfW = std::max(viewport.width * 0.5f - kMarginX, 1.0f);
+    const float halfH = std::max(viewport.height * 0.5f - kMarginY, 1.0f);
     const float scale = 1.0f / std::max(std::fabs(screenDx) / halfW, std::fabs(screenDy) / halfH);
 
-    arrowX = std::clamp(screenW * 0.5f + screenDx * scale, kMarginX, screenW - kMarginX);
-    arrowY = std::clamp(screenH * 0.5f + screenDy * scale, kMarginY, screenH - kMarginY);
+    arrowX = std::clamp(viewport.left + viewport.width * 0.5f + screenDx * scale,
+                        viewport.left + kMarginX,
+                        viewport.left + viewport.width - kMarginX);
+    arrowY = std::clamp(viewport.top + viewport.height * 0.5f + screenDy * scale,
+                        viewport.top + kMarginY,
+                        viewport.top + viewport.height - kMarginY);
     angleRad = std::atan2(screenDy, screenDx);
     return isValidNumber(arrowX) && isValidNumber(arrowY) && isValidNumber(angleRad);
 }
@@ -543,10 +616,19 @@ void UE4Overlay::drawOverlay(const DrawGameData& data) {
         }
 
         if (shouldLogEvery(s_lastSummaryLog, std::chrono::milliseconds(2000))) {
+            ProjectionBasis basis;
+            const bool hasProjectionBasis = buildProjectionBasis(renderData, screenW, screenH, basis);
+            const ProjectionViewport viewport = hasProjectionBasis ? basis.viewport : getProjectionViewport(screenW, screenH);
             DLOG(LOG_LEVEL_INFO,
-                 "overlay summary: screen=%.0fx%.0f tracked=%zu alive=%d/%d esp=%d minimap=%d cam=(%.0f, %.0f, %.0f) fov=%.1f",
+                 "overlay summary: screen=%.0fx%.0f viewport=(%.0f,%.0f %.0fx%.0f) projW=%.0f focal=%.1f tracked=%zu alive=%d/%d esp=%d minimap=%d cam=(%.0f, %.0f, %.0f) fov=%.1f",
                  screenW,
                  screenH,
+                 viewport.left,
+                 viewport.top,
+                 viewport.width,
+                 viewport.height,
+                 hasProjectionBasis ? basis.projectionWidth : 0.0f,
+                 hasProjectionBasis ? basis.focalLength : 0.0f,
                  renderData.players.size(),
                  renderData.aliveCount,
                  renderData.totalCount,
@@ -750,28 +832,17 @@ bool UE4Overlay::worldToScreen(const DrawGameData& cam,
                                float wx, float wy, float wz,
                                float screenW, float screenH,
                                float& sx, float& sy) {
-    constexpr float DEG2RAD = 3.14159265358979f / 180.0f;
-
     CameraSpacePoint cameraPoint;
     if (!transformWorldToCamera(cam, wx, wy, wz, cameraPoint)) {
         return false;
     }
 
-    constexpr float kNearDepth = 1.0f;
-    if (cameraPoint.z <= kNearDepth) {
+    ProjectionBasis basis;
+    if (!buildProjectionBasis(cam, screenW, screenH, basis)) {
         return false;
     }
 
-    const float tanHalfFov = std::tan(sanitizeFov(cam.camFOV) * 0.5f * DEG2RAD);
-    if (!isValidNumber(tanHalfFov) || tanHalfFov < 0.01f) {
-        return false;
-    }
-
-    const float focalLength = screenW * 0.5f / tanHalfFov;
-    sx = screenW * 0.5f + cameraPoint.x * focalLength / cameraPoint.z;
-    sy = screenH * 0.5f - cameraPoint.y * focalLength / cameraPoint.z;
-
-    return isValidNumber(sx) && isValidNumber(sy);
+    return projectCameraPoint(basis, cameraPoint, sx, sy);
 }
 
 // =====================================================================
@@ -824,13 +895,64 @@ int UE4Overlay::drawESP(const DrawGameData& data, float screenW, float screenH) 
             float footSY = 0.0f;
             float headSX = 0.0f;
             float headSY = 0.0f;
-            if (worldToScreen(data, p.posX, p.posY, p.posZ - kCharacterHalfHeight, screenW, screenH, footSX, footSY)
+            float boxLeft = 0.0f;
+            float boxRight = 0.0f;
+            float topY = 0.0f;
+            float botY = 0.0f;
+            bool hasBox = false;
+
+            if (p.boneMask != 0) {
+                float minX = screenW;
+                float maxX = 0.0f;
+                float minY = screenH;
+                float maxY = 0.0f;
+                int projectedBones = 0;
+                for (size_t boneIndex = 0; boneIndex < kTrackedBoneCount; ++boneIndex) {
+                    float boneX = 0.0f;
+                    float boneY = 0.0f;
+                    if (!projectBonePoint(data, p, static_cast<DrawBoneId>(boneIndex), screenW, screenH, boneX, boneY)) {
+                        continue;
+                    }
+                    if (boneX < -screenW || boneX > screenW * 2.0f || boneY < -screenH || boneY > screenH * 2.0f) {
+                        continue;
+                    }
+                    minX = std::min(minX, boneX);
+                    maxX = std::max(maxX, boneX);
+                    minY = std::min(minY, boneY);
+                    maxY = std::max(maxY, boneY);
+                    projectedBones++;
+                }
+                if (projectedBones >= 3) {
+                    const float boneBoxH = std::max(maxY - minY, 12.0f);
+                    const float boneBoxW = std::max(maxX - minX, boneBoxH * 0.32f);
+                    const float padX = std::clamp(boneBoxW * 0.20f, 4.0f, 18.0f);
+                    const float padTop = std::clamp(boneBoxH * 0.12f, 4.0f, 20.0f);
+                    const float padBottom = std::clamp(boneBoxH * 0.08f, 3.0f, 16.0f);
+                    boxLeft = minX - padX;
+                    boxRight = maxX + padX;
+                    topY = minY - padTop;
+                    botY = maxY + padBottom;
+                    hasBox = true;
+                }
+            }
+
+            if (!hasBox
+                && worldToScreen(data, p.posX, p.posY, p.posZ - kCharacterHalfHeight, screenW, screenH, footSX, footSY)
                 && worldToScreen(data, p.posX, p.posY, p.posZ + kCharacterHalfHeight, screenW, screenH, headSX, headSY)) {
-                const float boxH = std::fabs(footSY - headSY);
-                const float boxW = boxH * 0.48f;
-                const float cx = (footSX + headSX) * 0.5f;
-                const float topY = std::min(footSY, headSY);
-                const float botY = std::max(footSY, headSY);
+                const float rootBoxH = std::fabs(footSY - headSY);
+                const float rootBoxW = rootBoxH * 0.48f;
+                const float rootCx = (footSX + headSX) * 0.5f;
+                boxLeft = rootCx - rootBoxW / 2.0f;
+                boxRight = rootCx + rootBoxW / 2.0f;
+                topY = std::min(footSY, headSY);
+                botY = std::max(footSY, headSY);
+                hasBox = true;
+            }
+
+            if (hasBox) {
+                const float boxH = botY - topY;
+                const float boxW = boxRight - boxLeft;
+                const float cx = (boxLeft + boxRight) * 0.5f;
 
                 if (boxH >= 10.0f && boxH <= screenH * 0.9f
                     && cx >= -boxW && cx <= screenW + boxW
@@ -838,7 +960,7 @@ int UE4Overlay::drawESP(const DrawGameData& data, float screenW, float screenH) 
                     rendered = true;
                     preciseRendered = true;
 
-                    dl->AddRect(ImVec2(cx - boxW / 2, topY), ImVec2(cx + boxW / 2, botY),
+                    dl->AddRect(ImVec2(boxLeft, topY), ImVec2(boxRight, botY),
                                 boxColor, 0, 0, 2.0f);
 
                     if (m_enableSnapline) {
@@ -847,7 +969,7 @@ int UE4Overlay::drawESP(const DrawGameData& data, float screenW, float screenH) 
                     }
 
                     if (m_enableHP) {
-                        const float hpX = cx - boxW / 2 - 5.0f;
+                        const float hpX = boxLeft - 5.0f;
                         const float hpFill = topY + (botY - topY) * (1.0f - hpRatio);
                         dl->AddRectFilled(ImVec2(hpX - 3, topY), ImVec2(hpX, botY),
                                           IM_COL32(0, 0, 0, 150));
@@ -866,7 +988,7 @@ int UE4Overlay::drawESP(const DrawGameData& data, float screenW, float screenH) 
                         char boneBuf[32];
                         snprintf(boneBuf, sizeof(boneBuf), "B:%d", boneCount);
                         const ImU32 boneColor = boneCount > 0 ? IM_COL32(80, 255, 255, 230) : IM_COL32(255, 210, 80, 230);
-                        dl->AddText(ImVec2(cx + boxW * 0.5f + 6.0f, topY), boneColor, boneBuf);
+                        dl->AddText(ImVec2(boxRight + 6.0f, topY), boneColor, boneBuf);
                     }
 
                     if (m_enableDistance) {

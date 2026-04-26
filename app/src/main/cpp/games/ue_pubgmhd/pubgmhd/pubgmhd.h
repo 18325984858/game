@@ -70,6 +70,13 @@ struct ResolvedOffsets {
     // UWorld
     int32_t World_GameState             = -1;
     int32_t World_AuthorityGameMode     = -1;
+    int32_t World_PersistentLevel       = -1;
+    int32_t World_ActiveLevelActors     = -1;
+    int32_t World_Levels                = -1;
+
+    // ULevel / LevelActorContainer
+    int32_t Level_ActorCluster          = -1;
+    int32_t LevelActorContainer_Actors  = -1;
 
     // GameStateBase
     int32_t GS_bHasBegunPlay            = -1;
@@ -100,6 +107,9 @@ struct ResolvedOffsets {
     int32_t Actor_RootComponent         = -1;
     int32_t Actor_NetCullDistSq         = -1;
 
+    // Pawn
+    int32_t Pawn_PlayerState            = -1;
+
     // SceneComponent
     int32_t SceneComp_ComponentToWorld  = -1;
     int32_t SceneComp_Translation       = -1;
@@ -109,8 +119,18 @@ struct ResolvedOffsets {
     int32_t PC_bIsObserverInBattle      = -1;
     int32_t PC_bIsObserverHost          = -1;
 
+    // 本地玩家链路 (World -> GameInstance -> LocalPlayers[0] -> PlayerController)
+    int32_t World_OwningGameInstance    = -1;  // World.OwningGameInstance
+    int32_t GI_LocalPlayers             = -1;  // GameInstance.LocalPlayers (TArray<ULocalPlayer*>)
+    int32_t Player_PlayerController     = -1;  // UPlayer.PlayerController
+    int32_t PC_AcknowledgedPawn         = -1;  // PlayerController.AcknowledgedPawn
+    int32_t PC_PlayerState              = -1;  // Controller.PlayerState
+
     // Controller
     int32_t Ctrl_ControlRotation        = -1;  // FRotator (Pitch, Yaw, Roll)
+    int32_t STPC_LastFrameCacheControlRotation = -1;
+    int32_t STPC_CachedViewControlRotation     = -1;
+    int32_t STPC_CurrentActiveCameraCache      = -1;
 
     // Actor (通用)
     int32_t Actor_Owner                 = -1;  // AActor::Owner
@@ -119,6 +139,7 @@ struct ResolvedOffsets {
     int32_t PC_PlayerCameraManager      = -1;  // PlayerController.PlayerCameraManager
 
     // PlayerCameraManager
+    int32_t PCM_PCOwner                 = -1;
     int32_t PCM_CameraCache             = -1;  // PlayerCameraManager.CameraCache
     int32_t PCM_DefaultFOV              = -1;  // PlayerCameraManager.DefaultFOV
 
@@ -138,6 +159,7 @@ struct ResolvedOffsets {
     int32_t STBase_FPPComp              = -1;
     int32_t STBase_DefaultCharacterMesh = -1;
     int32_t STBase_LastSkeletalMesh     = -1;
+    int32_t STBase_STExtraPlayerState   = -1;
 
     // AvatarComponent
     int32_t Avatar_MasterBoneComponent  = -1;
@@ -475,6 +497,7 @@ private:
 
     // ---- 观战类型 ----
     uintptr_t getLocalPlayerController();
+    uintptr_t findPlayerCameraManagerInstance();
     EObserverType detectObserverType();
     bool setObserverType(EObserverType type);
 
@@ -555,6 +578,9 @@ private:
     uintptr_t m_cachedGSPtr = 0;                          // 上次命中的 GameState UObject
     std::unordered_map<uintptr_t,bool> m_gsClassSet;      // UClass* -> isSubclassOf(GameStateBase)
     uint64_t  m_lastEmptyGSScanMs = 0;                    // 最近一次空扫时间戳, 用于节流
+    uintptr_t m_cachedPCMPtr = 0;                          // PlayerCameraManager 兜底缓存
+    std::unordered_map<uintptr_t,bool> m_pcmClassSet;      // UClass* -> isSubclassOf(PlayerCameraManager)
+    uint64_t  m_lastPCMScanMs = 0;                         // 最近一次相机管理器空扫时间戳
     std::string   m_lastMatchState;
     std::string   m_currentMatchState;   // 当前对局状态 (InProgress/WaitingToStart/Aircraft 等)
     bool          m_isInMatch = false;

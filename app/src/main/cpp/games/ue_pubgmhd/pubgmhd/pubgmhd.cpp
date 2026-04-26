@@ -165,6 +165,126 @@ bool safeWriteMemory(uintptr_t addr, const void* src, size_t size) {
     return true;
 }
 
+bool looksLikeRemotePtr(uintptr_t value) {
+    return value >= 0x10000 && value < 0x0000800000000000ULL;
+}
+
+bool readRemoteS32(uintptr_t addr, int32_t& out) {
+    out = 0;
+    return safeReadMemory(addr, &out, sizeof(out));
+}
+
+bool readRemotePtr(uintptr_t addr, uintptr_t& out) {
+    out = 0;
+    if (!safeReadMemory(addr, &out, sizeof(out))) return false;
+    return looksLikeRemotePtr(out);
+}
+
+enum class UObjectArrayLayoutKind : uint8_t {
+    Invalid = 0,
+    ModernFlat,
+    LegacyChunked,
+};
+
+struct UObjectArrayLayout {
+    UObjectArrayLayoutKind kind = UObjectArrayLayoutKind::Invalid;
+    uintptr_t items = 0;
+    int32_t totalNum = 0;
+    int32_t maxNum = 0;
+    int32_t numChunks = 0;
+};
+
+const char* uObjectArrayLayoutName(UObjectArrayLayoutKind kind) {
+    switch (kind) {
+        case UObjectArrayLayoutKind::ModernFlat: return "ModernFlat";
+        case UObjectArrayLayoutKind::LegacyChunked: return "LegacyChunked";
+        default: return "Invalid";
+    }
+}
+
+bool detectUObjectArrayLayout(uintptr_t arrayBase, UObjectArrayLayout& out) {
+    out = {};
+    if (!looksLikeRemotePtr(arrayBase)) return false;
+
+    int32_t flatNum = 0;
+    int32_t flatMax = 0;
+    int32_t flatChunks = 0;
+    uintptr_t flatItems = 0;
+    if (readRemoteS32(arrayBase + 0xB8, flatNum)
+        && readRemoteS32(arrayBase + 0xC0, flatMax)
+        && readRemotePtr(arrayBase + 0xC8, flatItems)
+        && readRemoteS32(arrayBase + 0xD0, flatChunks)
+        && flatNum > 0 && flatNum <= flatMax && flatMax <= 5000000
+        && flatChunks > 0 && flatChunks <= 4096) {
+        out.kind = UObjectArrayLayoutKind::ModernFlat;
+        out.items = flatItems;
+        out.totalNum = flatNum;
+        out.maxNum = flatMax;
+        out.numChunks = flatChunks;
+        return true;
+    }
+
+    int32_t numChunks = 0;
+    int32_t totalNum = 0;
+    uintptr_t firstChunk = 0;
+    int32_t firstChunkCount = 0;
+    if (readRemoteS32(arrayBase + 0xF8, numChunks)
+        && readRemoteS32(arrayBase + 0x100, totalNum)
+        && readRemotePtr(arrayBase + 0xC8, firstChunk)
+        && readRemoteS32(arrayBase + 0xE8, firstChunkCount)
+        && numChunks > 0 && numChunks <= 4096
+        && totalNum > 0 && totalNum <= 5000000
+        && firstChunkCount > 0) {
+        out.kind = UObjectArrayLayoutKind::LegacyChunked;
+        out.totalNum = totalNum;
+        out.numChunks = numChunks;
+        return true;
+    }
+
+    return false;
+}
+
+bool readUObjectItemAt(uintptr_t arrayBase, const UObjectArrayLayout& layout, int32_t index, ue4::FUObjectItem& outItem) {
+    outItem = {};
+    if (index < 0 || index >= layout.totalNum) return false;
+
+    if (layout.kind == UObjectArrayLayoutKind::ModernFlat) {
+        return safeReadMemory(layout.items + static_cast<uintptr_t>(index) * sizeof(ue4::FUObjectItem),
+                              &outItem,
+                              sizeof(outItem));
+    }
+
+    if (layout.kind == UObjectArrayLayoutKind::LegacyChunked) {
+        int32_t remaining = index;
+        for (int32_t chunkIndex = 0; chunkIndex < layout.numChunks; ++chunkIndex) {
+            int32_t chunkCount = 0;
+            uintptr_t chunkBase = 0;
+            if (!readRemoteS32(arrayBase + 0xE8 + static_cast<uintptr_t>(chunkIndex) * sizeof(int32_t), chunkCount)
+                || chunkCount <= 0) {
+                continue;
+            }
+            if (remaining >= chunkCount) {
+                remaining -= chunkCount;
+                continue;
+            }
+            if (!readRemotePtr(arrayBase + 0xC8 + static_cast<uintptr_t>(chunkIndex) * sizeof(uintptr_t), chunkBase)) {
+                return false;
+            }
+            return safeReadMemory(chunkBase + static_cast<uintptr_t>(remaining) * sizeof(ue4::FUObjectItem),
+                                  &outItem,
+                                  sizeof(outItem));
+        }
+    }
+
+    return false;
+}
+
+uintptr_t readUObjectAt(uintptr_t arrayBase, const UObjectArrayLayout& layout, int32_t index) {
+    ue4::FUObjectItem item{};
+    if (!readUObjectItemAt(arrayBase, layout, index, item)) return 0;
+    return reinterpret_cast<uintptr_t>(item.Object);
+}
+
 bool isFiniteVector(const FVector3& value) {
     return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
 }
@@ -321,7 +441,7 @@ std::chrono::milliseconds getSlowRefreshInterval(int32_t matchElapsedSeconds) {
 int getCharacterScanBudget(int32_t matchElapsedSeconds) {
     switch (getLoadThrottlePhase(matchElapsedSeconds)) {
         case LoadThrottlePhase::Early:
-            return 0;
+            return 8192;
         case LoadThrottlePhase::Transition:
             return 32768;
         case LoadThrottlePhase::Normal:
@@ -333,7 +453,7 @@ int getCharacterScanBudget(int32_t matchElapsedSeconds) {
 int getCharacterScanIntervalMs(int32_t matchElapsedSeconds) {
     switch (getLoadThrottlePhase(matchElapsedSeconds)) {
         case LoadThrottlePhase::Early:
-            return -1;
+            return 1000;
         case LoadThrottlePhase::Transition:
             return 800;
         case LoadThrottlePhase::Normal:
@@ -505,53 +625,19 @@ uintptr_t resolveWeakObjectPtr(uintptr_t guObjectArrayPtr, uintptr_t weakPtrAddr
         return 0;
     }
 
-    int32_t numChunks = 0;
-    int32_t totalNum = 0;
-    if (!safeReadMemory(guObjectArrayPtr + 0xF8, &numChunks, sizeof(numChunks))
-        || !safeReadMemory(guObjectArrayPtr + 0x100, &totalNum, sizeof(totalNum))
-        || numChunks <= 0
-        || numChunks > 1000
-        || weakPtr.objectIndex >= totalNum) {
+    UObjectArrayLayout layout{};
+    if (!detectUObjectArrayLayout(guObjectArrayPtr, layout)
+        || weakPtr.objectIndex >= layout.totalNum) {
         return 0;
     }
 
-    int32_t remainingIndex = weakPtr.objectIndex;
-    for (int32_t chunkIndex = 0; chunkIndex < numChunks; ++chunkIndex) {
-        int32_t chunkCount = 0;
-        if (!safeReadMemory(guObjectArrayPtr + 0xE8 + static_cast<uintptr_t>(chunkIndex) * sizeof(int32_t),
-                            &chunkCount,
-                            sizeof(chunkCount))
-            || chunkCount <= 0) {
-            continue;
-        }
-
-        if (remainingIndex >= chunkCount) {
-            remainingIndex -= chunkCount;
-            continue;
-        }
-
-        uintptr_t chunkBase = 0;
-        if (!safeReadMemory(guObjectArrayPtr + 0xC8 + static_cast<uintptr_t>(chunkIndex) * sizeof(uintptr_t),
-                            &chunkBase,
-                            sizeof(chunkBase))
-            || chunkBase < 0x10000) {
-            return 0;
-        }
-
-        ue4::FUObjectItem item{};
-        const uintptr_t itemAddr = chunkBase + static_cast<uintptr_t>(remainingIndex) * sizeof(ue4::FUObjectItem);
-        if (!safeReadMemory(itemAddr, &item, sizeof(item))) {
-            return 0;
-        }
-
-        if (item.SerialNumber != weakPtr.objectSerialNumber) {
-            return 0;
-        }
-
-        return reinterpret_cast<uintptr_t>(item.Object);
+    ue4::FUObjectItem item{};
+    if (!readUObjectItemAt(guObjectArrayPtr, layout, weakPtr.objectIndex, item)
+        || item.SerialNumber != weakPtr.objectSerialNumber) {
+        return 0;
     }
 
-    return 0;
+    return reinterpret_cast<uintptr_t>(item.Object);
 }
 
 bool MatchMonitor::initOffsets() {
@@ -560,6 +646,18 @@ bool MatchMonitor::initOffsets() {
     // UWorld
     RESOLVE_OFFSET(m_off.World_GameState,         "World", "GameState");
     RESOLVE_OFFSET(m_off.World_AuthorityGameMode,  "World", "AuthorityGameMode");
+    RESOLVE_OFFSET_MULTI(m_off.World_PersistentLevel,   "PersistentLevel",   "World");
+    if (m_off.World_PersistentLevel < 0) m_off.World_PersistentLevel = 0xB0;
+    RESOLVE_OFFSET_MULTI(m_off.World_ActiveLevelActors, "ActiveLevelActors", "World");
+    if (m_off.World_ActiveLevelActors < 0) m_off.World_ActiveLevelActors = 0xAA0;
+    RESOLVE_OFFSET_MULTI(m_off.World_Levels,            "Levels",           "World");
+    if (m_off.World_Levels < 0) m_off.World_Levels = 0xAD8;
+
+    // ULevel / LevelActorContainer — 当前关卡 Actor 列表, 用于训练场/大厅真实可见角色
+    RESOLVE_OFFSET_MULTI(m_off.Level_ActorCluster,         "ActorCluster", "Level");
+    if (m_off.Level_ActorCluster < 0) m_off.Level_ActorCluster = 0xE0;
+    RESOLVE_OFFSET_MULTI(m_off.LevelActorContainer_Actors, "Actors",       "LevelActorContainer");
+    if (m_off.LevelActorContainer_Actors < 0) m_off.LevelActorContainer_Actors = 0x28;
 
     // GameState / GameStateBase — MatchState 声明在 GameState 而非 GameStateBase
     // 注: 腾讯版字段实际类名为 STExtraGameStateBase (IDA + dump.cs 验证),
@@ -595,7 +693,12 @@ bool MatchMonitor::initOffsets() {
 
     // Actor
     RESOLVE_OFFSET(m_off.Actor_RootComponent,     "Actor", "RootComponent");
+    RESOLVE_OFFSET_MULTI(m_off.Actor_Owner,       "Owner",                 "Actor", "Pawn", "Character");
     RESOLVE_OFFSET_MULTI(m_off.Actor_NetCullDistSq, "NetCullDistanceSquared", "Actor", "Character", "Pawn");
+
+    // Pawn — CharacterScan 扫到的 Pawn 可从这里回到 PlayerState 读取真实名字
+    RESOLVE_OFFSET_MULTI(m_off.Pawn_PlayerState,  "PlayerState",           "Pawn", "Character", "UAECharacter", "STExtraCharacter");
+    if (m_off.Pawn_PlayerState < 0) m_off.Pawn_PlayerState = 0x5F0;
 
     // SceneComponent — 使用 ComponentToWorld.Translation (世界坐标, 非 RelativeLocation)
     // ComponentToWorld 是 FTransform, Translation 在 FTransform+0x10
@@ -617,8 +720,32 @@ bool MatchMonitor::initOffsets() {
     RESOLVE_OFFSET_MULTI(m_off.PC_bIsObserverInBattle, "bIsObserverInBattle", "UAEPlayerController", "STExtraPlayerController");
     RESOLVE_OFFSET_MULTI(m_off.PC_bIsObserverHost,     "bIsObserverHost",     "UAEPlayerController", "STExtraPlayerController");
 
+    // 本地玩家链路 (反射 + dump.cs fallback)
+    RESOLVE_OFFSET_MULTI(m_off.World_OwningGameInstance, "OwningGameInstance", "World");
+    if (m_off.World_OwningGameInstance < 0) m_off.World_OwningGameInstance = 0xB08;
+    RESOLVE_OFFSET_MULTI(m_off.GI_LocalPlayers,        "LocalPlayers",        "GameInstance");
+    if (m_off.GI_LocalPlayers < 0) m_off.GI_LocalPlayers = 0x48;
+    RESOLVE_OFFSET_MULTI(m_off.Player_PlayerController, "PlayerController",   "Player", "LocalPlayer");
+    if (m_off.Player_PlayerController < 0) m_off.Player_PlayerController = 0x30;
+    RESOLVE_OFFSET_MULTI(m_off.PC_AcknowledgedPawn,    "AcknowledgedPawn",    "PlayerController", "UAEPlayerController", "STExtraPlayerController");
+    if (m_off.PC_AcknowledgedPawn < 0) m_off.PC_AcknowledgedPawn = 0x640;
+    RESOLVE_OFFSET_MULTI(m_off.PC_PlayerState,         "PlayerState",         "Controller", "PlayerController", "UAEPlayerController");
+
     // Controller — ControlRotation (FRotator: Pitch, Yaw, Roll)
     RESOLVE_OFFSET_MULTI(m_off.Ctrl_ControlRotation,   "ControlRotation",     "Controller", "PlayerController", "UAEPlayerController", "STExtraPlayerController");
+    RESOLVE_OFFSET_MULTI(m_off.STPC_LastFrameCacheControlRotation, "LastFrameCacheControlRotation", "STExtraPlayerController");
+    if (m_off.STPC_LastFrameCacheControlRotation < 0) m_off.STPC_LastFrameCacheControlRotation = 0x5590;
+    RESOLVE_OFFSET_MULTI(m_off.STPC_CachedViewControlRotation, "CachedViewControlRotation", "STExtraPlayerController");
+    if (m_off.STPC_CachedViewControlRotation < 0) m_off.STPC_CachedViewControlRotation = 0x559C;
+    RESOLVE_OFFSET_MULTI(m_off.STPC_CurrentActiveCameraCache, "CurrentActiveCameraCache", "STExtraPlayerController");
+    if (m_off.STPC_CurrentActiveCameraCache < 0) m_off.STPC_CurrentActiveCameraCache = 0x3990;
+
+    // PlayerController / PlayerCameraManager — 相机链
+    RESOLVE_OFFSET_MULTI(m_off.PC_PlayerCameraManager, "PlayerCameraManager", "PlayerController", "UAEPlayerController", "STExtraPlayerController");
+    RESOLVE_OFFSET_MULTI(m_off.PCM_PCOwner,             "PCOwner",             "PlayerCameraManager");
+    if (m_off.PCM_PCOwner < 0) m_off.PCM_PCOwner = 0x5D0;
+    RESOLVE_OFFSET_MULTI(m_off.PCM_CameraCache,        "CameraCache",         "PlayerCameraManager");
+    RESOLVE_OFFSET_MULTI(m_off.PCM_DefaultFOV,         "DefaultFOV",          "PlayerCameraManager");
 
     // UAECharacter
     RESOLVE_OFFSET_MULTI(m_off.Char_TeamID,        "TeamID",             "UAECharacter", "STExtraCharacter", "STExtraBaseCharacter");
@@ -640,6 +767,8 @@ bool MatchMonitor::initOffsets() {
     RESOLVE_OFFSET_MULTI(m_off.STBase_FPPComp,      "FPPComp",           "STExtraBaseCharacter", "STExtraCharacter");
     RESOLVE_OFFSET_MULTI(m_off.STBase_DefaultCharacterMesh, "DefaultCharacterMesh", "STExtraBaseCharacter");
     RESOLVE_OFFSET_MULTI(m_off.STBase_LastSkeletalMesh, "LastSkeletalMesh", "STExtraBaseCharacter");
+    RESOLVE_OFFSET_MULTI(m_off.STBase_STExtraPlayerState, "STExtraPlayerState", "STExtraBaseCharacter", "STExtraCharacter");
+    if (m_off.STBase_STExtraPlayerState < 0) m_off.STBase_STExtraPlayerState = 0x3310;
 
     // AvatarComponent
     RESOLVE_OFFSET_MULTI(m_off.Avatar_MasterBoneComponent, "MasterBoneComponent", "AvatarComponent");
@@ -712,6 +841,8 @@ bool MatchMonitor::initOffsets() {
         m_off.BTC_VerticalRecoilTarget, m_off.BTC_HorizontalRecoilTarget, m_off.BTC_CurRecoilValue);
     LOG(LOG_LEVEL_INFO, "[InitOffsets] Weapon: CurWeapon=0x%X BulletTrackComp=0x%X",
         m_off.Char_CurWeapon, m_off.Weapon_BulletTrackComp);
+    LOG(LOG_LEVEL_INFO, "[InitOffsets] Camera: PC.PlayerCameraManager=0x%X PCM.CameraCache=0x%X PCM.DefaultFOV=0x%X",
+        m_off.PC_PlayerCameraManager, m_off.PCM_CameraCache, m_off.PCM_DefaultFOV);
 
     return m_off.isValid();
 }
@@ -960,40 +1091,34 @@ uintptr_t MatchMonitor::findCurrentGameStateInstance() {
 
     // ---- 慢路径: 全表扫 GUObjectArray ----
     const uintptr_t arr = m_gUObjectArray;
-    const int numChunks = safeReadS32(arr + 0xF8);
-    const int totalNum  = safeReadS32(arr + 0x100);
-    if (numChunks <= 0 || numChunks > 1000 || totalNum <= 0 || totalNum > 5000000) {
+    UObjectArrayLayout layout{};
+    if (!detectUObjectArrayLayout(arr, layout)) {
         m_lastEmptyGSScanMs = nowMs;
         return 0;
     }
-    static constexpr size_t kFUObjectItemSize = 24;
-    for (int ci = 0; ci < numChunks; ++ci) {
-        const uintptr_t chunkBase = safeReadPtr(arr + 0xC8 + static_cast<uintptr_t>(ci) * 8);
-        const int cnt = safeReadS32(arr + 0xE8 + static_cast<uintptr_t>(ci) * 4);
-        if (chunkBase == 0 || chunkBase < 0x10000 || cnt <= 0) continue;
-        for (int i = 0; i < cnt; ++i) {
-            const uintptr_t obj = safeReadPtr(chunkBase + static_cast<uintptr_t>(i) * kFUObjectItemSize);
-            if (obj == 0 || obj < 0x10000) continue;
-            const uintptr_t cls = safeReadPtr(obj + kUObjectClassPrivateOffset);
-            if (cls == 0 || cls < 0x10000) continue;
-            auto it = m_gsClassSet.find(cls);
-            bool isGS;
-            if (it != m_gsClassSet.end()) {
-                isGS = it->second;
-            } else {
-                isGS = isSubclassOf(cls, "GameStateBase");
-                m_gsClassSet[cls] = isGS;
-            }
-            if (!isGS) continue;
-            // 排除 CDO (Default__XXX): NamePrivate 以 Default__ 开头
-            const std::string objName = readObjName(obj);
-            if (objName.compare(0, 9, "Default__") == 0) continue;
-            m_cachedGSPtr = obj;
-            m_lastEmptyGSScanMs = 0;
-            LOG(LOG_LEVEL_INFO, "[MatchCall] GameState instance found @ %p name=%s class=%s",
-                (void*)obj, objName.c_str(), readObjName(cls).c_str());
-            return obj;
+
+    for (int32_t index = 0; index < layout.totalNum; ++index) {
+        const uintptr_t obj = readUObjectAt(arr, layout, index);
+        if (obj == 0 || obj < 0x10000) continue;
+        const uintptr_t cls = safeReadPtr(obj + kUObjectClassPrivateOffset);
+        if (cls == 0 || cls < 0x10000) continue;
+        auto it = m_gsClassSet.find(cls);
+        bool isGS;
+        if (it != m_gsClassSet.end()) {
+            isGS = it->second;
+        } else {
+            isGS = isSubclassOf(cls, "GameStateBase");
+            m_gsClassSet[cls] = isGS;
         }
+        if (!isGS) continue;
+        // 排除 CDO (Default__XXX): NamePrivate 以 Default__ 开头
+        const std::string objName = readObjName(obj);
+        if (objName.compare(0, 9, "Default__") == 0) continue;
+        m_cachedGSPtr = obj;
+        m_lastEmptyGSScanMs = 0;
+        LOG(LOG_LEVEL_INFO, "[MatchCall] GameState instance found @ %p name=%s class=%s layout=%s",
+            (void*)obj, objName.c_str(), readObjName(cls).c_str(), uObjectArrayLayoutName(layout.kind));
+        return obj;
     }
     m_lastEmptyGSScanMs = nowMs;
     return 0;
@@ -1151,6 +1276,25 @@ bool MatchMonitor::resolveTrackedBoneIndices(uintptr_t skeletalMeshAssetPtr, Bon
     BoneAssetCacheEntry entry;
     entry.trackedBoneIndices.fill(-1);
 
+    // 方法0: 当前 dump.cs 暴露了 SkeletalMesh.RefBoneNames, 优先走反射偏移。
+    int32_t skMeshRefBoneNamesOff = -1;
+    if (const auto* refNamesField = m_interface.findFieldInHierarchy("SkeletalMesh", "RefBoneNames")) {
+        skMeshRefBoneNamesOff = refNamesField->offset;
+    }
+    if (skMeshRefBoneNamesOff < 0) skMeshRefBoneNamesOff = 0x3E8;
+    ue4::TArray<ue4::FName> skMeshRefBoneNames{};
+    if (safeReadMemory(skeletalMeshAssetPtr + skMeshRefBoneNamesOff, &skMeshRefBoneNames, sizeof(skMeshRefBoneNames))
+        && isUsableRemoteArray(skMeshRefBoneNames, kMaxBoneNameCount)) {
+        matchBoneNamesFromFNameArray(reinterpret_cast<uintptr_t>(skMeshRefBoneNames.Data),
+                                     skMeshRefBoneNames.Num,
+                                     entry);
+        if (entry.matchedCount >= kMinRenderableBoneMatches) {
+            m_boneAssetCache[skeletalMeshAssetPtr] = entry;
+            outEntry = entry;
+            return true;
+        }
+    }
+
     // 方法1: SkeletalMesh+0x238 FReferenceSkeleton (全身骨骼, stride=16)
     constexpr uintptr_t kRefBoneInfoOffset = 0x238;
     const uintptr_t boneInfoData = safeReadPtr(skeletalMeshAssetPtr + kRefBoneInfoOffset);
@@ -1170,7 +1314,7 @@ bool MatchMonitor::resolveTrackedBoneIndices(uintptr_t skeletalMeshAssetPtr, Bon
 
     // 方法2: Skeleton → RefBoneNames
     const int32_t skelOff = (m_off.SkeletalMeshAsset_Skeleton >= 0) ? m_off.SkeletalMeshAsset_Skeleton : 0x48;
-    const int32_t refOff = (m_off.Skeleton_RefBoneNames >= 0) ? m_off.Skeleton_RefBoneNames : 0x280;
+    const int32_t refOff = (m_off.Skeleton_RefBoneNames >= 0) ? m_off.Skeleton_RefBoneNames : 0x2D0;
     const uintptr_t skeletonPtr = safeReadPtr(skeletalMeshAssetPtr + skelOff);
     if (skeletonPtr >= 0x10000) {
         ue4::TArray<ue4::FName> refBoneNames{};
@@ -1196,20 +1340,20 @@ bool MatchMonitor::resolveTrackedBoneIndices(uintptr_t skeletalMeshAssetPtr, Bon
 bool MatchMonitor::fillPlayerSkeleton(uintptr_t characterPtr, ue4draw::DrawPlayerInfo& outPlayer) {
     static Clock::time_point s_lastSkeletonLogTime;
 
-    // dump.cs 静态偏移 (反射失败时的回退)
-    constexpr int32_t kFB_Char_Mesh         = 0x650;
+    // dump.cs 当前值仅作最后兜底; 正常路径使用 UE4Interface 运行时反射偏移。
+    constexpr int32_t kFB_Char_Mesh         = 0x658;
     constexpr int32_t kFB_ComponentToWorld   = 0x1F0;
-    constexpr int32_t kFB_SkeletalMesh       = 0x7F0;
-    constexpr int32_t kFB_MasterPose         = 0x7F8;
-    constexpr int32_t kFB_CachedTransforms   = 0xBB8;
-    constexpr int32_t kFB_CachedBoneTrans    = 0xBA8;
-    constexpr int32_t kFB_AvatarComp         = 0x3B98;
-    constexpr int32_t kFB_FPPComp            = 0x4168;
-    constexpr int32_t kFB_DefaultMesh        = 0x4630;
-    constexpr int32_t kFB_LastSkelMesh       = 0x4790;
+    constexpr int32_t kFB_SkeletalMesh       = 0x808;
+    constexpr int32_t kFB_MasterPose         = 0x810;
+    constexpr int32_t kFB_CachedTransforms   = 0xBE0;
+    constexpr int32_t kFB_CachedBoneTrans    = 0xBD0;
+    constexpr int32_t kFB_AvatarComp         = 0x3C88;
+    constexpr int32_t kFB_FPPComp            = 0x4258;
+    constexpr int32_t kFB_DefaultMesh        = 0x4730;
+    constexpr int32_t kFB_LastSkelMesh       = 0x4890;
     constexpr int32_t kFB_MasterBone         = 0x300;
-    constexpr int32_t kFB_MeshCompList       = 0x528;
-    constexpr int32_t kFB_SkelPool           = 0xF10;
+    constexpr int32_t kFB_MeshCompList       = 0x530;
+    constexpr int32_t kFB_SkelPool           = 0xF30;
     constexpr int32_t kFB_FPPAvatar          = 0x380;
 
     outPlayer.boneMask = 0;
@@ -1224,24 +1368,37 @@ bool MatchMonitor::fillPlayerSkeleton(uintptr_t characterPtr, ue4draw::DrawPlaye
         m_nameCache.clear();
     }
 
-    auto off = [](int32_t reflected, int32_t fallback) -> int32_t {
-        return (reflected >= 0) ? reflected : fallback;
+    const std::string characterClassName = readClassName(characterPtr);
+
+    auto dynamicFieldOff = [&](const std::string& className, const char* fieldName) -> int32_t {
+        if (className.empty() || className[0] == '<') return -1;
+        if (const auto* field = m_interface.findFieldInHierarchy(className, fieldName)) {
+            return field->offset;
+        }
+        return -1;
     };
 
-    const int32_t oMesh      = off(m_off.Char_Mesh, kFB_Char_Mesh);
-    const int32_t oCtw       = off(m_off.SceneComp_ComponentToWorld, kFB_ComponentToWorld);
-    const int32_t oSkelMesh  = off(m_off.SkinnedMesh_SkeletalMesh, kFB_SkeletalMesh);
-    const int32_t oMasterP   = off(m_off.SkinnedMesh_MasterPoseComponent, kFB_MasterPose);
-    const int32_t oCached    = off(m_off.SkeletalMeshComp_CachedComponentSpaceTransforms, kFB_CachedTransforms);
-    const int32_t oAvatar    = off(m_off.STBase_AvatarComponent, kFB_AvatarComp);
-    const int32_t oMasterB   = off(m_off.Avatar_MasterBoneComponent, kFB_MasterBone);
+    auto off = [](int32_t objectSpecific, int32_t reflected, int32_t fallback) -> int32_t {
+        if (objectSpecific >= 0) return objectSpecific;
+        if (reflected >= 0) return reflected;
+        return fallback;
+    };
+
+    const int32_t oMesh      = off(dynamicFieldOff(characterClassName, "Mesh"), m_off.Char_Mesh, kFB_Char_Mesh);
+    const int32_t oCtw       = off(dynamicFieldOff("SceneComponent", "ComponentToWorld"), m_off.SceneComp_ComponentToWorld, kFB_ComponentToWorld);
+    const int32_t oSkelMesh  = off(dynamicFieldOff("SkeletalMeshComponent", "SkeletalMesh"), m_off.SkinnedMesh_SkeletalMesh, kFB_SkeletalMesh);
+    const int32_t oMasterP   = off(dynamicFieldOff("SkeletalMeshComponent", "MasterPoseComponent"), m_off.SkinnedMesh_MasterPoseComponent, kFB_MasterPose);
+    const int32_t oCached    = off(dynamicFieldOff("SkeletalMeshComponent", "CachedComponentSpaceTransforms"), m_off.SkeletalMeshComp_CachedComponentSpaceTransforms, kFB_CachedTransforms);
+    const int32_t oCachedBone = off(dynamicFieldOff("SkeletalMeshComponent", "CachedBoneSpaceTransforms"), -1, kFB_CachedBoneTrans);
+    const int32_t oAvatar    = off(dynamicFieldOff(characterClassName, "AvatarComponent"), m_off.STBase_AvatarComponent, kFB_AvatarComp);
+    const int32_t oMasterB   = off(dynamicFieldOff("AvatarComponent", "MasterBoneComponent"), m_off.Avatar_MasterBoneComponent, kFB_MasterBone);
 
     // ---- 辅助 ----
     auto readTransformArray = [&](uintptr_t comp, ue4::TArray<RemoteTransform>& out) -> bool {
         if (comp < 0x10000) return false;
         if (safeReadMemory(comp + oCached, &out, sizeof(out)) && isUsableRemoteArray(out, kMaxBoneNameCount))
             return true;
-        if (safeReadMemory(comp + kFB_CachedBoneTrans, &out, sizeof(out)) && isUsableRemoteArray(out, kMaxBoneNameCount))
+        if (safeReadMemory(comp + oCachedBone, &out, sizeof(out)) && isUsableRemoteArray(out, kMaxBoneNameCount))
             return true;
         return false;
     };
@@ -1284,7 +1441,7 @@ bool MatchMonitor::fillPlayerSkeleton(uintptr_t characterPtr, ue4draw::DrawPlaye
         if (mbRoot != masterBone) tryAdd(mbRoot);
 
         // meshComponentList TSparseMap
-        const int32_t oMeshList = off(m_off.Avatar_MeshComponentList, kFB_MeshCompList);
+        const int32_t oMeshList = off(dynamicFieldOff("AvatarComponent", "meshComponentList"), m_off.Avatar_MeshComponentList, kFB_MeshCompList);
         const uintptr_t mapBase = avatar + static_cast<uintptr_t>(oMeshList);
         const uintptr_t entries = safeReadPtr(mapBase);
         const int32_t maxIdx = safeReadS32(mapBase + 0x28);
@@ -1304,7 +1461,7 @@ bool MatchMonitor::fillPlayerSkeleton(uintptr_t characterPtr, ue4draw::DrawPlaye
         }
 
         // SkeletalMeshCompPool
-        const int32_t oPool = off(m_off.Avatar_SkeletalMeshCompPool, kFB_SkelPool);
+        const int32_t oPool = off(dynamicFieldOff("AvatarComponent", "SkeletalMeshCompPool"), m_off.Avatar_SkeletalMeshCompPool, kFB_SkelPool);
         ue4::TArray<uintptr_t> pool{};
         if (safeReadMemory(avatar + oPool, &pool, sizeof(pool)) && isUsableRemoteArray(pool, 64)) {
             uintptr_t pd = reinterpret_cast<uintptr_t>(pool.Data);
@@ -1314,7 +1471,7 @@ bool MatchMonitor::fillPlayerSkeleton(uintptr_t characterPtr, ue4draw::DrawPlaye
     }
 
     // 3. FPPComp → _AvatarComp → MasterBone
-    const uintptr_t fpp = safeReadPtr(characterPtr + off(m_off.STBase_FPPComp, kFB_FPPComp));
+    const uintptr_t fpp = safeReadPtr(characterPtr + off(dynamicFieldOff(characterClassName, "FPPComp"), m_off.STBase_FPPComp, kFB_FPPComp));
     if (fpp >= 0x10000) {
         int32_t fppAvatarOff = kFB_FPPAvatar;
         const std::string fppCls = readClassName(fpp);
@@ -1342,8 +1499,8 @@ bool MatchMonitor::fillPlayerSkeleton(uintptr_t characterPtr, ue4draw::DrawPlaye
             assets.push_back(ptr);
     };
     for (const auto& c : candidates) addAsset(safeReadPtr(c.comp + oSkelMesh));
-    addAsset(safeReadPtr(characterPtr + off(m_off.STBase_DefaultCharacterMesh, kFB_DefaultMesh)));
-    addAsset(safeReadPtr(characterPtr + off(m_off.STBase_LastSkeletalMesh, kFB_LastSkelMesh)));
+    addAsset(safeReadPtr(characterPtr + off(dynamicFieldOff(characterClassName, "DefaultCharacterMesh"), m_off.STBase_DefaultCharacterMesh, kFB_DefaultMesh)));
+    addAsset(safeReadPtr(characterPtr + off(dynamicFieldOff(characterClassName, "LastSkeletalMesh"), m_off.STBase_LastSkeletalMesh, kFB_LastSkelMesh)));
 
     // ---- 匹配: 找最优 (组件 × 资产) ----
     // ---- 匹配并一次性拷贝骨骼变换到栈缓冲 (避免 TOCTOU 竞争) ----
@@ -1432,15 +1589,123 @@ bool MatchMonitor::isSubclassOf(uintptr_t classPtr, const char* targetName) {
 uintptr_t MatchMonitor::getLocalPlayerController() {
     uintptr_t worldPtr = safeReadPtr(m_gWorld);
     if (worldPtr == 0 || worldPtr < 0x10000) return 0;
+
+    // 主路径: World.OwningGameInstance -> LocalPlayers[0] -> PlayerController
+    if (m_off.World_OwningGameInstance >= 0
+        && m_off.GI_LocalPlayers >= 0
+        && m_off.Player_PlayerController >= 0) {
+        uintptr_t gi = safeReadPtr(worldPtr + m_off.World_OwningGameInstance);
+        if (gi >= 0x10000) {
+            uintptr_t lpData = safeReadPtr(gi + m_off.GI_LocalPlayers);
+            int32_t   lpNum  = safeReadS32(gi + m_off.GI_LocalPlayers + 8);
+            if (lpData >= 0x10000 && lpNum > 0) {
+                uintptr_t lp = safeReadPtr(lpData);
+                if (lp >= 0x10000) {
+                    uintptr_t pc = safeReadPtr(lp + m_off.Player_PlayerController);
+                    if (pc >= 0x10000) return pc;
+                }
+            }
+        }
+    }
+
+    // 回退: PlayerArray[0].Owner (旧逻辑, 训练场不可靠)
     if (m_off.World_GameState < 0 || m_off.GS_PlayerArray < 0) return 0;
     uintptr_t gsPtr = safeReadPtr(worldPtr + m_off.World_GameState);
     if (gsPtr == 0 || gsPtr < 0x10000) return 0;
     uintptr_t arrayData = safeReadPtr(gsPtr + m_off.GS_PlayerArray);
     int32_t arrayNum = safeReadS32(gsPtr + m_off.GS_PlayerArray + 8);
     if (arrayData == 0 || arrayNum <= 0) return 0;
-    uintptr_t psPtr = safeReadPtr(arrayData); // PlayerArray[0] = 本地玩家 PlayerState
+    uintptr_t psPtr = safeReadPtr(arrayData);
     if (psPtr == 0) return 0;
-    return safeReadPtr(psPtr + 0x98); // AActor::Owner = PlayerController
+    const int32_t ownerOff = (m_off.Actor_Owner >= 0) ? m_off.Actor_Owner : 0x98;
+    return safeReadPtr(psPtr + ownerOff);
+}
+
+uintptr_t MatchMonitor::findPlayerCameraManagerInstance() {
+    auto looksLikeLivePCM = [&](uintptr_t pcmPtr) {
+        if (pcmPtr < 0x10000) return false;
+        const int32_t camCacheOff = (m_off.PCM_CameraCache >= 0) ? m_off.PCM_CameraCache : 0x640;
+        const int32_t defaultFovOff = (m_off.PCM_DefaultFOV >= 0) ? m_off.PCM_DefaultFOV : 0x5E8;
+        const uintptr_t pov = pcmPtr + static_cast<uintptr_t>(camCacheOff) + 0x10;
+        const float locX = safeReadFloat(pov + 0x0);
+        const float locY = safeReadFloat(pov + 0x4);
+        const float locZ = safeReadFloat(pov + 0x8);
+        const bool hasLoc = std::isfinite(locX) && std::isfinite(locY) && std::isfinite(locZ)
+            && (std::fabs(locX) > 1.0f || std::fabs(locY) > 1.0f || std::fabs(locZ) > 1.0f);
+        if (!hasLoc) return false;
+
+        const float fovCandidates[] = {
+            safeReadFloat(pov + 0x18),
+            safeReadFloat(pov + 0x1C),
+            safeReadFloat(pov + 0x30),
+            safeReadFloat(pcmPtr + defaultFovOff),
+        };
+        for (float fov : fovCandidates) {
+            if (std::isfinite(fov) && fov >= 30.0f && fov <= 170.0f) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    if (m_cachedPCMPtr >= 0x10000) {
+        uintptr_t cachedClass = safeReadPtr(m_cachedPCMPtr + kUObjectClassPrivateOffset);
+        if (cachedClass >= 0x10000) {
+            auto cachedIt = m_pcmClassSet.find(cachedClass);
+            bool cachedIsPCM = false;
+            if (cachedIt != m_pcmClassSet.end()) {
+                cachedIsPCM = cachedIt->second;
+            } else {
+                cachedIsPCM = isSubclassOf(cachedClass, "PlayerCameraManager");
+                m_pcmClassSet[cachedClass] = cachedIsPCM;
+            }
+            if (cachedIsPCM && looksLikeLivePCM(m_cachedPCMPtr)) return m_cachedPCMPtr;
+        }
+        m_cachedPCMPtr = 0;
+    }
+
+    const uint64_t nowMs = nowMonotonicMs();
+    if (m_lastPCMScanMs != 0 && nowMs >= m_lastPCMScanMs && nowMs - m_lastPCMScanMs < 2000) {
+        return 0;
+    }
+    m_lastPCMScanMs = nowMs;
+
+    UObjectArrayLayout layout{};
+    if (!detectUObjectArrayLayout(m_gUObjectArray, layout)) return 0;
+
+    for (int32_t index = 0; index < layout.totalNum; ++index) {
+        const uintptr_t obj = readUObjectAt(m_gUObjectArray, layout, index);
+        if (obj < 0x10000) continue;
+
+        const uintptr_t cls = safeReadPtr(obj + kUObjectClassPrivateOffset);
+        if (cls < 0x10000) continue;
+
+        auto it = m_pcmClassSet.find(cls);
+        bool isPCM = false;
+        if (it != m_pcmClassSet.end()) {
+            isPCM = it->second;
+        } else {
+            isPCM = isSubclassOf(cls, "PlayerCameraManager");
+            m_pcmClassSet[cls] = isPCM;
+        }
+        if (!isPCM) continue;
+
+        const std::string objName = readObjName(obj);
+        if (objName.compare(0, 9, "Default__") == 0) continue;
+        if (!looksLikeLivePCM(obj)) continue;
+
+        m_cachedPCMPtr = obj;
+        LOG(LOG_LEVEL_INFO, "[Camera] PlayerCameraManager fallback found pcm=%p name=%s class=%s layout=%s",
+            (void*)obj, objName.c_str(), readObjName(cls).c_str(), uObjectArrayLayoutName(layout.kind));
+        return obj;
+    }
+
+    static Clock::time_point s_lastPCMScanMissLog;
+    if (shouldLogEvery(s_lastPCMScanMissLog, std::chrono::milliseconds(3000))) {
+        LOG(LOG_LEVEL_WARN, "[Camera] PlayerCameraManager fallback scan miss total=%d layout=%s",
+            layout.totalNum, uObjectArrayLayoutName(layout.kind));
+    }
+    return 0;
 }
 
 EObserverType MatchMonitor::detectObserverType() {
@@ -1633,136 +1898,260 @@ int MatchMonitor::scanCharacters() {
         m_lastCharacterScanMs = nowMs;
     }
 
-    // 通过 safeRead 访问 GUObjectArray, 避免游戏重分配时裸解引用崩溃
-    uintptr_t objArrayAddr = m_gUObjectArray;
-    // FUObjectArray: NumChunks @ +0xF8, TotalNumElements @ +0x100
-    int numChunks = safeReadS32(objArrayAddr + 0xF8);
-    int totalNum  = safeReadS32(objArrayAddr + 0x100);
-    if (numChunks <= 0 || numChunks > 1000 || totalNum <= 0 || totalNum > 5000000) return 0;
-
     int newCharsFound = 0;
+    int actorArrays = 0;
+    int actorItems = 0;
+    int charCandidates = 0;
+    int skipSelf = 0;
+    int skipExisting = 0;
+    int skipHealth = 0;
+    int skipPosition = 0;
 
-    if (m_characterScanChunkIndex < 0 || m_characterScanChunkIndex >= numChunks) {
-        m_characterScanChunkIndex = 0;
-        m_characterScanItemIndex = 0;
+    // 本地 Pawn (AcknowledgedPawn) 以便排除自己
+    uintptr_t myPawn = 0;
+    if (m_off.PC_AcknowledgedPawn >= 0) {
+        uintptr_t pc = getLocalPlayerController();
+        if (pc >= 0x10000) myPawn = safeReadPtr(pc + m_off.PC_AcknowledgedPawn);
     }
 
-    if (m_characterScanChunkIndex == 0 && m_characterScanItemIndex == 0) {
+    int processedItems = 0;
+    BatchMemReader charBatch;
+    bool epochStartedThisCall = false;
+
+    auto startCharacterScanEpoch = [&]() {
         ++m_characterScanEpoch;
         if (m_characterScanEpoch == 0) {
             m_characterScanEpoch = 1;
         }
+        epochStartedThisCall = true;
+    };
+
+    auto acceptActor = [&](uintptr_t objPtr, const char* sourceName) -> bool {
+        if (objPtr == 0 || objPtr < 0x10000) return false;
+        if (myPawn != 0 && objPtr == myPawn) {
+            skipSelf++;
+            return false;
+        }
+
+        uintptr_t classPtr = safeReadPtr(objPtr + kUObjectClassPrivateOffset);
+        if (classPtr == 0) return false;
+
+        auto classIt = m_characterClassSet.find(classPtr);
+        if (classIt != m_characterClassSet.end()) {
+            if (!classIt->second) return false;
+        } else {
+            bool isChar = isSubclassOf(classPtr, "Character") || isSubclassOf(classPtr, "Pawn");
+            m_characterClassSet[classPtr] = isChar;
+            if (!isChar) return false;
+        }
+
+        charCandidates++;
+        charBatch.read(objPtr, m_charReadSize);
+
+        uint32_t playerKey = (m_off.Char_PlayerKey >= 0) ? charBatch.getU32(m_off.Char_PlayerKey) : 0;
+        if (playerKey == 0) {
+            playerKey = 0x80000000u | static_cast<uint32_t>(objPtr & 0x7FFFFFFFu);
+        }
+
+        PlayerNode* existing = m_playerList.findByKey(playerKey);
+        if (existing != nullptr && existing->source == PlayerSource::PlayerArray) {
+            skipExisting++;
+            return false;
+        }
+
+        FVector3 loc{};
+        if (!getActorLocation(objPtr, loc) || !hasUsablePlayerPosition(loc)) {
+            skipPosition++;
+            return false;
+        }
+
+        const std::string className = readClassName(objPtr);
+        const bool looksLikePlayerPawn = className.find("Player") != std::string::npos
+            || className.find("Pawn") != std::string::npos
+            || className.find("Character") != std::string::npos
+            || className.find("Train") != std::string::npos;
+
+        int32_t teamID = (m_off.Char_TeamID >= 0) ? charBatch.getS32(m_off.Char_TeamID) : -1;
+        float health = (m_off.Char_Health >= 0) ? charBatch.getFloat(m_off.Char_Health) : 0.0f;
+        float healthMax = (m_off.Char_HealthMax >= 0) ? charBatch.getFloat(m_off.Char_HealthMax) : 0.0f;
+        bool bDead = (m_off.Char_bDead >= 0) ? ((charBatch.getU8(m_off.Char_bDead) & 1) != 0) : false;
+
+        if (!std::isfinite(health) || health < 0.0f) health = 0.0f;
+        if (!std::isfinite(healthMax) || healthMax <= 0.0f) {
+            if (!looksLikePlayerPawn) {
+                skipHealth++;
+                return false;
+            }
+            health = health > 0.0f ? health : 100.0f;
+            healthMax = 100.0f;
+        }
+        if (health <= 0.0f && looksLikePlayerPawn) {
+            health = healthMax;
+        }
+
+        std::string playerName;
+        if (m_off.Char_PlayerName >= 0) {
+            playerName = readFString(objPtr + m_off.Char_PlayerName);
+        }
+        auto readPlayerStateName = [&](uintptr_t psPtr) -> std::string {
+            if (psPtr < 0x10000 || m_off.PS_PlayerName < 0) return "";
+            std::string name = readFString(psPtr + m_off.PS_PlayerName);
+            if (name.empty() || name.size() > 64) return "";
+            return name;
+        };
+        if ((playerName.empty() || playerName.size() > 64) && m_off.Pawn_PlayerState >= 0) {
+            playerName = readPlayerStateName(safeReadPtr(objPtr + m_off.Pawn_PlayerState));
+        }
+        if ((playerName.empty() || playerName.size() > 64) && m_off.STBase_STExtraPlayerState >= 0) {
+            playerName = readPlayerStateName(safeReadPtr(objPtr + m_off.STBase_STExtraPlayerState));
+        }
+        // 名称仍未解析: 不再直接把内部 className (如 "BP_FPS_Base_C")
+        // 当玩家名展示, 改为根据 className 推断身份.
+        bool inferredAI = false;
+        if (playerName.empty() || playerName.size() > 64) {
+            playerName.clear();
+            const bool isTrainingDummy = !className.empty()
+                && (className.find("Train") != std::string::npos
+                    || className.find("FPS_Base") != std::string::npos
+                    || className.find("Dummy") != std::string::npos
+                    || className.find("Bot") != std::string::npos
+                    || className.find("AI") != std::string::npos);
+            if (isTrainingDummy) {
+                playerName = "训练人偶";
+                inferredAI = true;
+            }
+            // 其余 (className 缺失或不像 AI) 留空, 让 UI 显示 "Enemy" 而不是脏字符串.
+            (void)sourceName;
+        }
+
+        patchActorNetCull(objPtr);
+
+        PlayerNode data;
+        data.teamID = (teamID > 0) ? teamID : -1;
+        data.playerName = playerName;
+        data.isAI = inferredAI;
+        data.liveState = bDead ? 1 : 0;
+        data.health = health;
+        data.healthMax = healthMax;
+        data.kills = 0;
+        data.pos = loc;
+        data.characterPtr = objPtr;
+        data.source = PlayerSource::CharacterScan;
+        PlayerNode* node = m_playerList.upsert(playerKey, data);
+        if (node) {
+            node->source = PlayerSource::CharacterScan;
+            node->lastSeenCharacterScanEpoch = m_characterScanEpoch;
+        }
+        newCharsFound++;
+        return true;
+    };
+
+    auto scanActorPointerArray = [&](uintptr_t arrayData, int32_t arrayNum, const char* sourceName) {
+        if (arrayData < 0x10000 || arrayNum <= 0 || arrayNum > 30000) return;
+        if (!epochStartedThisCall) {
+            startCharacterScanEpoch();
+        }
+        actorArrays++;
+        const int32_t limit = std::min<int32_t>(arrayNum, scanBudget);
+        for (int32_t i = 0; i < limit; ++i) {
+            uintptr_t actorPtr = safeReadPtr(arrayData + static_cast<uintptr_t>(i) * sizeof(uintptr_t));
+            actorItems++;
+            acceptActor(actorPtr, sourceName);
+        }
+    };
+
+    auto scanTArray = [&](uintptr_t base, int32_t offset, const char* sourceName) {
+        if (base < 0x10000 || offset < 0) return;
+        uintptr_t arrayData = safeReadPtr(base + offset);
+        int32_t arrayNum = safeReadS32(base + offset + 8);
+        scanActorPointerArray(arrayData, arrayNum, sourceName);
+    };
+
+    uintptr_t worldPtr = safeReadPtr(m_gWorld);
+    uintptr_t activeActorsDataForLog = 0;
+    int32_t activeActorsNumForLog = 0;
+    uintptr_t persistentLevelForLog = 0;
+    uintptr_t actorClusterForLog = 0;
+    uintptr_t levelsDataForLog = 0;
+    int32_t levelsNumForLog = 0;
+    if (worldPtr >= 0x10000) {
+        if (m_off.World_ActiveLevelActors >= 0) {
+            activeActorsDataForLog = safeReadPtr(worldPtr + m_off.World_ActiveLevelActors);
+            activeActorsNumForLog = safeReadS32(worldPtr + m_off.World_ActiveLevelActors + 8);
+        }
+        scanTArray(worldPtr, m_off.World_ActiveLevelActors, "World.ActiveLevelActors");
+
+        uintptr_t persistentLevel = (m_off.World_PersistentLevel >= 0)
+            ? safeReadPtr(worldPtr + m_off.World_PersistentLevel)
+            : 0;
+        persistentLevelForLog = persistentLevel;
+        if (persistentLevel >= 0x10000 && m_off.Level_ActorCluster >= 0 && m_off.LevelActorContainer_Actors >= 0) {
+            uintptr_t actorCluster = safeReadPtr(persistentLevel + m_off.Level_ActorCluster);
+            actorClusterForLog = actorCluster;
+            scanTArray(actorCluster, m_off.LevelActorContainer_Actors, "PersistentLevel.ActorCluster.Actors");
+        }
+
+        if (m_off.World_Levels >= 0 && m_off.Level_ActorCluster >= 0 && m_off.LevelActorContainer_Actors >= 0) {
+            uintptr_t levelsData = safeReadPtr(worldPtr + m_off.World_Levels);
+            int32_t levelsNum = safeReadS32(worldPtr + m_off.World_Levels + 8);
+            levelsDataForLog = levelsData;
+            levelsNumForLog = levelsNum;
+            if (levelsData >= 0x10000 && levelsNum > 0 && levelsNum <= 256) {
+                for (int32_t i = 0; i < levelsNum; ++i) {
+                    uintptr_t levelPtr = safeReadPtr(levelsData + static_cast<uintptr_t>(i) * sizeof(uintptr_t));
+                    if (levelPtr < 0x10000) continue;
+                    uintptr_t actorCluster = safeReadPtr(levelPtr + m_off.Level_ActorCluster);
+                    scanTArray(actorCluster, m_off.LevelActorContainer_Actors, "World.Levels.ActorCluster.Actors");
+                }
+            }
+        }
     }
 
-    int processedItems = 0;
-    int visitedChunks = 0;
-
-    while (processedItems < scanBudget && visitedChunks < numChunks) {
-        const int ci = m_characterScanChunkIndex;
-        // ChunkPtrs @ +0xC8, 每个指针 8 字节
-        uintptr_t chunkBase = safeReadPtr(objArrayAddr + 0xC8 + static_cast<uintptr_t>(ci) * 8);
-        // ChunkElementCounts @ +0xE8, 每个 int32 4 字节
-        const int chunkCount = safeReadS32(objArrayAddr + 0xE8 + static_cast<uintptr_t>(ci) * 4);
-
-        if (chunkBase == 0 || chunkBase < 0x10000 || chunkCount <= 0) {
-            m_characterScanChunkIndex = (ci + 1) % numChunks;
-            m_characterScanItemIndex = 0;
-            visitedChunks++;
-            continue;
+    if (actorArrays > 0) {
+        static Clock::time_point s_lastWorldActorScanLog;
+        if (shouldLogEvery(s_lastWorldActorScanLog, std::chrono::milliseconds(1000))) {
+            LOG(LOG_LEVEL_INFO,
+                "[WorldActorScanProbe] arrays=%d actors=%d chars=%d added=%d skipSelf=%d skipExisting=%d skipHealth=%d skipPos=%d epoch=%u",
+                actorArrays, actorItems, charCandidates, newCharsFound, skipSelf, skipExisting, skipHealth, skipPosition, m_characterScanEpoch);
         }
+        m_lastCompletedCharacterScanEpoch = m_characterScanEpoch;
+        return newCharsFound;
+    }
 
-        int wi = m_characterScanItemIndex;
-        if (wi < 0 || wi >= chunkCount) {
-            wi = 0;
-        }
+    static Clock::time_point s_lastWorldActorScanMissLog;
+    if (shouldLogEvery(s_lastWorldActorScanMissLog, std::chrono::milliseconds(1000))) {
+        LOG(LOG_LEVEL_INFO,
+            "[WorldActorScanMiss] world=%p activeData=%p activeNum=%d persistent=%p actorCluster=%p levelsData=%p levelsNum=%d epoch=%u",
+            (void*)worldPtr, (void*)activeActorsDataForLog, activeActorsNumForLog,
+            (void*)persistentLevelForLog, (void*)actorClusterForLog,
+            (void*)levelsDataForLog, levelsNumForLog, m_characterScanEpoch);
+    }
 
-        // FUObjectItem 大小 = 24 字节 (Object* @ +0x00)
-        static constexpr size_t kFUObjectItemSize = 24;
-        BatchMemReader charBatch;
+    // 通过 safeRead 访问 GUObjectArray, 避免游戏重分配时裸解引用崩溃; World Actor 数组不可用时才兜底。
+    uintptr_t objArrayAddr = m_gUObjectArray;
+    UObjectArrayLayout layout{};
+    if (!detectUObjectArrayLayout(objArrayAddr, layout)) return 0;
+    const int totalNum = layout.totalNum;
 
-        while (wi < chunkCount && processedItems < scanBudget) {
-            // 通过 safeReadPtr 读取 FUObjectItem.Object
-            uintptr_t objPtr = safeReadPtr(chunkBase + static_cast<uintptr_t>(wi) * kFUObjectItemSize);
-            processedItems++;
-            wi++;
-            if (objPtr == 0 || objPtr < 0x10000) continue;
-            uintptr_t classPtr = safeReadPtr(objPtr + kUObjectClassPrivateOffset);
-            if (classPtr == 0) continue;
+    if (m_characterScanItemIndex < 0 || m_characterScanItemIndex >= totalNum) {
+        m_characterScanItemIndex = 0;
+    }
+    if (m_characterScanItemIndex == 0 || m_characterScanEpoch == 0) {
+        startCharacterScanEpoch();
+    }
 
-            auto it = m_characterClassSet.find(classPtr);
-            if (it != m_characterClassSet.end()) {
-                if (!it->second) continue;
-            } else {
-                bool isChar = isSubclassOf(classPtr, "STExtraBaseCharacter");
-                m_characterClassSet[classPtr] = isChar;
-                if (!isChar) continue;
-            }
+    while (processedItems < scanBudget && m_characterScanItemIndex < totalNum) {
+        uintptr_t objPtr = readUObjectAt(objArrayAddr, layout, m_characterScanItemIndex);
+        processedItems++;
+        m_characterScanItemIndex++;
+        acceptActor(objPtr, "GUObjectArray");
 
-            // ----- 批量读取 Character (best-effort, get() 自动回退) -----
-            charBatch.read(objPtr, m_charReadSize);
+        if (m_characterScanItemIndex >= totalNum) break;
+    }
 
-            uint32_t playerKey = charBatch.getU32(m_off.Char_PlayerKey);
-            if (playerKey == 0) continue;
-
-            PlayerNode* existing = m_playerList.findByKey(playerKey);
-            if (existing != nullptr && existing->source == PlayerSource::PlayerArray) {
-                continue;
-            }
-
-            int32_t teamID = charBatch.getS32(m_off.Char_TeamID);
-            float health = charBatch.getFloat(m_off.Char_Health);
-            float healthMax = charBatch.getFloat(m_off.Char_HealthMax);
-            bool bDead = (charBatch.getU8(m_off.Char_bDead) & 1) != 0;
-            std::string playerName = readFString(objPtr + m_off.Char_PlayerName);
-
-            FVector3 loc;
-            // 位置: 通过 RootComponent -> SceneComponent 获取
-            if (m_off.Actor_RootComponent >= 0) {
-                const uintptr_t rootComp = charBatch.getPtr(m_off.Actor_RootComponent);
-                if (rootComp != 0 && m_off.SceneComp_Translation >= 0) {
-                    loc.x = safeReadFloat(rootComp + m_off.SceneComp_Translation);
-                    loc.y = safeReadFloat(rootComp + m_off.SceneComp_Translation + 4);
-                    loc.z = safeReadFloat(rootComp + m_off.SceneComp_Translation + 8);
-                }
-            } else {
-                getActorLocation(objPtr, loc);
-            }
-
-            if (healthMax <= 0) continue;
-
-            patchActorNetCull(objPtr);
-
-            PlayerNode data;
-            data.teamID = teamID;
-            data.playerName = playerName;
-            data.isAI = false;
-            data.liveState = bDead ? 1 : 0;
-            data.health = health;
-            data.healthMax = healthMax;
-            data.kills = 0;
-            data.pos = loc;
-            data.characterPtr = objPtr;
-            data.source = PlayerSource::CharacterScan;
-            PlayerNode* node = m_playerList.upsert(playerKey, data);
-            if (node) {
-                node->source = PlayerSource::CharacterScan;
-                node->lastSeenCharacterScanEpoch = m_characterScanEpoch;
-            }
-            newCharsFound++;
-        }
-
-        if (wi >= chunkCount) {
-            m_characterScanChunkIndex = (ci + 1) % numChunks;
-            m_characterScanItemIndex = 0;
-            visitedChunks++;
-            if (m_characterScanChunkIndex == 0) {
-                m_lastCompletedCharacterScanEpoch = m_characterScanEpoch;
-            }
-        } else {
-            m_characterScanChunkIndex = ci;
-            m_characterScanItemIndex = wi;
-            break;
-        }
+    if (m_characterScanItemIndex >= totalNum) {
+        m_characterScanItemIndex = 0;
+        m_lastCompletedCharacterScanEpoch = m_characterScanEpoch;
     }
 
     return newCharsFound;
@@ -1881,12 +2270,37 @@ int MatchMonitor::updatePlayerList(uintptr_t gameStatePtr) {
         seenKeys[playerKey] = true;
         updated++;
 
-        // 记录本地玩家 key / TeamID
-        if (i == 0) {
-            if (teamID > 0) {
-                m_myTeamID = teamID;
+    }
+
+    // 通过本地 PlayerController 锁定自己 (训练场 PlayerArray[0] 是占位, 不可信)
+    if (m_off.PC_PlayerState >= 0 || m_off.PC_AcknowledgedPawn >= 0) {
+        uintptr_t pc = getLocalPlayerController();
+        if (pc >= 0x10000) {
+            uintptr_t myPS = (m_off.PC_PlayerState >= 0) ? safeReadPtr(pc + m_off.PC_PlayerState) : 0;
+            if (myPS >= 0x10000 && m_off.PS_PlayerKey >= 0) {
+                uint32_t key = safeReadU32(myPS + m_off.PS_PlayerKey);
+                if (key != 0) {
+                    m_myPlayerKey = key;
+                    if (m_off.PS_TeamID >= 0) {
+                        int32_t tid = safeReadS32(myPS + m_off.PS_TeamID);
+                        if (tid > 0) m_myTeamID = tid;
+                    }
+                }
             }
-            m_myPlayerKey = playerKey;
+            // AcknowledgedPawn 兜底: 从自己角色读 PlayerKey/TeamID
+            if (m_myPlayerKey == 0 && m_off.PC_AcknowledgedPawn >= 0) {
+                uintptr_t myPawn = safeReadPtr(pc + m_off.PC_AcknowledgedPawn);
+                if (myPawn >= 0x10000 && m_off.Char_PlayerKey >= 0) {
+                    uint32_t key = safeReadU32(myPawn + m_off.Char_PlayerKey);
+                    if (key != 0) {
+                        m_myPlayerKey = key;
+                        if (m_off.Char_TeamID >= 0) {
+                            int32_t tid = safeReadS32(myPawn + m_off.Char_TeamID);
+                            if (tid > 0) m_myTeamID = tid;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1949,43 +2363,148 @@ void MatchMonitor::refreshTrackedPlayersFast() {
 
 void MatchMonitor::fillCameraSnapshot(ue4draw::DrawGameData& drawData) {
     const uintptr_t pc = getLocalPlayerController();
-    if (pc == 0) {
-        return;
-    }
 
-    const uintptr_t pcm = safeReadPtr(pc + 0x660);  // PlayerController.PlayerCameraManager (dump.cs: 0x660, 不是 0x658)
+    const int32_t pcmOff = (m_off.PC_PlayerCameraManager >= 0) ? m_off.PC_PlayerCameraManager : 0x660;
+    uintptr_t pcm = (pc >= 0x10000) ? safeReadPtr(pc + pcmOff) : 0;
+    if (pcm < 0x10000) {
+        pcm = findPlayerCameraManagerInstance();
+    }
     if (pcm == 0) {
+        static Clock::time_point s_lastNoPCMLog;
+        if (shouldLogEvery(s_lastNoPCMLog, std::chrono::milliseconds(2000))) {
+            LOG(LOG_LEVEL_WARN, "[Camera] no PlayerCameraManager pc=%p pcmOff=0x%X", (void*)pc, pcmOff);
+        }
         return;
     }
 
-    auto readMinimalViewInfo = [&](uintptr_t viewInfoPtr,
-                                   float& locX,
-                                   float& locY,
-                                   float& locZ,
-                                   float& pitch,
-                                   float& yaw,
-                                   float& roll,
-                                   float& fov) {
-        locX = safeReadFloat(viewInfoPtr + 0x0);
-        locY = safeReadFloat(viewInfoPtr + 0x4);
-        locZ = safeReadFloat(viewInfoPtr + 0x8);
-        pitch = safeReadFloat(viewInfoPtr + 0x18);
-        yaw = safeReadFloat(viewInfoPtr + 0x1C);
-        roll = safeReadFloat(viewInfoPtr + 0x20);
-        fov = safeReadFloat(viewInfoPtr + 0x30);
-    };
+    uintptr_t cameraPC = pc;
+    if (cameraPC < 0x10000 && m_off.PCM_PCOwner >= 0) {
+        cameraPC = safeReadPtr(pcm + m_off.PCM_PCOwner);
+    }
+
+    const int32_t camCacheOff = (m_off.PCM_CameraCache >= 0) ? m_off.PCM_CameraCache : 0x640;
+    const int32_t defaultFovOff = (m_off.PCM_DefaultFOV >= 0) ? m_off.PCM_DefaultFOV : 0x5E8;
+
     auto hasFiniteCameraPose = [](float locX,
                                   float locY,
                                   float locZ,
                                   float pitch,
                                   float yaw,
                                   float roll) {
+        // UE world bounds: PUBG 地图最大约 8x8km, 任何 |loc| > 2e6 cm (20 km) 都是
+        // 候选 ViewInfo 偏移读错 (野指针/未初始化内存被解释为 float) 产生的垃圾值.
+        // 必须 reject, 否则会以最优 baseScore 抢占真正有效的 CameraCache 候选.
+        constexpr float kMaxWorldCoord = 2.0e6f;
         return std::isfinite(locX) && std::isfinite(locY) && std::isfinite(locZ)
+            && std::fabs(locX) < kMaxWorldCoord
+            && std::fabs(locY) < kMaxWorldCoord
+            && std::fabs(locZ) < kMaxWorldCoord
             && (std::fabs(locX) > 1.0f || std::fabs(locY) > 1.0f || std::fabs(locZ) > 1.0f)
             && std::isfinite(pitch) && std::isfinite(yaw) && std::isfinite(roll);
     };
     auto hasValidFov = [](float fov) {
         return std::isfinite(fov) && fov >= 30.0f && fov <= 170.0f;
+    };
+    auto normalizeAngle = [](float value) {
+        return std::isfinite(value) ? std::remainder(value, 360.0f) : 0.0f;
+    };
+    auto angleDelta = [&](float lhs, float rhs) {
+        return std::fabs(normalizeAngle(lhs - rhs));
+    };
+    auto angleMagnitude = [&](float pitch, float yaw, float roll) {
+        return std::fabs(normalizeAngle(pitch)) + std::fabs(normalizeAngle(yaw)) + std::fabs(normalizeAngle(roll));
+    };
+    auto hasMeaningfulRotation = [&](float pitch, float yaw, float roll) {
+        return std::isfinite(pitch) && std::isfinite(yaw) && std::isfinite(roll)
+            && angleMagnitude(pitch, yaw, roll) > 1.0f;
+    };
+
+    float controlPitch = 0.0f;
+    float controlYaw = 0.0f;
+    float controlRoll = 0.0f;
+    bool hasControlRotation = false;
+    if (cameraPC >= 0x10000 && m_off.Ctrl_ControlRotation >= 0) {
+        controlPitch = safeReadFloat(cameraPC + m_off.Ctrl_ControlRotation);
+        controlYaw = safeReadFloat(cameraPC + m_off.Ctrl_ControlRotation + 4);
+        controlRoll = safeReadFloat(cameraPC + m_off.Ctrl_ControlRotation + 8);
+        hasControlRotation = std::isfinite(controlPitch) && std::isfinite(controlYaw) && std::isfinite(controlRoll);
+    }
+
+    struct RotationCandidate {
+        const char* label = "";
+        float pitch = 0.0f;
+        float yaw = 0.0f;
+        float roll = 0.0f;
+        float score = 1000000.0f;
+        bool valid = false;
+    };
+    auto makeRotationCandidate = [&](uintptr_t addr, const char* label, float baseScore) {
+        RotationCandidate candidate{};
+        candidate.label = label;
+        if (addr < 0x10000) return candidate;
+        candidate.pitch = safeReadFloat(addr);
+        candidate.yaw = safeReadFloat(addr + 4);
+        candidate.roll = safeReadFloat(addr + 8);
+        candidate.valid = hasMeaningfulRotation(candidate.pitch, candidate.yaw, candidate.roll);
+        if (!candidate.valid) return candidate;
+        candidate.score = baseScore;
+        if (hasControlRotation && hasMeaningfulRotation(controlPitch, controlYaw, controlRoll)) {
+            candidate.score += angleDelta(candidate.pitch, controlPitch) * 0.5f;
+            candidate.score += angleDelta(candidate.yaw, controlYaw) * 0.75f;
+            candidate.score += angleDelta(candidate.roll, controlRoll) * 0.1f;
+        }
+        return candidate;
+    };
+
+    struct CameraCandidate {
+        const char* label = "";
+        float locX = 0.0f;
+        float locY = 0.0f;
+        float locZ = 0.0f;
+        float pitch = 0.0f;
+        float yaw = 0.0f;
+        float roll = 0.0f;
+        float fov = 0.0f;
+        float score = 1000000.0f;
+        bool valid = false;
+    };
+
+    const float defaultFov = safeReadFloat(pcm + defaultFovOff);
+    auto makeCandidate = [&](uintptr_t viewInfoPtr,
+                             int32_t rotOff,
+                             int32_t fovOff,
+                             const char* label,
+                             float baseScore) {
+        CameraCandidate candidate{};
+        candidate.label = label;
+        if (viewInfoPtr < 0x10000) return candidate;
+        candidate.locX = safeReadFloat(viewInfoPtr + 0x0);
+        candidate.locY = safeReadFloat(viewInfoPtr + 0x4);
+        candidate.locZ = safeReadFloat(viewInfoPtr + 0x8);
+        candidate.pitch = safeReadFloat(viewInfoPtr + rotOff);
+        candidate.yaw = safeReadFloat(viewInfoPtr + rotOff + 4);
+        candidate.roll = safeReadFloat(viewInfoPtr + rotOff + 8);
+        candidate.fov = safeReadFloat(viewInfoPtr + fovOff);
+        if (!hasValidFov(candidate.fov) && hasValidFov(defaultFov)) {
+            candidate.fov = defaultFov;
+            baseScore += 15.0f;
+        }
+
+        candidate.valid = hasFiniteCameraPose(candidate.locX, candidate.locY, candidate.locZ,
+                                              candidate.pitch, candidate.yaw, candidate.roll)
+            && hasValidFov(candidate.fov);
+        if (!candidate.valid) return candidate;
+
+        candidate.score = baseScore;
+        if (hasControlRotation) {
+            candidate.score += angleDelta(candidate.pitch, controlPitch) * 1.5f;
+            candidate.score += angleDelta(candidate.yaw, controlYaw) * 2.0f;
+            candidate.score += angleDelta(candidate.roll, controlRoll) * 0.25f;
+        } else {
+            candidate.score += std::fabs(normalizeAngle(candidate.pitch)) * 0.05f;
+            candidate.score += std::fabs(normalizeAngle(candidate.roll)) * 0.05f;
+        }
+        return candidate;
     };
 
     float camLocX = 0.0f;
@@ -1996,15 +2515,88 @@ void MatchMonitor::fillCameraSnapshot(ue4draw::DrawGameData& drawData) {
     float camRoll = 0.0f;
     float camFov = 0.0f;
 
-    // CameraCacheEntry.POV @ PCM+0x650, MinimalViewInfo.FOV @ +0x30 => PCM+0x680
-    readMinimalViewInfo(pcm + 0x650, camLocX, camLocY, camLocZ, camPitch, camYaw, camRoll, camFov);
-    if (!hasFiniteCameraPose(camLocX, camLocY, camLocZ, camPitch, camYaw, camRoll)) {
-        // CachedViewPOV is a direct MinimalViewInfo at PCM+0x2120.
-        readMinimalViewInfo(pcm + 0x2120, camLocX, camLocY, camLocZ, camPitch, camYaw, camRoll, camFov);
+    CameraCandidate best{};
+    const uintptr_t cameraCachePOV = pcm + static_cast<uintptr_t>(camCacheOff) + 0x10;
+    const uintptr_t cachedViewPOV = pcm + 0x2120;
+    std::vector<CameraCandidate> candidates;
+    candidates.reserve(18);
+
+    uintptr_t activeCameraCache = 0;
+    if (cameraPC >= 0x10000 && m_off.STPC_CurrentActiveCameraCache >= 0) {
+        activeCameraCache = safeReadPtr(cameraPC + static_cast<uintptr_t>(m_off.STPC_CurrentActiveCameraCache));
+        if (activeCameraCache >= 0x10000) {
+            candidates.push_back(makeCandidate(activeCameraCache + 0x10, 0x0C, 0x18, "STPC.CurrentActiveCameraCache+10.compact", -30.0f));
+            candidates.push_back(makeCandidate(activeCameraCache + 0x10, 0x10, 0x1C, "STPC.CurrentActiveCameraCache+10.aligned", -25.0f));
+            candidates.push_back(makeCandidate(activeCameraCache + 0x10, 0x18, 0x30, "STPC.CurrentActiveCameraCache+10.legacyWide", -20.0f));
+            candidates.push_back(makeCandidate(activeCameraCache + 0x30, 0x0C, 0x18, "STPC.CurrentActiveCameraCache+30.compact", -15.0f));
+            candidates.push_back(makeCandidate(activeCameraCache + 0x30, 0x10, 0x1C, "STPC.CurrentActiveCameraCache+30.aligned", -10.0f));
+            candidates.push_back(makeCandidate(activeCameraCache + 0x30, 0x18, 0x30, "STPC.CurrentActiveCameraCache+30.legacyWide", -5.0f));
+        }
     }
 
-    if (!hasValidFov(camFov)) {
-        camFov = safeReadFloat(pcm + 0x5E8);  // PlayerCameraManager.DefaultFOV (dump.cs: 0x5E8)
+    candidates.push_back(makeCandidate(cachedViewPOV, 0x0C, 0x18, "CachedViewPOV.compact", 0.0f));
+    candidates.push_back(makeCandidate(cachedViewPOV, 0x10, 0x1C, "CachedViewPOV.aligned", 5.0f));
+    candidates.push_back(makeCandidate(cachedViewPOV, 0x18, 0x30, "CachedViewPOV.legacyWide", 10.0f));
+    candidates.push_back(makeCandidate(cameraCachePOV, 0x0C, 0x18, "CameraCache.compact", 20.0f));
+    candidates.push_back(makeCandidate(cameraCachePOV, 0x10, 0x1C, "CameraCache.aligned", 25.0f));
+    candidates.push_back(makeCandidate(cameraCachePOV, 0x18, 0x30, "CameraCache.legacyWide", 30.0f));
+
+    for (const auto& candidate : candidates) {
+        if (candidate.valid && (!best.valid || candidate.score < best.score)) {
+            best = candidate;
+        }
+    }
+
+    if (best.valid) {
+        camLocX = best.locX;
+        camLocY = best.locY;
+        camLocZ = best.locZ;
+        camPitch = best.pitch;
+        camYaw = best.yaw;
+        camRoll = best.roll;
+        camFov = best.fov;
+
+        RotationCandidate bestRotation{};
+        if (cameraPC >= 0x10000) {
+            const RotationCandidate rotationCandidates[] = {
+            makeRotationCandidate((m_off.STPC_CachedViewControlRotation >= 0) ? cameraPC + static_cast<uintptr_t>(m_off.STPC_CachedViewControlRotation) : 0,
+                                      "STPC.CachedViewControlRotation", 0.0f),
+            makeRotationCandidate((m_off.STPC_LastFrameCacheControlRotation >= 0) ? cameraPC + static_cast<uintptr_t>(m_off.STPC_LastFrameCacheControlRotation) : 0,
+                                      "STPC.LastFrameCacheControlRotation", 5.0f),
+            makeRotationCandidate((m_off.Ctrl_ControlRotation >= 0) ? cameraPC + static_cast<uintptr_t>(m_off.Ctrl_ControlRotation) : 0,
+                                      "Controller.ControlRotation", 15.0f),
+            };
+            for (const auto& rotationCandidate : rotationCandidates) {
+                if (rotationCandidate.valid && (!bestRotation.valid || rotationCandidate.score < bestRotation.score)) {
+                    bestRotation = rotationCandidate;
+                }
+            }
+        }
+
+        // ⚠️ 重要: 只在相机旋转 "真的无效" (全零/NaN) 时才用控制器旋转覆盖.
+        // TPS 第三人称视角下, PlayerCameraManager.CameraCache 的 rotation 与
+        // PlayerController.ControlRotation 之间会差几度 (spring-arm 平滑/瞄准点偏移),
+        // 这是游戏正常行为. 如果用 ControlRotation 覆盖, 会让 *旋转源* 与 *位置源*
+        // (仍是 PCM CameraCache.POV.Location) 不匹配, 导致 ESP 在屏幕上随相机旋转方向
+        // 系统性漂移. 必须保持 rot/loc 来自同一个 ViewInfo.
+        bool usedRotationOverride = false;
+        const bool cameraRotationLooksEmpty = !hasMeaningfulRotation(camPitch, camYaw, camRoll);
+        if (bestRotation.valid && cameraRotationLooksEmpty) {
+            camPitch = bestRotation.pitch;
+            camYaw = bestRotation.yaw;
+            camRoll = bestRotation.roll;
+            usedRotationOverride = true;
+        }
+
+        static Clock::time_point s_lastCameraLayoutLog;
+        if (shouldLogEvery(s_lastCameraLayoutLog, std::chrono::milliseconds(2000))) {
+            LOG(LOG_LEVEL_INFO,
+                "[Camera] selected=%s score=%.1f pc=%p ownerPC=%p activeCam=%p loc=(%.0f,%.0f,%.0f) rot=(%.1f,%.1f,%.1f) fov=%.1f ctrl=(%.1f,%.1f,%.1f) hasCtrl=%d rotOverride=%s%s",
+                best.label, best.score, (void*)pc, (void*)cameraPC, (void*)activeCameraCache, camLocX, camLocY, camLocZ, camPitch, camYaw, camRoll, camFov,
+                controlPitch, controlYaw, controlRoll, hasControlRotation ? 1 : 0,
+                usedRotationOverride ? "1:" : "0",
+                usedRotationOverride ? bestRotation.label : "");
+        }
     }
 
     if (hasFiniteCameraPose(camLocX, camLocY, camLocZ, camPitch, camYaw, camRoll)) {
@@ -2826,12 +3418,18 @@ void MatchMonitor::pollPlayers() {
         || m_myPlayerKey == 0
         || shouldLogEvery(s_lastSlowRefreshTime, slowRefreshInterval);
 
+    bool ranSlowPath = false;
     if (shouldRunSlowPath) {
         const int count = updatePlayerList(ms.gameStatePtr);
         if (count <= 0 && m_playerList.size() <= 0) {
             return;
         }
+        ranSlowPath = true;
     } else {
+        refreshTrackedPlayersFast();
+    }
+
+    if (ranSlowPath && m_playerList.size() > 0) {
         refreshTrackedPlayersFast();
     }
 
@@ -2889,7 +3487,10 @@ void MatchMonitor::pollPlayers() {
             continue;
         }
 
-        const bool isTeammate = (m_myTeamID > 0 && cur->teamID == m_myTeamID);
+        // 自己 (本地玩家) 也归入 "显示队友" 开关控制范围:
+        // 单人/训练场下 m_myTeamID 可能是 -1, teamID 比较失效, 必须用 playerKey 兜底.
+        const bool isSelf = (m_myPlayerKey != 0 && cur->playerKey == m_myPlayerKey);
+        const bool isTeammate = isSelf || (m_myTeamID > 0 && cur->teamID == m_myTeamID);
         aliveCount++;
         if (isTeammate) {
             aliveTeam++;

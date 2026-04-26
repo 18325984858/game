@@ -140,6 +140,101 @@ uint32_t UE4Dumper::safeReadU32(uintptr_t addr) {
     return val;
 }
 
+namespace {
+
+enum class UObjectArrayLayoutKind : uint8_t {
+    Invalid = 0,
+    ModernFlat,
+    LegacyChunked,
+};
+
+struct UObjectArrayLayout {
+    UObjectArrayLayoutKind kind = UObjectArrayLayoutKind::Invalid;
+    uintptr_t items = 0;
+    int32_t totalNum = 0;
+    int32_t maxNum = 0;
+    int32_t numChunks = 0;
+};
+
+bool looksLikeUserPtr(uintptr_t value) {
+    return value >= 0x10000 && value < 0x0000800000000000ULL;
+}
+
+bool detectUObjectArrayLayout(uintptr_t arrayBase, UObjectArrayLayout& out) {
+    out = {};
+    if (!looksLikeUserPtr(arrayBase)) return false;
+
+    const int32_t flatNum = UE4Dumper::safeReadS32(arrayBase + 0xB8);
+    const int32_t flatMax = UE4Dumper::safeReadS32(arrayBase + 0xC0);
+    const uintptr_t flatItems = UE4Dumper::safeReadPtr(arrayBase + 0xC8);
+    const int32_t flatChunks = UE4Dumper::safeReadS32(arrayBase + 0xD0);
+    if (flatNum > 0 && flatNum <= flatMax && flatMax <= 5000000
+        && looksLikeUserPtr(flatItems)
+        && flatChunks > 0 && flatChunks <= 4096) {
+        out.kind = UObjectArrayLayoutKind::ModernFlat;
+        out.items = flatItems;
+        out.totalNum = flatNum;
+        out.maxNum = flatMax;
+        out.numChunks = flatChunks;
+        return true;
+    }
+
+    const int32_t numChunks = UE4Dumper::safeReadS32(arrayBase + 0xF8);
+    const int32_t totalNum = UE4Dumper::safeReadS32(arrayBase + 0x100);
+    const uintptr_t firstChunk = UE4Dumper::safeReadPtr(arrayBase + 0xC8);
+    const int32_t firstChunkCount = UE4Dumper::safeReadS32(arrayBase + 0xE8);
+    if (numChunks > 0 && numChunks <= 4096
+        && totalNum > 0 && totalNum <= 5000000
+        && looksLikeUserPtr(firstChunk)
+        && firstChunkCount > 0) {
+        out.kind = UObjectArrayLayoutKind::LegacyChunked;
+        out.totalNum = totalNum;
+        out.numChunks = numChunks;
+        return true;
+    }
+
+    return false;
+}
+
+bool readFUObjectItemAtAddress(uintptr_t itemAddr, FUObjectItem& outItem) {
+    outItem = {};
+    if (!looksLikeUserPtr(itemAddr)) return false;
+    outItem.Object = reinterpret_cast<UObjectBase*>(UE4Dumper::safeReadPtr(itemAddr));
+    outItem.Flags = UE4Dumper::safeReadS32(itemAddr + 0x08);
+    outItem.ClusterRootIndex = UE4Dumper::safeReadS32(itemAddr + 0x0C);
+    outItem.SerialNumber = UE4Dumper::safeReadS32(itemAddr + 0x10);
+    return true;
+}
+
+bool readUObjectItem(uintptr_t arrayBase, const UObjectArrayLayout& layout, int32_t index, FUObjectItem& outItem) {
+    outItem = {};
+    if (index < 0 || index >= layout.totalNum) return false;
+
+    if (layout.kind == UObjectArrayLayoutKind::ModernFlat) {
+        const uintptr_t itemAddr = layout.items + static_cast<uintptr_t>(index) * sizeof(FUObjectItem);
+        return readFUObjectItemAtAddress(itemAddr, outItem);
+    }
+
+    if (layout.kind == UObjectArrayLayoutKind::LegacyChunked) {
+        int32_t remaining = index;
+        for (int32_t chunkIndex = 0; chunkIndex < layout.numChunks; ++chunkIndex) {
+            const int32_t chunkCount = UE4Dumper::safeReadS32(arrayBase + 0xE8 + static_cast<uintptr_t>(chunkIndex) * sizeof(int32_t));
+            if (chunkCount <= 0) continue;
+            if (remaining >= chunkCount) {
+                remaining -= chunkCount;
+                continue;
+            }
+            const uintptr_t chunkBase = UE4Dumper::safeReadPtr(arrayBase + 0xC8 + static_cast<uintptr_t>(chunkIndex) * sizeof(uintptr_t));
+            if (!looksLikeUserPtr(chunkBase)) return false;
+            return readFUObjectItemAtAddress(chunkBase + static_cast<uintptr_t>(remaining) * sizeof(FUObjectItem), outItem);
+        }
+    }
+
+    return false;
+}
+
+} // namespace
+
 // ===================== FName 解析 ====================================
 
 const char* UE4Dumper::getNameByIndex(int index) {
@@ -215,34 +310,18 @@ std::string UE4Dumper::readFullPath(uintptr_t objPtr) {
 
 int UE4Dumper::forEachUObject(uintptr_t arrayBase, ForEachCallback cb, void* userData) {
     if (arrayBase == 0 || arrayBase < 0x10000) return 0;
-    int numChunks = safeReadS32(arrayBase + 0xF8);
-    int totalNum  = safeReadS32(arrayBase + 0x100);
+    UObjectArrayLayout layout{};
+    if (!detectUObjectArrayLayout(arrayBase, layout)) return 0;
 
-    if (numChunks <= 0 || numChunks > 1000 || totalNum <= 0 || totalNum > 5000000) return 0;
-
-    int globalIdx = 0;
     int total = 0;
-    static constexpr size_t kItemSize = 24;
-
-    for (int ci = 0; ci < numChunks; ci++) {
-        uintptr_t chunkBase = safeReadPtr(arrayBase + 0xC8 + static_cast<uintptr_t>(ci) * 8);
-        int chunkCount = safeReadS32(arrayBase + 0xE8 + static_cast<uintptr_t>(ci) * 4);
-
-        if (chunkBase == 0 || chunkBase < 0x10000 || chunkCount <= 0) {
-            globalIdx += (chunkCount > 0 ? chunkCount : 0);
-            continue;
+    for (int32_t index = 0; index < layout.totalNum; ++index) {
+        FUObjectItem item{};
+        if (!readUObjectItem(arrayBase, layout, index, item)) continue;
+        const uintptr_t objPtr = reinterpret_cast<uintptr_t>(item.Object);
+        if (objPtr != 0 && objPtr >= 0x10000) {
+            cb(objPtr, index, userData);
+            total++;
         }
-
-        for (int wi = 0; wi < chunkCount; wi++) {
-            uintptr_t objPtr = safeReadPtr(chunkBase + static_cast<uintptr_t>(wi) * kItemSize);
-            if (objPtr != 0 && objPtr >= 0x10000) {
-                cb(objPtr, globalIdx, userData);
-                total++;
-            }
-            globalIdx++;
-            if (globalIdx >= totalNum) break;
-        }
-        if (globalIdx >= totalNum) break;
     }
     return total;
 }
@@ -366,9 +445,14 @@ bool UE4Dumper::dumpGWorld(const char* filePath) {
 
     if (m_GWorld == 0) return false;
 
-    std::string worldName  = readObjectFName(m_GWorld);
-    std::string worldClass = readClassName(m_GWorld);
-    std::string worldPath  = readFullPath(m_GWorld);
+    uintptr_t worldPtr = safeReadPtr(m_GWorld);
+    if (!looksLikeUserPtr(worldPtr)) {
+        worldPtr = m_GWorld;
+    }
+
+    std::string worldName  = readObjectFName(worldPtr);
+    std::string worldClass = readClassName(worldPtr);
+    std::string worldPath  = readFullPath(worldPtr);
 
     std::string path;
     if (filePath != nullptr) {
@@ -381,7 +465,7 @@ bool UE4Dumper::dumpGWorld(const char* filePath) {
     FILE* fp = fopen(path.c_str(), "w");
     if (!fp) return false;
 
-    fprintf(fp, "GWorld: 0x%lX\n", (unsigned long)m_GWorld);
+    fprintf(fp, "GWorld: 0x%lX\n", (unsigned long)worldPtr);
     fprintf(fp, "Class: %s\n", worldClass.c_str());
     fprintf(fp, "Name: %s\n", worldName.c_str());
     fprintf(fp, "Path: %s\n", worldPath.c_str());
