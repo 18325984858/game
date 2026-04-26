@@ -127,11 +127,15 @@ public class MainActivity extends AppCompatActivity {
         // ── AI 屏幕检测: 解压模型并启动后台线程 (默认 disabled, 通过 ImGui 菜单开启) ──
         try {
             AIScreenDetect.init(getApplicationContext());
+            // 必须 FIRST: 创建跨进程共享文件并设置 SELinux context.
+            // 之后任何调用 AISharedData::getInstance() 的 native 方法 (setScoreThreshold/
+            // setEnabled 等) 才能成功 mmap. 否则单例首次构造会因文件不存在而 m_hdr=null,
+            // 永远不再 retry.
+            AIScreenDetect.prepareSharedDets();
             AIScreenDetect.setUseGpu(true);
             AIScreenDetect.setUseSu(true);           // screencap 在 app uid 下被 SELinux 拒绝, 必须走 su
             AIScreenDetect.setIntervalMs(120);
             AIScreenDetect.setScoreThreshold(0.25f);
-            AIScreenDetect.prepareSharedDets();      // 先创建跨进程共享文件
             AIScreenDetect.start();
             // 提前 chmod /dev/uinput, 启用 "AI 辅助瞄准(注入)" 时不再需要等待
             AIScreenDetect.prepareTouchInjection();

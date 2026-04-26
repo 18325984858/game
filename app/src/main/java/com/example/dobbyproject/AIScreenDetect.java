@@ -101,12 +101,15 @@ public final class AIScreenDetect {
         try {
             Process p = Runtime.getRuntime().exec(new String[] {
                     "su", "-c",
-                    // 1) 创建文件并预分配 16KB (大于 Header 实际大小, 满足 mmap)
-                    // 2) chmod 666 让任何 uid 可读写
-                    // 3) chcon 设为 magisk_file: untrusted_app 允许 read/write/map
-                    //    (若该 context 不存在则降级为默认 device, 仍优于 shell_data_file)
+                    // 关键: 不能 rm + dd, 否则会创建新 inode, 已 mmap 旧 inode 的进程 (PUBG)
+                    // 看到的是旧 (空) 文件. 必须就地 truncate + 保留 inode.
+                    // 1) 若文件不存在则创建并填充 16KB
+                    // 2) 若已存在则保留 inode, 仅 fallocate/truncate 到 16KB
+                    // 3) chmod 666 让任何 uid 可读写
+                    // 4) chcon magisk_file (回退 system_data_file): 允许 untrusted_app 读写 mmap
                     "F=/data/local/tmp/ai_dets.bin; " +
-                    "rm -f $F; dd if=/dev/zero of=$F bs=1 count=16384 2>/dev/null; " +
+                    "if [ ! -f $F ]; then dd if=/dev/zero of=$F bs=1 count=16384 2>/dev/null; fi; " +
+                    "truncate -s 16384 $F 2>/dev/null || dd if=/dev/zero of=$F bs=1 count=16384 conv=notrunc 2>/dev/null; " +
                     "chmod 666 $F; " +
                     "chcon u:object_r:magisk_file:s0 $F 2>/dev/null || " +
                     "chcon u:object_r:system_data_file:s0 $F 2>/dev/null || " +
