@@ -24,3 +24,6 @@ sdk_dump.cs
 
 build.log
 build_output.txt
+
+app/src/main/cpp/ncnn/
+
