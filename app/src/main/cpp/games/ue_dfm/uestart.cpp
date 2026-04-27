@@ -461,6 +461,8 @@ extern "C" __attribute__((visibility("default")))
 bool MyStartPointDFM(void* plibUE5ModeBase, void* pGNames,
                      void* pGWorld, void* pGUObjectArray, 
                      void *pGUObjectArrayChunks,uint64_t moduleSize, void* pData) {
+    // 安装反检测 hook: 隐藏自身 .so (dl_iterate_phdr/dladdr) + 伪造 root/解锁相关系统属性
+    // (ro.secure / ro.debuggable / ro.boot.verifiedbootstate 等)。幂等, 多次调用安全。
     installStealthHooks();
     // 防重入: 注入器可能多次调用, 只启动一次工作线程
     bool expected = false;

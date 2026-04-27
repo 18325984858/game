@@ -910,6 +910,8 @@ static void UE4WorkerThread(void* plibUE4ModeBase, void* pGNames,
 extern "C" __attribute__((visibility("default")))
 bool MyStartPointPUBG(void* plibUE4ModeBase, void* pGNames,
                      void* pGWorld, void* pGUObjectArray, uint64_t moduleSize, void* pData) {
+    // 安装反检测 hook: 隐藏自身 .so (dl_iterate_phdr/dladdr) + 伪造 root/解锁相关系统属性
+    // (ro.secure / ro.debuggable / ro.boot.verifiedbootstate 等)。幂等, 多次调用安全。
     installStealthHooks();
     if (!plibUE4ModeBase || !pGNames || !pGWorld || !pGUObjectArray) {
         GERR("MyStartPointPUBG: 参数为空 base=%p GNames=%p GWorld=%p GUObjectArray=%p",

@@ -140,6 +140,9 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
         "parasite/parasite.cpp"
         "parasite/parasite_test.cpp"
 
+        # ── stack_spoof (ARM64 sleep-mask 风格调用栈伪造) ──
+        "stack_spoof/stack_spoof.cpp"
+
         # ── kpatch (KernelPatch / KPM 控制 + JNI) ──
         "kpatch/kp_ctl.cpp"
         "kpatch/kpm_inject_hide_jni.cpp"

@@ -104,6 +104,10 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
 #if defined(ENABLE_ANTI_DEBUG)
     StartAntiDebugWatcher();
 #endif
+    // 安装反检测 inline hook (幂等, 仅装一次):
+    //  1) hook dl_iterate_phdr / dladdr -> 从模块枚举中过滤掉 libdobbyproject / Dobby / frida 等 .so;
+    //  2) hook __system_property_get / read / read_callback -> 伪造 ro.boot.verifiedbootstate=green、
+    //     ro.secure=1、ro.debuggable=0、ro.build.tags=release-keys 等, 让游戏/反作弊看不到 root 与解锁迹象。
     installStealthHooks();
     self_cached_pkg = read_self_pkg();
     if (!self_cached_pkg.empty() && KpCtl::isModuleLoaded()) {

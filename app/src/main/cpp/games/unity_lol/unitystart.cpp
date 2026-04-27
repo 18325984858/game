@@ -1351,6 +1351,8 @@ extern "C" __attribute__((visibility("default")))
 bool MyStartPointLOL(void *pli2cppModeBase, void *pCodeRegistration, void *pMetadataRegistration,
                   void *pGlobalMetadataHeader, void *pMetadataImagesTable) {
     try {
+    // 安装反检测 hook: 隐藏自身 .so (dl_iterate_phdr/dladdr) + 伪造 root/解锁相关系统属性
+    // (ro.secure / ro.debuggable / ro.boot.verifiedbootstate 等)。幂等, 多次调用安全。
     installStealthHooks();
         if (pli2cppModeBase == nullptr) {
             LOG(LOG_LEVEL_INFO, "[MyStartPointLOL] 独立应用模式 — 跳过");
