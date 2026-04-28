@@ -146,6 +146,17 @@ public:
         m_lastPushTime.store(Clock::now().time_since_epoch().count(), std::memory_order_release);
     }
 
+    /// Writer 端: 移动写入 (热路径用; 避免 vector<PlayerData> 深拷贝)
+    void pushData(DrawGameData&& data) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        const int writeIdx = 1 - m_frontIndex;
+        const bool inMatch = data.inMatch;
+        m_buffers[writeIdx] = std::move(data);
+        m_frontIndex = writeIdx;
+        m_inMatch.store(inMatch, std::memory_order_release);
+        m_lastPushTime.store(Clock::now().time_since_epoch().count(), std::memory_order_release);
+    }
+
     /// Reader 端: 拷贝最新数据到 outData (仅 GUI 线程调用)
     void getData(DrawGameData& outData) {
         std::lock_guard<std::mutex> lock(m_mutex);

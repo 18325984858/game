@@ -57,9 +57,13 @@ namespace pubgmhd {
 //  引擎常量
 // =====================================================================
 static constexpr int POLL_INTERVAL_MS         = 250;
-// PLAYER_POLL_INTERVAL_MS: 玩家列表轮询间隔. 8ms (~125Hz) 会让 process_vm_readv
-// 频次过高被反作弊判断为非常规进程, 触发踢线. 30ms (~33Hz) 仍能保证 ESP 流畅.
-static constexpr int PLAYER_POLL_INTERVAL_MS  = 30;
+// PLAYER_POLL_INTERVAL_MS: 玩家列表轮询间隔.
+//   - 8ms (~125Hz): 频次过高, 被反作弊判定为异常采样.
+//   - 16ms (~60Hz): 与游戏帧率上限对齐, 每帧只取一次最新数据;
+//     fast path 用 BatchMemReader 把每个玩家 6 次 safeRead 合并为 1 次,
+//     总 syscall 量反而降低.
+//   - 30ms (~33Hz): 旧值, ESP 在转身/快速移动时有可见抖动.
+static constexpr int PLAYER_POLL_INTERVAL_MS  = 16;
 static constexpr int MONITOR_IDLE_SLEEP_MS    = 2;
 static constexpr int STATE_LOG_INTERVAL_MS    = 1000;
 static constexpr int PLAYER_LOG_INTERVAL_MS   = 1000;

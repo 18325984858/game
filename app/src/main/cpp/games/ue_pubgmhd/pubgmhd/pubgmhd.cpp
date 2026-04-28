@@ -3313,28 +3313,52 @@ int MatchMonitor::scanWorldObjects(std::vector<ue4draw::DrawWorldObject>& outObj
 }
 
 void MatchMonitor::refreshTrackedPlayersFast() {
+    // 优化: 每个玩家原本要发起 6 次 safeRead (RootComp + pos×3 + health + healthMax + bDead),
+    // 每次 safeRead 都会经过 sigsetjmp (含 rt_sigprocmask) 和函数调用开销.
+    // 改用 BatchMemReader 后:
+    //   - Character 结构: 1 次批量读 (m_charReadSize 字节) -> 提取 RootComp/Health/HealthMax/bDead
+    //   - SceneComponent 结构: 1 次批量读 (Translation+12) -> 提取 FVector3
+    // 单玩家 6 次 safeRead -> 2 次, 20 玩家 120 -> 40 次, 反作弊采样压力同步下降.
+    BatchMemReader charBatch;
+    BatchMemReader rootBatch;
+    const int32_t sceneTransOff = m_off.SceneComp_Translation;
+    const size_t  rootBatchSize = (sceneTransOff >= 0)
+        ? static_cast<size_t>(sceneTransOff) + sizeof(FVector3)
+        : 0;
+
     PlayerNode* cur = m_playerList.head();
     while (cur) {
-        if (cur->characterPtr != 0 && cur->characterPtr >= 0x10000) {
-            FVector3 loc{};
-            if (getActorLocation(cur->characterPtr, loc) && hasUsablePlayerPosition(loc)) {
-                cur->pos = loc;
+        if (cur->characterPtr >= 0x10000 && m_charReadSize > 0) {
+            charBatch.read(cur->characterPtr, m_charReadSize);
+
+            uintptr_t rootComp = 0;
+            if (m_off.Actor_RootComponent >= 0) {
+                const uintptr_t raw = charBatch.getPtr(m_off.Actor_RootComponent);
+                if (raw >= 0x10000) rootComp = raw;
+            }
+
+            if (rootComp != 0 && rootBatchSize > 0) {
+                rootBatch.read(rootComp, rootBatchSize);
+                const FVector3 loc = rootBatch.getVec3(sceneTransOff);
+                if (hasUsablePlayerPosition(loc)) {
+                    cur->pos = loc;
+                }
             }
 
             if (m_off.Char_Health >= 0) {
-                const float charHealth = safeReadFloat(cur->characterPtr + m_off.Char_Health);
+                const float charHealth = charBatch.getFloat(m_off.Char_Health);
                 if (std::isfinite(charHealth) && charHealth >= 0.0f) {
                     cur->health = charHealth;
                 }
             }
             if (m_off.Char_HealthMax >= 0) {
-                const float charHealthMax = safeReadFloat(cur->characterPtr + m_off.Char_HealthMax);
+                const float charHealthMax = charBatch.getFloat(m_off.Char_HealthMax);
                 if (std::isfinite(charHealthMax) && charHealthMax > 0.0f) {
                     cur->healthMax = charHealthMax;
                 }
             }
             if (m_off.Char_bDead >= 0) {
-                const bool bDead = (safeReadU8(cur->characterPtr + m_off.Char_bDead) & 1) != 0;
+                const bool bDead = (charBatch.getU8(m_off.Char_bDead) & 1) != 0;
                 cur->liveState = bDead ? 1 : 0;
             } else if (std::isfinite(cur->health) && cur->health <= 0.0f) {
                 cur->liveState = 1;
@@ -4632,7 +4656,7 @@ void MatchMonitor::pollPlayers() {
         writeLog("");
     }
 
-    ue4draw::SharedUE4Data::getInstance().pushData(drawData);
+    ue4draw::SharedUE4Data::getInstance().pushData(std::move(drawData));
 }
 
 // =====================================================================
