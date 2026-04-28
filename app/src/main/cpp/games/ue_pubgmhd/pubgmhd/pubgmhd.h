@@ -330,6 +330,39 @@ private:
     bool      m_valid = false;
 };
 
+// =====================================================================
+//  LiveCameraSnapshot — 渲染线程零延迟相机刷新
+//
+//  问题: 玩家轮询 (含相机解析) 每 16ms 一次. 渲染线程每帧 (可达 90~120Hz)
+//        都要画 ESP, 用的相机姿态可能旧到 16ms. 玩家快速滑屏旋转视角时,
+//        ESP 框会明显滞后于目标几像素.
+//
+//  方案: 慢路径 (poll thread) 一旦选定最佳 ViewInfo, 把 (loc/rot/fov) 三个
+//        地址 publish() 到本类. 快路径 (render thread) 每帧调 refresh(),
+//        只做 ~7 次 safeReadFloat (~微秒级), 把 DrawGameData 的 cam* 字段
+//        刷新到当前 game-tick 的最新值.
+// =====================================================================
+class LiveCameraSnapshot {
+public:
+    static LiveCameraSnapshot& instance();
+
+    // 慢路径: 选定相机源后发布地址 (rotOverrideAddr 非 0 表示 rot 来自 controller)
+    void publish(uintptr_t locAddr, uintptr_t rotAddr, uintptr_t fovAddr,
+                 uintptr_t rotOverrideAddr, float defaultFov);
+    void clear();
+
+    // 快路径: 渲染线程在 drawOverlay 前调用; 成功时覆盖 data 的 cam* 字段
+    bool refresh(ue4draw::DrawGameData& data) const;
+
+private:
+    LiveCameraSnapshot() = default;
+    std::atomic<uintptr_t> m_locAddr{0};
+    std::atomic<uintptr_t> m_rotAddr{0};
+    std::atomic<uintptr_t> m_fovAddr{0};
+    std::atomic<uintptr_t> m_rotOverrideAddr{0};
+    std::atomic<float>     m_defaultFov{90.0f};
+};
+
 enum class PlayerSource : uint8_t {
     PlayerArray = 0,
     CharacterScan = 1,

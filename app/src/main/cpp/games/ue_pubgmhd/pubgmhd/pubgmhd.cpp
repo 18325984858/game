@@ -959,6 +959,68 @@ bool BatchMemReader::safeReadMemoryStatic(uintptr_t addr, void* out, size_t size
 }
 
 // =====================================================================
+//  LiveCameraSnapshot — 实时相机刷新 (慢路径发布地址, 快路径每帧重读)
+// =====================================================================
+LiveCameraSnapshot& LiveCameraSnapshot::instance() {
+    static LiveCameraSnapshot inst;
+    return inst;
+}
+
+void LiveCameraSnapshot::publish(uintptr_t locAddr, uintptr_t rotAddr, uintptr_t fovAddr,
+                                 uintptr_t rotOverrideAddr, float defaultFov) {
+    m_locAddr.store(locAddr,         std::memory_order_relaxed);
+    m_rotAddr.store(rotAddr,         std::memory_order_relaxed);
+    m_fovAddr.store(fovAddr,         std::memory_order_relaxed);
+    m_rotOverrideAddr.store(rotOverrideAddr, std::memory_order_relaxed);
+    m_defaultFov.store(defaultFov,   std::memory_order_release);
+}
+
+void LiveCameraSnapshot::clear() {
+    m_locAddr.store(0,        std::memory_order_relaxed);
+    m_rotAddr.store(0,        std::memory_order_relaxed);
+    m_fovAddr.store(0,        std::memory_order_relaxed);
+    m_rotOverrideAddr.store(0, std::memory_order_release);
+}
+
+bool LiveCameraSnapshot::refresh(ue4draw::DrawGameData& data) const {
+    const uintptr_t locAddr = m_locAddr.load(std::memory_order_acquire);
+    if (locAddr < 0x10000) return false;
+    const uintptr_t rotAddr = m_rotAddr.load(std::memory_order_relaxed);
+    const uintptr_t fovAddr = m_fovAddr.load(std::memory_order_relaxed);
+    const uintptr_t rotOverrideAddr = m_rotOverrideAddr.load(std::memory_order_relaxed);
+
+    float locX = 0, locY = 0, locZ = 0;
+    if (!safeReadMemory(locAddr,     &locX, sizeof(float))) return false;
+    if (!safeReadMemory(locAddr + 4, &locY, sizeof(float))) return false;
+    if (!safeReadMemory(locAddr + 8, &locZ, sizeof(float))) return false;
+    if (!std::isfinite(locX) || !std::isfinite(locY) || !std::isfinite(locZ)) return false;
+
+    const uintptr_t actualRotAddr = (rotOverrideAddr >= 0x10000) ? rotOverrideAddr : rotAddr;
+    float pitch = 0, yaw = 0, roll = 0;
+    if (actualRotAddr >= 0x10000) {
+        safeReadMemory(actualRotAddr,     &pitch, sizeof(float));
+        safeReadMemory(actualRotAddr + 4, &yaw,   sizeof(float));
+        safeReadMemory(actualRotAddr + 8, &roll,  sizeof(float));
+    }
+    if (!std::isfinite(pitch) || !std::isfinite(yaw) || !std::isfinite(roll)) return false;
+
+    float fov = 0;
+    if (fovAddr >= 0x10000) safeReadMemory(fovAddr, &fov, sizeof(float));
+    if (!std::isfinite(fov) || fov < 30.0f || fov > 170.0f) {
+        fov = m_defaultFov.load(std::memory_order_relaxed);
+    }
+
+    data.camLocX = locX;
+    data.camLocY = locY;
+    data.camLocZ = locZ;
+    data.camPitch = pitch;
+    data.camYaw = yaw;
+    data.camRoll = roll;
+    data.camFOV = fov;
+    return true;
+}
+
+// =====================================================================
 //  偏移范围计算 — 确定 PlayerState / Character 批量读取所需的字节数
 // =====================================================================
 void MatchMonitor::computeBatchReadBounds() {
@@ -3442,6 +3504,7 @@ void MatchMonitor::fillCameraSnapshot(ue4draw::DrawGameData& drawData) {
 
     struct RotationCandidate {
         const char* label = "";
+        uintptr_t addr = 0;
         float pitch = 0.0f;
         float yaw = 0.0f;
         float roll = 0.0f;
@@ -3451,6 +3514,7 @@ void MatchMonitor::fillCameraSnapshot(ue4draw::DrawGameData& drawData) {
     auto makeRotationCandidate = [&](uintptr_t addr, const char* label, float baseScore) {
         RotationCandidate candidate{};
         candidate.label = label;
+        candidate.addr = addr;
         if (addr < 0x10000) return candidate;
         candidate.pitch = safeReadFloat(addr);
         candidate.yaw = safeReadFloat(addr + 4);
@@ -3468,6 +3532,9 @@ void MatchMonitor::fillCameraSnapshot(ue4draw::DrawGameData& drawData) {
 
     struct CameraCandidate {
         const char* label = "";
+        uintptr_t viewInfoPtr = 0;
+        int32_t rotOff = 0;
+        int32_t fovOff = 0;
         float locX = 0.0f;
         float locY = 0.0f;
         float locZ = 0.0f;
@@ -3487,6 +3554,9 @@ void MatchMonitor::fillCameraSnapshot(ue4draw::DrawGameData& drawData) {
                              float baseScore) {
         CameraCandidate candidate{};
         candidate.label = label;
+        candidate.viewInfoPtr = viewInfoPtr;
+        candidate.rotOff = rotOff;
+        candidate.fovOff = fovOff;
         if (viewInfoPtr < 0x10000) return candidate;
         candidate.locX = safeReadFloat(viewInfoPtr + 0x0);
         candidate.locY = safeReadFloat(viewInfoPtr + 0x4);
@@ -3598,6 +3668,19 @@ void MatchMonitor::fillCameraSnapshot(ue4draw::DrawGameData& drawData) {
             usedRotationOverride = true;
         }
 
+        // 把选中的源地址 publish 给渲染线程, 让 ESP 在 90~120Hz 重绘时
+        // 不再依赖 16ms 旧的 DrawGameData 相机快照, 滑屏时 ESP 框零滞后.
+        if (best.viewInfoPtr >= 0x10000) {
+            const uintptr_t locAddr = best.viewInfoPtr;
+            const uintptr_t rotAddr = best.viewInfoPtr + static_cast<uintptr_t>(best.rotOff);
+            const uintptr_t fovAddr = best.viewInfoPtr + static_cast<uintptr_t>(best.fovOff);
+            const uintptr_t rotOverrideAddr = (usedRotationOverride && bestRotation.addr >= 0x10000)
+                                                ? bestRotation.addr : 0;
+            LiveCameraSnapshot::instance().publish(locAddr, rotAddr, fovAddr,
+                                                   rotOverrideAddr,
+                                                   hasValidFov(defaultFov) ? defaultFov : 90.0f);
+        }
+
         static Clock::time_point s_lastCameraLayoutLog;
         if (shouldLogEvery(s_lastCameraLayoutLog, std::chrono::milliseconds(2000))) {
             LOG(LOG_LEVEL_INFO,
@@ -3617,6 +3700,8 @@ void MatchMonitor::fillCameraSnapshot(ue4draw::DrawGameData& drawData) {
         drawData.camYaw = camYaw;
         drawData.camRoll = camRoll;
         drawData.camFOV = hasValidFov(camFov) ? camFov : 90.0f;
+    } else {
+        LiveCameraSnapshot::instance().clear();
     }
 }
 

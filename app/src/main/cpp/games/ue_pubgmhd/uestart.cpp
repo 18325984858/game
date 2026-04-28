@@ -706,6 +706,10 @@ static void UE4GuiThread() {
         // drawOverlay 内部已有 5 秒陈旧检查, 会自动清空 ESP/玩家列表 (但保留菜单),
         // 所以这里不再外层 gate 否则大厅期间 staleMs>3s 会把菜单一起隐藏.
         ue4draw::SharedUE4Data::getInstance().getData(gameData);
+        // 实时相机刷新: 渲染帧率 (90~120Hz) 远高于轮询 (60Hz),
+        // 用 LiveCameraSnapshot 直接 re-read 当前 game-tick 的相机姿态,
+        // 避免 ESP 框在快速滑屏时滞后于目标.
+        pubgmhd::LiveCameraSnapshot::instance().refresh(gameData);
         overlay.drawOverlay(gameData);
 
         if (shouldLogEvery(lastHeartbeatLog, std::chrono::milliseconds(3000))) {
