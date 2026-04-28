@@ -1379,10 +1379,16 @@ MatchState MatchMonitor::getMatchState() {
     // 用 FName 字段读还原 inMatch 判定, 与最初纯字段读语义一致.
     if (!spoofResolved) {
         ms.inMatch = (ms.state == "InProgress");
+        // 大厅同样跑在 InProgress 状态 (avatar 展示场景), 表现为
+        // world=None + PlayerArray<=1 (只有本地一个槽位).
+        // 训练场 PlayerArray>=2 (小队), 真实对局 >=10, 均不会被误杀.
+        if (ms.inMatch && !hasStableWorld
+            && playerArrayNum >= 0 && playerArrayNum <= 1) {
+            ms.inMatch = false;
+        }
     }
-    // 仅在 worldName 不稳 *且* PlayerArray 完全为空时才走候选确认.
-    // 之前 playerArrayNum<10 太宽, 正常对局开局初期 PlayerArray 还在同步,
-    // 会导致 "已开局" UI 延迟好几秒才出现.
+    // 候选确认仅在 spoof 未跑 + worldName 不稳 + PlayerArray 完全空时使用,
+    // 此时连大厅过滤都没法判定, 用 PC->AcknowledgedPawn 类名兜底.
     ms.needsPlayerConfirmation = (!spoofResolved
                                && ms.inMatch
                                && ms.state == "InProgress"
@@ -4701,6 +4707,15 @@ void MatchMonitor::pollMatchStateLoop() {
                 if (m_isInMatch && !wasInMatch) {
                     LOG(LOG_LEVEL_INFO, "Entered match! State=%s World=%s", ms.state.c_str(), ms.worldName.c_str());
                     ue4draw::SharedUE4Data::getInstance().setInMatch(true);
+                    // 立即推送空帧标记 inMatch=true, 否则 GUI 端 getData() 取到的
+                    // 双缓冲快照是上一局结束时 push 的 inMatch=false (warmup 60s
+                    // 内 pollPlayers 不跑, 不会再 pushData), 导致菜单 "已进入对局"
+                    // 提示要等 60s 才出现.
+                    {
+                        ue4draw::DrawGameData enterData;
+                        enterData.inMatch = true;
+                        ue4draw::SharedUE4Data::getInstance().pushData(enterData);
+                    }
                     m_playerList.clear();
                     m_lastNetCullPatchMs.clear();
                     m_netCullOriginals.clear();
@@ -4791,6 +4806,11 @@ void MatchMonitor::pollMatchStateLoop() {
                     LOG(LOG_LEVEL_INFO, "[Warmup] entered match, waiting %llums before traversal",
                         (unsigned long long)leftMs);
                 }
+                // warmup 期间也要心跳推送, 否则 GUI 端 stale 检查 (>5s) 会把
+                // inMatch 强制覆写回 false, 让 "对局中" 标签在开局 ~5s 后消失.
+                ue4draw::DrawGameData warmupData;
+                warmupData.inMatch = true;
+                ue4draw::SharedUE4Data::getInstance().pushData(warmupData);
             } else {
                 pollPlayers();
             }
