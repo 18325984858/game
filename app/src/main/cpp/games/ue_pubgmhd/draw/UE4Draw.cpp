@@ -1391,8 +1391,7 @@ int UE4Overlay::drawMinimap(const DrawGameData& data, float screenW, float scree
     const float cy = mapY + mapSize / 2.0f;
     const float radarRadius = std::max(mapSize * 0.5f - 10.0f, 20.0f);
     const float rangeMeters = std::max(m_minimapRangeMeters, 60.0f);
-    constexpr float DEG2RAD = 3.14159265358979f / 180.0f;
-    const float yawRad = sanitizeAngleDegrees(data.camYaw) * DEG2RAD;
+    const float yawRad = 0.0f;
     const float forwardX = std::cos(yawRad);
     const float forwardY = std::sin(yawRad);
     const float rightX = -forwardY;

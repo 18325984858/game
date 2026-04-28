@@ -59,6 +59,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cerrno>
+#include <cstdlib>
 #include <unistd.h>
 #include <dirent.h>
 #include <dlfcn.h>
@@ -982,13 +983,30 @@ pid_t Injector::findPidByName(const char* packageName) {
     snprintf(cmd, sizeof(cmd), "pidof %s", packageName);
     FILE* fp = popen(cmd, "r");
     if (fp) {
-        char buf[64] = {0};
+        char buf[256] = {0};
         if (fgets(buf, sizeof(buf), fp)) {
             pclose(fp);
-            pid_t pid = atoi(buf);
-            if (pid > 0) {
-                LOG(LOG_LEVEL_INFO, "[Injector] 找到目标进程: %s -> pid=%d (pidof)", packageName, pid);
-                return pid;
+            char* save = nullptr;
+            for (char* token = strtok_r(buf, " \t\r\n", &save);
+                 token != nullptr;
+                 token = strtok_r(nullptr, " \t\r\n", &save)) {
+                pid_t pid = static_cast<pid_t>(strtol(token, nullptr, 10));
+                if (pid <= 0) continue;
+
+                char cmdlinePath[256];
+                snprintf(cmdlinePath, sizeof(cmdlinePath), "/proc/%d/cmdline", pid);
+                FILE* cmdlineFp = fopen(cmdlinePath, "r");
+                if (!cmdlineFp) continue;
+
+                char cmdline[256] = {0};
+                fgets(cmdline, sizeof(cmdline), cmdlineFp);
+                fclose(cmdlineFp);
+
+                if (strcmp(cmdline, packageName) == 0) {
+                    LOG(LOG_LEVEL_INFO, "[Injector] 找到目标进程: %s -> pid=%d (pidof)", packageName, pid);
+                    return pid;
+                }
+                LOG(LOG_LEVEL_INFO, "[Injector] 跳过 pidof 非主进程: pid=%d cmdline=%s", pid, cmdline);
             }
         } else {
             pclose(fp);

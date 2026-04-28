@@ -6,42 +6,71 @@
 #include <sys/stat.h>
 #include <csignal>
 #include <csetjmp>
+#include <mutex>
 
 // =====================================================================
 //  安全内存读取 — 使用 SIGSEGV 信号捕获防止崩溃
 // =====================================================================
 static thread_local sigjmp_buf s_safeReadJmpBuf;
 static thread_local volatile sig_atomic_t s_safeReadActive = 0;
+static thread_local volatile sig_atomic_t s_forwardingSignal = 0;
 static struct sigaction s_oldSigsegvAction;
 static struct sigaction s_oldSigbusAction;
-static bool s_safeReadGuardInstalled = false;
+static std::mutex s_safeReadGuardMutex;
 
 static void safeReadSignalHandler(int sig, siginfo_t* info, void* ctx) {
     if (s_safeReadActive) {
         s_safeReadActive = 0;
         siglongjmp(s_safeReadJmpBuf, sig);
     }
-    // 转发给原处理器
-    struct sigaction* old = (sig == SIGSEGV) ? &s_oldSigsegvAction : &s_oldSigbusAction;
-    if (old->sa_flags & SA_SIGINFO) {
-        old->sa_sigaction(sig, info, ctx);
-    } else if (old->sa_handler != SIG_DFL && old->sa_handler != SIG_IGN) {
-        old->sa_handler(sig);
-    } else {
+
+    if (s_forwardingSignal) {
         signal(sig, SIG_DFL);
         raise(sig);
+        return;
     }
+
+    // 转发给原处理器
+    struct sigaction* old = (sig == SIGSEGV) ? &s_oldSigsegvAction : &s_oldSigbusAction;
+    s_forwardingSignal = 1;
+    if ((old->sa_flags & SA_SIGINFO) != 0 && old->sa_sigaction != nullptr) {
+        old->sa_sigaction(sig, info, ctx);
+        s_forwardingSignal = 0;
+        return;
+    } else if (old->sa_handler != SIG_DFL && old->sa_handler != SIG_IGN) {
+        old->sa_handler(sig);
+        s_forwardingSignal = 0;
+        return;
+    } else if (old->sa_handler == SIG_IGN) {
+        s_forwardingSignal = 0;
+        return;
+    }
+    s_forwardingSignal = 0;
+
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static bool isSafeReadHandlerInstalled(int sig) {
+    struct sigaction current{};
+    if (sigaction(sig, nullptr, &current) != 0) return false;
+    return (current.sa_flags & SA_SIGINFO) != 0
+        && current.sa_sigaction == safeReadSignalHandler;
 }
 
 static void installSafeReadGuard() {
-    if (s_safeReadGuardInstalled) return;
+    std::lock_guard<std::mutex> lock(s_safeReadGuardMutex);
     struct sigaction sa{};
     sa.sa_sigaction = safeReadSignalHandler;
     sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
     sigemptyset(&sa.sa_mask);
-    sigaction(SIGSEGV, &sa, &s_oldSigsegvAction);
-    sigaction(SIGBUS,  &sa, &s_oldSigbusAction);
-    s_safeReadGuardInstalled = true;
+
+    if (!isSafeReadHandlerInstalled(SIGSEGV)) {
+        sigaction(SIGSEGV, &sa, &s_oldSigsegvAction);
+    }
+    if (!isSafeReadHandlerInstalled(SIGBUS)) {
+        sigaction(SIGBUS, &sa, &s_oldSigbusAction);
+    }
 }
 
 // =====================================================================
@@ -99,7 +128,7 @@ void UE4Dumper::setOutputPath(const std::string& path) {
 // ===================== 安全内存读取 (信号捕获保护) ====================
 
 uintptr_t UE4Dumper::safeReadPtr(uintptr_t addr) {
-    if (addr == 0) return 0;
+    if (addr < 0x10000) return 0;
     installSafeReadGuard();
     uintptr_t val = 0;
     if (sigsetjmp(s_safeReadJmpBuf, 1) != 0) {
@@ -113,7 +142,7 @@ uintptr_t UE4Dumper::safeReadPtr(uintptr_t addr) {
 }
 
 int32_t UE4Dumper::safeReadS32(uintptr_t addr) {
-    if (addr == 0) return 0;
+    if (addr < 0x10000) return 0;
     installSafeReadGuard();
     int32_t val = 0;
     if (sigsetjmp(s_safeReadJmpBuf, 1) != 0) {
@@ -127,7 +156,7 @@ int32_t UE4Dumper::safeReadS32(uintptr_t addr) {
 }
 
 uint32_t UE4Dumper::safeReadU32(uintptr_t addr) {
-    if (addr == 0) return 0;
+    if (addr < 0x10000) return 0;
     installSafeReadGuard();
     uint32_t val = 0;
     if (sigsetjmp(s_safeReadJmpBuf, 1) != 0) {
@@ -243,9 +272,9 @@ const char* UE4Dumper::getNameByIndex(int index) {
     int ci = index / ue4::NAMES_ELEMENTS_PER_CHUNK;
     int wi = index % ue4::NAMES_ELEMENTS_PER_CHUNK;
     uintptr_t chkPtr = safeReadPtr(m_GNames + static_cast<uintptr_t>(ci) * 8);
-    if (chkPtr == 0) return nullptr;
+    if (chkPtr < 0x10000) return nullptr;
     uintptr_t entryPtr = safeReadPtr(chkPtr + static_cast<uintptr_t>(wi) * 8);
-    if (entryPtr == 0) return nullptr;
+    if (entryPtr < 0x10000) return nullptr;
 
     static thread_local char s_nameBuf[256];
     installSafeReadGuard();

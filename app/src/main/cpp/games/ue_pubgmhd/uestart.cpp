@@ -26,6 +26,21 @@
 #include <dirent.h>
 
 namespace {
+std::string readSelfProcessName() {
+    char processName[256] = {};
+    const int cmdlineFd = open("/proc/self/cmdline", O_RDONLY | O_CLOEXEC);
+    if (cmdlineFd < 0) {
+        return {};
+    }
+    const ssize_t processNameSize = read(cmdlineFd, processName, sizeof(processName) - 1);
+    close(cmdlineFd);
+    if (processNameSize <= 0) {
+        return {};
+    }
+    processName[processNameSize] = '\0';
+    return std::string(processName);
+}
+
 std::string resolveUe4GuiTracePath() {
     static std::string cachedPath;
     const auto tryOpen = [](const std::string& path) -> int {
@@ -910,6 +925,13 @@ static void UE4WorkerThread(void* plibUE4ModeBase, void* pGNames,
 extern "C" __attribute__((visibility("default")))
 bool MyStartPointPUBG(void* plibUE4ModeBase, void* pGNames,
                      void* pGWorld, void* pGUObjectArray, uint64_t moduleSize, void* pData) {
+    const std::string selfProcessName = readSelfProcessName();
+    if (selfProcessName != "com.tencent.tmgp.pubgmhd") {
+        GLOG("MyStartPointPUBG: skip non-main process='%s'", selfProcessName.c_str());
+        LOG(LOG_LEVEL_WARN, "[MyStartPointPUBG] 跳过非主进程: %s", selfProcessName.c_str());
+        return false;
+    }
+
     // 安装反检测 hook: 隐藏自身 .so (dl_iterate_phdr/dladdr) + 伪造 root/解锁相关系统属性
     // (ro.secure / ro.debuggable / ro.boot.verifiedbootstate 等)。幂等, 多次调用安全。
     installStealthHooks();

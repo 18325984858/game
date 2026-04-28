@@ -3,6 +3,7 @@
 #include "../interface/interface.h"
 #include "../draw/UE4Draw.h"
 #include "../../../core/log/log.h"
+#include "../../../stack_spoof/stack_spoof.h"
 #include <sys/system_properties.h>
 
 extern "C" bool selfTestParasite();
@@ -78,7 +79,7 @@ bool isUsableRemoteArray(const ue4::TArray<T>& array, int maxNum) {
 using BoneAliasList = std::array<const char*, 8>;
 
 const std::array<BoneAliasList, TRACKED_BONE_COUNT> kTrackedBoneAliases = {{
-    BoneAliasList{"pelvis", "root", "hips", "bip001pelvis", "bip01pelvis", nullptr, nullptr, nullptr},
+    BoneAliasList{"pelvis", "hips", "bip001pelvis", "bip01pelvis", nullptr, nullptr, nullptr, nullptr},
     BoneAliasList{"spine01", "spine1", "spine", "bip001spine", "bip01spine", nullptr, nullptr, nullptr},
     BoneAliasList{"spine03", "spine3", "spine02", "spine2", "spine03jnt", "bip001spine1", "bip001spine2", "bip01spine2"},
     BoneAliasList{"neck01", "neck", "neck02", "bip001neck", "bip01neck", nullptr, nullptr, nullptr},
@@ -99,9 +100,10 @@ const std::array<BoneAliasList, TRACKED_BONE_COUNT> kTrackedBoneAliases = {{
 
 static thread_local sigjmp_buf s_safeReadJmpBuf;
 static thread_local volatile sig_atomic_t s_safeReadActive = 0;
+static thread_local volatile sig_atomic_t s_forwardingSignal = 0;
 static struct sigaction s_oldSigsegvAction{};
 static struct sigaction s_oldSigbusAction{};
-static std::once_flag s_safeReadGuardOnce;
+static std::mutex s_safeReadGuardMutex;
 
 void safeReadSignalHandler(int sig, siginfo_t* info, void* ctx) {
     if (s_safeReadActive) {
@@ -109,26 +111,52 @@ void safeReadSignalHandler(int sig, siginfo_t* info, void* ctx) {
         siglongjmp(s_safeReadJmpBuf, sig);
     }
 
-    struct sigaction* old = (sig == SIGSEGV) ? &s_oldSigsegvAction : &s_oldSigbusAction;
-    if ((old->sa_flags & SA_SIGINFO) != 0) {
-        old->sa_sigaction(sig, info, ctx);
-    } else if (old->sa_handler != SIG_DFL && old->sa_handler != SIG_IGN) {
-        old->sa_handler(sig);
-    } else {
+    if (s_forwardingSignal) {
         signal(sig, SIG_DFL);
         raise(sig);
+        return;
     }
+
+    struct sigaction* old = (sig == SIGSEGV) ? &s_oldSigsegvAction : &s_oldSigbusAction;
+    s_forwardingSignal = 1;
+    if ((old->sa_flags & SA_SIGINFO) != 0 && old->sa_sigaction != nullptr) {
+        old->sa_sigaction(sig, info, ctx);
+        s_forwardingSignal = 0;
+        return;
+    } else if (old->sa_handler != SIG_DFL && old->sa_handler != SIG_IGN) {
+        old->sa_handler(sig);
+        s_forwardingSignal = 0;
+        return;
+    } else if (old->sa_handler == SIG_IGN) {
+        s_forwardingSignal = 0;
+        return;
+    }
+    s_forwardingSignal = 0;
+
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+bool isSafeReadHandlerInstalled(int sig) {
+    struct sigaction current{};
+    if (sigaction(sig, nullptr, &current) != 0) return false;
+    return (current.sa_flags & SA_SIGINFO) != 0
+        && current.sa_sigaction == safeReadSignalHandler;
 }
 
 void installSafeReadGuard() {
-    std::call_once(s_safeReadGuardOnce, []() {
-        struct sigaction sa{};
-        sa.sa_sigaction = safeReadSignalHandler;
-        sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
-        sigemptyset(&sa.sa_mask);
+    std::lock_guard<std::mutex> lock(s_safeReadGuardMutex);
+    struct sigaction sa{};
+    sa.sa_sigaction = safeReadSignalHandler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+
+    if (!isSafeReadHandlerInstalled(SIGSEGV)) {
         sigaction(SIGSEGV, &sa, &s_oldSigsegvAction);
+    }
+    if (!isSafeReadHandlerInstalled(SIGBUS)) {
         sigaction(SIGBUS, &sa, &s_oldSigbusAction);
-    });
+    }
 }
 
 bool safeReadMemory(uintptr_t addr, void* out, size_t size) {
@@ -1081,6 +1109,56 @@ std::string MatchMonitor::readFString(uintptr_t addr) {
 //  对局状态读
 // =====================================================================
 
+// AGameStateBase::HasMatchStarted UFunction 原生 thunk 偏移 (libUE4.so 内).
+//
+// 来源: C:\Users\user\Desktop\bupg\dump.cs (~line 428625)
+//   class GameStateBase : public Info
+//     // Flags: Native|Net|Exec [Owner: GameStateBase]
+//     void HasMatchStarted(); // [Offset: 0xD0EF3CC] // NumParms: 1
+//
+// 历史教训: 同名函数在 GameModeBase 上也存在 (Offset 0xD0DE220),
+//   但客户端进程通常没有 GameMode 实例; 把 GameState 当 Context 传给
+//   GameModeBase 版 thunk 会因虚表槽指向不同函数 -> SIGSEGV.
+//   GameStateBase 版才与 findCurrentGameStateInstance() 命中的对象类型匹配.
+//
+// thunk 标准签名 (UE 源码 DECLARE_FUNCTION(execHasMatchStarted)):
+//   void exec(UObject* Context, FFrame& Stack, void* Z_Param__Result)
+//   函数体仅: P_FINISH; *(bool*)Result = ((AGameStateBase*)Context)->HasMatchStarted();
+//   P_FINISH 展开为 Stack.Code += !!Stack.Code; 故 FFrame 全 0 即可安全通过.
+//
+// NumParms=1: 只有 1 个 UProperty (即 bool 返回值), 无输入参数.
+// 调用约束: Context 必须能 static_cast 到 AGameStateBase* 后做虚函数调用,
+//   即指向真实 GameStateBase 子类实例的对象指针 (findCurrentGameStateInstance
+//   返回的 gsPtr 已经过 isSubclassOf("GameStateBase") 校验).
+static constexpr uintptr_t kHasMatchStartedThunkOffset = 0xD0EF3CC;
+
+namespace {
+
+// stack_spoof::call_spoofed 只接受一参 (void*(*)(void*)), 用上下文结构桥接 thunk
+// 三参 (Context, FFrame*, Result*) 调用. 出栈伪装窗口前后该结构在真栈上, 安全.
+struct HasMatchStartedSpoofCtx {
+    void  (*thunk)(void* /*Context*/, void* /*FFrame*/, void* /*Result*/);
+    void*   context;
+    // FFrame 在 tencent 改造的 UE 中内存布局未公开. execHasMatchStarted thunk
+    // 体只触碰 Stack.Code (P_FINISH), 不做 Logf / Locals 访问, 故全 0 缓冲即可.
+    // 256 字节 >= UE4 主流 FFrame size (~120B), 留足版本余量.
+    alignas(8) uint8_t frameBuf[256];
+    bool    result;
+};
+
+// 实际跑在 fake FP chain 下的小型蹦床: 先清空 FFrame 缓冲, 再调 UE 原生 thunk.
+// 注意 SP 不切换, 局部变量 / 入参指针仍指向真栈, thunk 内对 Result 的写入正常.
+void* hasMatchStartedTrampoline(void* p) {
+    auto* c = static_cast<HasMatchStartedSpoofCtx*>(p);
+    // 防御性清零, 防止上一次调用的脏字节让 thunk 误判 Stack.Code 非 null
+    for (auto& b : c->frameBuf) b = 0;
+    c->result = false;
+    c->thunk(c->context, c->frameBuf, &c->result);
+    return nullptr;
+}
+
+} // namespace
+
 // 通过 GUObjectArray 全表扫定位真实 GameState 实例.
 //
 // 背景: Frida 验证证明腾讯 PUBG 的 World+0xAC0 不指向真 GameState (该位置常
@@ -1188,15 +1266,141 @@ MatchState MatchMonitor::getMatchState() {
     // 不调 HasMatchStarted thunk —— 进入 libUE4.so 代码段会被腾讯 ACE 反作弊
     // 扫到调用栈, 大约 30-50 秒后会被 SI_TKILL SIGBUS 杀掉 UE 主线程.
     // 直接读字段是纯读, ACE 难以区分.
+    //
+    // [2026-04-27] 按需求改为"函数调用"路径 (走下方 stack_spoof + thunk),
+    // 这一段字段读判定整体注释保留作为回滚方案; 若 thunk 路径不稳, 把这段恢复
+    // 并把下方 kEnableSpoofedHasMatchStartedProbe 改回 false 即可一键回退.
+    // ----------------------------------------------------------------------
+    // if (m_off.GS_MatchState >= 0) {
+    //     const std::string mst = readFName(gsPtr + m_off.GS_MatchState);
+    //     ms.state = mst;
+    //     // 等价 UE 源码 AGameState::HasMatchStarted: MatchState != EnteringMap
+    //     // 下游 (pollPlayers / patchActorNetCull) 按 state=="InProgress" 字面 gating
+    //     ms.inMatch = (mst == "InProgress");
+    // } else {
+    //     ms.state = "MatchStateOffsetMissing";
+    //     ms.inMatch = false;
+    // }
+    // ----------------------------------------------------------------------
+    // state 仍保留 FName 字符串 (调试可读 + 下游 m_currentMatchState 仍用它做
+    // "InProgress" 字面 gating). inMatch 改由下方 thunk 返回值决定.
     if (m_off.GS_MatchState >= 0) {
-        const std::string mst = readFName(gsPtr + m_off.GS_MatchState);
-        ms.state = mst;
-        // 等价 UE 源码 AGameState::HasMatchStarted: MatchState != EnteringMap
-        // 下游 (pollPlayers / patchActorNetCull) 按 state=="InProgress" 字面 gating
-        ms.inMatch = (mst == "InProgress");
+        ms.state = readFName(gsPtr + m_off.GS_MatchState);
     } else {
         ms.state = "MatchStateOffsetMissing";
-        ms.inMatch = false;
+    }
+    ms.inMatch = false;  // 默认 false, 由下方 thunk 调用结果覆盖
+
+    int32_t playerArrayNum = -1;
+    if (m_off.GS_PlayerArray >= 0) {
+        playerArrayNum = safeReadS32(gsPtr + m_off.GS_PlayerArray + 8);
+    }
+    ms.playerArrayNum = playerArrayNum;
+    const bool hasStableWorld = !(ms.worldName.empty() || ms.worldName == "None");
+    const bool hasLikelyMatchPlayers = (playerArrayNum < 0 || playerArrayNum >= 10);
+
+    // === 栈伪装下调用原生 HasMatchStarted thunk (现作为 inMatch 权威来源) ===
+    // 切换 x29 (FP) 到伪造 chain 后再 BLR 进 libUE4.so, 让 ACE 周期栈采样看到的
+    // LR 链全部落在 libc.so / libart.so 白名单模块, 而非本注入 .so + libUE4.so 调用对.
+    // 注意:
+    //   - 现在调用的是 AGameStateBase 版 thunk (kHasMatchStartedThunkOffset =
+    //     0xD0EF3CC), Context = gsPtr (findCurrentGameStateInstance 已校验为
+    //     GameStateBase 子类实例), 虚表槽签名匹配, 不会再触发上次的 SIGSEGV.
+    //   - 历史教训:
+    //       1) 旧版本指向 AGameModeBase 版 thunk (0xD0DE220) + gsPtr,
+    //          因虚表失配导致 SIGSEGV; 客户端通常没有 GameMode 实例.
+    //       2) 即便切到 GameStateBase 版 thunk + 正确 Context, 仍可能崩, 怀疑
+    //          腾讯改造版 thunk 在 P_FINISH 之外还会读 FFrame.Node/Object/
+    //          PreviousFrame, 我们填的 256B 全 0 缓冲不满足.
+    //   - 一键回退: 把 kEnableSpoofedHasMatchStartedProbe 改回 false 并取消上方
+    //     字段读注释.
+    //   - SIGSEGV/SIGBUS 熔断: 复用 installSafeReadGuard 装的信号屏障 +
+    //     sigsetjmp, thunk 内部访问到非法内存时 longjmp 回来. 熔断粒度 = 该 GS
+    //     对象指针 (s_disabledGsPtr): 只对崩过的对象禁用, 下一局新 GS 出现时
+    //     自动恢复 thunk 调用.
+    //   - LeavingMap / WaitingPostMatch 主动跳过 thunk: 关卡切换/结算窗口期 UE
+    //     正在拆 GameState (World/Outer/AuthorityGameMode 链可能半 NULL),
+    //     此时 AGameStateBase::HasMatchStarted 实现内部摸 World 几乎必崩.
+    //     这两种状态下 inMatch 用 FName 字段读判定即可 (HasMatchStarted UE 语义
+    //     是 MatchState != EnteringMap, LeavingMap 它也返回 true, 反而不准).
+    constexpr bool kEnableSpoofedHasMatchStartedProbe = true;
+    static std::atomic<uintptr_t> s_disabledGsPtr{0};
+    bool spoofResolved = false;
+    const bool inDestructiveWindow = (ms.state == "LeavingMap"
+                                   || ms.state == "WaitingPostMatch");
+    const bool gsBlacklisted = (s_disabledGsPtr.load(std::memory_order_acquire) == gsPtr);
+    if (kEnableSpoofedHasMatchStartedProbe
+        && !gsBlacklisted
+        && !inDestructiveWindow
+        && ms.state == "InProgress"
+        && hasStableWorld
+        && hasLikelyMatchPlayers
+        && gsPtr != 0 && m_moduleBase != 0) {
+        using ThunkFn = void(*)(void*, void*, void*);
+        auto* thunk = reinterpret_cast<ThunkFn>(m_moduleBase + kHasMatchStartedThunkOffset);
+        HasMatchStartedSpoofCtx ctx{};
+        ctx.thunk   = thunk;
+        ctx.context = reinterpret_cast<void*>(gsPtr);
+
+        // 安装信号屏障 + sigsetjmp: 复用 safeReadMemory 那套 TLS jmp_buf, 信号
+        // 处理器仅在 s_safeReadActive=1 时 longjmp; trampoline 内无嵌套 safeRead,
+        // 复用安全.
+        installSafeReadGuard();
+        const int sigCaught = sigsetjmp(s_safeReadJmpBuf, 1);
+        if (sigCaught == 0) {
+            s_safeReadActive = 1;
+            // 执行栈伪装调用: 进入前切换 FP 到 fake chain, 出来立刻还原, 不留痕迹.
+            stack_spoof::call_spoofed(&hasMatchStartedTrampoline, &ctx);
+            s_safeReadActive = 0;
+            ms.inMatch = ctx.result;
+            spoofResolved = true;
+            static uint64_t s_lastSpoofLogMs = 0;
+            const uint64_t spoofNowMs = nowMonotonicMs();
+            if (spoofNowMs - s_lastSpoofLogMs > 3000) {
+                s_lastSpoofLogMs = spoofNowMs;
+                LOG(LOG_LEVEL_INFO,
+                    "[MatchRead] HasMatchStarted(spoofed)=%d (FName=%s, gs=%p)",
+                    ctx.result ? 1 : 0, ms.state.c_str(), (void*)gsPtr);
+            }
+        } else {
+            // longjmp 回来: 把当前 gsPtr 拉黑, 下一局换了新 GS 自动恢复 thunk
+            s_safeReadActive = 0;
+            s_disabledGsPtr.store(gsPtr, std::memory_order_release);
+            LOG(LOG_LEVEL_ERROR,
+                "[MatchRead][CRASH] HasMatchStarted spoofed thunk faulted (sig=%d), "
+                "blacklisting this GS and falling back to FName field read. "
+                "thunk=%p gs=%p FName=%s",
+                sigCaught,
+                (void*)(m_moduleBase + kHasMatchStartedThunkOffset),
+                (void*)gsPtr, ms.state.c_str());
+        }
+    }
+    // 兜底: thunk 路径未生效 (开关关 / GS 拉黑 / 销毁窗口 / gsPtr 缺失) 时,
+    // 用 FName 字段读还原 inMatch 判定, 与最初纯字段读语义一致.
+    if (!spoofResolved) {
+        ms.inMatch = (ms.state == "InProgress");
+    }
+    // 仅在 worldName 不稳 *且* PlayerArray 完全为空时才走候选确认.
+    // 之前 playerArrayNum<10 太宽, 正常对局开局初期 PlayerArray 还在同步,
+    // 会导致 "已开局" UI 延迟好几秒才出现.
+    ms.needsPlayerConfirmation = (!spoofResolved
+                               && ms.inMatch
+                               && ms.state == "InProgress"
+                               && !hasStableWorld
+                               && playerArrayNum == 0);
+
+    // === thunk 结果过滤 ===
+    // worldName / PlayerArray.Num 只用于过滤 thunk 路径的大厅误命中.
+    // 训练场 / 体验场景实测也会出现 InProgress + world=None + PlayerArray=0,
+    // 因此字段读兜底路径不能再用这两个值强行判非对局.
+    if (ms.inMatch && spoofResolved) {
+        if (ms.worldName.empty() || ms.worldName == "None") {
+            ms.inMatch = false;
+        } else if (playerArrayNum >= 0) {
+            if (playerArrayNum < 10) {
+                ms.inMatch = false;
+            }
+        }
     }
     // 周期诊断 (3s 一次): 打印 inMatch + state 给排障使用
     static uint64_t s_lastStateLogMs = 0;
@@ -1205,8 +1409,10 @@ MatchState MatchMonitor::getMatchState() {
     if (s_lastInMatch != (int)ms.inMatch || nowMs2 - s_lastStateLogMs > 3000) {
         s_lastStateLogMs = nowMs2;
         s_lastInMatch = ms.inMatch ? 1 : 0;
-        LOG(LOG_LEVEL_INFO, "[MatchRead] gs=%p inMatch=%d state=%s elapsed=%d",
-            (void*)gsPtr, ms.inMatch ? 1 : 0, ms.state.c_str(), ms.elapsedTimeSeconds);
+        LOG(LOG_LEVEL_INFO, "[MatchRead] gs=%p inMatch=%d candidate=%d state=%s world=%s playerArray=%d elapsed=%d",
+            (void*)gsPtr, ms.inMatch ? 1 : 0,
+            ms.needsPlayerConfirmation ? 1 : 0, ms.state.c_str(),
+            ms.worldName.c_str(), ms.playerArrayNum, ms.elapsedTimeSeconds);
     }
     return ms;
 }
@@ -2003,6 +2209,8 @@ void MatchMonitor::patchActorNetCull(uintptr_t actorPtr) {
     if (actorPtr == 0) return;
     // 已恢复状态下不再写入, 防止恢复后又被覆盖
     if (m_memoryRestored.load(std::memory_order_acquire)) return;
+    // 候选状态扫描不允许写入; 只有状态机确认进入对局后才修改 NetCullDist.
+    if (!m_isInMatch) return;
     // 仅在 InProgress 状态写入 NetCullDist, 避免在加载/飞机/跳伞阶段触发网络异常断开
     if (m_currentMatchState != "InProgress") return;
     const uint64_t nowMs = nowMonotonicMs();
@@ -4447,6 +4655,44 @@ void MatchMonitor::pollMatchStateLoop() {
             MatchState ms = getMatchState();
             lastKnownState = ms;
 
+            if (!m_isInMatch && ms.needsPlayerConfirmation) {
+                ms.inMatch = false;
+                static uint64_t s_lastCandidateLogMs = 0;
+                const uint64_t candidateNowMs = nowMonotonicMs();
+
+                std::string pawnClass;
+                uintptr_t localPawn = 0;
+                if (m_off.PC_AcknowledgedPawn >= 0) {
+                    const uintptr_t pc = getLocalPlayerController();
+                    if (pc >= 0x10000) {
+                        localPawn = safeReadPtr(pc + m_off.PC_AcknowledgedPawn);
+                        if (localPawn >= 0x10000) {
+                            pawnClass = readClassName(localPawn);
+                        }
+                    }
+                }
+
+                // 放宽 pawn 类名匹配: PUBG 的本地 Pawn 类名经常是
+                // STExtraXXX_C / BP_xxx_C 等不含 Player/Pawn/Character 关键字,
+                // 之前的关键字白名单会让 "已开局" 延迟到第一次成功匹配为止.
+                // 现在只要本地 PlayerController 已经 ack 了一个非 Lobby pawn,
+                // 就视为已开局.
+                const bool isLobbyPawn = pawnClass.find("Lobby") != std::string::npos;
+                const bool isGamePawn = !isLobbyPawn && localPawn >= 0x10000;
+                if (isGamePawn) {
+                    ms.inMatch = true;
+                    LOG(LOG_LEVEL_INFO,
+                        "[MatchCandidate] confirmed by local pawn=%p class=%s state=%s world=%s playerArray=%d",
+                        (void*)localPawn, pawnClass.c_str(), ms.state.c_str(), ms.worldName.c_str(), ms.playerArrayNum);
+                } else if (candidateNowMs - s_lastCandidateLogMs > 3000) {
+                    s_lastCandidateLogMs = candidateNowMs;
+                    LOG(LOG_LEVEL_INFO,
+                        "[MatchCandidate] waiting local pawn=%p class=%s state=%s world=%s playerArray=%d",
+                        (void*)localPawn, pawnClass.c_str(), ms.state.c_str(), ms.worldName.c_str(), ms.playerArrayNum);
+                }
+                lastKnownState = ms;
+            }
+
             bool wasInMatch = m_isInMatch;
             stateChanged = (ms.state != m_lastMatchState) || (ms.inMatch != wasInMatch);
             if (stateChanged) {
@@ -4533,8 +4779,8 @@ void MatchMonitor::pollMatchStateLoop() {
         if (m_isInMatch && (lastPlayerPollTime.time_since_epoch().count() == 0
             || now - lastPlayerPollTime >= std::chrono::milliseconds(PLAYER_POLL_INTERVAL_MS))) {
             lastPlayerPollTime = now;
-            // 进入对局后等待 10 秒再开始遍历, 避免 ACE 反作弊在加载期检测到扫描行为
-            constexpr uint64_t kPostEnterWarmupMs = 10000;
+            // 进入对局后等待 60 秒再开始遍历, 避免 ACE 反作弊在加载期检测到扫描行为
+            constexpr uint64_t kPostEnterWarmupMs = 60000;
             if (m_matchEnterTickMs != 0
                 && (nowMonotonicMs() - m_matchEnterTickMs) < kPostEnterWarmupMs) {
                 static uint64_t s_lastWarmupLogMs = 0;
@@ -4629,6 +4875,15 @@ bool MatchMonitor::start() {
         return false;
     }
     computeBatchReadBounds();
+
+    // 预热 stack_spoof 返回地址池: 扫 libc/libart/libandroid_runtime/libutils 的
+    // r-x 段, 收集 BL/BLR 之后的合法返回地址, 供 getMatchState 中的伪造 FP chain
+    // 复用. 提前在这里调用避免首次 spoof 时被扫描成本拖慢 poll 周期.
+    if (!stack_spoof::init()) {
+        LOG(LOG_LEVEL_WARN, "[StackSpoof] 返回地址池初始化失败, call_spoofed 将退化为直调");
+    } else {
+        LOG(LOG_LEVEL_INFO, "[StackSpoof] 返回地址池就绪");
+    }
 
     m_running.store(true, std::memory_order_release);
     m_lastMatchState = "";

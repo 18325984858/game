@@ -400,8 +400,10 @@ const char* observerTypeName(EObserverType type);
 struct MatchState {
     std::string state;
     bool inMatch = false;
+    bool needsPlayerConfirmation = false;
     uintptr_t gameStatePtr = 0;
     std::string worldName;
+    int32_t playerArrayNum = -1;
     int32_t elapsedTimeSeconds = -1;
 };
 
