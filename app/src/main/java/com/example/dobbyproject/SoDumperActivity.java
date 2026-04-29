@@ -157,6 +157,7 @@ public class SoDumperActivity extends AppCompatActivity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        if (!KpKeyStore.requireOrRedirect(this)) return;
         setContentView(R.layout.activity_so_dumper);
 
         etSearch = findViewById(R.id.et_search);

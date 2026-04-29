@@ -110,6 +110,7 @@ public class MemoryReaderActivity extends AppCompatActivity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        if (!KpKeyStore.requireOrRedirect(this)) return;
         setContentView(R.layout.activity_memory_reader);
         setTitle("内存读取器");
 

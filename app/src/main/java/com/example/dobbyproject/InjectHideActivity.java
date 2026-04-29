@@ -102,6 +102,7 @@ public class InjectHideActivity extends AppCompatActivity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        if (!KpKeyStore.requireOrRedirect(this)) return;
         setContentView(R.layout.activity_inject_hide);
 
         tvStatus       = findViewById(R.id.ih_tv_status);
@@ -132,8 +133,8 @@ public class InjectHideActivity extends AppCompatActivity {
         lvCommList.setAdapter(commAdapter);
         spProcMatch.setAdapter(procMatchAdapter);
 
-        // 把缓存里的 superkey 喂给 native
-        String cachedKey = readSuperkeyFromCache();
+        // 把 saved superkey 喚给 native (路径: getFilesDir()/.kp_key, 与 MainActivity 一致)
+        String cachedKey = KpKeyStore.read(this);
         if (cachedKey != null) nativeSetSuperkey(cachedKey);
 
         // ── 全局开关（单按钮） ──
@@ -714,17 +715,6 @@ public class InjectHideActivity extends AppCompatActivity {
     }
     private void persistClear(String name) {
         File f = keyFile(name); if (f.exists()) f.delete();
-    }
-
-    private String readSuperkeyFromCache() {
-        File f = new File(getCacheDir(), ".kp_key");
-        if (!f.exists() || f.length() == 0 || f.length() > 128) return null;
-        try (BufferedReader br = new BufferedReader(new FileReader(f))) {
-            StringBuilder sb = new StringBuilder();
-            String line; while ((line = br.readLine()) != null) sb.append(line);
-            String s = sb.toString().trim();
-            return s.isEmpty() ? null : s;
-        } catch (IOException e) { return null; }
     }
 
     // ── Native 绑定 ─────────────────────────────────────────
