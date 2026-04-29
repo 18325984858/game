@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ═══════════════════════════════════════════════════════════════════════
  *  DobbyProject - 注入流程说明
  * ═══════════════════════════════════════════════════════════════════════
@@ -281,8 +281,8 @@ public class MainActivity extends AppCompatActivity {
             boolean enableLog = cbLog.isChecked();
 
             clearDumpMarkers();
-            writeFiletoTargetPubg();
-            launchAndInjectPubg(enableUeDumper, enableUeHeader, enableLog);
+            GameLauncher.launch(GAME_PUBG, enableUeDumper, enableUeHeader, enableLog,
+                    makeGameLauncherEnv(GAME_PUBG, btnPubgLaunch, "和平精英"));
 
             String options = "";
             if (enableUeDumper) options += " [UE4 Dumper]";
@@ -317,8 +317,8 @@ public class MainActivity extends AppCompatActivity {
             boolean enableLog = cbLog.isChecked();
 
             clearDumpMarkers();
-            writeFiletoTargetDfm();
-            launchAndInjectDfm(enableUeDumper, enableUeHeader, enableLog);
+            GameLauncher.launch(GAME_DFM, enableUeDumper, enableUeHeader, enableLog,
+                    makeGameLauncherEnv(GAME_DFM, btnDfmLaunch, "三角洲"));
 
             String options2 = "";
             if (enableUeDumper) options2 += " [UE5 Dumper]";
@@ -353,8 +353,8 @@ public class MainActivity extends AppCompatActivity {
             boolean enableLog = cbLog.isChecked();
 
             clearDumpMarkers();
-            writeFiletoTargetNrc();
-            launchAndInjectNrc(enableUeDumper, enableUeHeader, enableLog);
+            GameLauncher.launch(GAME_NRC, enableUeDumper, enableUeHeader, enableLog,
+                    makeGameLauncherEnv(GAME_NRC, btnNrcLaunch, "洛克王国手游"));
 
             String options3 = "";
             if (enableUeDumper) options3 += " [UE4 Dumper]";
@@ -1452,410 +1452,65 @@ public class MainActivity extends AppCompatActivity {
     // ═══════════════════════════════════════════════════════════════════
 
     private static final String PUBG_PACKAGE = "com.tencent.tmgp.pubgmhd";
-    private static final String PUBG_INJECTOR_TRACE = "/data/local/tmp/injector_trace.txt";
-    private static final String PUBG_UE4_GUI_TRACE = "/data/data/" + PUBG_PACKAGE + "/cache/ue4_gui_trace.txt";
     private static final String PUBG_INJECT_SO_NAME = "libpre.so";
-    private static final String PUBG_INJECT_SO_PATH_FILE = "/data/local/tmp/pubg_inject_so_path";
 
     // ═══════════════════════════════════════════════════════════════════
-    //  三角洲 (Delta Force Mobile) 注入流程
+    //  三角洲 (Delta Force Mobile)
     // ═══════════════════════════════════════════════════════════════════
 
     private static final String DFM_PACKAGE = "com.tencent.tmgp.dfm";
-    private static final String DFM_INJECTOR_TRACE = "/data/local/tmp/dfm_injector_trace.txt";
-    private static final String DFM_UE4_GUI_TRACE = "/data/data/" + DFM_PACKAGE + "/cache/ue4_gui_trace.txt";
 
     // ═══════════════════════════════════════════════════════════════════
-    //  洛克王国手游 (NRC) 注入流程
+    //  洛克王国手游 (NRC)
     // ═══════════════════════════════════════════════════════════════════
 
     private static final String NRC_PACKAGE = "com.tencent.nrc";
-    private static final String NRC_INJECTOR_TRACE = "/data/local/tmp/nrc_injector_trace.txt";
-    private static final String NRC_UE4_GUI_TRACE = "/data/data/" + NRC_PACKAGE + "/cache/ue4_gui_trace.txt";
 
-    /**
-     * 拷贝 SO 到和平精英目标目录
-     */
-    public void writeFiletoTargetPubg() {
-        String srcFile = g_nativeLibPath + (g_nativeLibPath.endsWith("/") ? "" : "/") + "libdobbyproject.so";
-        String dstDir = resolvePackageNativeLibDir(PUBG_PACKAGE);
-        if (dstDir == null || dstDir.isEmpty()) {
-            dstDir = "/data/data/" + PUBG_PACKAGE + "/files";
-        }
-        String dstFile = dstDir + "/" + PUBG_INJECT_SO_NAME;
+    // ═══════════════════════════════════════════════════════════════════
+    //  统一注入入口的 GameSpec 配置
+    //  添加新游戏: 只需 new GameLauncher.GameSpec(...) + 一个按钮 onClick
+    //  → GameLauncher.launch(SPEC, ..., makeGameLauncherEnv(...))
+    // ═══════════════════════════════════════════════════════════════════
 
-        LogUtil.i("[PUBG] 源文件: " + srcFile);
-        LogUtil.i("[PUBG] 拷贝 SO -> " + dstFile);
+    private static final GameLauncher.GameSpec GAME_PUBG = new GameLauncher.GameSpec(
+            "PUBG", "和平精英", PUBG_PACKAGE, "pubg",
+            PUBG_INJECT_SO_NAME, /*useApkLibDir=*/true, /*chconApkData=*/true,
+            /*waitMs=*/15000, /*retryWithTrace=*/true, /*hideSoName=*/PUBG_INJECT_SO_NAME);
 
-        try { nativeKpmRawCtl("remove_hide_so:" + PUBG_INJECT_SO_NAME); } catch (Throwable ignored) {}
+    private static final GameLauncher.GameSpec GAME_DFM = new GameLauncher.GameSpec(
+            "DFM", "三角洲", DFM_PACKAGE, "dfm",
+            "libdobbyproject.so", /*useApkLibDir=*/false, /*chconApkData=*/false,
+            /*waitMs=*/15000, /*retryWithTrace=*/false, /*hideSoName=*/null);
 
-        String cmd = "mkdir -p " + dstDir + "\n" +
-                "cp -f " + srcFile + " " + dstFile + "\n" +
-                "chmod 755 " + dstFile + "\n" +
-                "chcon u:object_r:apk_data_file:s0 " + dstFile + " 2>/dev/null || true\n" +
-                "echo " + dstFile + " > " + PUBG_INJECT_SO_PATH_FILE + "\n" +
-                "sync\nexit\n";
+    private static final GameLauncher.GameSpec GAME_NRC = new GameLauncher.GameSpec(
+            "NRC", "洛克王国手游", NRC_PACKAGE, "nrc",
+            "libdobbyproject.so", /*useApkLibDir=*/false, /*chconApkData=*/false,
+            /*waitMs=*/12000, /*retryWithTrace=*/false, /*hideSoName=*/null);
 
-        String[] suVariants = {"su -M", "su -mm", "su"};
-        for (String suCmd : suVariants) {
-            try {
-                Process p = Runtime.getRuntime().exec(suCmd);
-                DataOutputStream os = new DataOutputStream(p.getOutputStream());
-                os.writeBytes(cmd);
-                os.flush();
-                int exitCode = p.waitFor();
-                if (exitCode == 0) {
-                    LogUtil.i("[PUBG] ✓ " + suCmd + " 拷贝成功");
-                    return;
-                }
-            } catch (Exception e) {
-                LogUtil.i("[PUBG] " + suCmd + " 不可用");
+    /** 把 Activity 上的依赖打包成 GameLauncher.Env, 让启动逻辑与 Activity 解耦. */
+    private GameLauncher.Env makeGameLauncherEnv(GameLauncher.GameSpec spec,
+                                                 android.widget.Button btn,
+                                                 String displayName) {
+        return new GameLauncher.Env() {
+            @Override public String rootBinary() { return "su"; }
+            @Override public String appNativeLibDir() { return g_nativeLibPath; }
+            @Override public String resolveTargetLibDir(String pkg) {
+                return resolvePackageNativeLibDir(pkg);
             }
-        }
-        LogUtil.e("[PUBG] 所有 su 方式均失败", null);
-    }
-
-    /**
-     * 启动和平精英并注入 (PUBG 模式)
-     */
-    public void launchAndInjectPubg(boolean enableUeDumper, boolean enableUeHeader, boolean enableLog) {
-        String soPath = resolvePubgInjectSoPath();
-        String soDir = soPath.substring(0, soPath.lastIndexOf('/'));
-        String injectorDst = "/data/local/tmp/injector";
-
-        new Thread(() -> {
-            try {
-                try { nativeKpmRawCtl("remove_hide_so:" + PUBG_INJECT_SO_NAME); } catch (Throwable ignored) {}
-
-                // 1. 部署 injector
-                LogUtil.i("[PUBG] 部署 injector");
-                Process deployP = Runtime.getRuntime().exec("su");
-                DataOutputStream deployOs = new DataOutputStream(deployP.getOutputStream());
-                deployOs.writeBytes("cp -f " + g_nativeLibPath + "/libinjector.so " + injectorDst + "\n");
-                deployOs.writeBytes("chmod 755 " + injectorDst + "\n");
-                deployOs.writeBytes("mkdir -p " + soDir + "\n");
-                deployOs.writeBytes("cp -f " + g_nativeLibPath + "/libdobbyproject.so " + soPath + "\n");
-                deployOs.writeBytes("chmod 755 " + soPath + "\n");
-                deployOs.writeBytes("chcon u:object_r:apk_data_file:s0 " + soPath + " 2>/dev/null || true\n");
-                deployOs.writeBytes("echo " + soPath + " > " + PUBG_INJECT_SO_PATH_FILE + "\n");
-                deployOs.writeBytes("exit\n");
-                deployOs.flush();
-                deployP.waitFor();
-
-                // 2. 启动和平精英
-                LogUtil.i("[PUBG] 启动和平精英");
-                Process launchP = Runtime.getRuntime().exec("su");
-                DataOutputStream launchOs = new DataOutputStream(launchP.getOutputStream());
-                launchOs.writeBytes("monkey -p " + PUBG_PACKAGE + " -c android.intent.category.LAUNCHER 1 2>/dev/null\n");
-                launchOs.writeBytes("exit\n");
-                launchOs.flush();
-                launchP.waitFor();
-
-                // 3. 等待游戏初始化
-                LogUtil.i("[PUBG] 等待 15 秒游戏初始化...");
-                Thread.sleep(15000);
-
-                // 4. 写入配置文件
-                Process cfgP = Runtime.getRuntime().exec("su");
-                DataOutputStream cfgOs = new DataOutputStream(cfgP.getOutputStream());
-                String cfgContent = "ue_dumper=" + (enableUeDumper ? "1" : "0") + "\n"
-                                  + "ue_header=" + (enableUeHeader ? "1" : "0") + "\n"
-                                  + "log=" + (enableLog ? "1" : "0") + "\n";
-                cfgOs.writeBytes("echo '" + cfgContent + "' > /data/local/tmp/dobby_config.txt\n");
-                cfgOs.writeBytes("chmod 644 /data/local/tmp/dobby_config.txt\n");
-                cfgOs.writeBytes("rm -f " + PUBG_INJECTOR_TRACE + " " + PUBG_UE4_GUI_TRACE + "\n");
-                cfgOs.writeBytes("exit\n");
-                cfgOs.flush();
-                cfgP.waitFor();
-
-                // 5. 执行注入 (pubg 模式)
-                LogUtil.i("[PUBG] 执行注入: " + injectorDst + " " + PUBG_PACKAGE + " " + soPath + " pubg");
-                Process p = Runtime.getRuntime().exec("su");
-                DataOutputStream os = new DataOutputStream(p.getOutputStream());
-                os.writeBytes("success=0\n");
-                os.writeBytes("last_ret=2\n");
-                os.writeBytes("for attempt in 1 2 3 4; do\n");
-                os.writeBytes("  pid_before=$(pidof " + PUBG_PACKAGE + " 2>/dev/null)\n");
-                os.writeBytes("  echo [PUBG_TRACE] attempt=${attempt} pid_before=${pid_before}\n");
-                os.writeBytes("  " + injectorDst + " " + PUBG_PACKAGE + " " + soPath + " pubg > " + PUBG_INJECTOR_TRACE + " 2>&1\n");
-                os.writeBytes("  last_ret=$?\n");
-                os.writeBytes("  echo [PUBG_TRACE] injector_ret=${last_ret}\n");
-                os.writeBytes("  echo [PUBG_TRACE] injector_output_begin\n");
-                os.writeBytes("  cat " + PUBG_INJECTOR_TRACE + " 2>/dev/null\n");
-                os.writeBytes("  echo [PUBG_TRACE] injector_output_end\n");
-                os.writeBytes("  sleep 8\n");
-                os.writeBytes("  if [ -s " + PUBG_UE4_GUI_TRACE + " ]; then\n");
-                os.writeBytes("    success=1\n");
-                os.writeBytes("    echo [PUBG_TRACE] ue4_gui_trace_detected attempt=${attempt}\n");
-                os.writeBytes("    break\n");
-                os.writeBytes("  fi\n");
-                os.writeBytes("  pid_after=$(pidof " + PUBG_PACKAGE + " 2>/dev/null)\n");
-                os.writeBytes("  echo [PUBG_TRACE] no_ue4_trace attempt=${attempt} pid_after=${pid_after}\n");
-                os.writeBytes("  sleep 5\n");
-                os.writeBytes("done\n");
-                if (enableLog) {
-                    os.writeBytes("echo [PUBG_TRACE] ue4_gui_output_begin\n");
-                    os.writeBytes("cat " + PUBG_UE4_GUI_TRACE + " 2>/dev/null\n");
-                    os.writeBytes("echo [PUBG_TRACE] ue4_gui_output_end\n");
-                }
-                os.writeBytes("if [ \"$success\" = \"1\" ]; then exit 0; else exit 2; fi\n");
-                os.writeBytes("exit\n");
-                os.flush();
-
-                BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream()));
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    LogUtil.i("[PUBG] " + line);
-                }
-                int exitCode = p.waitFor();
-                LogUtil.i("[PUBG] 注入完成, exitCode=" + exitCode);
-                if (exitCode == 0) {
-                    try { nativeKpmRawCtl("add_hide_so:" + PUBG_INJECT_SO_NAME); } catch (Throwable ignored) {}
-                }
-
+            @Override public void kpmCtl(String cmd) {
+                try { nativeKpmRawCtl(cmd); } catch (Throwable ignored) {}
+            }
+            @Override public void onResult(boolean ok, int exitCode) {
                 runOnUiThread(() -> {
-                    if (exitCode == 0) {
-                        updateStatus("和平精英注入成功");
+                    if (ok) {
+                        updateStatus(displayName + "注入成功");
                     } else {
                         stopUe4OverlayService();
-                        updateStatus("和平精英注入失败 (code=" + exitCode + ")");
+                        updateStatus(displayName + "注入失败 (code=" + exitCode + ")");
                     }
                 });
-
-            } catch (Exception e) {
-                LogUtil.e("[PUBG] 注入异常: " + e.getMessage(), e);
-                runOnUiThread(() -> {
-                    stopUe4OverlayService();
-                    updateStatus("和平精英注入异常");
-                });
             }
-        }).start();
+        };
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    //  三角洲 (Delta Force Mobile) 注入方法
-    // ═══════════════════════════════════════════════════════════════════
-
-    /**
-     * 拷贝 SO 到三角洲目标目录
-     */
-    public void writeFiletoTargetDfm() {
-        String srcFile = g_nativeLibPath + (g_nativeLibPath.endsWith("/") ? "" : "/") + "libdobbyproject.so";
-        String dstDir = "/data/data/" + DFM_PACKAGE + "/files";
-        String dstFile = dstDir + "/libdobbyproject.so";
-
-        LogUtil.i("[DFM] 源文件: " + srcFile);
-        LogUtil.i("[DFM] 拷贝 SO -> " + dstFile);
-
-        String cmd = "mkdir -p " + dstDir + "\n" +
-                "cp -f " + srcFile + " " + dstFile + "\n" +
-                "chmod 777 " + dstFile + "\n" +
-                "sync\nexit\n";
-
-        String[] suVariants = {"su -M", "su -mm", "su"};
-        for (String suCmd : suVariants) {
-            try {
-                Process p = Runtime.getRuntime().exec(suCmd);
-                DataOutputStream os = new DataOutputStream(p.getOutputStream());
-                os.writeBytes(cmd);
-                os.flush();
-                int exitCode = p.waitFor();
-                if (exitCode == 0) {
-                    LogUtil.i("[DFM] ✓ " + suCmd + " 拷贝成功");
-                    return;
-                }
-            } catch (Exception e) {
-                LogUtil.i("[DFM] " + suCmd + " 不可用");
-            }
-        }
-        LogUtil.e("[DFM] 所有 su 方式均失败", null);
-    }
-
-    /**
-     * 启动三角洲并注入 (DFM 模式)
-     */
-    public void launchAndInjectDfm(boolean enableUeDumper, boolean enableUeHeader, boolean enableLog) {
-        String soPath = "/data/data/" + DFM_PACKAGE + "/files/libdobbyproject.so";
-        String injectorDst = "/data/local/tmp/injector";
-
-        new Thread(() -> {
-            try {
-                // 1. 部署 injector
-                LogUtil.i("[DFM] 部署 injector");
-                Process deployP = Runtime.getRuntime().exec("su");
-                DataOutputStream deployOs = new DataOutputStream(deployP.getOutputStream());
-                deployOs.writeBytes("cp -f " + g_nativeLibPath + "/libinjector.so " + injectorDst + "\n");
-                deployOs.writeBytes("chmod 755 " + injectorDst + "\n");
-                deployOs.writeBytes("exit\n");
-                deployOs.flush();
-                deployP.waitFor();
-
-                // 2. 启动三角洲
-                LogUtil.i("[DFM] 启动三角洲");
-                Process launchP = Runtime.getRuntime().exec("su");
-                DataOutputStream launchOs = new DataOutputStream(launchP.getOutputStream());
-                launchOs.writeBytes("monkey -p " + DFM_PACKAGE + " -c android.intent.category.LAUNCHER 1 2>/dev/null\n");
-                launchOs.writeBytes("exit\n");
-                launchOs.flush();
-                launchP.waitFor();
-
-                // 3. 等待游戏初始化
-                LogUtil.i("[DFM] 等待 15 秒游戏初始化...");
-                Thread.sleep(15000);
-
-                // 4. 写入配置文件
-                Process cfgP = Runtime.getRuntime().exec("su");
-                DataOutputStream cfgOs = new DataOutputStream(cfgP.getOutputStream());
-                String cfgContent = "ue_dumper=" + (enableUeDumper ? "1" : "0") + "\n"
-                                  + "ue_header=" + (enableUeHeader ? "1" : "0") + "\n"
-                                  + "log=" + (enableLog ? "1" : "0") + "\n";
-                cfgOs.writeBytes("echo '" + cfgContent + "' > /data/local/tmp/dobby_config.txt\n");
-                cfgOs.writeBytes("chmod 644 /data/local/tmp/dobby_config.txt\n");
-                cfgOs.writeBytes("rm -f " + DFM_INJECTOR_TRACE + " " + DFM_UE4_GUI_TRACE + "\n");
-                cfgOs.writeBytes("exit\n");
-                cfgOs.flush();
-                cfgP.waitFor();
-
-                // 5. 执行注入 (dfm 模式, 单次注入, 不重试 — DFM 无 GUI overlay trace 文件)
-                LogUtil.i("[DFM] 执行注入: " + injectorDst + " " + DFM_PACKAGE + " " + soPath + " dfm");
-                Process p = Runtime.getRuntime().exec("su");
-                DataOutputStream os = new DataOutputStream(p.getOutputStream());
-                os.writeBytes(injectorDst + " " + DFM_PACKAGE + " " + soPath + " dfm 2>&1\n");
-                os.writeBytes("exit $?\n");
-                os.flush();
-
-                BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream()));
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    LogUtil.i("[DFM] " + line);
-                }
-                int exitCode = p.waitFor();
-                LogUtil.i("[DFM] 注入完成, exitCode=" + exitCode);
-
-                runOnUiThread(() -> {
-                    if (exitCode == 0) {
-                        updateStatus("三角洲注入成功");
-                    } else {
-                        stopUe4OverlayService();
-                        updateStatus("三角洲注入失败 (code=" + exitCode + ")");
-                    }
-                });
-
-            } catch (Exception e) {
-                LogUtil.e("[DFM] 注入异常: " + e.getMessage(), e);
-                runOnUiThread(() -> {
-                    stopUe4OverlayService();
-                    updateStatus("三角洲注入异常");
-                });
-            }
-        }).start();
-    }
-
-    // ═══════════════════════════════════════════════════════════════════
-    //  洛克王国手游 (NRC) 注入方法
-    // ═══════════════════════════════════════════════════════════════════
-
-    public void writeFiletoTargetNrc() {
-        String srcFile = g_nativeLibPath + (g_nativeLibPath.endsWith("/") ? "" : "/") + "libdobbyproject.so";
-        String dstDir = "/data/data/" + NRC_PACKAGE + "/files";
-        String dstFile = dstDir + "/libdobbyproject.so";
-
-        LogUtil.i("[NRC] 源文件: " + srcFile);
-        LogUtil.i("[NRC] 拷贝 SO -> " + dstFile);
-
-        String cmd = "mkdir -p " + dstDir + "\n" +
-                "cp -f " + srcFile + " " + dstFile + "\n" +
-                "chmod 777 " + dstFile + "\n" +
-                "sync\nexit\n";
-
-        String[] suVariants = {"su -M", "su -mm", "su"};
-        for (String suCmd : suVariants) {
-            try {
-                Process p = Runtime.getRuntime().exec(suCmd);
-                DataOutputStream os = new DataOutputStream(p.getOutputStream());
-                os.writeBytes(cmd);
-                os.flush();
-                int exitCode = p.waitFor();
-                if (exitCode == 0) {
-                    LogUtil.i("[NRC] ✓ " + suCmd + " 拷贝成功");
-                    return;
-                }
-            } catch (Exception e) {
-                LogUtil.i("[NRC] " + suCmd + " 不可用");
-            }
-        }
-        LogUtil.e("[NRC] 所有 su 方式均失败", null);
-    }
-
-    public void launchAndInjectNrc(boolean enableUeDumper, boolean enableUeHeader, boolean enableLog) {
-        String soPath = "/data/data/" + NRC_PACKAGE + "/files/libdobbyproject.so";
-        String injectorDst = "/data/local/tmp/injector";
-
-        new Thread(() -> {
-            try {
-                LogUtil.i("[NRC] 部署 injector");
-                Process deployP = Runtime.getRuntime().exec("su");
-                DataOutputStream deployOs = new DataOutputStream(deployP.getOutputStream());
-                deployOs.writeBytes("cp -f " + g_nativeLibPath + "/libinjector.so " + injectorDst + "\n");
-                deployOs.writeBytes("chmod 755 " + injectorDst + "\n");
-                deployOs.writeBytes("exit\n");
-                deployOs.flush();
-                deployP.waitFor();
-
-                LogUtil.i("[NRC] 启动洛克王国手游");
-                Process launchP = Runtime.getRuntime().exec("su");
-                DataOutputStream launchOs = new DataOutputStream(launchP.getOutputStream());
-                launchOs.writeBytes("monkey -p " + NRC_PACKAGE + " -c android.intent.category.LAUNCHER 1 2>/dev/null\n");
-                launchOs.writeBytes("exit\n");
-                launchOs.flush();
-                launchP.waitFor();
-
-                LogUtil.i("[NRC] 等待 12 秒游戏初始化...");
-                Thread.sleep(12000);
-
-                Process cfgP = Runtime.getRuntime().exec("su");
-                DataOutputStream cfgOs = new DataOutputStream(cfgP.getOutputStream());
-                String cfgContent = "ue_dumper=" + (enableUeDumper ? "1" : "0") + "\n"
-                                  + "ue_header=" + (enableUeHeader ? "1" : "0") + "\n"
-                                  + "log=" + (enableLog ? "1" : "0") + "\n";
-                cfgOs.writeBytes("echo '" + cfgContent + "' > /data/local/tmp/dobby_config.txt\n");
-                cfgOs.writeBytes("chmod 644 /data/local/tmp/dobby_config.txt\n");
-                cfgOs.writeBytes("rm -f " + NRC_INJECTOR_TRACE + " " + NRC_UE4_GUI_TRACE + "\n");
-                cfgOs.writeBytes("exit\n");
-                cfgOs.flush();
-                cfgP.waitFor();
-
-                LogUtil.i("[NRC] 执行注入: " + injectorDst + " " + NRC_PACKAGE + " " + soPath + " nrc");
-                Process p = Runtime.getRuntime().exec("su");
-                DataOutputStream os = new DataOutputStream(p.getOutputStream());
-                os.writeBytes(injectorDst + " " + NRC_PACKAGE + " " + soPath + " nrc 2>&1\n");
-                os.writeBytes("exit $?\n");
-                os.flush();
-
-                BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream()));
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    LogUtil.i("[NRC] " + line);
-                }
-                int exitCode = p.waitFor();
-                LogUtil.i("[NRC] 注入完成, exitCode=" + exitCode);
-
-                runOnUiThread(() -> {
-                    if (exitCode == 0) {
-                        updateStatus("洛克王国手游注入成功");
-                    } else {
-                        stopUe4OverlayService();
-                        updateStatus("洛克王国手游注入失败 (code=" + exitCode + ")");
-                    }
-                });
-
-            } catch (Exception e) {
-                LogUtil.e("[NRC] 注入异常: " + e.getMessage(), e);
-                runOnUiThread(() -> {
-                    stopUe4OverlayService();
-                    updateStatus("洛克王国手游注入异常");
-                });
-            }
-        }).start();
-    }
 }
