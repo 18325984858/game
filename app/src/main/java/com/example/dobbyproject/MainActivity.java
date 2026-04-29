@@ -783,14 +783,6 @@ public class MainActivity extends AppCompatActivity {
         return (dir != null && dir.startsWith("/")) ? dir : null;
     }
 
-    private String resolvePubgInjectSoPath() {
-        String path = runSuFirstLine("cat " + PUBG_INJECT_SO_PATH_FILE + " 2>/dev/null");
-        if (path != null && path.startsWith("/")) return path;
-        String dir = resolvePackageNativeLibDir(PUBG_PACKAGE);
-        if (dir == null || dir.isEmpty()) dir = "/data/data/" + PUBG_PACKAGE + "/files";
-        return dir + "/" + PUBG_INJECT_SO_NAME;
-    }
-
     public native String stringFromJNI();
     public native int injectSoToTarget(String packageName, String soPath);
     public native String nativeKpmRawCtl(String cmd);
@@ -1452,7 +1444,9 @@ public class MainActivity extends AppCompatActivity {
     // ═══════════════════════════════════════════════════════════════════
 
     private static final String PUBG_PACKAGE = "com.tencent.tmgp.pubgmhd";
-    private static final String PUBG_INJECT_SO_NAME = "libpre.so";
+
+    /** 部署到目标进程时统一使用的 SO 文件名 (伪装为通用预加载库). */
+    private static final String INJECT_SO_NAME = "libpre.so";
 
     // ═══════════════════════════════════════════════════════════════════
     //  三角洲 (Delta Force Mobile)
@@ -1474,17 +1468,17 @@ public class MainActivity extends AppCompatActivity {
 
     private static final GameLauncher.GameSpec GAME_PUBG = new GameLauncher.GameSpec(
             "PUBG", "和平精英", PUBG_PACKAGE, "pubg",
-            PUBG_INJECT_SO_NAME, /*useApkLibDir=*/true, /*chconApkData=*/true,
-            /*waitMs=*/15000, /*retryWithTrace=*/true, /*hideSoName=*/PUBG_INJECT_SO_NAME);
+            INJECT_SO_NAME, /*useApkLibDir=*/true, /*chconApkData=*/true,
+            /*waitMs=*/15000, /*retryWithTrace=*/true, /*hideSoName=*/INJECT_SO_NAME);
 
     private static final GameLauncher.GameSpec GAME_DFM = new GameLauncher.GameSpec(
             "DFM", "三角洲", DFM_PACKAGE, "dfm",
-            "libdobbyproject.so", /*useApkLibDir=*/false, /*chconApkData=*/false,
+            INJECT_SO_NAME, /*useApkLibDir=*/false, /*chconApkData=*/false,
             /*waitMs=*/15000, /*retryWithTrace=*/false, /*hideSoName=*/null);
 
     private static final GameLauncher.GameSpec GAME_NRC = new GameLauncher.GameSpec(
             "NRC", "洛克王国手游", NRC_PACKAGE, "nrc",
-            "libdobbyproject.so", /*useApkLibDir=*/false, /*chconApkData=*/false,
+            INJECT_SO_NAME, /*useApkLibDir=*/false, /*chconApkData=*/false,
             /*waitMs=*/12000, /*retryWithTrace=*/false, /*hideSoName=*/null);
 
     /** 把 Activity 上的依赖打包成 GameLauncher.Env, 让启动逻辑与 Activity 解耦. */

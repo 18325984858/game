@@ -1,0 +1,309 @@
+ACE 检测面静态分析记录
+======================
+
+IDA 数据库映射:
+- libUE4.so      -> ida-pro-mcp-3
+- libtersafe.so  -> ida-pro-mcp-4
+- libtprt.so     -> ida-pro-mcp-5
+- libcubehawk.so -> ida-pro-mcp-6 (当前会话未暴露可调用 MCP 工具, 本轮未直接取证)
+
+结论摘要:
+- 本地立即崩溃最像 #4 栈回溯扫描: libtprt 提供 unwind_xx_info_query / unwind_xx_ioctl,
+	libtersafe 承载检测策略和上报字段。
+- #1/#2/#5/#9 在 libtersafe 有强字符串和引用证据。
+- #3 GOT/PLT、#7 Java ClassLoader 缺少直接字符串证据, 只能标为“可能折叠在完整性/SDK JNI 逻辑中”。
+- #10 root/kernel 环境检测有 ro.debuggable、emulator/root 上报字段, 但未见 Magisk/KSU/SELinux 直接字符串。
+
+
+1. maps 扫描: 周期 read /proc/self/maps, 匹配未签名/未在白名单的 .so 路径  ⚠️
+--------------------------------------------------------------------------------
+检测逻辑:
+1) 打开 /proc/self/maps。
+2) 逐行解析内存段: start-end, perms, path。
+3) 抽取 path/basename, 对 .so 或可执行映射做白名单/签名/路径判断。
+4) 命中未知模块路径时进入上报链; 是否本地 abort 取决于策略分支。
+
+静态证据:
+- libtersafe.so+0x564008: 字符串 "/proc/self/maps"。
+- libtersafe.so+0x564028: 字符串 "/proc/self/maps"。
+- libtersafe.so+0x321FBC: sub_321FBC 引用 maps 字符串, callgraph 显示调用 sub_4EE598 / sub_322E88 / sub_2F04CC。
+- libtersafe.so+0x4E54BC: module 字符串处理函数, 引用字符串 "module" (libtersafe.so+0x986DA), callgraph 显示 getpid / memset / 多个格式化/采集 helper。
+- 相关动态符号字符串: basename(libtersafe.so+0x32FD), strrchr(libtersafe.so+0x370A), strstr(libtersafe.so+0x36BD), strcasestr(libtersafe.so+0x3191), dladdr(libtersafe.so+0x341D), dl_iterate_phdr(libtersafe.so+0x39AC)。
+
+模块偏移:
+- libtersafe.so+0x321FBC  maps 初始化/读取入口候选
+- libtersafe.so+0x564008  "/proc/self/maps" 字符串
+- libtersafe.so+0x564028  "/proc/self/maps" 字符串
+- libtersafe.so+0x4E54BC  module 上报/采集候选
+- libtersafe.so+0x986DA   "module" 字符串
+
+判定:
+- 强确认存在 maps 扫描面。
+- 从已有崩溃表现看它不是本次 SIGABRT/崩溃主因, 更像后台/服务端上报或辅助检测。
+
+
+2. 代码段 CRC: 对关键 .text 段算哈希, 比对启动时基线, 检测 inline hook
+--------------------------------------------------------------------------------
+检测逻辑:
+1) 枚举模块和 PT_LOAD 段, 找 r-x/.text 范围。
+2) 对目标模块的代码段或指定函数窗口计算 CRC/hash。
+3) 与启动基线或云端下发基线比较。
+4) mismatch 进入 mrpcs_data_crc_error / hook opcode report 上报。
+
+静态证据:
+- libtersafe.so+0x9151E: 字符串 "%s;crc:%s"。
+- libtersafe.so+0x9492C: 字符串 "mrpcs_data_crc_error"。
+- libtersafe.so+0x3FD5C0: sub_3FD5C0 同时引用 "%s;crc:%s"、"mrpcs_data_crc_error"、inline hook/opcode 字符串, 是完整性/上报字段聚合入口候选。
+- libtersafe.so+0x4E3D64: sub_4E3D64 引用 "module_size_in_range"; callgraph 显示它分派到多组 module/range helper, 符合枚举模块范围再计算/校验的结构。
+- libtersafe.so+0x39AC: 动态符号字符串 "dl_iterate_phdr", 支持按 ELF program header 枚举模块段。
+
+模块偏移:
+- libtersafe.so+0x3FD5C0  CRC/inline hook 上报字段聚合入口候选
+- libtersafe.so+0x9151E  "%s;crc:%s"
+- libtersafe.so+0x9492C  "mrpcs_data_crc_error"
+- libtersafe.so+0x4E3D64  module/range 校验候选
+- libtersafe.so+0x97D86  "module_size_in_range"
+- libtersafe.so+0x39AC   "dl_iterate_phdr"
+
+判定:
+- 强确认存在代码完整性/CRC 上报面。
+- 若改写 libUE4.so/.text 或 Dobby inline patch 触碰被监控窗口, 会触发该面。
+
+
+3. GOT/PLT 完整性: 检查 import 表项是否被改写 (PLT hook)
+-----------------------------------------------------------
+检测逻辑(推断):
+1) 枚举目标模块 dynamic section / relocation 表。
+2) 读取 GOT/PLT 目标地址。
+3) 校验目标是否仍落在期望模块范围, 或与启动快照一致。
+4) 失败后复用完整性上报链。
+
+静态证据:
+- 本轮未找到 "GOT" / "PLT" / "JUMP_SLOT" / "relocation" 等直接字符串。
+- 可疑关联是 libtersafe.so+0x4E3D64 的 module/range 检查和 libtersafe.so+0x3FD5C0 的完整性上报聚合。
+- libtersafe 导入/符号字符串中有 dladdr(libtersafe.so+0x341D) 和 dl_iterate_phdr(libtersafe.so+0x39AC), 足以支撑“地址归属模块校验”。
+
+模块偏移:
+- libtersafe.so+0x4E3D64  module/range 校验候选
+- libtersafe.so+0x3FD5C0  完整性上报聚合候选
+- libtersafe.so+0x341D   "dladdr"
+- libtersafe.so+0x39AC   "dl_iterate_phdr"
+
+判定:
+- 弱确认。没有直接 GOT/PLT 字符串, 不能把它写成独立已确认实现。
+- 更可能折叠在“模块地址归属 + CRC/完整性”通用策略内。
+
+
+4. 栈回溯扫描: 周期 backtrace 当前/重点线程, 检查 LR/PC 是否落在白名单模块外  ✅ 主因
+-----------------------------------------------------------------------------------------
+检测逻辑:
+1) 检测调度侧请求 unwind 信息。
+2) libtprt 提供 unwind_xx_info_query / unwind_xx_ioctl 接口。
+3) unwind 引擎读取线程上下文、栈、eh_frame/exidx, 展开 PC/LR 链。
+4) 对每一帧 PC/LR 做 dladdr/模块归属判断。
+5) 模块不在白名单或无法解释时进入本地 abort/kill 或上报链。
+
+静态证据:
+- libtprt.so+0xBA814: 导出 unwind_xx_info_query。
+	反编译: 调 sub_1319D4() 获取全局表/管理器, 再调 sub_131C70(v6, a1, a2, a3) 查询 unwind 信息。
+- libtprt.so+0xBAB9C: 导出 unwind_xx_ioctl。
+	反编译: OLLVM 平坦化 switch, 对 cmd 1/2/4 分发到 sub_149040 / sub_148FFC / sub_128BF0 等。
+- libtprt.so+0x131C70: 查询路径, 字符串 key 查表后把结果拷贝到调用方 buffer。
+- libtprt.so+0x131DA4: 写入/更新 key-value 路径。
+- libtprt.so+0x13E17C: 引用字符串 "unwind_xx_info_query", 用于导出名/接口名解析。
+- libtprt.so 动态符号字符串: dladdr(libtprt.so+0x1CA6), ptrace(libtprt.so+0x1D1F), syscall(libtprt.so+0x1D42), pthread_create(libtprt.so+0x1B8A)。
+- libtersafe.so 内也有 libunwind / _Unwind / .eh_frame 相关字符串, 但更像运行库/异常展开代码或策略侧复用。
+
+模块偏移:
+- libtprt.so+0xBA814   unwind_xx_info_query
+- libtprt.so+0xBAB9C   unwind_xx_ioctl
+- libtprt.so+0x1319D4  unwind 全局管理器 getter
+- libtprt.so+0x131C70  unwind info query 查表/拷贝
+- libtprt.so+0x131DA4  unwind info update/write
+- libtprt.so+0x13E17C  "unwind_xx_info_query" 解析 helper
+- libtprt.so+0x1CA6    "dladdr"
+- libtprt.so+0x1D1F    "ptrace"
+- libtprt.so+0x1D42    "syscall"
+
+判定:
+- 强确认, 并且最符合“我们死在这里”的现象。
+- 只要采样到的任意帧 PC/LR 落在 libdobby.so、匿名 RX、Frida/Gum 等非白名单模块, 就可能触发本地终止。
+
+
+5. inline trampoline 检测: 扫 .text 开头是否被改成 LDR x16,#8 / BR x16 (Dobby 典型 trampoline)
+----------------------------------------------------------------------------------------------
+检测逻辑:
+1) 枚举/定位被保护函数入口。
+2) 读取函数入口若干字节。
+3) 匹配常见 inline hook/trampoline opcode 模式, 或与基线 opcode 比较。
+4) mismatch 走 inline_hook_opcode_dismatch / ms_hook_opcode 上报。
+
+静态证据:
+- libtersafe.so+0x920A9: 字符串 "inline_hook_opcode_dismatch"。
+- libtersafe.so+0x92876: 字符串 "set_inline_hook_error"。
+- libtersafe.so+0x96B5F: 字符串 "ms_set_inlie_hook" (原文拼写 inlie)。
+- libtersafe.so+0x9859E: 字符串 "ms_hook_opcode"。
+- 上述字符串均 xref 到 libtersafe.so+0x3FD5C0, 说明与 #2 共用完整性/上报聚合逻辑。
+
+模块偏移:
+- libtersafe.so+0x3FD5C0  inline/opcode 上报字段聚合入口候选
+- libtersafe.so+0x920A9  "inline_hook_opcode_dismatch"
+- libtersafe.so+0x92876  "set_inline_hook_error"
+- libtersafe.so+0x96B5F  "ms_set_inlie_hook"
+- libtersafe.so+0x9859E  "ms_hook_opcode"
+
+判定:
+- 强确认存在 inline opcode/trampoline 检测上报面。
+- 是否本地 abort 未确认; 从字段命名看更偏“采集 + 上报”。
+
+
+6. syscall 异常: hook ptrace/process_vm_readv, 谁碰自己进程内存就报
+--------------------------------------------------------------
+检测逻辑:
+1) 监测或主动调用 ptrace/syscall 相关接口。
+2) 结合 unwind/memory scanner 判断是否有外部调试/读写内存行为。
+3) 命中后上报或阻断。
+
+静态证据:
+- libtersafe.so+0x3382: 动态符号字符串 "ptrace"。
+- libtersafe.so+0x331B: 动态符号字符串 "syscall"。
+- libtprt.so+0x1D1F: 动态符号字符串 "ptrace"。
+- libtprt.so+0x1D42: 动态符号字符串 "syscall"。
+- 未找到 "process_vm_readv" 字符串。
+- 未找到 "tgkill" 字符串。
+
+模块偏移:
+- libtersafe.so+0x3382  "ptrace"
+- libtersafe.so+0x331B  "syscall"
+- libtprt.so+0x1D1F     "ptrace"
+- libtprt.so+0x1D42     "syscall"
+
+判定:
+- ptrace/syscall 面确认存在。
+- process_vm_readv 未在字符串层确认, 可能走 syscall number 或未实现该项。
+
+
+7. Java 层: 检测 ClassLoader 链里是否插入了非腾讯签名的 dex
+------------------------------------------------------
+检测逻辑(推断):
+1) JNI 入口拿到 JavaVM/JNIEnv。
+2) 查询 ClassLoader / DexPathList / dexElements。
+3) 校验 dex 路径、签名、来源包。
+4) 异常进入 tss_jni_cmd 或 SDK 上报链。
+
+静态证据:
+- libtersafe.so+0x3162: 字符串 "JNI_OnLoad"。
+- libtersafe.so+0x34BA: 字符串 "tss_jni_cmd"。
+- libtersafe.so+0x97178: 另一个 "JNI_OnLoad" 字符串, xref 到 libtersafe.so+0x4DD244。
+- libtersafe.so+0x4DD244: sub_4DD244 callgraph 显示 dlopen / dlsym / dladdr / dlclose, 疑似 JNI/动态解析初始化逻辑。
+- 未找到 "ClassLoader" / "DexClassLoader" / "PathClassLoader" / "dexElements" / "classes.dex" 直接字符串。
+
+模块偏移:
+- libtersafe.so+0x3162   "JNI_OnLoad"
+- libtersafe.so+0x34BA   "tss_jni_cmd"
+- libtersafe.so+0x97178  "JNI_OnLoad"
+- libtersafe.so+0x4DD244 JNI/动态解析初始化候选
+
+判定:
+- 弱确认。确认存在 JNI/Java 通道, 但 ClassLoader 链检测没有直接静态字符串证据。
+- 若存在, 可能字符串被加密或由 Java 层/其他模块实现。
+
+
+8. 签名/包名校验: APK 重打包检测
+--------------------------------
+检测逻辑:
+1) SDK 初始化或 resume/recv signature 时收集 apk_path / 包签名 / token。
+2) 与服务端下发签名或本地期望值比较。
+3) 失败后通过 TssSDKOnRecvSignature / tss_recv_sec_signature / wait_verify 上报或阻断。
+
+静态证据:
+- libtersafe.so+0x910B0: 字符串 "apk_path:%s"。
+- libtersafe.so+0x2F6B: 导出/符号字符串 "tss_recv_sec_signature"。
+- libtersafe.so+0x30BB: 导出/符号字符串 "TssSDKOnRecvSignature"。
+- libtersafe.so+0x2F03: 导出/符号字符串 "tss_sdk_wait_verify"。
+- libtersafe.so+0x2D7D / 0x303B: "tss_sdk_ioctl" / "TssSDKIoctl"。
+
+模块偏移:
+- libtersafe.so+0x910B0  "apk_path:%s"
+- libtersafe.so+0x2F6B   "tss_recv_sec_signature"
+- libtersafe.so+0x30BB   "TssSDKOnRecvSignature"
+- libtersafe.so+0x2F03   "tss_sdk_wait_verify"
+- libtersafe.so+0x2D7D   "tss_sdk_ioctl"
+- libtersafe.so+0x303B   "TssSDKIoctl"
+
+判定:
+- 中等确认。签名/包路径/校验通道存在, 但具体 APK 证书解析逻辑未在本轮静态证据中展开。
+
+
+9. modules 数量比对: 启动后 dl_iterate_phdr 数, 加载新 .so 触发
+---------------------------------------------------------
+检测逻辑:
+1) 启动/初始化时记录模块列表或数量基线。
+2) 周期通过 dl_iterate_phdr 或 maps 重新枚举。
+3) 比较数量、模块名、模块大小范围。
+4) 新增未知 .so 或范围异常进入 module_size_in_range / module 上报链。
+
+静态证据:
+- libtersafe.so+0x39AC: 动态符号字符串 "dl_iterate_phdr"。
+- libtersafe.so+0x97D86: 字符串 "module_size_in_range"。
+- libtersafe.so+0x4E3D64: sub_4E3D64 引用 "module_size_in_range", 并分派多个 module/range helper。
+- libtersafe.so+0x986DA: 字符串 "module"。
+- libtersafe.so+0x4E54BC: sub_4E54BC 引用 "module", callgraph 显示 getpid / 多个采集 helper。
+- libtersafe.so+0xDBB60: 字符串 "_engine_module_name" (本轮未解析到函数引用, 可能位于数据/配置表)。
+
+模块偏移:
+- libtersafe.so+0x39AC   "dl_iterate_phdr"
+- libtersafe.so+0x4E3D64 module_size/range 检查候选
+- libtersafe.so+0x97D86  "module_size_in_range"
+- libtersafe.so+0x4E54BC module 上报/采集候选
+- libtersafe.so+0x986DA  "module"
+- libtersafe.so+0xDBB60  "_engine_module_name"
+
+判定:
+- 强确认存在 modules/range 检测面。
+- 这类通常是服务端/策略上报, 不一定导致本地立刻崩溃。
+
+
+10. kernel-level / root 环境: KSU/Magisk hide、SELinux 状态、ro.debuggable 等
+---------------------------------------------------------------------
+检测逻辑:
+1) 读取系统属性或环境特征。
+2) 检查 emulator/root/debuggable/rom 状态。
+3) 生成 name/rate/is_root 或 emulator 字段上报。
+4) 是否本地阻断取决于策略。
+
+静态证据:
+- libtersafe.so+0x55F6E9: 字符串 "ro.debuggable"。
+- libtersafe.so+0x2BAF90: sub_2BAF90 引用 "ro.debuggable" 两处, 基本确认读取/判断该系统属性。
+- libtersafe.so+0x9766E: 字符串 "|emulator_name="。
+- libtersafe.so+0x1BFEF4: tp2_sdk_ioctl 引用 "|emulator_name=", 是 ioctl 大分发中的环境检测/上报路径。
+- libtersafe.so+0x98A12: 字符串 "name=%s|rate=%.2f|is_root=%d"。
+- libtersafe.so+0x4CC5E0: sub_4CC5E0 引用 root/rate 字符串。
+- 未找到 "Magisk" / "KSU" / "KernelSU" / "SELinux" / "zygisk" 直接字符串。
+
+模块偏移:
+- libtersafe.so+0x2BAF90  ro.debuggable 检查候选
+- libtersafe.so+0x55F6E9  "ro.debuggable"
+- libtersafe.so+0x1BFEF4  tp2_sdk_ioctl 环境检测分发候选
+- libtersafe.so+0x9766E   "|emulator_name="
+- libtersafe.so+0x4CC5E0  root/rate 上报候选
+- libtersafe.so+0x98A12   "name=%s|rate=%.2f|is_root=%d"
+
+判定:
+- root/debuggable/emulator 环境面确认存在。
+- Magisk/KSU/SELinux 具体检测未在本轮字符串层确认, 可能字符串加密、由 Java 层或其他模块实现。
+
+
+补充: libUE4 / libcubehawk
+--------------------------
+- libUE4.so(mcp-3): 本轮只验证过关键全局偏移无 xref 结果; 它是被保护/被检测目标, 不是 ACE 检测策略主体。
+	已知偏移: GNames=libUE4.so+0x154CE510, GUObjectArray=libUE4.so+0x14CEC650, GWorld=libUE4.so+0x14CEE938。
+- libcubehawk.so(mcp-6): 当前会话没有可调用的 mcp-6 工具接口, 本轮没有直接静态结论。
+
+
+本次优先级判断
+--------------
+1) 触发本地崩溃的首要目标: #4 栈回溯扫描 (libtprt.so+0xBA814 / +0xBAB9C)。
+2) 会影响 inline hook 稳定性的高风险项: #2 代码段 CRC 与 #5 inline trampoline opcode 检测 (libtersafe.so+0x3FD5C0 及相关字符串)。
+3) 会影响注入/加载长期风险的项: #1 maps 与 #9 module 数量/范围检测 (libtersafe.so+0x321FBC / +0x4E3D64 / +0x4E54BC)。
+4) #6/#8/#10 是环境/协议/调试辅助面; 目前证据偏“上报/策略”, 非本次本地崩溃主因。

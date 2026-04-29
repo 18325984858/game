@@ -1,8 +1,67 @@
 {
-  "mcpServers": {
-    "ida-pro-mcp": {
+  "servers": {
+    "ida-pro-mcp-1": {
+      "command": "C:\\Users\\user\\Desktop\\Project\\ida9.2\\python311\\python.exe",
+      "args": [
+        "C:\\Users\\user\\Desktop\\Project\\ida9.2\\python311\\Lib\\site-packages\\ida_pro_mcp\\server.py",
+        "--ida-rpc",
+        "http://127.0.0.1:13337",
+      ],
+      "type": "stdio",
+    },
+    "ida-pro-mcp-2": {
+      "command": "C:\\Users\\user\\Desktop\\Project\\ida9.2\\python311\\python.exe",
+      "args": [
+        "C:\\Users\\user\\Desktop\\Project\\ida9.2\\python311\\Lib\\site-packages\\ida_pro_mcp\\server.py",
+        "--ida-rpc",
+        "http://127.0.0.1:13338",
+      ],
+      "type": "stdio",
+    },
+    "ida-pro-mcp-3": {
+      "command": "C:\\Users\\user\\Desktop\\Project\\ida9.2\\python311\\python.exe",
+      "args": [
+        "C:\\Users\\user\\Desktop\\Project\\ida9.2\\python311\\Lib\\site-packages\\ida_pro_mcp\\server.py",
+        "--ida-rpc",
+        "http://127.0.0.1:13339",
+      ],
+      "type": "stdio",
+    },
+    "ida-pro-mcp-4": {
+      "command": "C:\\Users\\user\\Desktop\\Project\\ida9.2\\python311\\python.exe",
+      "args": [
+        "C:\\Users\\user\\Desktop\\Project\\ida9.2\\python311\\Lib\\site-packages\\ida_pro_mcp\\server.py",
+        "--ida-rpc",
+        "http://127.0.0.1:13340",
+      ],
+      "type": "stdio",
+    },
+
+    "ida-pro-mcp-5": {
+      "command": "C:\\Users\\user\\Desktop\\Project\\ida9.2\\python311\\python.exe",
+      "args": [
+        "C:\\Users\\user\\Desktop\\Project\\ida9.2\\python311\\Lib\\site-packages\\ida_pro_mcp\\server.py",
+        "--ida-rpc",
+        "http://127.0.0.1:13341",
+      ],
+      "type": "stdio",
+    },
+    "ida-pro-mcp-6": {
+      "command": "C:\\Users\\user\\Desktop\\Project\\ida9.2\\python311\\python.exe",
+      "args": [
+        "C:\\Users\\user\\Desktop\\Project\\ida9.2\\python311\\Lib\\site-packages\\ida_pro_mcp\\server.py",
+        "--ida-rpc",
+        "http://127.0.0.1:13342",
+      ],
+      "type": "stdio",
+    },
+    "fiddler": {
       "type": "http",
-      "url": "http://127.0.0.1:13337/mcp"
-    }
-  }
+      "url": "http://localhost:8868/mcp",
+      "headers": {
+        "Authorization": "ApiKey 333682cd-16dd-4bdf-8539-012a6271557d",
+      },
+    },
+  },
+  "inputs": [],
 }

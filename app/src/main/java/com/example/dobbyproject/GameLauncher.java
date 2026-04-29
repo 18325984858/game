@@ -40,7 +40,7 @@ public final class GameLauncher {
         public final String pkg;
         /** 传给 injector argv[3] 的模式 (pubg/dfm/nrc/lol). */
         public final String mode;
-        /** 部署到目标的 SO 文件名 (PUBG=libpre.so, 其它=libdobbyproject.so). */
+        /** 部署到目标的 SO 文件名 (统一使用 libpre.so 等伪装名). */
         public final String soFileName;
         /** true=部署到 APK 自带的 nativeLibraryDir (PUBG); false=/data/data/<pkg>/files. */
         public final boolean useApkLibDir;
