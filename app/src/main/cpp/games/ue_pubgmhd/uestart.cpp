@@ -632,6 +632,7 @@ static void UE4GuiThread() {
         .screenHeight = displayInfo.height,
         .rotateTheta = displayInfo.rotateTheta,
         .clientConnectAddress = "127.0.0.1",
+        .port = 16888,  // PUBG 专用端口 (PUBG=16888, DFM=16889, NRC=16890)
     };
 
     GLOG("AImGui RenderClient 选项已准备: width=%d height=%d rotate=%d", imguiOptions.screenWidth, imguiOptions.screenHeight, imguiOptions.rotateTheta);

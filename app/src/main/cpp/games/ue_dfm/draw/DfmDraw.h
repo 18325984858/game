@@ -22,20 +22,20 @@ public:
 private:
     // ── 菜单状态 ──
     bool m_menuExpanded    = true;
-    bool m_enableESP       = true;     // 3D ESP 方框
+    bool m_enableESP       = false;    // 3D ESP 方框
     bool m_enableBones     = false;    // 骨骼绘制
-    bool m_enableSnapline  = true;     // 底部射线
-    bool m_enableName      = true;     // 玩家名
-    bool m_enableHP        = true;     // 血条
-    bool m_enableDistance   = true;     // 距离
-    bool m_enableTeammate  = true;     // 显示队友 (默认开, 否则同队全部被过滤)
-    bool m_enableMinimap   = true;     // 小地图
-    bool m_enableLoot      = true;     // 物资显示
-    bool m_enableLootESP   = true;     // 物资3D名称标签
-    bool m_enableContainer = true;     // 物资箱
+    bool m_enableSnapline  = false;    // 底部射线
+    bool m_enableName      = false;    // 玩家名
+    bool m_enableHP        = false;    // 血条
+    bool m_enableDistance   = false;    // 距离
+    bool m_enableTeammate  = false;    // 显示队友
+    bool m_enableMinimap   = false;    // 小地图
+    bool m_enableLoot      = false;    // 物资显示
+    bool m_enableLootESP   = false;    // 物资3D名称标签
+    bool m_enableContainer = false;    // 物资箱
     bool m_enableRemoteOpen = false;   // 物资箱远程开箱按钮 (默认关 — 风控敏感)
     bool m_enablePlayerList = false;   // 玩家列表面板
-    bool m_enableArmor     = true;     // 护甲/头盔显示
+    bool m_enableArmor     = false;    // 护甲/头盔显示
     bool m_filterAmmo      = true;     // 过滤弹药
     bool m_filterJunk      = true;     // 过滤杂物
     float m_minimapSize    = 200.0f;

@@ -192,6 +192,7 @@ static void DfmGuiThread() {
         .screenHeight = displayInfo.height,
         .rotateTheta = displayInfo.rotateTheta,
         .clientConnectAddress = "127.0.0.1",
+        .port = 16889,  // DFM 专用端口 (PUBG=16888, DFM=16889, NRC=16890)
     };
 
     // 检测游戏进程存活 (用于退出重试循环)

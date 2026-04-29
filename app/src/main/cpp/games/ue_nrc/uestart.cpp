@@ -115,6 +115,7 @@ static void NrcGuiThread() {
         .screenHeight = dpy.height,
         .rotateTheta = dpy.rotateTheta,
         .clientConnectAddress = "127.0.0.1",
+        .port = 16890,  // NRC 专用端口 (PUBG=16888, DFM=16889, NRC=16890)
     };
 
     std::unique_ptr<android::AImGui> imgui;

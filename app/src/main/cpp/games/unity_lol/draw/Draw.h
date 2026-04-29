@@ -29,7 +29,7 @@ namespace draw {
         bool m_panelExpanded = true;
         bool m_enableESP     = false;
         bool m_enableRadar   = false;
-        bool m_enableInfo    = true;
+        bool m_enableInfo    = false;
         bool m_enableHeroInfo = false;
         bool m_enableWards   = false;
         bool m_enableSkillRange = false;

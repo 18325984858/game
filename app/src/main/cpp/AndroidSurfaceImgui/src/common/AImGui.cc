@@ -953,7 +953,7 @@ namespace android
 
         // Initialize rpc
         m_transportAddress.sin_family = AF_INET;
-        m_transportAddress.sin_port = htons(16888);
+        m_transportAddress.sin_port = htons(static_cast<uint16_t>(m_options.port > 0 ? m_options.port : 16888));
         if (RenderType::RenderClient == m_options.renderType)
         {
             inet_pton(AF_INET, m_options.clientConnectAddress.data(), &m_transportAddress.sin_addr);

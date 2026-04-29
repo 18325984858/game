@@ -2,7 +2,6 @@ package com.example.dobbyproject;
 
 import android.app.usage.UsageEvents;
 import android.app.usage.UsageStatsManager;
-import android.app.ActivityManager;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
@@ -30,56 +29,62 @@ import android.view.WindowMetrics;
 
 import androidx.core.app.NotificationCompat;
 
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+/**
+ * 多游戏 Overlay 服务: 同一时刻只保留 1 个活动 overlay (TextureView + RenderServer),
+ * 按前台游戏包动态切换.
+ *
+ * 为什么不能同时开 3 个 RenderServer:
+ *   dear imgui 在同一进程内是全局单例 (GImGui + BackendRendererUserData),
+ *   并发 Init 会触发 imgui_impl_opengl3.cpp:267 的 assert "Already initialized a renderer backend!"
+ *   导致 SIGABRT 整个 service 进程.
+ *
+ * 端口分配 (与 PublicOverlayBridge / 各游戏 uestart.cpp 一致):
+ *   PUBG = 16888
+ *   DFM  = 16889
+ *   NRC  = 16890
+ * 游戏端 RenderClient 用各自端口连本机回环, 切换时旧 client 自然 ECONNREFUSED 重试.
+ */
 public class Ue4OverlayService extends Service {
     public static final String ACTION_START = "com.example.dobbyproject.action.START_UE4_OVERLAY";
     public static final String ACTION_STOP = "com.example.dobbyproject.action.STOP_UE4_OVERLAY";
+    /** 可选 Intent extra: 明确指定要 overlay 的游戏包名。传入后会立即创建 overlay,
+     *  不再需要 UsageStats 权限轮询。 */
+    public static final String EXTRA_PACKAGE = "com.example.dobbyproject.extra.PACKAGE";
 
     private static final String TAG = "UE4OverlayService";
     private static final String CHANNEL_ID = "ue4_overlay_debug";
     private static final int NOTIFICATION_ID = 1107;
     private static final float TOUCH_PASSTHROUGH_ALPHA = 0.7f;
-    private static final long OVERLAY_LAYOUT_SYNC_INTERVAL_MS = 500L;
-    private static final String[] GAME_PACKAGES = {
-        "com.tencent.tmgp.pubgmhd",
-        "com.tencent.tmgp.dfm",
-        "com.tencent.nrc"
-    };
-    private static final long GAME_ALIVE_CHECK_INTERVAL_MS = 2000L;
+    private static final long FOREGROUND_POLL_INTERVAL_MS = 800L;
+
+    /** package -> RenderServer 端口 */
+    private static final Map<String, Integer> GAME_PORT_MAP = new LinkedHashMap<>();
+    static {
+        GAME_PORT_MAP.put("com.tencent.tmgp.pubgmhd", PublicOverlayBridge.PORT_PUBG);
+        GAME_PORT_MAP.put("com.tencent.tmgp.dfm",     PublicOverlayBridge.PORT_DFM);
+        GAME_PORT_MAP.put("com.tencent.nrc",          PublicOverlayBridge.PORT_NRC);
+    }
 
     private WindowManager windowManager;
     private PowerManager.WakeLock wakeLock;
-    private OverlayTextureView overlayTextureView;
-    private Surface overlaySurface;
-    private WindowManager.LayoutParams overlayLayoutParams;
-    private int lastRendererWidth = 0;
-    private int lastRendererHeight = 0;
-    private int lastRendererRotation = -1;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
-    private final Runnable overlayLayoutSyncRunnable = new Runnable() {
-        @Override
-        public void run() {
-            syncOverlayLayout();
-            updateOverlayVisibility();
-            if (overlayTextureView != null) {
-                mainHandler.postDelayed(this, OVERLAY_LAYOUT_SYNC_INTERVAL_MS);
-            }
-        }
-    };
-    private final Runnable gameAliveCheckRunnable = new Runnable() {
-        @Override
-        public void run() {
-            // 不检测游戏进程 — Android 14+ 无法可靠检测其他 UID 的进程
-            // overlay 清理依赖: RenderClient 断线 → RenderServer 检测到 → 清屏
-            // 用户手动 stopSelf 或系统回收
-            mainHandler.postDelayed(this, GAME_ALIVE_CHECK_INTERVAL_MS);
-        }
-    };
+    /** 同一时刻最多 1 个 (ImGui 全局状态限制). null 表示当前前台不是已知游戏. */
+    private GameOverlay activeOverlay;
 
-    private boolean isGameRunning() {
-        // Android 14+ getRunningAppProcesses() 只返回自己 UID 的进程，无法检测其他 app
-        // 改用 /proc 扫描
-        return isGameProcessRunning();
-    }
+    private final Runnable foregroundPollRunnable = new Runnable() {
+        @Override
+        public void run() {
+            try {
+                syncActiveOverlayWithForeground();
+            } catch (Throwable t) {
+                Log.e(TAG, "foregroundPoll 异常", t);
+            }
+            mainHandler.postDelayed(this, FOREGROUND_POLL_INTERVAL_MS);
+        }
+    };
 
     @Override
     public void onCreate() {
@@ -87,7 +92,6 @@ public class Ue4OverlayService extends Service {
         Log.w(TAG, "=== onCreate: overlay 服务启动 pid=" + android.os.Process.myPid() + " ===");
         windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
 
-        // 获取 PARTIAL_WAKE_LOCK 防止进程被 freeze (保持 CPU 活跃, TCP listen socket 不被清理)
         PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
         if (pm != null) {
             wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "dobby:overlay_wakelock");
@@ -102,9 +106,9 @@ public class Ue4OverlayService extends Service {
         } else {
             startForeground(NOTIFICATION_ID, notification);
         }
-        // 尽早创建 overlay view, 不等 onStartCommand, 避免服务被冻结前未初始化
+
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M || Settings.canDrawOverlays(this)) {
-            ensureOverlayView();
+            // 不在 onCreate 启动 polling; 等 onStartCommand 决定是显式指定还是 fallback 轮询
         } else {
             Log.e(TAG, "onCreate: 缺少悬浮窗权限");
         }
@@ -124,16 +128,25 @@ public class Ue4OverlayService extends Service {
             return START_NOT_STICKY;
         }
 
-        ensureOverlayView();
+        // 优先使用 Intent 中的明确包名 (不依赖 UsageStats)
+        String requestedPkg = intent != null ? intent.getStringExtra(EXTRA_PACKAGE) : null;
+        if (requestedPkg != null && GAME_PORT_MAP.containsKey(requestedPkg)) {
+            Log.w(TAG, "onStartCommand: 显式指定游戏 pkg=" + requestedPkg);
+            // 关闭 UsageStats 轮询, 避免误判前台拆掉 overlay
+            mainHandler.removeCallbacks(foregroundPollRunnable);
+            switchActiveOverlayTo(requestedPkg);
+        } else if (activeOverlay == null) {
+            // 只有在完全没有明确请求且当前无 overlay 时才轮询
+            startForegroundPolling();
+        }
         return START_STICKY;
     }
 
     @Override
     public void onDestroy() {
-        PublicOverlayBridge.stopRenderer();
-        mainHandler.removeCallbacks(overlayLayoutSyncRunnable);
-        mainHandler.removeCallbacks(gameAliveCheckRunnable);
-        removeOverlayView();
+        mainHandler.removeCallbacks(foregroundPollRunnable);
+        teardownActiveOverlay();
+        PublicOverlayBridge.stopAllRenderers();
         if (wakeLock != null && wakeLock.isHeld()) {
             wakeLock.release();
             Log.w(TAG, "=== WakeLock released ===");
@@ -147,158 +160,152 @@ public class Ue4OverlayService extends Service {
         return null;
     }
 
-    private void ensureOverlayView() {
-        if (overlayTextureView != null) {
+    private void startForegroundPolling() {
+        mainHandler.removeCallbacks(foregroundPollRunnable);
+        mainHandler.post(foregroundPollRunnable);
+    }
+
+    /** 明确切换到指定游戏的 overlay (由 MainActivity 启动时调用). */
+    private void switchActiveOverlayTo(String pkg) {
+        Integer port = GAME_PORT_MAP.get(pkg);
+        if (port == null) return;
+        if (activeOverlay != null && activeOverlay.pkg.equals(pkg)) {
+            return;
+        }
+        if (activeOverlay != null) {
+            Log.w(TAG, "切换 overlay (显式): " + activeOverlay.pkg + " -> " + pkg);
+            teardownActiveOverlay();
+        }
+        activeOverlay = createOverlayFor(pkg, port);
+    }
+
+    /** 检查前台 package, 必要时切换 active overlay. 同一时刻只保留 1 个. */
+    private void syncActiveOverlayWithForeground() {
+        String frontPkg = getForegroundPackage();
+        Integer port = frontPkg != null ? GAME_PORT_MAP.get(frontPkg) : null;
+
+        if (port == null) {
+            // 前台不是任何已知游戏 → 销毁现有 overlay 释放 ImGui 全局状态
+            if (activeOverlay != null) {
+                Log.w(TAG, "前台非游戏 (" + frontPkg + "), 销毁 overlay pkg=" + activeOverlay.pkg);
+                teardownActiveOverlay();
+            }
             return;
         }
 
-        Log.w(TAG, "ensureOverlayView: 开始创建 TextureView pid=" + android.os.Process.myPid());
+        if (activeOverlay != null && activeOverlay.pkg.equals(frontPkg)) {
+            // 同一游戏继续保持; 顺便同步尺寸
+            syncOverlayLayout();
+            return;
+        }
 
+        // 切换到新游戏
+        if (activeOverlay != null) {
+            Log.w(TAG, "切换 overlay: " + activeOverlay.pkg + " -> " + frontPkg);
+            teardownActiveOverlay();
+        } else {
+            Log.w(TAG, "前台游戏激活: " + frontPkg + " port=" + port);
+        }
+        activeOverlay = createOverlayFor(frontPkg, port);
+    }
+
+    private GameOverlay createOverlayFor(String pkg, int port) {
+        Log.w(TAG, "createOverlayFor: pkg=" + pkg + " port=" + port);
+
+        OverlayTextureView view;
         try {
-            overlayTextureView = new OverlayTextureView(this);
+            view = new OverlayTextureView(this, pkg, port);
         } catch (Exception e) {
-            Log.e(TAG, "ensureOverlayView: 创建 OverlayTextureView 失败", e);
-            return;
+            Log.e(TAG, "createOverlayFor: 创建 TextureView 失败 pkg=" + pkg, e);
+            return null;
         }
-        Point displaySize = getCurrentDisplaySize();
 
+        Point displaySize = getCurrentDisplaySize();
         int windowType = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
                 ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
                 : WindowManager.LayoutParams.TYPE_PHONE;
-
         int flags = WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
                 | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
                 | WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                 | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
                 | WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED;
-
-        WindowManager.LayoutParams layoutParams = new WindowManager.LayoutParams(
-                displaySize.x,
-                displaySize.y,
-                windowType,
-                flags,
-                PixelFormat.TRANSLUCENT
-        );
-        layoutParams.gravity = Gravity.TOP | Gravity.START;
-        layoutParams.alpha = TOUCH_PASSTHROUGH_ALPHA;
-        layoutParams.setTitle("UE4DebugOverlay");
+        WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
+                displaySize.x, displaySize.y, windowType, flags, PixelFormat.TRANSLUCENT);
+        lp.gravity = Gravity.TOP | Gravity.START;
+        lp.alpha = TOUCH_PASSTHROUGH_ALPHA;
+        lp.setTitle("UE4DebugOverlay-" + pkg);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            layoutParams.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
+            lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
         }
-        overlayLayoutParams = layoutParams;
+        view.setVisibility(View.VISIBLE);
 
         try {
-            windowManager.addView(overlayTextureView, layoutParams);
+            windowManager.addView(view, lp);
         } catch (Exception e) {
-            Log.e(TAG, "ensureOverlayView: addView 失败", e);
-            overlayTextureView = null;
-            return;
+            Log.e(TAG, "createOverlayFor: addView 失败 pkg=" + pkg, e);
+            return null;
         }
-        startOverlayLayoutSync();
-        startGameAliveCheck();
-        Log.w(TAG, "=== Overlay TextureView 已添加 alpha=" + TOUCH_PASSTHROUGH_ALPHA + " size=" + displaySize.x + "x" + displaySize.y + " pid=" + android.os.Process.myPid() + " ===");
+
+        Log.w(TAG, "=== Overlay 已添加 pkg=" + pkg + " port=" + port + " size=" + displaySize.x + "x" + displaySize.y + " ===");
+        return new GameOverlay(pkg, port, view, lp);
     }
 
-    private void removeOverlayView() {
-        if (overlayTextureView == null) {
-            return;
-        }
-
-        PublicOverlayBridge.stopRenderer();
-        releaseOverlaySurface();
-
+    private void teardownActiveOverlay() {
+        if (activeOverlay == null) return;
+        GameOverlay ov = activeOverlay;
+        activeOverlay = null;
+        // 1. 先停 RenderServer (关闭 ImGui context, 释放 BackendRendererUserData)
+        PublicOverlayBridge.stopRenderer(ov.port);
+        // 2. 再 removeView (会触发 onSurfaceTextureDestroyed, 但 RenderServer 已停, 不会重复)
         try {
-            overlayTextureView.setVisibility(View.INVISIBLE);
-            windowManager.removeViewImmediate(overlayTextureView);
+            windowManager.removeViewImmediate(ov.view);
         } catch (Exception e) {
-            Log.e(TAG, "移除 Overlay TextureView 失败", e);
+            Log.e(TAG, "removeView 失败 pkg=" + ov.pkg, e);
         }
-        overlayTextureView = null;
-        overlayLayoutParams = null;
-    }
-
-    private void startOverlayLayoutSync() {
-        mainHandler.removeCallbacks(overlayLayoutSyncRunnable);
-        mainHandler.post(overlayLayoutSyncRunnable);
+        ov.releaseSurface();
+        Log.w(TAG, "=== Overlay 已销毁 pkg=" + ov.pkg + " port=" + ov.port + " ===");
     }
 
     private void syncOverlayLayout() {
-        if (overlayTextureView == null || overlayLayoutParams == null) {
-            return;
-        }
-
+        if (activeOverlay == null) return;
         Point displaySize = getCurrentDisplaySize();
-        if (displaySize.x <= 0 || displaySize.y <= 0) {
-            return;
-        }
-
-        if (overlayLayoutParams.width == displaySize.x && overlayLayoutParams.height == displaySize.y) {
-            return;
-        }
-
-        overlayLayoutParams.width = displaySize.x;
-        overlayLayoutParams.height = displaySize.y;
+        if (displaySize.x <= 0 || displaySize.y <= 0) return;
+        if (activeOverlay.layoutParams.width == displaySize.x
+                && activeOverlay.layoutParams.height == displaySize.y) return;
+        activeOverlay.layoutParams.width = displaySize.x;
+        activeOverlay.layoutParams.height = displaySize.y;
         try {
-            windowManager.updateViewLayout(overlayTextureView, overlayLayoutParams);
-            Log.i(TAG, "Overlay 布局刷新为 " + displaySize.x + "x" + displaySize.y);
+            windowManager.updateViewLayout(activeOverlay.view, activeOverlay.layoutParams);
         } catch (Exception e) {
-            Log.e(TAG, "刷新 Overlay 布局失败", e);
+            Log.e(TAG, "刷新 Overlay 布局失败 pkg=" + activeOverlay.pkg, e);
         }
     }
 
     private Point getCurrentDisplaySize() {
         Point size = new Point(1, 1);
-        if (windowManager == null) {
-            return size;
-        }
-
+        if (windowManager == null) return size;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             WindowMetrics metrics = windowManager.getMaximumWindowMetrics();
             size.x = metrics.getBounds().width();
             size.y = metrics.getBounds().height();
             return size;
         }
-
         Display display = windowManager.getDefaultDisplay();
         display.getRealSize(size);
         return size;
     }
 
     private int getCurrentDisplayRotationDegrees() {
-        if (windowManager == null) {
-            return 0;
-        }
-
+        if (windowManager == null) return 0;
         Display display = windowManager.getDefaultDisplay();
-        if (display == null) {
-            return 0;
-        }
-
+        if (display == null) return 0;
         return display.getRotation() * 90;
     }
 
-    private void releaseOverlaySurface() {
-        if (overlaySurface == null) {
-            return;
-        }
-
-        overlaySurface.release();
-        overlaySurface = null;
-    }
-
-    private void updateOverlayVisibility() {
-        if (overlayTextureView == null) return;
-        boolean gameInFront = isGameInForeground();
-        int desired = gameInFront ? View.VISIBLE : View.INVISIBLE;
-        if (overlayTextureView.getVisibility() != desired) {
-            overlayTextureView.setVisibility(desired);
-        }
-    }
-
-    private boolean isGameInForeground() {
+    private String getForegroundPackage() {
         try {
             UsageStatsManager usm = (UsageStatsManager) getSystemService(Context.USAGE_STATS_SERVICE);
-            if (usm == null) return true;
+            if (usm == null) return null;
             long now = System.currentTimeMillis();
             UsageEvents events = usm.queryEvents(now - 2000, now);
             String lastPkg = null;
@@ -309,13 +316,9 @@ public class Ue4OverlayService extends Service {
                     lastPkg = event.getPackageName();
                 }
             }
-            if (lastPkg == null) return true; // 无法判断时默认显示
-            for (String pkg : GAME_PACKAGES) {
-                if (pkg.equals(lastPkg)) return true;
-            }
-            return false;
+            return lastPkg;
         } catch (Exception e) {
-            return true; // 异常时默认显示
+            return null;
         }
     }
 
@@ -323,118 +326,99 @@ public class Ue4OverlayService extends Service {
         return new NotificationCompat.Builder(this, CHANNEL_ID)
                 .setSmallIcon(android.R.drawable.ic_menu_view)
                 .setContentTitle("UE4 Overlay 调试中")
-                .setContentText("公开 API 悬浮层已启动")
+                .setContentText("公开 API 多游戏 overlay 已启动")
                 .setOngoing(true)
                 .setSilent(true)
                 .build();
     }
 
     private void createNotificationChannel() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
-            return;
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return;
+        NotificationChannel channel = new NotificationChannel(
+                CHANNEL_ID, "UE4 Overlay", NotificationManager.IMPORTANCE_DEFAULT);
+        channel.setDescription("UE4 公开 API 调试悬浮层");
+        NotificationManager manager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+        if (manager != null) manager.createNotificationChannel(channel);
+    }
+
+    // ---- 内部数据结构 -------------------------------------------------------
+
+    private static final class GameOverlay {
+        final String pkg;
+        final int port;
+        final OverlayTextureView view;
+        final WindowManager.LayoutParams layoutParams;
+
+        GameOverlay(String pkg, int port, OverlayTextureView view, WindowManager.LayoutParams lp) {
+            this.pkg = pkg;
+            this.port = port;
+            this.view = view;
+            this.layoutParams = lp;
         }
 
-        NotificationChannel channel = new NotificationChannel(
-                CHANNEL_ID,
-                "UE4 Overlay",
-                NotificationManager.IMPORTANCE_DEFAULT
-        );
-        channel.setDescription("UE4 公开 API 调试悬浮层");
-
-        NotificationManager manager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
-        if (manager != null) {
-            manager.createNotificationChannel(channel);
+        void releaseSurface() {
+            view.releaseSurface();
         }
     }
 
     private final class OverlayTextureView extends TextureView implements TextureView.SurfaceTextureListener {
-        OverlayTextureView(Context context) {
+        private final String pkg;
+        private final int port;
+        private Surface surface;
+        private int lastW = 0, lastH = 0, lastR = -1;
+
+        OverlayTextureView(Context context, String pkg, int port) {
             super(context);
+            this.pkg = pkg;
+            this.port = port;
             setOpaque(false);
             setSurfaceTextureListener(this);
+        }
+
+        void releaseSurface() {
+            if (surface != null) {
+                surface.release();
+                surface = null;
+            }
         }
 
         @Override
         public void onSurfaceTextureAvailable(SurfaceTexture surfaceTexture, int width, int height) {
             int rotateTheta = getCurrentDisplayRotationDegrees();
-            Log.w(TAG, "=== onSurfaceTextureAvailable width=" + width + " height=" + height + " rotate=" + rotateTheta + " pid=" + android.os.Process.myPid() + " ===");
-            PublicOverlayBridge.stopRenderer();
-            releaseOverlaySurface();
-            overlaySurface = new Surface(surfaceTexture);
-            boolean started = PublicOverlayBridge.startRenderer(overlaySurface, width, height, rotateTheta);
-            Log.w(TAG, "=== RenderServer started=" + started + " ===");
-            lastRendererWidth = width;
-            lastRendererHeight = height;
-            lastRendererRotation = rotateTheta;
+            Log.w(TAG, "=== onSurfaceTextureAvailable pkg=" + pkg + " port=" + port
+                    + " width=" + width + " height=" + height + " rotate=" + rotateTheta + " ===");
+            PublicOverlayBridge.stopRenderer(port);
+            releaseSurface();
+            surface = new Surface(surfaceTexture);
+            boolean started = PublicOverlayBridge.startRenderer(surface, width, height, rotateTheta, port);
+            Log.w(TAG, "=== RenderServer started pkg=" + pkg + " port=" + port + " ok=" + started + " ===");
+            lastW = width; lastH = height; lastR = rotateTheta;
         }
 
         @Override
         public void onSurfaceTextureSizeChanged(SurfaceTexture surfaceTexture, int width, int height) {
             int rotateTheta = getCurrentDisplayRotationDegrees();
-            // 尺寸和旋转均未变化时跳过重建, 避免 layout sync 触发的无效重启闪烁
-            if (width == lastRendererWidth && height == lastRendererHeight && rotateTheta == lastRendererRotation) {
-                Log.d(TAG, "onSurfaceTextureSizeChanged same size/rotation, skip restart");
+            if (width == lastW && height == lastH && rotateTheta == lastR) {
                 return;
             }
-            Log.i(TAG, "onSurfaceTextureSizeChanged width=" + width + " height=" + height + " rotate=" + rotateTheta);
-            PublicOverlayBridge.stopRenderer();
-            releaseOverlaySurface();
-            overlaySurface = new Surface(surfaceTexture);
-            PublicOverlayBridge.startRenderer(overlaySurface, width, height, rotateTheta);
-            lastRendererWidth = width;
-            lastRendererHeight = height;
-            lastRendererRotation = rotateTheta;
+            Log.i(TAG, "onSurfaceTextureSizeChanged pkg=" + pkg + " port=" + port
+                    + " width=" + width + " height=" + height + " rotate=" + rotateTheta);
+            PublicOverlayBridge.stopRenderer(port);
+            releaseSurface();
+            surface = new Surface(surfaceTexture);
+            PublicOverlayBridge.startRenderer(surface, width, height, rotateTheta, port);
+            lastW = width; lastH = height; lastR = rotateTheta;
         }
 
         @Override
         public boolean onSurfaceTextureDestroyed(SurfaceTexture surfaceTexture) {
-            Log.i(TAG, "onSurfaceTextureDestroyed");
-            PublicOverlayBridge.stopRenderer();
-            releaseOverlaySurface();
+            Log.i(TAG, "onSurfaceTextureDestroyed pkg=" + pkg + " port=" + port);
+            PublicOverlayBridge.stopRenderer(port);
+            releaseSurface();
             return true;
         }
 
         @Override
-        public void onSurfaceTextureUpdated(SurfaceTexture surfaceTexture) {
-        }
-    }
-
-    private void startGameAliveCheck() {
-        mainHandler.removeCallbacks(gameAliveCheckRunnable);
-        // 首次检查延迟 10 秒, 给游戏进程充足的启动时间
-        mainHandler.postDelayed(gameAliveCheckRunnable, 10_000L);
-    }
-
-    private boolean isGameProcessRunning() {
-        try {
-            java.io.File procDir = new java.io.File("/proc");
-            java.io.File[] entries = procDir.listFiles();
-            if (entries == null) return true; // 无法访问 /proc, 假设存活
-            for (java.io.File entry : entries) {
-                if (!entry.isDirectory()) continue;
-                try {
-                    Integer.parseInt(entry.getName());
-                } catch (NumberFormatException e) {
-                    continue; // 非 PID 目录
-                }
-                java.io.File cmdline = new java.io.File(entry, "cmdline");
-                try (java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.FileReader(cmdline))) {
-                    String line = reader.readLine();
-                    if (line != null) {
-                        for (String pkg : GAME_PACKAGES) {
-                            if (line.contains(pkg)) {
-                                return true;
-                            }
-                        }
-                    }
-                } catch (Exception ignored) {
-                    // 无权限读取, 跳过
-                }
-            }
-        } catch (Exception e) {
-            Log.w(TAG, "检查游戏进程失败", e);
-            return true; // 检查失败时假设存活, 避免误杀
-        }
-        return false;
+        public void onSurfaceTextureUpdated(SurfaceTexture surfaceTexture) { }
     }
 }

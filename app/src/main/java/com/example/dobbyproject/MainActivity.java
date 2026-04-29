@@ -473,8 +473,15 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void startUe4OverlayService() {
+        startUe4OverlayService(null);
+    }
+
+    private void startUe4OverlayService(String gamePkg) {
         Intent intent = new Intent(this, Ue4OverlayService.class);
         intent.setAction(Ue4OverlayService.ACTION_START);
+        if (gamePkg != null) {
+            intent.putExtra(Ue4OverlayService.EXTRA_PACKAGE, gamePkg);
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             startForegroundService(intent);
         } else {
@@ -1181,7 +1188,7 @@ public class MainActivity extends AppCompatActivity {
                 return;
             }
 
-            startUe4OverlayService();
+            startUe4OverlayService(spec.pkg);
             btn.setEnabled(false);
 
             boolean enableUeDumper = cbDumper.isChecked();

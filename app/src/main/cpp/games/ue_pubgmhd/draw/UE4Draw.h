@@ -248,24 +248,24 @@ private:
     int m_lastFallbackESP  = 0;
 
     // ---- AI 屏幕检测 (NCNN NanoDet, 通过 screencap 旁路截屏, 无任何 Hook) ----
-    bool  m_enableAIDetect = true;              // 总开关 (默认开)
+    bool  m_enableAIDetect = false;             // 总开关 (默认关)
     float m_aiScoreThr     = 0.25f;             // 置信度阈值
     int   m_aiIntervalMs   = 120;               // 推理间隔 (~8 fps)
-    bool  m_aiOnlyPerson   = true;              // 仅显示 person 类(COCO 0)
+    bool  m_aiOnlyPerson   = false;             // 仅显示 person 类(COCO 0)
     float m_aiBoxColor[3]  = {1.0f, 0.4f, 0.1f}; // 默认橙红
     float m_aiBoxThickness = 2.0f;
-    bool  m_aiDrawScore    = true;
+    bool  m_aiDrawScore    = false;
 
     // ---- AI 辅助瞄准 (仅基于 AI 检测结果, 不读内存) ----
-    bool  m_aiAimEnable    = true;              // 总开关 (默认开视觉锁定)
-    bool  m_aiAimVisualOnly= true;              // true=仅视觉锁定指示; false=触屏注入
+    bool  m_aiAimEnable    = false;             // 总开关 (默认关)
+    bool  m_aiAimVisualOnly= false;             // true=仅视觉锁定指示; false=触屏注入
     float m_aiAimFovRadius = 500.0f;            // FOV 圆半径(像素)
     float m_aiAimHeadRatio = 0.18f;             // 目标头部位置占框高度的比例(0=顶,1=底)
     float m_aiAimSmoothing = 0.55f;             // 平滑系数(0=瞬移,1=完全不动)
     float m_aiAimSensitivityX = 1.0f;           // 像素→触屏拖拽 X 灵敏度倍数
     float m_aiAimSensitivityY = 1.0f;           //                         Y
     int   m_aiAimMinScore  = 15;                // 最低置信度(*100, NanoDet 在游戏画面上识别偏低)
-    bool  m_aiAimOnlyPerson= true;              // 只锁定 person 类
+    bool  m_aiAimOnlyPerson= false;             // 只锁定 person 类
     bool  m_aiAimRequireTrigger = false;        // 视觉模式下默认不需要按住
 
     // ---- 子绘制 ----

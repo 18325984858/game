@@ -58,6 +58,9 @@ namespace android
             ANativeWindow *externalNativeWindow = nullptr;
             std::string serverListenAddress = "127.0.0.1";
             std::string clientConnectAddress = "127.0.0.1";
+            // RenderServer 监听端口 / RenderClient 连接端口
+            // 默认 16888 (PUBG); DFM=16889; NRC=16890; 不同游戏使用不同端口避免占用冲突
+            int port = 16888;
         };
 
     public:
@@ -101,7 +104,10 @@ namespace android
         double m_lastTime = 0.0;
 
         Options m_options;
-        size_t m_maxPacketSize = 8 * 1024 * 1024; // 8MB, enough for Chinese font atlas exchange
+        // 16MB. Chinese font atlas (4096x2048 RGBA = 32MB?) is sent via separate font packet path,
+        // but font packet header carries size 8388616 (8MB+8B) that previously exceeded 8MB cap and
+        // caused server to disconnect DFM client immediately ("Packet is too large: 8").
+        size_t m_maxPacketSize = 16 * 1024 * 1024;
         sockaddr_in m_transportAddress{};
         int m_serverFd = -1, m_clientFd = -1;
         std::atomic<bool> m_clientConnected{false};  // 渲染线程安全的连接状态
