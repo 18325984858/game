@@ -1,116 +1,307 @@
-# il2cppDumper
+# Dobby Project
 
-## Windows-llvm + Android NDK
+一个基于 Android NDK + 自定义 Windows-LLVM 前端（带 OLLVM/Polaris 混淆）的多游戏运行时分析 / Overlay 框架。
+项目同时支持 Unity（IL2CPP）与 Unreal Engine（UE4 / UE5）目标，集成了内存读取、SO Dump、注入器、KernelPatch 控制、反调试 / 反 Frida、AI 屏检（NCNN + NanoDet）等模块。
 
-This project can drive the repo-local Windows-llvm frontend while still using the Android NDK toolchain for `--target`, `--sysroot`, and platform libraries.
+> 仅供学习与逆向研究使用。
 
-### Runtime DLLs required by `Windows-llvm/bin/clang(.exe)`
+---
 
-Copy these three DLLs into `Windows-llvm/bin` after a fresh environment setup:
+## 目录
 
-- `libgcc_s_seh-1.dll`
-- `libstdc++-6.dll`
-- `libwinpthread-1.dll`
+- [项目目录结构](#项目目录结构)
+- [功能模块说明](#功能模块说明)
+- [技术栈与开源项目](#技术栈与开源项目)
+- [开发环境 / 编译要求](#开发环境--编译要求)
+- [克隆与编译步骤](#克隆与编译步骤)
+- [Windows-LLVM 前端 + Android NDK](#windows-llvm-前端--android-ndk)
+- [常用命令](#常用命令)
 
-Verified source on this machine:
+---
 
-- `C:\Program Files\Git\mingw64\bin\libgcc_s_seh-1.dll`
-- `C:\Program Files\Git\mingw64\bin\libstdc++-6.dll`
-- `C:\Program Files\Git\mingw64\bin\libwinpthread-1.dll`
+## 项目目录结构
 
-If these DLLs are missing, `Windows-llvm/bin/clang.exe --version` will usually fail with `0xC0000135`.
-
-### How the frontend is wired in
-
-The Android NDK toolchain will overwrite `CMAKE_C_COMPILER` and `CMAKE_CXX_COMPILER`, so this project does not replace the compiler directly.
-
-Instead, the wiring is:
-
-1. `app/build.gradle.kts` passes `CMAKE_C_COMPILER_LAUNCHER` and `CMAKE_CXX_COMPILER_LAUNCHER`.
-2. `tools/windows_llvm_launcher.cmd` is the launcher entry used by CMake/Ninja.
-3. `tools/windows_llvm_launcher_host/WindowsLlvmLauncher.exe` forwards every original clang argument with `ProcessStartInfo.ArgumentList`.
-4. The launcher swaps the frontend to `Windows-llvm/bin/clang.exe` or `clang++.exe` and injects the correct `-resource-dir` for `Windows-llvm/clang/16`.
-
-### Build the launcher host
-
-If `tools/windows_llvm_launcher_host/WindowsLlvmLauncher.exe` is missing, rebuild it with:
-
-```powershell
-dotnet publish .\tools\windows_llvm_launcher_host\WindowsLlvmLauncher.csproj -c Release -o .\tools\windows_llvm_launcher_host
+```
+game/
+├── app/
+│   ├── build.gradle.kts                # AGP 模块构建脚本（NDK / CMake / Windows-LLVM 接线）
+│   ├── proguard-rules.pro
+│   └── src/main/
+│       ├── AndroidManifest.xml
+│       ├── assets/                     # 字体、模型等资源
+│       ├── res/                        # 布局、图标
+│       ├── java/com/example/dobbyproject/   # Java 层
+│       │   ├── MainActivity.java
+│       │   ├── GameLauncher.java
+│       │   ├── InjectHideActivity.java     # KPM 注入隐藏控制
+│       │   ├── MemoryReaderActivity.java   # 跨进程内存读取 UI
+│       │   ├── SoDumperActivity.java       # 运行时 SO Dump UI
+│       │   ├── PublicOverlayBridge.java    # Overlay 桥
+│       │   ├── Ue4OverlayService.java      # UE4 Overlay 后台服务
+│       │   ├── AIScreenDetect.java         # NCNN 屏检入口
+│       │   ├── Arm64Disassembler.java
+│       │   └── KpKeyStore.java / SuShell.java / Deploy.java
+│       └── cpp/                        # 全部 Native 源码（见下）
+│           ├── CMakeLists.txt
+│           ├── core/                   # 跨游戏基础设施
+│           │   ├── log/                # 日志
+│           │   ├── file/               # 文件 IO
+│           │   ├── overlay/            # PublicOverlayRenderer（ImGui 渲染层）
+│           │   ├── stealth/            # stealth_hooks（隐藏自身）
+│           │   └── anti_debug/         # 反调试 / 反 Frida 自检线程
+│           ├── memory/                 # /proc/<pid>/mem 跨进程读取 + JNI
+│           ├── so_dumper/              # 运行时 SO dump + JNI
+│           ├── injector/               # 注入器实现（同时被 libinjector.so 复用）
+│           ├── parasite/               # D 方案 / 寄生执行骨架
+│           ├── stack_spoof/            # ARM64 sleep-mask 调用栈伪造
+│           ├── kpatch/                 # KernelPatch / KPM 控制 + JNI
+│           ├── ai_overlay/             # NCNN + NanoDet 屏检管线 + JNI
+│           ├── pvr_helper/             # PVR 纹理辅助
+│           ├── ncnn/<ABI>/             # 预编译 ncnn 静态库（按 ABI）
+│           ├── Dobby/                  # Dobby Hook 框架（子模块/源码）
+│           ├── AndroidSurfaceImgui/    # Android Surface + ImGui 渲染
+│           ├── Polaris-Obfuscator/     # OLLVM/Polaris 混淆器源码
+│           └── games/                  # 游戏适配层（一种游戏一个目录）
+│               ├── unity_lol/          # Unity / IL2CPP 通用 + 英雄联盟手游
+│               │   ├── il2cpp_dumper/  # IL2CPP 运行时 Dump
+│               │   ├── il2cpp_header/
+│               │   ├── unity_api/      # Unity API 包装
+│               │   ├── draw/           # Draw.cpp（绘制）
+│               │   ├── symbol/         # Symbol.cpp（符号解析）
+│               │   ├── lol/lolm.cpp    # LoL 业务逻辑
+│               │   └── interface/      # ImGui 菜单
+│               ├── ue_pubgmhd/         # UE4 / 和平精英 (PUBGMHD)
+│               │   ├── engine/         # UE4Struct/Dumper/Header
+│               │   ├── draw/UE4Draw.cpp
+│               │   ├── pubgmhd/pubgmhd.cpp
+│               │   └── interface/
+│               ├── ue_dfm/             # UE5 / 三角洲行动 (DFM)
+│               │   ├── engine/         # UE5DfmStruct/Dumper + UE5Header
+│               │   ├── draw/DfmDraw.cpp
+│               │   ├── dfm/            # dfm.cpp + dfm_item_registry.cpp
+│               │   └── interface/
+│               └── ue_nrc/             # UE 4.26 / 洛克王国手游 (NRC)
+│                   ├── engine/
+│                   └── nrc/nrc.cpp
+├── tools/
+│   ├── windows_llvm_launcher.cmd       # CMake/Ninja 用 launcher
+│   └── windows_llvm_launcher_host/     # C# 编写的 launcher 实现
+├── gradle/libs.versions.toml           # 版本目录
+├── settings.gradle.kts
+├── build.gradle.kts
+├── gradlew / gradlew.bat
+├── build_obfuscated.bat                # 一键混淆构建
+├── build_and_run.bat / .sh
+├── build_llvm_push.bat / .ps1
+├── logcat.bat
+└── README.md
 ```
 
-### Enable the frontend in Gradle
+---
 
-Use these properties when building native code through AGP:
+## 功能模块说明
+
+| 模块 | 路径 | 作用 |
+| --- | --- | --- |
+| Core 基础设施 | `cpp/core/` | 日志、文件、Overlay 渲染、隐藏自身、反调试 |
+| 跨进程内存读取 | `cpp/memory/` | 通过 `/proc/<pid>/mem` 读取目标游戏内存，并通过 JNI 暴露给 Java 层 |
+| SO 运行时 Dump | `cpp/so_dumper/` | 在目标进程运行时把已加载 SO 修复并 dump 到磁盘 |
+| 注入器 | `cpp/injector/` | 远程注入，独立产物 `libinjector.so` |
+| KernelPatch / KPM | `cpp/kpatch/` | 控制 KPM 模块（隐藏注入痕迹等） |
+| 反调试 / 反 Frida | `cpp/core/anti_debug/` | `JNI_OnLoad` 启动自检线程，可通过 `ENABLE_ANTI_DEBUG` 开关 |
+| Stack Spoof | `cpp/stack_spoof/` | ARM64 sleep-mask 风格调用栈伪造 |
+| Parasite | `cpp/parasite/` | "D 方案" 寄生执行骨架 |
+| AI 屏检 | `cpp/ai_overlay/` | NCNN + NanoDet 旁路截屏推理（不 Hook 渲染管线），含 AimAssist |
+| Overlay 渲染 | `cpp/AndroidSurfaceImgui/` + `core/overlay/` | 基于 Android Surface 的独立 ImGui Overlay |
+| Unity / IL2CPP | `cpp/games/unity_lol/` | IL2CPP Dump、Unity API 包装、LoL 业务 |
+| UE4 / PUBGMHD | `cpp/games/ue_pubgmhd/` | UE4 Struct/Dumper + 和平精英业务 |
+| UE5 / DFM | `cpp/games/ue_dfm/` | UE5 Struct/Dumper + 三角洲行动业务 |
+| UE 4.26 / NRC | `cpp/games/ue_nrc/` | 洛克王国手游业务 |
+
+---
+
+## 技术栈与开源项目
+
+**语言**
+
+- Java 11（Android 应用层 / UI / JNI 桥接）
+- C++20（全部 Native 业务、Hook、Overlay、Dump、注入）
+- C#（`tools/windows_llvm_launcher_host/`，.NET 发布的 launcher 转发器）
+- CMake / Kotlin DSL（构建脚本）
+- PowerShell / Batch / Bash（构建和推送脚本）
+
+**核心框架与库**
+
+- [Android Gradle Plugin 9.1.0](https://developer.android.com/build) + Gradle Wrapper
+- Android NDK（CMake 3.22.1，Ninja 生成器）
+- AndroidX：`appcompat 1.6.1`、`material 1.10.0`、`constraintlayout 2.1.4`
+- 测试：JUnit 4.13.2、AndroidX Test、Espresso 3.5.1
+
+**Native 第三方 / 开源项目**
+
+| 项目 | 用途 | 位置 |
+| --- | --- | --- |
+| [Dobby](https://github.com/jmpews/Dobby) | Inline Hook / Trampoline | `cpp/Dobby/` |
+| [ImGui](https://github.com/ocornut/imgui) | Overlay UI 渲染 | `cpp/AndroidSurfaceImgui/third_party/imgui` |
+| AndroidSurfaceImgui | Android Surface + ImGui 适配层 | `cpp/AndroidSurfaceImgui/` |
+| [Polaris Obfuscator](https://github.com/za233/Polaris-Obfuscator) / OLLVM | 控制流扁平化（fla）/ 字符串加密（strcry）/ 间接调用 / BCF / Substitution 等编译期混淆 | `cpp/Polaris-Obfuscator/` + 自定义 Windows-LLVM 前端 |
+| [ncnn](https://github.com/Tencent/ncnn) | 移动端神经网络推理（Vulkan） | `cpp/ncnn/<ABI>/`（预编译） |
+| [NanoDet](https://github.com/RangiLyu/nanodet) | 轻量目标检测模型，用于 AI 屏检 / AimAssist | `cpp/ai_overlay/` |
+| KernelPatch / KPM | 内核态注入隐藏 | `cpp/kpatch/` |
+| il2cppDumper 思路 | Unity IL2CPP 运行时 Dump | `cpp/games/unity_lol/il2cpp_dumper/` |
+
+**渲染 / 系统库**
+
+- OpenGL ES 3 (`GLESv3`) + EGL，Android 原生 `log`、`android`、`dl`
+
+---
+
+## 开发环境 / 编译要求
+
+在新机器上准备以下环境：
+
+| 组件 | 版本 / 说明 |
+| --- | --- |
+| 操作系统 | Windows 10/11（脚本以 PowerShell / Batch 编写）；macOS / Linux 也可用 `build_and_run.sh`，但 Windows-LLVM 前端为 Windows 专用 |
+| JDK | 17+（AGP 9.x 要求） |
+| Android Studio | Hedgehog 或更高（可选，便于打开工程） |
+| Android SDK | `compileSdk = 36`、`targetSdk = 36`、`minSdk = 24` |
+| Android NDK | 与 AGP 9.1.0 兼容的版本（推荐 NDK r26+） |
+| CMake | 3.22.1（由 SDK Manager 安装） |
+| Ninja | 由 NDK 自带 |
+| .NET SDK | 6.0+（仅当需要重建 `WindowsLlvmLauncher.exe` 时） |
+| Git | 用于克隆 + 子模块 |
+| Windows-LLVM 工具链 | 仓库外，存放路径例如 `C:\...\il2cppDumper\Windows-llvm`（可选，仅启用混淆时需要） |
+| MinGW DLL | `libgcc_s_seh-1.dll` / `libstdc++-6.dll` / `libwinpthread-1.dll` 复制到 `Windows-llvm/bin`（可选） |
+| ADB | 若需 `build_and_run` 自动安装 / 拉起 APK |
+
+ABI：当前 `app/build.gradle.kts` 仅启用 `arm64-v8a`，如需其它 ABI 请取消注释 `abiFilters` 中的对应行，并在 `cpp/ncnn/<ABI>/` 提供对应 ncnn 预编译。
+
+---
+
+## 克隆与编译步骤
+
+### 1. 克隆仓库
 
 ```powershell
-.\gradlew.bat :app:externalNativeBuildDebug -PuseWindowsLlvmFrontend=true -PwindowsLlvmRoot="c:/Users/Song/Desktop/file/lol/il2cppDumper/Windows-llvm"
+git clone <你的仓库地址> game
+cd game
+# 如包含 submodule（Dobby / Polaris-Obfuscator 等）
+git submodule update --init --recursive
 ```
 
-Full obfuscated Debug APK build:
+### 2. 配置 `local.properties`
+
+在 `game/local.properties` 中指定你的 SDK / NDK 路径：
+
+```properties
+sdk.dir=C\:\\Users\\<You>\\AppData\\Local\\Android\\Sdk
+ndk.dir=C\:\\Users\\<You>\\AppData\\Local\\Android\\Sdk\\ndk\\<version>
+```
+
+### 3. （可选）准备 Windows-LLVM 前端
+
+如果想启用混淆 / Polaris：
+
+1. 把 Windows-LLVM 工具链放到任意位置，例如 `D:\toolchains\Windows-llvm`，需要存在 `bin/clang.exe` 与 `bin/clang++.exe`。
+2. 复制以下 DLL 到 `Windows-llvm/bin`（典型来源：`C:\Program Files\Git\mingw64\bin\`）：
+   - `libgcc_s_seh-1.dll`
+   - `libstdc++-6.dll`
+   - `libwinpthread-1.dll`
+
+   缺失这三个 DLL 通常会让 `Windows-llvm/bin/clang.exe --version` 报 `0xC0000135`。
+3. 若 `tools/windows_llvm_launcher_host/WindowsLlvmLauncher.exe` 缺失，重新构建：
+
+   ```powershell
+   dotnet publish .\tools\windows_llvm_launcher_host\WindowsLlvmLauncher.csproj -c Release -o .\tools\windows_llvm_launcher_host
+   ```
+
+### 4. 构建
+
+**普通 Debug（不启用 Windows-LLVM 混淆）**
 
 ```powershell
-.\gradlew.bat :app:assembleDebug -PuseWindowsLlvmFrontend=true -PwindowsLlvmRoot="c:/Users/Song/Desktop/file/lol/il2cppDumper/Windows-llvm" -PenableWindowsLlvmObfuscation=true
+.\gradlew.bat :app:assembleDebug
 ```
 
-Equivalent environment variables are also supported:
-
-- `USE_WINDOWS_LLVM_FRONTEND=true`
-- `WINDOWS_LLVM_ROOT=c:/Users/Song/Desktop/file/lol/il2cppDumper/Windows-llvm`
-
-### Obfuscation flags
-
-When the Windows-llvm frontend is enabled, obfuscation is enabled by default unless you explicitly disable it with:
-
-- Gradle property: `-PenableWindowsLlvmObfuscation=false`
-- Environment variable: `ENABLE_WINDOWS_LLVM_OBFUSCATION=false`
-
-Current pass layout:
-
-- Base pass for `dobbyproject` and `injector`: `sub`
-- Medium pass set for `Draw/Draw.cpp`, `Symbol/Symbol.cpp`, `li2cppDumper/li2cppdumper.cpp`: `fla,sub`
-- Heavy pass set for `start.cpp`, `lol/lolm.cpp`, `interface/interface.cpp`: `fla,sub`
-
-## Verified commands
-
-These commands were re-verified on this machine after lowering the heavy pass set to `fla,sub` and forcing the CMake cache variables:
+**启用 Windows-LLVM 前端 + 混淆 Debug**
 
 ```powershell
-.\build_obfuscated_and_run.bat native
-.\build_obfuscated_and_run.bat
+.\gradlew.bat :app:assembleDebug `
+    -PuseWindowsLlvmFrontend=true `
+    -PwindowsLlvmRoot="D:/toolchains/Windows-llvm" `
+    -PenableWindowsLlvmObfuscation=true
 ```
 
-What they currently do:
-
-- `build_obfuscated_and_run.bat native`
-	- Builds obfuscated native Debug outputs only.
-	- Verified result: `libdobbyproject.so` and `libinjector.so` were generated under `app/build/intermediates/cxx/Debug/.../obj/<abi>/`.
-- `build_obfuscated_and_run.bat`
-	- Builds the obfuscated Debug APK, installs it, and launches `com.example.dobbyproject/.MainActivity`.
-	- Verified result: build succeeded, the APK was produced at `app/build/outputs/apk/debug/app-debug.apk`, and the app was started on the attached device.
-
-## Notes from the successful run
-
-- The current stable obfuscation setup is:
-	- Base: `sub`
-	- Medium: `fla,sub`
-	- Heavy: `fla,sub`
-- The old heavier set `fla,bcf,sub,indcall,gvenc` crashed this Windows-llvm frontend on `start.cpp`, `lol/lolm.cpp`, and `interface/interface.cpp`.
-- The pass variables in `app/src/main/cpp/CMakeLists.txt` are cached, so changing them may not take effect unless the cache is forced or the native CMake build directory is cleaned.
-- During install, `adb install -r` may fail with `INSTALL_FAILED_UPDATE_INCOMPATIBLE` if an older APK with a different signing key is already on the device. The script already handles this by uninstalling the old package and retrying.
-- The current build still emits several C/C++ warnings, but the verified obfuscated build completed successfully with those warnings present.
-
-## Convenience script
-
-Use the wrapper script for the common flows:
+也可使用环境变量：
 
 ```powershell
-.\build_obfuscated_and_run.bat help
+$env:USE_WINDOWS_LLVM_FRONTEND="true"
+$env:WINDOWS_LLVM_ROOT="D:/toolchains/Windows-llvm"
+$env:ENABLE_WINDOWS_LLVM_OBFUSCATION="true"
+.\gradlew.bat :app:assembleDebug
 ```
 
-Useful commands:
+**只构建 Native**
 
-- Default: build obfuscated Debug APK, install, and launch.
-- `native`: build obfuscated native outputs only.
-- `release`: build obfuscated Release APK only.
-- `logcat`: attach to the running app process logcat stream after launch.
+```powershell
+.\gradlew.bat :app:externalNativeBuildDebug -PuseWindowsLlvmFrontend=true -PwindowsLlvmRoot="D:/toolchains/Windows-llvm"
+```
+
+**一键混淆 + 安装 + 启动**
+
+```powershell
+.\build_obfuscated.bat            # 安装并启动
+.\build_obfuscated.bat native     # 只构建 native
+.\build_obfuscated.bat release    # 构建混淆 Release APK
+.\build_obfuscated.bat logcat     # 启动后挂 logcat
+.\build_obfuscated.bat help
+```
+
+构建产物：
+
+- APK：`app/build/outputs/apk/debug/app-debug.apk`
+- Native：`app/build/intermediates/cxx/Debug/.../obj/<abi>/libdobbyproject.so`、`libinjector.so`
+
+### 5. 可调开关（Gradle 属性 / 环境变量）
+
+| Gradle 属性 | 环境变量 | 默认 | 作用 |
+| --- | --- | --- | --- |
+| `useWindowsLlvmFrontend` | `USE_WINDOWS_LLVM_FRONTEND` | false | 启用自定义 Windows-LLVM 前端 |
+| `windowsLlvmRoot` | `WINDOWS_LLVM_ROOT` | 无 | Windows-LLVM 根目录 |
+| `enableWindowsLlvmObfuscation` | `ENABLE_WINDOWS_LLVM_OBFUSCATION` | 跟随上面 | 启用 Polaris/OLLVM Pass |
+| `enableAntiDebug` | `ENABLE_ANTI_DEBUG` | true | 启用反调试 / 反 Frida 自检线程 |
+| `enableVisibilityHidden` | `ENABLE_VISIBILITY_HIDDEN` | false | 默认隐藏所有符号，仅 JNIEXPORT 导出 |
+
+混淆 Pass 在 `app/src/main/cpp/CMakeLists.txt` 中按强度分组（`sub` / `fla,sub` 等），并按源文件应用。
+
+---
+
+## Windows-LLVM 前端 + Android NDK
+
+由于 Android NDK 工具链会覆盖 `CMAKE_C_COMPILER` / `CMAKE_CXX_COMPILER`，本项目并不直接替换编译器，而是通过 launcher 转发：
+
+1. `app/build.gradle.kts` 注入 `CMAKE_C_COMPILER_LAUNCHER` / `CMAKE_CXX_COMPILER_LAUNCHER`。
+2. `tools/windows_llvm_launcher.cmd` 是 CMake/Ninja 的 launcher 入口。
+3. `tools/windows_llvm_launcher_host/WindowsLlvmLauncher.exe`（C# 编写）使用 `ProcessStartInfo.ArgumentList` 转发原始 clang 参数。
+4. Launcher 把前端切换为 `Windows-llvm/bin/clang(.exe)` 或 `clang++.exe`，并注入正确的 `-resource-dir`（`Windows-llvm/clang/16`）。
+
+这样即可在保留 NDK `--target` / `--sysroot` / 平台库的同时使用 Polaris/OLLVM Pass。
+
+---
+
+## 常用命令
+
+```powershell
+# Debug 构建并安装运行
+.\build_and_run.bat
+
+# 推送构建产物到设备
+.\build_llvm_push.bat
+.\build_llvm_push.ps1
+
+# logcat 抓取
+.\logcat.bat
+```
+
+> 安装时若遇到 `INSTALL_FAILED_UPDATE_INCOMPATIBLE`（旧 APK 签名不同），脚本会自动卸载旧包后重试。
