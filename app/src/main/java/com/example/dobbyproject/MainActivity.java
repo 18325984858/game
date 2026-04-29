@@ -1479,7 +1479,7 @@ public class MainActivity extends AppCompatActivity {
     private static final GameLauncher.GameSpec GAME_NRC = new GameLauncher.GameSpec(
             "NRC", "洛克王国手游", NRC_PACKAGE, "nrc",
             INJECT_SO_NAME, /*useApkLibDir=*/false, /*chconApkData=*/false,
-            /*waitMs=*/12000, /*retryWithTrace=*/false, /*hideSoName=*/null);
+            /*waitMs=*/15000, /*retryWithTrace=*/false, /*hideSoName=*/null);
 
     /** 把 Activity 上的依赖打包成 GameLauncher.Env, 让启动逻辑与 Activity 解耦. */
     private GameLauncher.Env makeGameLauncherEnv(GameLauncher.GameSpec spec,
