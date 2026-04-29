@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ═══════════════════════════════════════════════════════════════════════
  *  DobbyProject - 注入流程说明
  * ═══════════════════════════════════════════════════════════════════════
@@ -1466,6 +1466,32 @@ public class MainActivity extends AppCompatActivity {
     //  → GameLauncher.launch(SPEC, ..., makeGameLauncherEnv(...))
     // ═══════════════════════════════════════════════════════════════════
 
+    /**
+     * 和平精英 (PUBG Mobile) 的注入参数。
+     *
+     * 字段对应 {@link GameLauncher.GameSpec} 构造参数:
+     *   tag            = "PUBG"           日志前缀 + trace 文件名: pubg_injector_trace.txt
+     *   displayName    = "和平精英"        UI 状态栏显示名
+     *   pkg            = PUBG_PACKAGE     com.tencent.tmgp.pubgmhd
+     *   mode           = "pubg"           injector argv[3], native 端按此分支选偏移
+     *   soFileName     = INJECT_SO_NAME   部署到目标的 SO 文件名 (libpre.so, 伪装通用预加载库)
+     *   useApkLibDir   = true             部署到 APK 自带 nativeLibraryDir
+     *                                      (/data/app/.../lib/arm64/), 而非 /data/data/<pkg>/files
+     *   chconApkData   = true             部署后打 SELinux 标签 u:object_r:apk_data_file:s0,
+     *                                      让 ACE 反作弊扫描时与游戏自身 .so 同标签, 不易被识破
+     *   waitMs         = 15000            monkey 启动后等 15s 让游戏初始化 (libUE4.so 加载完)
+     *   retryWithTrace = true             4 次重试, 每次后轮询
+     *                                      /data/data/<pkg>/cache/ue4_gui_trace.txt 判成功;
+     *                                      PUBG 反作弊偶尔 ptrace 失败需要重试
+     *   hideSoName     = INJECT_SO_NAME   注入成功后调 KPM add_hide_so:libpre.so,
+     *                                      让 maps/dlopen 看不到该 SO; 注入前 launcher 会
+     *                                      自动 remove_hide_so 撤销, 否则 dlopen 会报
+     *                                      "not accessible for the namespace"
+     *
+     * 调用入口 (见上方 btnPubgLaunch.setOnClickListener):
+     *   GameLauncher.launch(GAME_PUBG, enableUeDumper, enableUeHeader, enableLog,
+     *                       makeGameLauncherEnv(GAME_PUBG, btnPubgLaunch, "和平精英"));
+     */
     private static final GameLauncher.GameSpec GAME_PUBG = new GameLauncher.GameSpec(
             "PUBG", "和平精英", PUBG_PACKAGE, "pubg",
             INJECT_SO_NAME, /*useApkLibDir=*/true, /*chconApkData=*/true,
@@ -1473,13 +1499,13 @@ public class MainActivity extends AppCompatActivity {
 
     private static final GameLauncher.GameSpec GAME_DFM = new GameLauncher.GameSpec(
             "DFM", "三角洲", DFM_PACKAGE, "dfm",
-            INJECT_SO_NAME, /*useApkLibDir=*/false, /*chconApkData=*/false,
-            /*waitMs=*/15000, /*retryWithTrace=*/false, /*hideSoName=*/null);
+            INJECT_SO_NAME, /*useApkLibDir=*/true, /*chconApkData=*/true,
+            /*waitMs=*/15000, /*retryWithTrace=*/true, /*hideSoName=*/INJECT_SO_NAME);
 
     private static final GameLauncher.GameSpec GAME_NRC = new GameLauncher.GameSpec(
             "NRC", "洛克王国手游", NRC_PACKAGE, "nrc",
             INJECT_SO_NAME, /*useApkLibDir=*/false, /*chconApkData=*/false,
-            /*waitMs=*/15000, /*retryWithTrace=*/false, /*hideSoName=*/null);
+            /*waitMs=*/15000, /*retryWithTrace=*/false, /*hideSoName=*/INJECT_SO_NAME);
 
     /** 把 Activity 上的依赖打包成 GameLauncher.Env, 让启动逻辑与 Activity 解耦. */
     private GameLauncher.Env makeGameLauncherEnv(GameLauncher.GameSpec spec,
