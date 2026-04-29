@@ -38,6 +38,12 @@ namespace {
 static std::string g_superkey;
 static int g_kp_ready = -1;
 
+// onReady 订阅者清单。所有注册者会在 verifyKey() 首次返回 true 时
+// 被依次同步调用。为了避免重复发送 (Java 可能多次 verifyKey),
+// 下面 dispatch_ready_locked() 里为每个 hook 记一个“已触发”位。
+static std::vector<KpCtl::ReadyHook> g_ready_hooks;
+static std::vector<bool>             g_ready_fired;
+
 static std::string popen_su(const std::string& cmd) {
     // 用 timeout(1) 包裹避免 su 未授权时永久挂起.
     // 2s 足够读几个小文件, 且不会拖住 UI.
@@ -238,11 +244,31 @@ bool verifyKey(const std::string& key) {
     bool ok = sc_hello_ok();
     if (ok) {
         g_kp_ready = 1;
+        // KPM 首次可用: 按注册顺序发送一次 onReady, 让 JNI_OnLoad 阶段
+        // 被跳过的初始化 (如 kpm_inject_hide_jni 里的 add_hide_pkg /
+        // add_exempt_self) 在这里补做。
+        for (size_t i = 0; i < g_ready_hooks.size(); i++) {
+            if (g_ready_fired[i]) continue;       // 每个 hook 只调一次
+            g_ready_fired[i] = true;
+            if (g_ready_hooks[i]) g_ready_hooks[i]();
+        }
     } else {
         g_superkey.clear();
         g_kp_ready = 0;
     }
     return ok;
+}
+
+void onReady(ReadyHook fn) {
+    if (!fn) return;
+    g_ready_hooks.push_back(fn);
+    g_ready_fired.push_back(false);
+    // 如果 KPM 已经就绪 (verifyKey 在本 hook 注册前已成功), 立刻补发一次,
+    // 以免“后注册”的订阅者错过此次事件。
+    if (g_kp_ready == 1) {
+        g_ready_fired.back() = true;
+        fn();
+    }
 }
 
 } // namespace KpCtl

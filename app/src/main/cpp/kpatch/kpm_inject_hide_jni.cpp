@@ -96,10 +96,34 @@ static std::string read_self_pkg() {
     return full;
 }
 
+// KPM "首次可用" 回调: 由 KpCtl::verifyKey() 成功时同步触发 (一般是
+// MainActivity 的 nativeValidateKpKey 路径). 此时 g_superkey 已被 Java 喂入,
+// 可以安全地调 sc_kpm_ctl. 这里把 add_hide_pkg / add_exempt_self 这些原本
+// 想在 JNI_OnLoad 里做的事 "迁移" 到这条延迟通路, 避免 SO 加载时同步 popen("su")
+// 阻塞 UI 主线程, 也避免在没有 key 的情况下静默失败.
+static void onKpmReady_AutoHideSelf() {
+    if (self_cached_pkg.empty()) self_cached_pkg = read_self_pkg();
+    if (self_cached_pkg.empty()) {
+        LOG(LOG_LEVEL_WARN, KTAG " onKpmReady: self_cached_pkg empty, skip");
+        return;
+    }
+    std::string out;
+    bool ok = KpCtl::rawCtl("add_hide_pkg:" + self_cached_pkg, &out);
+    LOG(LOG_LEVEL_INFO, KTAG " onKpmReady auto add_hide_pkg '%s' ok=%d resp='%s'",
+        self_cached_pkg.c_str(), (int)ok, out.c_str());
+
+    // 同时把自己加入 RootHide UID 豁免名单, 防止 root_hide 启用后自家进程被
+    // 168 个 root 关键字误伤导致 su 等检测失败.
+    std::string out2;
+    bool ok2 = KpCtl::rawCtl("add_exempt_self", &out2);
+    LOG(LOG_LEVEL_INFO, KTAG " onKpmReady auto add_exempt_self ok=%d resp='%s'",
+        (int)ok2, out2.c_str());
+}
+
 extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
     JNIEnv* env = nullptr;
     if (vm && vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK) {
-        // 拿不�?env 也不影响后续逻辑
+        // 拿不到 env 也不影响后续逻辑
     }
 #if defined(ENABLE_ANTI_DEBUG)
     StartAntiDebugWatcher();
@@ -109,16 +133,18 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
     //  2) hook __system_property_get / read / read_callback -> 伪造 ro.boot.verifiedbootstate=green、
     //     ro.secure=1、ro.debuggable=0、ro.build.tags=release-keys 等, 让游戏/反作弊看不到 root 与解锁迹象。
     installStealthHooks();
+
+    // 只缓存包名, 不在这里调用 KpCtl::isModuleLoaded() —— 该函数会触发
+    // sc_hello / get_key / popen("su -c cat ...") 链路, 而此时 Java 还未把
+    // superkey 喂给 native, 必然失败, 还会同步阻塞 SO 加载耗时数秒.
+    //
+    // 真正的 "首次可用" 时机由 KpCtl::verifyKey() 成功后通过 onReady 回调
+    // 通知, 见 onKpmReady_AutoHideSelf().
     self_cached_pkg = read_self_pkg();
-    if (!self_cached_pkg.empty() && KpCtl::isModuleLoaded()) {
-        std::string out;
-        bool ok = KpCtl::rawCtl("add_hide_pkg:" + self_cached_pkg, &out);
-        LOG(LOG_LEVEL_INFO, KTAG " auto add_hide_pkg '%s' ok=%d resp='%s'",
-            self_cached_pkg.c_str(), (int)ok, out.c_str());
-    } else {
-        LOG(LOG_LEVEL_INFO, KTAG " JNI_OnLoad: skip auto hide (pkg='%s', kpm_loaded=%d)",
-            self_cached_pkg.c_str(), (int)KpCtl::isModuleLoaded());
-    }
+    KpCtl::onReady(&onKpmReady_AutoHideSelf);
+    LOG(LOG_LEVEL_INFO, KTAG " JNI_OnLoad: pkg='%s', deferred auto-hide via onReady",
+        self_cached_pkg.c_str());
+
     return JNI_VERSION_1_6;
 }
 
