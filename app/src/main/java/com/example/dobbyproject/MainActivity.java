@@ -381,13 +381,21 @@ public class MainActivity extends AppCompatActivity {
             }
 
             // ── Root 校验通过后：验证 KernelPatch superkey ──
-            // 优先用 App 缓存目录里保存过的 key；没有再让 native 层从系统路径找
-            // (/data/local/tmp/.kp_key 等，给 adb 调试用)。
-            String cachedKey = readKpKeyFromCache();
+            // 唯一真源: /data/data/<pkg>/files/.kp_key (app 私有, 不需 root)。
+            // 缺失或验证失败 → 删除 + 弹输入框。
+            String savedKey = readKpKeyFromFiles();
             boolean keyOk = false;
-            try { keyOk = nativeValidateKpKey(cachedKey != null ? cachedKey : ""); }
-            catch (Throwable t) { LogUtil.e("nativeValidateKpKey 调用异常", t); }
+            String promptMsg = "未检测到 Superkey，请输入 APatch Super Key：";
+            if (savedKey != null) {
+                try { keyOk = nativeValidateKpKey(savedKey); }
+                catch (Throwable t) { LogUtil.e("nativeValidateKpKey 调用异常", t); }
+                if (!keyOk) {
+                    deleteKpKeyFile();
+                    promptMsg = "❌ 保存的 Superkey 已失效，请重新输入 APatch Super Key：";
+                }
+            }
             final boolean keyOkFinal = keyOk;
+            final String promptMsgFinal = promptMsg;
             runOnUiThread(() -> {
                 if (keyOkFinal) {
                     // key 有效：彻底隐藏这块 UI
@@ -396,7 +404,7 @@ public class MainActivity extends AppCompatActivity {
                     setMainContentVisible(true);
                 } else {
                     setMainContentVisible(false);
-                    showKpKeyPrompt("未检测到有效 Superkey，请输入 APatch Super Key：");
+                    showKpKeyPrompt(promptMsgFinal);
                 }
             });
 
@@ -860,7 +868,7 @@ public class MainActivity extends AppCompatActivity {
                 try { ok = nativeValidateKpKey(key); }
                 catch (Throwable t) { LogUtil.e("nativeValidateKpKey", t); }
                 final boolean fok = ok;
-                if (fok) saveKpKeyToFile(key);   // 成功才落盘
+                if (fok) saveKpKeyToFile(key);   // 写入 files/.kp_key
                 runOnUiThread(() -> {
                     btnSubmit.setEnabled(true);
                     if (fok) {
@@ -880,16 +888,16 @@ public class MainActivity extends AppCompatActivity {
     }
 
     /**
-     * App 缓存目录下的 superkey 文件路径：
-     *   /data/data/<package>/cache/.kp_key
-     * 只有本 app (同 uid) 能读写；不需要 root 权限。
+     * App 私有目录下的 superkey 文件路径：
+     *   /data/data/<package>/files/.kp_key
+     * 只有本 app (同 uid) 能读写；不需要 root 权限；clear data 才会被清。
      */
     private File getKpKeyFile() {
-        return new File(getCacheDir(), ".kp_key");
+        return new File(getFilesDir(), ".kp_key");
     }
 
-    /** 从缓存文件读出 key；不存在或读失败返回 null。 */
-    private String readKpKeyFromCache() {
+    /** 从 files/.kp_key 读出 key；不存在或读失败返回 null。 */
+    private String readKpKeyFromFiles() {
         File f = getKpKeyFile();
         if (!f.exists() || f.length() == 0 || f.length() > 128) return null;
         try (FileInputStream fis = new FileInputStream(f)) {
@@ -899,7 +907,7 @@ public class MainActivity extends AppCompatActivity {
             String s = new String(buf, 0, n, "UTF-8").trim();
             return s.isEmpty() ? null : s;
         } catch (Exception e) {
-            LogUtil.e("readKpKeyFromCache", e);
+            LogUtil.e("readKpKeyFromFiles", e);
             return null;
         }
     }
@@ -920,6 +928,12 @@ public class MainActivity extends AppCompatActivity {
         } catch (Exception e) {
             LogUtil.e("saveKpKeyToFile 异常", e);
         }
+    }
+
+    /** 删除 files/.kp_key (验证失败时调用)。 */
+    private void deleteKpKeyFile() {
+        try { File f = getKpKeyFile(); if (f.exists()) f.delete(); }
+        catch (Throwable t) { LogUtil.e("deleteKpKeyFile", t); }
     }
 
     /**
