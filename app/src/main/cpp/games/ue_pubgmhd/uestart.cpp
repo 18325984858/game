@@ -6,7 +6,7 @@
 #include "engine/UE4Struct.h"
 #include "interface/interface.h"
 #include "pubgmhd/pubgmhd.h"
-#include "draw/UE4Draw.h"
+#include "draw/PubgmhdDraw.h"
 #include "AImGui.h"
 #include "ANativeWindowCreator.h"
 #include <atomic>

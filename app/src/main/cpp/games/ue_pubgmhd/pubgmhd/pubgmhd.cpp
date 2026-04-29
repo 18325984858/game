@@ -1,7 +1,7 @@
 #include "pubgmhd.h"
 #include "../engine/UE4Struct.h"
 #include "../interface/interface.h"
-#include "../draw/UE4Draw.h"
+#include "../draw/PubgmhdDraw.h"
 #include "../../../core/log/log.h"
 #include "../../../stack_spoof/stack_spoof.h"
 #include <sys/system_properties.h>

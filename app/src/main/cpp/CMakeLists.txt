@@ -153,7 +153,7 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
         # ── games/unity_lol (Unity / LoL) ──
         "games/unity_lol/native-lib.cpp"
         "games/unity_lol/unitystart.cpp"
-        "games/unity_lol/draw/Draw.cpp"
+        "games/unity_lol/draw/LolDraw.cpp"
         "games/unity_lol/symbol/Symbol.cpp"
         "games/unity_lol/unity_api/unityapi.cpp"
         "games/unity_lol/il2cpp_dumper/il2cpp_dumper.cpp"
@@ -166,7 +166,7 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
         "games/ue_pubgmhd/engine/UE4Struct.cpp"
         "games/ue_pubgmhd/engine/UE4Dumper.cpp"
         "games/ue_pubgmhd/engine/UE4Header.cpp"
-        "games/ue_pubgmhd/draw/UE4Draw.cpp"
+        "games/ue_pubgmhd/draw/PubgmhdDraw.cpp"
         "games/ue_pubgmhd/interface/interface.cpp"
         "games/ue_pubgmhd/pubgmhd/pubgmhd.cpp"
 
@@ -252,7 +252,7 @@ if(USE_WINDOWS_LLVM_FRONTEND AND ENABLE_WINDOWS_LLVM_OBFUSCATION)
         )
 
         set_source_files_properties(
-                "games/unity_lol/draw/Draw.cpp"
+                "games/unity_lol/draw/LolDraw.cpp"
                 "games/unity_lol/symbol/Symbol.cpp"
                 "games/unity_lol/il2cpp_dumper/il2cpp_dumper.cpp"
                 "games/unity_lol/il2cpp_header/il2cppHeader.cpp"
@@ -260,7 +260,7 @@ if(USE_WINDOWS_LLVM_FRONTEND AND ENABLE_WINDOWS_LLVM_OBFUSCATION)
                 "games/ue_pubgmhd/engine/UE4Struct.cpp"
                 "games/ue_pubgmhd/engine/UE4Dumper.cpp"
                 "games/ue_pubgmhd/engine/UE4Header.cpp"
-                "games/ue_pubgmhd/draw/UE4Draw.cpp"
+                "games/ue_pubgmhd/draw/PubgmhdDraw.cpp"
                 "games/ue_dfm/engine/UE5DfmStruct.cpp"
                 "games/ue_dfm/engine/UE5DfmDumper.cpp"
                 "games/ue_dfm/engine/UE5Header.cpp"

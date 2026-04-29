@@ -12,7 +12,7 @@
 #include <algorithm>
 #include <cstring>
 #include "../engine/UE4Struct.h"
-#include "../draw/UE4Draw.h"
+#include "../draw/PubgmhdDraw.h"
 
 // 前向声明
 namespace ue4inf { class UE4Interface; }
