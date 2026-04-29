@@ -543,6 +543,30 @@ private:
     // ---- FString 读取 (UE4 Android: UTF-16LE) ----
     static std::string readFString(uintptr_t addr);
 
+    // ---- 物资真实名称 (调用 libUE4.so 内部 sub_A3B7AC8) ----
+    // 在 stack_spoof FP-chain 伪造 + sigsetjmp 熔断保护下调用游戏内部
+    // 配置表查名函数, 把 ItemDefineID.TypeSpecificID (itemID) 翻译成
+    // 玩家可见的真实物资名 (UTF-16 FString -> UTF-8). 命中/失败均缓存,
+    // 同一 itemID 不会重复进入伪造调用窗口.
+    bool tryGetItemNameNative(int32_t itemID, std::string& out);
+
+    // 动态解析 sub_A3B7AC8 的运行时地址 (0 表示失败).
+    // 优先路径: UE4Interface 反射拿到 ItemUtilsV2::GetItemNameV2 thunk,
+    //   再解码 thunk 的第一条 BL imm26 → sub_A3B7AC8 (BP thunk 模板就是
+    //   "拆 FFrame 取 itemID → BL 真正查表函数 → 拷 FString 到 Result").
+    // 兜底: m_moduleBase + 硬编码 RVA 0xA3B7AC8 (dump.cs 当前版本).
+    // 结果永久缓存到 m_itemNameFnAddr; 失败也缓存为 sentinel ~0 不重试.
+    uintptr_t resolveItemNameFnAddress();
+
+    // 动态解析物资配置表 UClass 缓存槽 (libUE4.so 内 unk_150ED768) 的运行时
+    // 地址 (0 表示失败). 沿调用链解码 ARM64 指令: sub_A3B7AC8 → 第 1 条 BL =
+    // sub_981FDB4 → 第 1 条 BL = sub_98322E0 → 第 1 对 ADRP+ADD = 槽地址.
+    // 失败回退 m_moduleBase + 硬编码 RVA 0x150ED768. 进程级原子缓存零重试.
+    // 该槽用于在 tryGetItemNameNative 入口判断游戏线程是否已自行初始化配置表
+    // (零 = 未初始化, 此时调用 sub_A3B7AC8 会触发 sub_AED16BC FindObject
+    // 从工作线程发起 UE 反射加载 → SIGSEGV).
+    uintptr_t resolveItemConfigCacheSlot();
+
     // ---- 对局状态 ----
     MatchState getMatchState();
 
@@ -636,6 +660,10 @@ private:
     int       m_numNames = 0;
     std::string m_logDir;
     std::string m_logFile;
+
+    // 物资查表辅助: resolveItemNameFnAddress 一次性把 (fn, slot) 同步写入,
+    // resolveItemConfigCacheSlot 直接从这里读, 避免重复扫描 thunk.
+    std::atomic<uintptr_t> m_itemConfigSlotCache{0};
 
     std::atomic<bool> m_running{false};
     std::thread   m_pollThread;         // 轮询线程 (joinable, 非 detach)

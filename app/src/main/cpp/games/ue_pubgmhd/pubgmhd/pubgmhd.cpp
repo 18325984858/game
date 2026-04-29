@@ -2972,6 +2972,404 @@ static std::string lookupVehicleName(uint8_t vt) {
     return buf;
 }
 
+// =====================================================================
+//  物资真实名称 — 调用 libUE4.so 内部配置表查名函数
+//
+//  IDA 验证 (ida-pro-mcp-2 / dump.cs):
+//    ItemUtilsV2::GetItemNameV2 (BlueprintCallable thunk, NumParms=24)
+//      -> sub_A3B7AC8(itemID)
+//           -> sub_981FDB4(itemID, 0) + 0x8     (返回配置表行内 FString*)
+//
+//  我们直接走 sub_A3B7AC8 这条内部路径, 避开 BP thunk 的 FFrame 序列化:
+//    - 标准 AAPCS 函数, 单参 int32 itemID, 返回值是 FString* (借引用,
+//      指向引擎内部物品配置表行 +0x8 处, 不要 free).
+//    - FString 布局 {void* Data; int32 Num; int32 Max}, Data 为 UTF-16LE.
+//
+//  反作弊对抗: 在 stack_spoof::call_spoofed 的伪造 FP chain 下发起调用,
+//    周期栈采样看到的 LR 链落在 libc.so / libart.so 等白名单模块.
+//    外层再套 sigsetjmp 熔断 (复用 safeReadMemory 装的信号屏障), 命中
+//    SIGSEGV/SIGBUS 时把 itemID 拉黑, 单点失败不会拖垮整个扫描循环.
+//
+//  缓存策略: 配置表常量, itemID -> name 永久缓存 (空串表示已知失败).
+// =====================================================================
+//
+// =====================================================================
+//  ★ 游戏更新后如何重新定位 sub_A3B7AC8 / sub_981FDB4 / sub_98322E0 / unk_150ED768 ★
+// =====================================================================
+//
+//  正常情况下完全不需要手动定位 — resolveItemNameFnAddress() 会运行时解析,
+//  这里记录的是当 IDA 验证 / 兜底常量更新 / 链路被腾讯改动 时的复现步骤.
+//
+//  ─── 工具 ───────────────────────────────────────────────────────────
+//   * IDA Pro (本仓库自带 mcp_ida-pro-mcp-2 桥接, 端口 13338)
+//   * UE4Dumper 输出的 dump.cs (m_interface 的反射数据源)
+//   * adb logcat 抓 [ItemNameNative] 日志
+//
+//  ─── Step 1: 找 thunk (ItemUtilsV2::execGetItemNameV2) ───────────────
+//   1) 在 dump.cs 搜 `ItemUtilsV2` Class, 记下 GetItemNameV2 UFunction.
+//      签名: static FString GetItemNameV2(int32 ItemID).
+//   2) UFunction 对象 +0xB0 = Func, 即 thunk 入口 RVA.
+//      也可在 IDA 字符串窗搜 "GetItemNameV2", 反查 xref 找到对应
+//      FNativeFunctionRegistrar::RegisterFunction(...) 调用, 取第 2 个参数 (函数指针).
+//
+//  ─── Step 2: thunk 内识别真正的业务函数 sub_A3B7AC8 ─────────────────
+//   BP Native thunk 的标准模板:
+//     1. 拆 FFrame: 一系列 BL Stack.StepCompiledIn / FFrame::Step 等 helper
+//        (用来从字节码栈取 ItemID 参数, 通常 1~3 个 BL).
+//     2. BL <真正业务函数>          ← 我们要的 sub_A3B7AC8
+//     3. 拷返回值 FString 到 Result.
+//
+//   ★ 区分手段 (本文件 resolveItemNameFnAddress 即采用第 3 种,自动化) ★
+//     a) Stack helper 体积小, 第一条多为 ldr/cbz, 不会再做后续大调用链.
+//     b) 真业务函数体积大, 通常以 stp x29,x30,[sp,#-...]! 起手, 内部多次 BL +
+//        ADRP+LDR 访问全局表.
+//     c) ★ 链路指纹 ★ — 真函数命中 "sub_A3B7AC8 → 1stBL → 1stBL → ADRP+ADD"
+//        最终能解出一个落在 libUE4.so .bss 段的全局指针 (即 unk_150ED768).
+//        helper 不可能产生这种链路, 因此可作判别条件.
+//
+//   人工验证: IDA 打开 thunk, F5 看伪代码. 真函数调用形如
+//     `v3 = sub_A3B7AC8(itemID); *Result = *v3; ...; v3->Num=0;`
+//
+//  ─── Step 3: 沿 sub_A3B7AC8 找配置表缓存槽 unk_150ED768 ─────────────
+//   sub_A3B7AC8 (~4 条指令的小桥) 第 1 条 BL → sub_981FDB4 (查表入口).
+//   sub_981FDB4 内部第 1 条 BL → sub_98322E0 (LazyInit + 缓存 UClass*).
+//   sub_98322E0 头部第 1 对 ADRP+ADD pair = unk_150ED768 (UClass* 缓存槽).
+//   该槽内容 = 0 表示游戏自己还没碰过配置表; != 0 表示已经 FindObject 过.
+//
+//   验证 unk_150ED768 是否定位正确:
+//     1) 在 IDA 看 sub_98322E0, 紧跟 ADRP+ADD 的代码必形如
+//        `if (!*(_QWORD *)unk_150ED768) *(_QWORD *)unk_150ED768 = sub_AED16BC(...,"/Script/...");`
+//     2) 跑游戏让其先自然加载一次 (开局之后), adb shell dd 直接读该地址应当
+//        是一个落在 libUE4.so 范围内的非零指针 (UClass*).
+//
+//  ─── Step 4: 更新本文件的兜底常量 ───────────────────────────────────
+//   两个 RVA 都是 "万一动态链路被改坏" 时使用的兜底硬编码:
+//     kItemNameLookupInternalOffsetFallback = sub_A3B7AC8 RVA
+//     kItemConfigUClassCacheRvaFallback     = unk_150ED768 RVA
+//   日志会打印动态解析结果与兜底是否一致 ("一致" / "已漂移"). "已漂移" =
+//   游戏更了, 此时把日志里的 RVA 抄进这两个常量即可保留兜底安全网.
+//
+//  ─── Step 5: 链路结构变了怎么办 ─────────────────────────────────────
+//   如果腾讯把 sub_A3B7AC8/sub_981FDB4/sub_98322E0 之间的层级合并或拆分了,
+//   resolveItemNameFnAddress 里的 validateChain lambda 会自动失败 (没有
+//   候选能跑通链), 直接走兜底. 修复方法:
+//     * 在 IDA 重新跟一次 thunk → ... → 缓存槽 的指令路径;
+//     * 调整 validateChain 里 findFirstBLTarget 的层数 / 跳过的 BL 数量;
+//     * 必要时改 findAdrpAddSlot 接受 ADRP+LDR (而非 ADRP+ADD) 模式 —
+//       某些版本 LazyInit 直接把指针装载, 而非取 lea 地址.
+//
+//   只要 kItemConfigUClassCacheRvaFallback 仍然是真实槽, 即便链路解析失败,
+//   tryGetItemNameNative 的门控仍能保护工作线程不撞 SIGSEGV (代价是无法享
+//   受 ASLR 后偏移漂移自动跟随).
+// =====================================================================
+
+// libUE4.so 内 sub_A3B7AC8 的 RVA. ASLR 下运行时地址 = m_moduleBase + 该 RVA.
+// 仅作动态解析失败时的兜底常量, 正常路径走 resolveItemNameFnAddress() 反射 + BL 解码.
+// 更新方法见上方 "★ 游戏更新后如何重新定位 ★" 注释块 Step 1-4.
+static constexpr uintptr_t kItemNameLookupInternalOffsetFallback = 0xA3B7AC8;
+
+// 物资配置表 UClass 缓存指针的 RVA (libUE4.so 内 unk_150ED768) — 兜底常量,
+// 正常路径走 resolveItemConfigCacheSlot() 沿调用链动态推算 (sub_A3B7AC8 →
+// sub_981FDB4 → sub_98322E0 → ADRP+ADD), 与 dump.cs 版本完全解耦.
+// 为何要门控该槽: sub_98322E0 在槽为零时会调 sub_AED16BC(...,"/",...) 即
+// UE FindObject — 从我们的工作线程发起 UE 反射加载会 SIGSEGV.
+// 更新方法见上方 "★ 游戏更新后如何重新定位 ★" 注释块 Step 3-4.
+static constexpr uintptr_t kItemConfigUClassCacheRvaFallback = 0x150ED768;
+
+namespace {
+
+// stack_spoof::call_spoofed 只接受一参 (void*(*)(void*)),
+// 用上下文结构桥接 sub_A3B7AC8 的 (int32) -> FString* 调用约定.
+struct ItemNameNativeSpoofCtx {
+    void* (*fn)(int32_t);  // sub_A3B7AC8 的真实函数指针 (m_moduleBase + RVA)
+    int32_t itemID;        // 输入: ItemDefineID.TypeSpecificID
+    void*   fstrPtr;       // 输出: 借引用的 FString* (指向配置表内, 勿释放)
+};
+
+// 在伪造 FP chain 下执行的小型蹦床, SP 不切换, 入参/返回值均落在真栈上.
+void* itemNameNativeTrampoline(void* p) {
+    auto* c = static_cast<ItemNameNativeSpoofCtx*>(p);
+    c->fstrPtr = c->fn(c->itemID);
+    return c->fstrPtr;
+}
+
+} // namespace
+
+// ===== 物资名查表函数 / 配置表缓存槽 动态解析 =====
+//
+// 设计:
+//   thunk(ItemUtilsV2::GetItemNameV2) 内部至少有 2 条 BL: 第 1 条通常是
+//   Stack.StepCompiledIn 之类的参数解包 helper, 真正的 sub_A3B7AC8 在后面
+//   (历史 IDA 验证为 thunk+0x68, 即 26 号 insn). 因此 "扫第一条 BL" 的旧
+//   策略会误命中 helper, 调用即 SIGSEGV.
+//
+//   新策略 = scan + validate.
+//   候选 = thunk 前 64 条指令里所有 BL 目标.
+//   验证 = 该候选必须能跑通整条链:
+//     候选 → 第 1 条 BL = sub_981FDB4
+//          → 第 1 条 BL = sub_98322E0
+//          → 第 1 对 ADRP+ADD = unk_150ED768 (slot)
+//   且 slot 必须落在 m_moduleBase 加载范围内. 业务函数链路在该 thunk 内独
+//   一无二, 几乎不可能与 Step/FrameNext 等 helper 冲突.
+//
+//   两个 resolver 共享 (fn, slot) 一次性缓存, 避免重复扫描.
+
+namespace {
+struct ItemNameResolved {
+    uintptr_t fn   = 0;
+    uintptr_t slot = 0;
+};
+constexpr uintptr_t kItemNameResolveSentinel = static_cast<uintptr_t>(-1);
+} // namespace
+
+uintptr_t MatchMonitor::resolveItemNameFnAddress() {
+    static std::atomic<uintptr_t> s_addr{0};
+    static std::atomic<uintptr_t> s_slot{0};
+    constexpr uintptr_t kSentinelFailed = kItemNameResolveSentinel;
+
+    uintptr_t cached = s_addr.load(std::memory_order_acquire);
+    if (cached == kSentinelFailed) return 0;
+    if (cached != 0) {
+        // 让 resolveItemConfigCacheSlot 也能取到 slot
+        m_itemConfigSlotCache.store(s_slot.load(std::memory_order_acquire),
+                                    std::memory_order_release);
+        return cached;
+    }
+
+    auto store = [&](uintptr_t fn, uintptr_t slot) -> uintptr_t {
+        s_slot.store(slot, std::memory_order_release);
+        s_addr.store(fn == 0 ? kSentinelFailed : fn, std::memory_order_release);
+        m_itemConfigSlotCache.store(slot, std::memory_order_release);
+        return fn;
+    };
+    auto fallback = [&]() -> uintptr_t {
+        if (m_moduleBase == 0) return store(0, 0);
+        const uintptr_t fn   = m_moduleBase + kItemNameLookupInternalOffsetFallback;
+        const uintptr_t slot = m_moduleBase + kItemConfigUClassCacheRvaFallback;
+        LOG(LOG_LEVEL_WARN,
+            "[ItemNameNative] 反射/链式校验全部失败, 回退硬编码 fn RVA=0x%lX slot RVA=0x%lX",
+            (unsigned long)kItemNameLookupInternalOffsetFallback,
+            (unsigned long)kItemConfigUClassCacheRvaFallback);
+        return store(fn, slot);
+    };
+
+    if (m_moduleBase == 0 || m_moduleSize == 0) return fallback();
+    const uintptr_t modBegin = m_moduleBase;
+    const uintptr_t modEnd   = m_moduleBase + m_moduleSize;
+    auto inMod = [&](uintptr_t p) { return p >= modBegin && p < modEnd; };
+
+    auto decodeBL = [](uintptr_t pc, uint32_t insn, uintptr_t& outTarget) -> bool {
+        if ((insn & 0xFC000000u) != 0x94000000u) return false;
+        int32_t imm26 = static_cast<int32_t>(insn & 0x03FFFFFFu);
+        if (imm26 & 0x02000000) imm26 |= 0xFC000000;
+        outTarget = pc + static_cast<uintptr_t>(static_cast<intptr_t>(imm26) * 4);
+        return true;
+    };
+    auto findFirstBLTarget = [&](uintptr_t fnAddr, int maxScan,
+                                 uintptr_t& outTarget) -> bool {
+        std::vector<uint32_t> insns(maxScan, 0);
+        if (!safeReadMemory(fnAddr, insns.data(), insns.size() * sizeof(uint32_t))) return false;
+        for (int i = 0; i < maxScan; ++i) {
+            uintptr_t t = 0;
+            if (decodeBL(fnAddr + static_cast<uintptr_t>(i) * 4, insns[i], t)) {
+                outTarget = t; return true;
+            }
+        }
+        return false;
+    };
+    auto findAdrpAddSlot = [&](uintptr_t fnAddr, int maxScan,
+                               uintptr_t& outSlot) -> bool {
+        std::vector<uint32_t> insns(maxScan, 0);
+        if (!safeReadMemory(fnAddr, insns.data(), insns.size() * sizeof(uint32_t))) return false;
+        for (int i = 0; i + 1 < maxScan; ++i) {
+            const uint32_t adrp = insns[i];
+            if ((adrp & 0x9F000000u) != 0x90000000u) continue;
+            const uint32_t add = insns[i + 1];
+            if ((add & 0xFF800000u) != 0x91000000u) continue;
+            const uint32_t adrpRd = adrp & 0x1Fu;
+            const uint32_t addRn  = (add >> 5) & 0x1Fu;
+            const uint32_t addRd  = add & 0x1Fu;
+            if (adrpRd != addRn || adrpRd != addRd) continue;
+            int32_t immlo = (adrp >> 29) & 0x3;
+            int32_t immhi = (adrp >> 5) & 0x7FFFF;
+            int32_t imm21 = (immhi << 2) | immlo;
+            if (imm21 & 0x100000) imm21 |= 0xFFE00000;
+            const uintptr_t pc = fnAddr + static_cast<uintptr_t>(i) * 4u;
+            const uintptr_t adrpTarget = (pc & ~uintptr_t{0xFFF})
+                + (static_cast<uintptr_t>(static_cast<intptr_t>(imm21)) << 12);
+            uint32_t imm12 = (add >> 10) & 0xFFF;
+            const uint32_t sh = (add >> 22) & 0x1;
+            const uintptr_t addImm = static_cast<uintptr_t>(imm12) << (sh ? 12 : 0);
+            outSlot = adrpTarget + addImm;
+            return true;
+        }
+        return false;
+    };
+    // 链式校验: candidate 看起来像 sub_A3B7AC8 当且仅当
+    // candidate→1stBL→1stBL 内能解出 ADRP+ADD slot 且 slot ∈ module.
+    auto validateChain = [&](uintptr_t candidate, uintptr_t& outSlot) -> bool {
+        if (!inMod(candidate)) return false;
+        uintptr_t fn981 = 0;
+        if (!findFirstBLTarget(candidate, 8, fn981) || !inMod(fn981)) return false;
+        uintptr_t fn983 = 0;
+        if (!findFirstBLTarget(fn981, 16, fn983) || !inMod(fn983)) return false;
+        uintptr_t slot = 0;
+        if (!findAdrpAddSlot(fn983, 32, slot)) return false;
+        if (!inMod(slot)) return false;
+        outSlot = slot;
+        return true;
+    };
+
+    // ---- Step 1: 反射拿 ItemUtilsV2::GetItemNameV2 thunk ----
+    const uintptr_t thunkAddr = m_interface.getFuncAddress("ItemUtilsV2", "GetItemNameV2");
+    if (!inMod(thunkAddr)) {
+        LOG(LOG_LEVEL_WARN,
+            "[ItemNameNative] ItemUtilsV2::GetItemNameV2 反射地址越界: %p (module [%p, %p))",
+            (void*)thunkAddr, (void*)m_moduleBase, (void*)(m_moduleBase + m_moduleSize));
+        return fallback();
+    }
+
+    // ---- Step 2: 扫 thunk 前 64 条指令所有 BL, 逐个用链路验证 ----
+    constexpr int kMaxScanInsns = 64;
+    uint32_t insnBuf[kMaxScanInsns] = {};
+    if (!safeReadMemory(thunkAddr, insnBuf, sizeof(insnBuf))) {
+        LOG(LOG_LEVEL_WARN, "[ItemNameNative] thunk 字节读取失败 @ %p", (void*)thunkAddr);
+        return fallback();
+    }
+    int candidatesScanned = 0;
+    for (int i = 0; i < kMaxScanInsns; ++i) {
+        uintptr_t cand = 0;
+        if (!decodeBL(thunkAddr + static_cast<uintptr_t>(i) * 4u, insnBuf[i], cand)) continue;
+        ++candidatesScanned;
+        uintptr_t slot = 0;
+        if (!validateChain(cand, slot)) continue;
+
+        const uintptr_t fnRva = cand - m_moduleBase;
+        const uintptr_t slotRva = slot - m_moduleBase;
+        LOG(LOG_LEVEL_INFO,
+            "[ItemNameNative] 动态解析成功 (扫描 %d 个 BL 候选): "
+            "thunk=%p[+0x%X] -> sub_A3B7AC8=%p (RVA=0x%lX, 兜底 0x%lX, %s); "
+            "unk_slot=%p (RVA=0x%lX, 兜底 0x%lX, %s)",
+            candidatesScanned, (void*)thunkAddr, i * 4,
+            (void*)cand, (unsigned long)fnRva,
+            (unsigned long)kItemNameLookupInternalOffsetFallback,
+            fnRva == kItemNameLookupInternalOffsetFallback ? "一致" : "已漂移",
+            (void*)slot, (unsigned long)slotRva,
+            (unsigned long)kItemConfigUClassCacheRvaFallback,
+            slotRva == kItemConfigUClassCacheRvaFallback ? "一致" : "已漂移");
+        return store(cand, slot);
+    }
+
+    LOG(LOG_LEVEL_WARN,
+        "[ItemNameNative] thunk @ %p 内 %d 个 BL 候选均无法通过链路校验, 回退",
+        (void*)thunkAddr, candidatesScanned);
+    return fallback();
+}
+
+uintptr_t MatchMonitor::resolveItemConfigCacheSlot() {
+    // 触发 (或读取已缓存) fn 解析, 同步把 slot 写入 m_itemConfigSlotCache.
+    if (resolveItemNameFnAddress() == 0) return 0;
+    return m_itemConfigSlotCache.load(std::memory_order_acquire);
+}
+
+bool MatchMonitor::tryGetItemNameNative(int32_t itemID, std::string& out) {
+    if (itemID <= 0 || m_moduleBase == 0) return false;
+
+    // 门控 1: 物资配置表 UClass 缓存必须已被游戏自己初始化过.
+    // unk_150ED768 是 sub_98322E0 内 FindObject("/N") 的结果缓存. 非零 = 游戏
+    // 线程已经至少跑过一次配置加载, 后续从工作线程调用纯属哈希查表, 安全.
+    // 零 = 游戏还没碰过, 我们的工作线程贸然进 sub_AED16BC 就会 SIGSEGV.
+    {
+        const uintptr_t cacheSlot = resolveItemConfigCacheSlot();
+        if (cacheSlot == 0) return false;
+        const uintptr_t cachedClass = safeReadPtr(cacheSlot);
+        if (cachedClass < 0x10000) {
+            static std::atomic<uint64_t> s_lastWaitLogMs{0};
+            const uint64_t now = nowMonotonicMs();
+            if (now - s_lastWaitLogMs.load(std::memory_order_relaxed) > 5000) {
+                s_lastWaitLogMs.store(now, std::memory_order_relaxed);
+                LOG(LOG_LEVEL_INFO,
+                    "[ItemNameNative] 等待游戏线程初始化物资配置表 (slot=%p val=%p), "
+                    "暂时退化到硬编码表",
+                    (void*)cacheSlot, (void*)cachedClass);
+            }
+            return false;
+        }
+    }
+
+    // ---- 缓存 (永久, key=itemID, value="" 表示已知失败) ----
+    static std::unordered_map<int32_t, std::string> s_cache;
+    static std::mutex s_cacheMu;
+    {
+        std::lock_guard<std::mutex> g(s_cacheMu);
+        auto it = s_cache.find(itemID);
+        if (it != s_cache.end()) {
+            if (it->second.empty()) return false;
+            out = it->second;
+            return true;
+        }
+    }
+
+    const uintptr_t fnAddr = resolveItemNameFnAddress();
+    if (fnAddr == 0) return false;
+
+    using FnT = void* (*)(int32_t);
+    auto fn = reinterpret_cast<FnT>(fnAddr);
+
+    ItemNameNativeSpoofCtx ctx{};
+    ctx.fn = fn;
+    ctx.itemID = itemID;
+    ctx.fstrPtr = nullptr;
+
+    // 复用 safeReadMemory 的信号屏障 + TLS jmp_buf, 把 sub_A3B7AC8 调用本身
+    // 也保护起来 (信号处理器仅在 s_safeReadActive=1 时 longjmp).
+    installSafeReadGuard();
+    void* fstrPtr = nullptr;
+    const int sigCaught = sigsetjmp(s_safeReadJmpBuf, 1);
+    if (sigCaught == 0) {
+        s_safeReadActive = 1;
+        // 进入栈伪装窗口: x29 切到 fake chain, BLR 跳进 libUE4.so;
+        // 出来后 x29 还原, 不留痕迹.
+        stack_spoof::call_spoofed(&itemNameNativeTrampoline, &ctx);
+        s_safeReadActive = 0;
+        fstrPtr = ctx.fstrPtr;
+    } else {
+        s_safeReadActive = 0;
+        LOG(LOG_LEVEL_WARN,
+            "[ItemNameNative] sub_A3B7AC8(%d) faulted sig=%d, blacklisting itemID",
+            itemID, sigCaught);
+        std::lock_guard<std::mutex> g(s_cacheMu);
+        s_cache[itemID] = "";
+        return false;
+    }
+
+    if (fstrPtr == nullptr || reinterpret_cast<uintptr_t>(fstrPtr) < 0x10000) {
+        std::lock_guard<std::mutex> g(s_cacheMu);
+        s_cache[itemID] = "";
+        return false;
+    }
+
+    // FString {Data, Num, Max} -> UTF-8. readFString 内部全部 safeReadMemory,
+    // 即便 Data 指针无效也只是返回 ""; 不会再次崩溃.
+    std::string name = readFString(reinterpret_cast<uintptr_t>(fstrPtr));
+    if (name.empty()) {
+        std::lock_guard<std::mutex> g(s_cacheMu);
+        s_cache[itemID] = "";
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> g(s_cacheMu);
+        s_cache[itemID] = name;
+    }
+    static std::atomic<int> s_loggedCount{0};
+    if (s_loggedCount.fetch_add(1, std::memory_order_relaxed) < 32) {
+        LOG(LOG_LEVEL_INFO, "[ItemNameNative] itemID=%d -> %s", itemID, name.c_str());
+    }
+    out = std::move(name);
+    return true;
+}
+
 // EItemType (PUBG 经验值): 1=Weapon 2=Attachment 3=Ammo 4=Med 5=Throwing
 // 6=Armor 7=Helmet 8=Backpack 9=Cloth 10=Other
 // TypeSpecificID 命名表 — 基于 PUBGm 社区已知的 ItemDefineID 配置.
@@ -3257,7 +3655,11 @@ int MatchMonitor::scanWorldObjects(std::vector<ue4draw::DrawWorldObject>& outObj
             obj.inBox = isInBox;
             obj.kind = (typeId == 1) ? ue4draw::DrawWorldObjectKind::Weapon
                                       : ue4draw::DrawWorldObjectKind::Item;
-            obj.label = lookupItemName(typeId, subId);
+            // 优先走 libUE4.so 内部配置表 (sub_A3B7AC8) 拿真实物资名,
+            // 失败 (函数 fault / 返回空 FString / itemID 已被拉黑) 回退到硬编码表.
+            if (!tryGetItemNameNative(subId, obj.label)) {
+                obj.label = lookupItemName(typeId, subId);
+            }
         } else if (kind == 2) {
             obj.kind = ue4draw::DrawWorldObjectKind::Vehicle;
             uint8_t vt = 0;
@@ -3326,7 +3728,10 @@ int MatchMonitor::scanWorldObjects(std::vector<ue4draw::DrawWorldObject>& outObj
                     child.kind = (typeId == 1) ? ue4draw::DrawWorldObjectKind::Weapon
                                                 : ue4draw::DrawWorldObjectKind::Item;
                     char nameBuf[64];
-                    std::string nm = lookupItemName(typeId, subId);
+                    std::string nm;
+                    if (!tryGetItemNameNative(subId, nm)) {
+                        nm = lookupItemName(typeId, subId);
+                    }
                     if (count > 1) snprintf(nameBuf, sizeof(nameBuf), "%s x%d", nm.c_str(), count);
                     else           snprintf(nameBuf, sizeof(nameBuf), "%s", nm.c_str());
                     child.label = nameBuf;
