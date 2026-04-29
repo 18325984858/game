@@ -1,4 +1,4 @@
-﻿/*
+/*
  * ═══════════════════════════════════════════════════════════════════════
  *  DobbyProject - 注入流程说明
  * ═══════════════════════════════════════════════════════════════════════
@@ -257,111 +257,16 @@ public class MainActivity extends AppCompatActivity {
         });
 
         // ── 和平精英启动按钮 ──
-        btnPubgLaunch.setOnClickListener(v -> {
-            if (!selinuxDone) {
-                Toast.makeText(this, "请先设置宽容模式", Toast.LENGTH_SHORT).show();
-                return;
-            }
-
-            if ("⚠ 游戏未安装".equals(btnPubgLaunch.getText().toString())) {
-                Toast.makeText(this, "和平精英未安装，请先安装游戏", Toast.LENGTH_SHORT).show();
-                return;
-            }
-
-            if (!ensureOverlayPermission()) {
-                updateStatus("请授予悬浮窗权限后重试");
-                return;
-            }
-
-            startUe4OverlayService();
-            btnPubgLaunch.setEnabled(false);
-
-            boolean enableUeDumper = cbPubgDumper.isChecked();
-            boolean enableUeHeader = cbPubgHeader.isChecked();
-            boolean enableLog = cbLog.isChecked();
-
-            clearDumpMarkers();
-            GameLauncher.launch(GAME_PUBG, enableUeDumper, enableUeHeader, enableLog,
-                    makeGameLauncherEnv(GAME_PUBG, btnPubgLaunch, "和平精英"));
-
-            String options = "";
-            if (enableUeDumper) options += " [UE4 Dumper]";
-            if (enableUeHeader) options += " [UE4 Header]";
-            btnPubgLaunch.setText("✅ 游戏已启动" + options);
-            updateStatus(UE4_OVERLAY_STATUS + " | 和平精英启动中..." + options);
-            Toast.makeText(this, "正在启动和平精英并注入..." + options, Toast.LENGTH_SHORT).show();
-        });
+        wireGameButton(btnPubgLaunch, GAME_PUBG, "和平精英",
+                cbPubgDumper, cbPubgHeader, cbLog, "[UE4 Dumper]", "[UE4 Header]");
 
         // ── 三角洲启动按钮 ──
-        btnDfmLaunch.setOnClickListener(v -> {
-            if (!selinuxDone) {
-                Toast.makeText(this, "请先设置宽容模式", Toast.LENGTH_SHORT).show();
-                return;
-            }
-
-            if ("⚠ 游戏未安装".equals(btnDfmLaunch.getText().toString())) {
-                Toast.makeText(this, "三角洲未安装，请先安装游戏", Toast.LENGTH_SHORT).show();
-                return;
-            }
-
-            if (!ensureOverlayPermission()) {
-                updateStatus("请授予悬浮窗权限后重试");
-                return;
-            }
-
-            startUe4OverlayService();
-            btnDfmLaunch.setEnabled(false);
-
-            boolean enableUeDumper = cbDfmDumper.isChecked();
-            boolean enableUeHeader = cbDfmHeader.isChecked();
-            boolean enableLog = cbLog.isChecked();
-
-            clearDumpMarkers();
-            GameLauncher.launch(GAME_DFM, enableUeDumper, enableUeHeader, enableLog,
-                    makeGameLauncherEnv(GAME_DFM, btnDfmLaunch, "三角洲"));
-
-            String options2 = "";
-            if (enableUeDumper) options2 += " [UE5 Dumper]";
-            if (enableUeHeader) options2 += " [UE5 Header]";
-            btnDfmLaunch.setText("✅ 游戏已启动" + options2);
-            updateStatus(UE4_OVERLAY_STATUS + " | 三角洲启动中..." + options2);
-            Toast.makeText(this, "正在启动三角洲并注入..." + options2, Toast.LENGTH_SHORT).show();
-        });
+        wireGameButton(btnDfmLaunch, GAME_DFM, "三角洲",
+                cbDfmDumper, cbDfmHeader, cbLog, "[UE5 Dumper]", "[UE5 Header]");
 
         // ── 洛克王国手游 (NRC) 启动按钮 ──
-        btnNrcLaunch.setOnClickListener(v -> {
-            if (!selinuxDone) {
-                Toast.makeText(this, "请先设置宽容模式", Toast.LENGTH_SHORT).show();
-                return;
-            }
-
-            if ("⚠ 游戏未安装".equals(btnNrcLaunch.getText().toString())) {
-                Toast.makeText(this, "洛克王国手游未安装，请先安装游戏", Toast.LENGTH_SHORT).show();
-                return;
-            }
-
-            if (!ensureOverlayPermission()) {
-                updateStatus("请授予悬浮窗权限后重试");
-                return;
-            }
-
-            startUe4OverlayService();
-            btnNrcLaunch.setEnabled(false);
-
-            boolean enableUeDumper = cbNrcDumper.isChecked();
-            boolean enableUeHeader = cbNrcHeader.isChecked();
-            boolean enableLog = cbLog.isChecked();
-
-            clearDumpMarkers();
-            GameLauncher.launch(GAME_NRC, enableUeDumper, enableUeHeader, enableLog,
-                    makeGameLauncherEnv(GAME_NRC, btnNrcLaunch, "洛克王国手游"));
-
-            String options3 = "";
-            if (enableUeDumper) options3 += " [UE4 Dumper]";
-            btnNrcLaunch.setText("✅ 游戏已启动" + options3);
-            updateStatus(UE4_OVERLAY_STATUS + " | 洛克王国手游启动中..." + options3);
-            Toast.makeText(this, "正在启动洛克王国手游并注入..." + options3, Toast.LENGTH_SHORT).show();
-        });
+        wireGameButton(btnNrcLaunch, GAME_NRC, "洛克王国手游",
+                cbNrcDumper, cbNrcHeader, cbLog, "[UE4 Dumper]", null);
 
         // ── 启动时初始化检测 ──
         updateStatus("正在检测环境...");
@@ -586,14 +491,7 @@ public class MainActivity extends AppCompatActivity {
      * 清除旧的 dump 完成标记文件
      */
     private void clearDumpMarkers() {
-        try {
-            Process p = Runtime.getRuntime().exec("su");
-            DataOutputStream os = new DataOutputStream(p.getOutputStream());
-            os.writeBytes("rm -f /data/local/tmp/dobby_dumper_done /data/local/tmp/dobby_header_done\n");
-            os.writeBytes("exit\n");
-            os.flush();
-            p.waitFor();
-        } catch (Exception ignored) {}
+        SuShell.run("rm -f /data/local/tmp/dobby_dumper_done /data/local/tmp/dobby_header_done");
     }
 
     /**
@@ -639,20 +537,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private boolean checkFileExists(String path) {
-        try {
-            Process p = Runtime.getRuntime().exec("su");
-            DataOutputStream os = new DataOutputStream(p.getOutputStream());
-            os.writeBytes("test -f " + path + " && echo YES\n");
-            os.writeBytes("exit\n");
-            os.flush();
-            BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream()));
-            String line;
-            while ((line = reader.readLine()) != null) {
-                if (line.contains("YES")) { p.waitFor(); return true; }
-            }
-            p.waitFor();
-        } catch (Exception ignored) {}
-        return false;
+        return SuShell.containsLine("test -f " + path + " && echo YES", "YES");
     }
 
     /**
@@ -695,40 +580,14 @@ public class MainActivity extends AppCompatActivity {
      * 检测 SELinux 是否已经是 Permissive 模式
      */
     private boolean checkSelinuxPermissive() {
-        try {
-            Process p = Runtime.getRuntime().exec("su");
-            DataOutputStream os = new DataOutputStream(p.getOutputStream());
-            os.writeBytes("getenforce\n");
-            os.writeBytes("exit\n");
-            os.flush();
-            BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream()));
-            String line;
-            while ((line = reader.readLine()) != null) {
-                if (line.trim().equalsIgnoreCase("Permissive")) { p.waitFor(); return true; }
-            }
-            p.waitFor();
-        } catch (Exception ignored) {}
-        return false;
+        return SuShell.anyLineMatches("getenforce", l -> l.trim().equalsIgnoreCase("Permissive"));
     }
 
     /**
      * 检测 /dev/input/event* 是否已有 666 权限 (other 可读写)
      */
     private boolean checkInputPermission() {
-        try {
-            Process p = Runtime.getRuntime().exec("su");
-            DataOutputStream os = new DataOutputStream(p.getOutputStream());
-            os.writeBytes("ls -l /dev/input/event0 | grep -q 'crw-rw-rw' && echo OK\n");
-            os.writeBytes("exit\n");
-            os.flush();
-            BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream()));
-            String line;
-            while ((line = reader.readLine()) != null) {
-                if (line.contains("OK")) { p.waitFor(); return true; }
-            }
-            p.waitFor();
-        } catch (Exception ignored) {}
-        return false;
+        return SuShell.containsLine("ls -l /dev/input/event0 | grep -q 'crw-rw-rw' && echo OK", "OK");
     }
 
     /**
@@ -739,39 +598,13 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private boolean checkPackageInstalled(String packageName) {
-        try {
-            Process p = Runtime.getRuntime().exec("su");
-            DataOutputStream os = new DataOutputStream(p.getOutputStream());
-            os.writeBytes("pm list packages " + packageName + " | grep -q " + packageName + " && echo INSTALLED\n");
-            os.writeBytes("exit\n");
-            os.flush();
-            BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream()));
-            String line;
-            while ((line = reader.readLine()) != null) {
-                if (line.contains("INSTALLED")) { p.waitFor(); return true; }
-            }
-            p.waitFor();
-        } catch (Exception ignored) {}
-        return false;
+        return SuShell.containsLine(
+                "pm list packages " + packageName + " | grep -q " + packageName + " && echo INSTALLED",
+                "INSTALLED");
     }
 
     private String runSuFirstLine(String cmd) {
-        try {
-            Process p = Runtime.getRuntime().exec("su");
-            DataOutputStream os = new DataOutputStream(p.getOutputStream());
-            os.writeBytes(cmd + "\n");
-            os.writeBytes("exit\n");
-            os.flush();
-            BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream()));
-            String line = reader.readLine();
-            p.waitFor();
-            if (line == null) return null;
-            line = line.trim();
-            return line.isEmpty() ? null : line;
-        } catch (Exception e) {
-            LogUtil.i("runSuFirstLine failed: " + e.getMessage());
-            return null;
-        }
+        return SuShell.firstLine(cmd);
     }
 
     private String resolvePackageNativeLibDir(String packageName) {
@@ -970,47 +803,25 @@ public class MainActivity extends AppCompatActivity {
      * lib/ = 32-bit, lib64/ = 64-bit
      */
     private boolean isTargetProcess32Bit(String packageName) {
-        try {
-            Process p = Runtime.getRuntime().exec("su");
-            DataOutputStream os = new DataOutputStream(p.getOutputStream());
-            os.writeBytes("cat /proc/$(pidof " + packageName + ")/maps | grep libc.so | head -1\n");
-            os.writeBytes("exit\n");
-            os.flush();
-            BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream()));
-            String line;
-            while ((line = reader.readLine()) != null) {
-                LogUtil.i("[架构] 目标 libc 映射: " + line);
-                if (line.contains("/lib64/")) {
-                    p.waitFor();
-                    return false; // 64-bit
-                }
-                if (line.contains("/lib/")) {
-                    p.waitFor();
-                    return true;  // 32-bit
-                }
-            }
-            p.waitFor();
-        } catch (Exception ignored) {}
+        // 主探测: 看加载的 libc.so 路径在 lib 还是 lib64
+        boolean[] result = { false };
+        boolean[] decided = { false };
+        SuShell.runWithLines("cat /proc/$(pidof " + packageName + ")/maps | grep libc.so | head -1", line -> {
+            LogUtil.i("[架构] 目标 libc 映射: " + line);
+            if (decided[0]) return;
+            if (line.contains("/lib64/")) { result[0] = false; decided[0] = true; }
+            else if (line.contains("/lib/"))  { result[0] = true;  decided[0] = true; }
+        });
+        if (decided[0]) return result[0];
+
         // 回退: 检查地址范围
-        try {
-            Process p = Runtime.getRuntime().exec("su");
-            DataOutputStream os = new DataOutputStream(p.getOutputStream());
-            os.writeBytes("head -3 /proc/$(pidof " + packageName + ")/maps\n");
-            os.writeBytes("exit\n");
-            os.flush();
-            BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream()));
-            String line;
-            while ((line = reader.readLine()) != null) {
-                String addr = line.split("-")[0].trim();
-                if (addr.length() > 8) {
-                    p.waitFor();
-                    return false; // 64-bit address
-                }
-            }
-            p.waitFor();
-            return true;
-        } catch (Exception ignored) {}
-        return false;
+        SuShell.runWithLines("head -3 /proc/$(pidof " + packageName + ")/maps", line -> {
+            if (decided[0]) return;
+            String addr = line.split("-")[0].trim();
+            if (addr.length() > 8) { result[0] = false; decided[0] = true; }
+        });
+        if (decided[0]) return result[0];
+        return true;
     }
 
     /**
@@ -1029,27 +840,10 @@ public class MainActivity extends AppCompatActivity {
                 return false;
             }
             String tmpPath = getCacheDir() + "/" + abi + "_" + libName;
-            InputStream is = zip.getInputStream(entry);
-            FileOutputStream fos = new FileOutputStream(tmpPath);
-            byte[] buf = new byte[8192];
-            int len;
-            while ((len = is.read(buf)) > 0) {
-                fos.write(buf, 0, len);
-            }
-            fos.close();
-            is.close();
+            boolean ok = Deploy.fromInputStream(zip.getInputStream(entry), tmpPath, destPath, "755");
             zip.close();
-
-            // 用 su 部署到目标路径
-            Process p = Runtime.getRuntime().exec("su");
-            DataOutputStream os = new DataOutputStream(p.getOutputStream());
-            os.writeBytes("cp -f " + tmpPath + " " + destPath + "\n");
-            os.writeBytes("chmod 755 " + destPath + "\n");
-            os.writeBytes("exit\n");
-            os.flush();
-            p.waitFor();
-            LogUtil.i("[提取] ✓ 已部署: " + destPath);
-            return true;
+            if (ok) LogUtil.i("[提取] ✓ 已部署: " + destPath);
+            return ok;
         } catch (Exception e) {
             LogUtil.e("[提取] 失败: " + e.getMessage(), e);
             return false;
@@ -1060,57 +854,24 @@ public class MainActivity extends AppCompatActivity {
      * 检测目标进程是否正在运行
      */
     private boolean isProcessRunning(String packageName) {
-        try {
-            Process p = Runtime.getRuntime().exec("su");
-            DataOutputStream os = new DataOutputStream(p.getOutputStream());
-            os.writeBytes("pidof " + packageName + " && echo RUNNING\n");
-            os.writeBytes("exit\n");
-            os.flush();
-            BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream()));
-            String line;
-            while ((line = reader.readLine()) != null) {
-                if (line.contains("RUNNING")) { p.waitFor(); return true; }
-            }
-            p.waitFor();
-        } catch (Exception ignored) {}
-        return false;
+        return SuShell.containsLine("pidof " + packageName + " && echo RUNNING", "RUNNING");
     }
 
     public void setSelinuxPermissive() {
-        try {
-            Process p = Runtime.getRuntime().exec("su");
-            DataOutputStream os = new DataOutputStream(p.getOutputStream());
-            os.writeBytes("setenforce 0\n");
-            os.writeBytes("exit\n");
-            os.flush();
-
-            int exitCode = p.waitFor();
-            if (exitCode == 0) {
-                LogUtil.i("SELinux 已设置为宽容模式 (Permissive)");
-            } else {
-                LogUtil.e("设置 SELinux 宽容模式失败，错误码: " + exitCode, null);
-            }
-        } catch (Exception e) {
-            LogUtil.e("设置 SELinux 异常: " + e.getMessage(), e);
+        int exitCode = SuShell.run("setenforce 0");
+        if (exitCode == 0) {
+            LogUtil.i("SELinux 已设置为宽容模式 (Permissive)");
+        } else {
+            LogUtil.e("设置 SELinux 宽容模式失败，错误码: " + exitCode, null);
         }
     }
 
     public void fixInputPermission() {
-        try {
-            Process p = Runtime.getRuntime().exec("su");
-            DataOutputStream os = new DataOutputStream(p.getOutputStream());
-            os.writeBytes("chmod 666 /dev/input/event*\n");
-            os.writeBytes("exit\n");
-            os.flush();
-
-            int exitCode = p.waitFor();
-            if (exitCode == 0) {
-                LogUtil.i("输入设备权限修改成功");
-            } else {
-                LogUtil.e("输入设备权限修改失败，错误码: " + exitCode, null);
-            }
-        } catch (Exception e) {
-            LogUtil.e("修改输入设备权限异常: " + e.getMessage(), e);
+        int exitCode = SuShell.run("chmod 666 /dev/input/event*");
+        if (exitCode == 0) {
+            LogUtil.i("输入设备权限修改成功");
+        } else {
+            LogUtil.e("输入设备权限修改失败，错误码: " + exitCode, null);
         }
     }
 
@@ -1122,36 +883,13 @@ public class MainActivity extends AppCompatActivity {
         new Thread(() -> {
             // 检查 SO 文件是否存在
             LogUtil.i("[注入流程] 检查 SO 文件: " + soPath);
-            try {
-                Process chk = Runtime.getRuntime().exec("su");
-                DataOutputStream chkOs = new DataOutputStream(chk.getOutputStream());
-                chkOs.writeBytes("ls -la " + soPath + "\n");
-                chkOs.writeBytes("exit\n");
-                chkOs.flush();
-                BufferedReader chkReader = new BufferedReader(new InputStreamReader(chk.getInputStream()));
-                String chkLine;
-                while ((chkLine = chkReader.readLine()) != null) {
-                    LogUtil.i("[注入流程] SO 文件信息: " + chkLine);
-                }
-                chk.waitFor();
-            } catch (Exception e) {
-                LogUtil.e("[注入流程] 检查 SO 文件异常: " + e.getMessage(), e);
-            }
+            SuShell.runWithLines("ls -la " + soPath,
+                    l -> LogUtil.i("[注入流程] SO 文件信息: " + l));
 
             // 部署 injector 可执行文件
             LogUtil.i("[注入流程] 部署 injector: " + injectorSrc + " -> " + injectorDst);
-            try {
-                Process dep = Runtime.getRuntime().exec("su");
-                DataOutputStream depOs = new DataOutputStream(dep.getOutputStream());
-                depOs.writeBytes("cp -f " + injectorSrc + " " + injectorDst + "\n");
-                depOs.writeBytes("chmod 755 " + injectorDst + "\n");
-                depOs.writeBytes("exit\n");
-                depOs.flush();
-                dep.waitFor();
-                LogUtil.i("[注入流程] injector 部署完成");
-            } catch (Exception e) {
-                LogUtil.e("[注入流程] 部署 injector 异常: " + e.getMessage(), e);
-            }
+            SuShell.run("cp -f " + injectorSrc + " " + injectorDst + "\nchmod 755 " + injectorDst);
+            LogUtil.i("[注入流程] injector 部署完成");
 
             // 启动目标应用
             LogUtil.i("[注入流程] 正在启动目标应用: " + g_packFileName);
@@ -1161,18 +899,9 @@ public class MainActivity extends AppCompatActivity {
             if (!appLaunched) {
                 try {
                     LogUtil.i("[注入流程] 尝试 monkey 启动...");
-                    Process p = Runtime.getRuntime().exec("su");
-                    DataOutputStream os = new DataOutputStream(p.getOutputStream());
-                    os.writeBytes("monkey -p " + g_packFileName + " -c android.intent.category.LAUNCHER 1 2>/dev/null\n");
-                    os.writeBytes("exit $?\n");
-                    os.flush();
-                    BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream()));
-                    String l;
-                    while ((l = br.readLine()) != null) {
-                        LogUtil.i("[注入流程] monkey: " + l);
-                    }
-                    p.waitFor();
-                    // 验证进程是否启动
+                    SuShell.runWithLines(
+                            "monkey -p " + g_packFileName + " -c android.intent.category.LAUNCHER 1 2>/dev/null",
+                            l -> LogUtil.i("[注入流程] monkey: " + l));
                     Thread.sleep(2000);
                     if (isProcessRunning(g_packFileName)) {
                         appLaunched = true;
@@ -1189,20 +918,14 @@ public class MainActivity extends AppCompatActivity {
             if (!appLaunched) {
                 try {
                     LogUtil.i("[注入流程] 尝试 am start 启动...");
-                    Process p = Runtime.getRuntime().exec("su");
-                    DataOutputStream os = new DataOutputStream(p.getOutputStream());
-                    os.writeBytes("am start -n " + g_packFileName + "/com.riotgames.league.RiotNativeActivity 2>&1\n");
-                    os.writeBytes("exit $?\n");
-                    os.flush();
-                    BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream()));
-                    String l;
-                    boolean hasError = false;
-                    while ((l = br.readLine()) != null) {
-                        LogUtil.i("[注入流程] am start: " + l);
-                        if (l.contains("Error") || l.contains("error")) hasError = true;
-                    }
-                    p.waitFor();
-                    if (!hasError) {
+                    boolean[] hasError = { false };
+                    SuShell.runWithLines(
+                            "am start -n " + g_packFileName + "/com.riotgames.league.RiotNativeActivity 2>&1",
+                            l -> {
+                                LogUtil.i("[注入流程] am start: " + l);
+                                if (l.contains("Error") || l.contains("error")) hasError[0] = true;
+                            });
+                    if (!hasError[0]) {
                         Thread.sleep(2000);
                         if (isProcessRunning(g_packFileName)) {
                             appLaunched = true;
@@ -1218,17 +941,9 @@ public class MainActivity extends AppCompatActivity {
             if (!appLaunched) {
                 try {
                     LogUtil.i("[注入流程] 尝试 am start launcher intent...");
-                    Process p = Runtime.getRuntime().exec("su");
-                    DataOutputStream os = new DataOutputStream(p.getOutputStream());
-                    os.writeBytes("am start -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -n $(cmd package resolve-activity --brief " + g_packFileName + " 2>/dev/null | tail -1) 2>&1 || am start -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p " + g_packFileName + " 2>&1\n");
-                    os.writeBytes("exit\n");
-                    os.flush();
-                    BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream()));
-                    String l;
-                    while ((l = br.readLine()) != null) {
-                        LogUtil.i("[注入流程] launch: " + l);
-                    }
-                    p.waitFor();
+                    SuShell.runWithLines(
+                            "am start -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -n $(cmd package resolve-activity --brief " + g_packFileName + " 2>/dev/null | tail -1) 2>&1 || am start -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p " + g_packFileName + " 2>&1",
+                            l -> LogUtil.i("[注入流程] launch: " + l));
                     Thread.sleep(2000);
                     if (isProcessRunning(g_packFileName)) {
                         appLaunched = true;
@@ -1282,51 +997,24 @@ public class MainActivity extends AppCompatActivity {
             LogUtil.i("[注入流程] 以 root 身份执行 injector...");
 
             // 写入配置文件，告知 C++ 层是否启用 Dumper/Header
-            try {
-                Process cfgP = Runtime.getRuntime().exec("su");
-                DataOutputStream cfgOs = new DataOutputStream(cfgP.getOutputStream());
-                String cfgContent = "dumper=" + (enableDumper ? "1" : "0") + "\n"
-                                  + "header=" + (enableHeader ? "1" : "0") + "\n"
-                                  + "log=" + (enableLog ? "1" : "0") + "\n"
-                                  + "ue_dumper=" + (cbPubgDumper.isChecked() ? "1" : "0") + "\n";
-                cfgOs.writeBytes("echo '" + cfgContent + "' > /data/local/tmp/dobby_config.txt\n");
-                cfgOs.writeBytes("chmod 644 /data/local/tmp/dobby_config.txt\n");
-                cfgOs.writeBytes("exit\n");
-                cfgOs.flush();
-                cfgP.waitFor();
-                LogUtil.i("[注入流程] 配置文件已写入: dumper=" + enableDumper + " header=" + enableHeader);
-            } catch (Exception e) {
-                LogUtil.e("[注入流程] 写入配置文件异常: " + e.getMessage(), e);
-            }
+            String cfgContent = "dumper=" + (enableDumper ? "1" : "0") + "\n"
+                              + "header=" + (enableHeader ? "1" : "0") + "\n"
+                              + "log=" + (enableLog ? "1" : "0") + "\n"
+                              + "ue_dumper=" + (cbPubgDumper.isChecked() ? "1" : "0") + "\n";
+            SuShell.run("echo '" + cfgContent + "' > /data/local/tmp/dobby_config.txt\n"
+                    + "chmod 644 /data/local/tmp/dobby_config.txt");
+            LogUtil.i("[注入流程] 配置文件已写入: dumper=" + enableDumper + " header=" + enableHeader);
 
             long startTime = System.currentTimeMillis();
-            try {
-                Process p = Runtime.getRuntime().exec("su");
-                DataOutputStream os = new DataOutputStream(p.getOutputStream());
-                os.writeBytes(injectorDst + " " + g_packFileName + " " + soPath + "\n");
-                os.writeBytes("exit\n");
-                os.flush();
+            int exitCode = SuShell.runWithLines(
+                    injectorDst + " " + g_packFileName + " " + soPath + " 2>&1",
+                    l -> LogUtil.i("[注入流程] " + l));
+            long elapsed = System.currentTimeMillis() - startTime;
 
-                BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream()));
-                BufferedReader errReader = new BufferedReader(new InputStreamReader(p.getErrorStream()));
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    LogUtil.i("[注入流程] " + line);
-                }
-                while ((line = errReader.readLine()) != null) {
-                    LogUtil.e("[注入流程] stderr: " + line, null);
-                }
-
-                int exitCode = p.waitFor();
-                long elapsed = System.currentTimeMillis() - startTime;
-
-                if (exitCode == 0) {
-                    LogUtil.i("[注入流程] ✓ 注入成功! 耗时: " + elapsed + "ms");
-                } else {
-                    LogUtil.e("[注入流程] ✗ 注入失败, 退出码: " + exitCode + " 耗时: " + elapsed + "ms", null);
-                }
-            } catch (Exception e) {
-                LogUtil.e("[注入流程] 执行 injector 异常: " + e.getMessage(), e);
+            if (exitCode == 0) {
+                LogUtil.i("[注入流程] ✓ 注入成功! 耗时: " + elapsed + "ms");
+            } else {
+                LogUtil.e("[注入流程] ✗ 注入失败, 退出码: " + exitCode + " 耗时: " + elapsed + "ms", null);
             }
         }).start();
     }
@@ -1339,58 +1027,18 @@ public class MainActivity extends AppCompatActivity {
         String dstFile = "/data/local/tmp/chinese.ttf";
 
         // 检查目标是否已存在（避免重复复制）
-        try {
-            Process chk = Runtime.getRuntime().exec("su");
-            DataOutputStream chkOs = new DataOutputStream(chk.getOutputStream());
-            chkOs.writeBytes("test -f " + dstFile + " && echo EXISTS\n");
-            chkOs.writeBytes("exit\n");
-            chkOs.flush();
-            BufferedReader chkReader = new BufferedReader(new InputStreamReader(chk.getInputStream()));
-            String chkLine;
-            boolean exists = false;
-            while ((chkLine = chkReader.readLine()) != null) {
-                if (chkLine.contains("EXISTS")) exists = true;
-            }
-            chk.waitFor();
-            if (exists) {
-                LogUtil.i("[Font] chinese.ttf 已存在于 " + dstFile + "，跳过部署");
-                return;
-            }
-        } catch (Exception ignored) {}
-
-        // 从 assets 提取到 app cache 目录
-        try {
-            InputStream is = getAssets().open("chinese.ttf");
-            FileOutputStream fos = new FileOutputStream(tmpFile);
-            byte[] buf = new byte[8192];
-            int len;
-            while ((len = is.read(buf)) > 0) {
-                fos.write(buf, 0, len);
-            }
-            fos.close();
-            is.close();
-            LogUtil.i("[Font] 已从 assets 提取到: " + tmpFile);
-        } catch (Exception e) {
-            LogUtil.e("[Font] 提取 chinese.ttf 失败: " + e.getMessage(), e);
+        if (SuShell.containsLine("test -f " + dstFile + " && echo EXISTS", "EXISTS")) {
+            LogUtil.i("[Font] chinese.ttf 已存在于 " + dstFile + "，跳过部署");
             return;
         }
 
-        // 用 su 复制到 /data/local/tmp/
+        // 从 assets 提取 + su 部署 (一步完成)
         try {
-            Process p = Runtime.getRuntime().exec("su");
-            DataOutputStream os = new DataOutputStream(p.getOutputStream());
-            os.writeBytes("cp -f " + tmpFile + " " + dstFile + "\n");
-            os.writeBytes("chmod 644 " + dstFile + "\n");
-            os.writeBytes("exit\n");
-            os.flush();
-            int exitCode = p.waitFor();
-            if (exitCode == 0) {
+            if (Deploy.fromInputStream(getAssets().open("chinese.ttf"), tmpFile, dstFile, "644")) {
                 LogUtil.i("[Font] ✓ chinese.ttf 已部署到 " + dstFile);
-            } else {
-                LogUtil.e("[Font] 部署失败，错误码: " + exitCode, null);
             }
         } catch (Exception e) {
-            LogUtil.e("[Font] 部署异常: " + e.getMessage(), e);
+            LogUtil.e("[Font] 提取 chinese.ttf 失败: " + e.getMessage(), e);
         }
     }
 
@@ -1506,6 +1154,52 @@ public class MainActivity extends AppCompatActivity {
             "NRC", "洛克王国手游", NRC_PACKAGE, "nrc",
             INJECT_SO_NAME, /*useApkLibDir=*/false, /*chconApkData=*/false,
             /*waitMs=*/15000, /*retryWithTrace=*/false, /*hideSoName=*/INJECT_SO_NAME);
+
+    /**
+     * 把 4 个游戏启动按钮共用的 onClick 流程抽出, 仅靠 GameSpec + 按钮 + 文案标签区分。
+     *
+     * 流程: selinuxDone 检查 → "未安装" 文案检查 → overlay 权限 → 启动 service →
+     *       clearDumpMarkers → GameLauncher.launch → 更新按钮文案/状态/Toast.
+     *
+     * @param headerLabel 为 null 表示该游戏的 header 选项不显示在按钮文案里 (NRC 行为)
+     */
+    private void wireGameButton(android.widget.Button btn, GameLauncher.GameSpec spec,
+                                String displayName,
+                                CheckBox cbDumper, CheckBox cbHeader, CheckBox cbLog,
+                                String dumperLabel, String headerLabel) {
+        btn.setOnClickListener(v -> {
+            if (!selinuxDone) {
+                Toast.makeText(this, "请先设置宽容模式", Toast.LENGTH_SHORT).show();
+                return;
+            }
+            if ("⚠ 游戏未安装".equals(btn.getText().toString())) {
+                Toast.makeText(this, displayName + "未安装，请先安装游戏", Toast.LENGTH_SHORT).show();
+                return;
+            }
+            if (!ensureOverlayPermission()) {
+                updateStatus("请授予悬浮窗权限后重试");
+                return;
+            }
+
+            startUe4OverlayService();
+            btn.setEnabled(false);
+
+            boolean enableUeDumper = cbDumper.isChecked();
+            boolean enableUeHeader = cbHeader.isChecked();
+            boolean enableLog = cbLog.isChecked();
+
+            clearDumpMarkers();
+            GameLauncher.launch(spec, enableUeDumper, enableUeHeader, enableLog,
+                    makeGameLauncherEnv(spec, btn, displayName));
+
+            String options = "";
+            if (enableUeDumper) options += " " + dumperLabel;
+            if (enableUeHeader && headerLabel != null) options += " " + headerLabel;
+            btn.setText("✅ 游戏已启动" + options);
+            updateStatus(UE4_OVERLAY_STATUS + " | " + displayName + "启动中..." + options);
+            Toast.makeText(this, "正在启动" + displayName + "并注入..." + options, Toast.LENGTH_SHORT).show();
+        });
+    }
 
     /** 把 Activity 上的依赖打包成 GameLauncher.Env, 让启动逻辑与 Activity 解耦. */
     private GameLauncher.Env makeGameLauncherEnv(GameLauncher.GameSpec spec,

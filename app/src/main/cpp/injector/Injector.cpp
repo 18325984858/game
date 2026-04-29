@@ -526,6 +526,58 @@ static int ptrace_call(pid_t pid, uint64_t funcAddr, uint64_t* params, int param
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// 模式分支共用 helpers — 把 4 个分支里重复的 dlsym/模块基址/StartPoint 调用抽出。
+// 每个 helper 失败时打日志并返回 false/0; 调用方只需 `if (!helper(...)) goto cleanup;`。
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/** 远程 dlsym 查找入口函数地址。失败返回 0 并打日志。 */
+static uint64_t resolveStartPoint(pid_t pid, uint64_t dlopenResult, uint64_t remoteMem,
+                                  uint64_t remoteDlsymAddr, const char* funcName) {
+    if (ptrace_writedata(pid, remoteMem, funcName, strlen(funcName) + 1) < 0) {
+        LOG(LOG_LEVEL_ERROR, "[Injector] 写入函数名失败");
+        return 0;
+    }
+    uint64_t dlsymParams[2] = { dlopenResult, remoteMem };
+    uint64_t funcAddr = 0;
+    if (ptrace_call(pid, remoteDlsymAddr, dlsymParams, 2, &funcAddr) < 0 || funcAddr == 0) {
+        LOG(LOG_LEVEL_ERROR, "[Injector] dlsym 查找 %s 失败", funcName);
+        return 0;
+    }
+    LOG(LOG_LEVEL_INFO, "[Injector] %s 地址: %llx", funcName, (unsigned long long)funcAddr);
+    return funcAddr;
+}
+
+/** 取目标 SO 基址 + 大小, 同时打日志。base==0 视为失败返回 false。 */
+static bool loadModuleInfo(pid_t pid, const char* libName, uint64_t* base, uint64_t* size) {
+    *base = getRemoteModuleBase(pid, libName);
+    if (*base == 0) {
+        LOG(LOG_LEVEL_ERROR, "[Injector] 无法找到 %s 基址", libName);
+        return false;
+    }
+    *size = getRemoteModuleSize(pid, libName);
+    LOG(LOG_LEVEL_INFO, "[Injector] %s 基址: %llx 大小: 0x%llx",
+        libName, (unsigned long long)*base, (unsigned long long)*size);
+    return true;
+}
+
+/** 远程调用 MyStartPoint*, 打日志, 返回值非 0 才算成功。 */
+static bool invokeStartPoint(pid_t pid, uint64_t funcAddr, const char* funcName,
+                             uint64_t* params, int nParams) {
+    LOG(LOG_LEVEL_INFO, "[Injector] 调用 %s...", funcName);
+    uint64_t startRet = 0;
+    if (ptrace_call(pid, funcAddr, params, nParams, &startRet) < 0) {
+        LOG(LOG_LEVEL_ERROR, "[Injector] %s 调用失败", funcName);
+        return false;
+    }
+    LOG(LOG_LEVEL_INFO, "[Injector] ✓ %s 返回: %lld", funcName, (long long)startRet);
+    if (startRet == 0) {
+        LOG(LOG_LEVEL_ERROR, "[Injector] %s 返回 0, 视为失败", funcName);
+        return false;
+    }
+    return true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // injectRemote — 核心注入函数
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -649,30 +701,11 @@ int Injector::injectRemote(pid_t pid, const char* soPath, InjectMode mode) {
             static constexpr uint32_t PUBG_OFF_GWORLD         = 0x14CEE938;
 
             const char* funcName = "MyStartPointPUBG";
-            if (ptrace_writedata(pid, remoteMem, funcName, strlen(funcName) + 1) < 0) {
-                LOG(LOG_LEVEL_ERROR, "[Injector] 写入函数名失败");
-                goto cleanup;
-            }
+            uint64_t funcAddr = resolveStartPoint(pid, dlopenResult, remoteMem, remoteDlsymAddr, funcName);
+            if (funcAddr == 0) goto cleanup;
 
-            uint64_t dlsymParams[2] = { dlopenResult, remoteMem };
-            uint64_t funcAddr = 0;
-            if (ptrace_call(pid, remoteDlsymAddr, dlsymParams, 2, &funcAddr) < 0 || funcAddr == 0) {
-                LOG(LOG_LEVEL_ERROR, "[Injector] dlsym 查找 MyStartPointPUBG 失败");
-                goto cleanup;
-            }
-            LOG(LOG_LEVEL_INFO, "[Injector] MyStartPointPUBG 地址: %llx", (unsigned long long)funcAddr);
-
-            // 获取 libUE4.so 基址
-            uint64_t ue4Base = getRemoteModuleBase(pid, "libUE4.so");
-            if (ue4Base == 0) {
-                LOG(LOG_LEVEL_ERROR, "[Injector] 无法找到 libUE4.so 基址");
-                goto cleanup;
-            }
-            LOG(LOG_LEVEL_INFO, "[Injector] libUE4.so 基址: %llx", (unsigned long long)ue4Base);
-
-            // 获取 libUE4.so 模块大小
-            uint64_t ue4Size = getRemoteModuleSize(pid, "libUE4.so");
-            LOG(LOG_LEVEL_INFO, "[Injector] libUE4.so 大小: 0x%llx", (unsigned long long)ue4Size);
+            uint64_t ue4Base = 0, ue4Size = 0;
+            if (!loadModuleInfo(pid, "libUE4.so", &ue4Base, &ue4Size)) goto cleanup;
 
             // 读取 GNames/GUObjectArray/GWorld 指针
             uint64_t pGNames        = ptrace_peekptr(pid, ue4Base + PUBG_OFF_GNAMES);
@@ -694,17 +727,7 @@ int Injector::injectRemote(pid_t pid, const char* soPath, InjectMode mode) {
 
             // 调用 MyStartPointPUBG(libUE4Base, pGNames, pGWorld, pGUObjectArray, moduleSize, NULL)
             uint64_t startParams[6] = { ue4Base, pGNames, pGWorld, pGUObjectArray, ue4Size, 0 };
-            LOG(LOG_LEVEL_INFO, "[Injector] 调用 MyStartPointPUBG...");
-            uint64_t startRet = 0;
-            if (ptrace_call(pid, funcAddr, startParams, 6, &startRet) < 0) {
-                LOG(LOG_LEVEL_ERROR, "[Injector] MyStartPointPUBG 调用失败");
-                goto cleanup;
-            }
-            LOG(LOG_LEVEL_INFO, "[Injector] ✓ MyStartPointPUBG 返回: %lld", (long long)startRet);
-            if (startRet == 0) {
-                LOG(LOG_LEVEL_ERROR, "[Injector] MyStartPointPUBG 返回 0, 视为失败");
-                goto cleanup;
-            }
+            if (!invokeStartPoint(pid, funcAddr, funcName, startParams, 6)) goto cleanup;
             result = 0;
         } else if (mode == MODE_DFM) {
             // ═══ DFM (UE5.4 三角洲) 注入路径 ═══
@@ -721,27 +744,15 @@ int Injector::injectRemote(pid_t pid, const char* soPath, InjectMode mode) {
             static constexpr uint32_t DFM_OFF_GWORLD            = 0x1BBAA930;
 
             const char* funcName = "MyStartPointDFM";
-            if (ptrace_writedata(pid, remoteMem, funcName, strlen(funcName) + 1) < 0) {
-                LOG(LOG_LEVEL_ERROR, "[Injector] 写入函数名失败");
-                goto cleanup;
-            }
+            uint64_t funcAddr = resolveStartPoint(pid, dlopenResult, remoteMem, remoteDlsymAddr, funcName);
+            if (funcAddr == 0) goto cleanup;
 
-            uint64_t dlsymParams[2] = { dlopenResult, remoteMem };
-            uint64_t funcAddr = 0;
-            if (ptrace_call(pid, remoteDlsymAddr, dlsymParams, 2, &funcAddr) < 0 || funcAddr == 0) {
-                LOG(LOG_LEVEL_ERROR, "[Injector] dlsym 查找 MyStartPointDFM 失败");
+            uint64_t ue4Base = 0, ue4Size = 0;
+            if (!loadModuleInfo(pid, "libUE4.so", &ue4Base, &ue4Size)) goto cleanup;
+            if (ue4Size == 0) {
+                LOG(LOG_LEVEL_ERROR, "[Injector] DFM ue4Size=0");
                 goto cleanup;
             }
-            LOG(LOG_LEVEL_INFO, "[Injector] MyStartPointDFM 地址: %llx", (unsigned long long)funcAddr);
-
-            // 获取 libUE4.so 基址和大小
-            uint64_t ue4Base = getRemoteModuleBase(pid, "libUE4.so");
-            if (ue4Base == 0) {
-                LOG(LOG_LEVEL_ERROR, "[Injector] 无法找到 libUE4.so 基址");
-                goto cleanup;
-            }
-            uint64_t ue4Size = getRemoteModuleSize(pid, "libUE4.so");
-            LOG(LOG_LEVEL_INFO, "[Injector] libUE4.so 基址: %llx 大小: 0x%llx", (unsigned long long)ue4Base, (unsigned long long)ue4Size);
 
             // 直接传递偏移值 (不加 ue4Base, C++ 层使用 base + offset 计算)
             uint64_t pNamePool          = DFM_OFF_NAMEPOOL;                  // NamePool 偏移
@@ -753,11 +764,6 @@ int Injector::injectRemote(pid_t pid, const char* soPath, InjectMode mode) {
                 (unsigned long long)pNamePool, (unsigned long long)pGUObjectArrayNum,
                 (unsigned long long)pGUObjectArrayChunks, (unsigned long long)pGWorld);
 
-            if (ue4Size == 0) {
-                LOG(LOG_LEVEL_ERROR, "[Injector] DFM ue4Size=0");
-                goto cleanup;
-            }
-
             // 调用 MyStartPointDFM(libUE4Base, offNamePool, offGWorld, offGUObjArrayNum, offGUObjArrayChunks, moduleSize, NULL)
             uint64_t startParams[7] = {
                 ue4Base,                // X0: plibUE4ModeBase - libUE4.so 基址
@@ -768,17 +774,7 @@ int Injector::injectRemote(pid_t pid, const char* soPath, InjectMode mode) {
                 ue4Size,                // X5: moduleSize
                 0                       // X6: pData - 预留
             };
-            LOG(LOG_LEVEL_INFO, "[Injector] 调用 MyStartPointDFM...");
-            uint64_t startRet = 0;
-            if (ptrace_call(pid, funcAddr, startParams, 7, &startRet) < 0) {
-                LOG(LOG_LEVEL_ERROR, "[Injector] MyStartPointDFM 调用失败");
-                goto cleanup;
-            }
-            LOG(LOG_LEVEL_INFO, "[Injector] ✓ MyStartPointDFM 返回: %lld", (long long)startRet);
-            if (startRet == 0) {
-                LOG(LOG_LEVEL_ERROR, "[Injector] MyStartPointDFM 返回 0, 视为失败");
-                goto cleanup;
-            }
+            if (!invokeStartPoint(pid, funcAddr, funcName, startParams, 7)) goto cleanup;
             result = 0;
         } else if (mode == MODE_NRC) {
             // ═══ NRC (UE 4.26 洛克王国手游) 注入路径 ═══
@@ -796,27 +792,11 @@ int Injector::injectRemote(pid_t pid, const char* soPath, InjectMode mode) {
             static constexpr uint32_t NRC_OFF_GWORLD               = 0x0DF3A198;
 
             const char* funcName = "MyStartPointNRC";
-            if (ptrace_writedata(pid, remoteMem, funcName, strlen(funcName) + 1) < 0) {
-                LOG(LOG_LEVEL_ERROR, "[Injector] 写入函数名失败");
-                goto cleanup;
-            }
+            uint64_t funcAddr = resolveStartPoint(pid, dlopenResult, remoteMem, remoteDlsymAddr, funcName);
+            if (funcAddr == 0) goto cleanup;
 
-            uint64_t dlsymParams[2] = { dlopenResult, remoteMem };
-            uint64_t funcAddr = 0;
-            if (ptrace_call(pid, remoteDlsymAddr, dlsymParams, 2, &funcAddr) < 0 || funcAddr == 0) {
-                LOG(LOG_LEVEL_ERROR, "[Injector] dlsym 查找 MyStartPointNRC 失败");
-                goto cleanup;
-            }
-            LOG(LOG_LEVEL_INFO, "[Injector] MyStartPointNRC 地址: %llx", (unsigned long long)funcAddr);
-
-            uint64_t ue4Base = getRemoteModuleBase(pid, "libUE4.so");
-            if (ue4Base == 0) {
-                LOG(LOG_LEVEL_ERROR, "[Injector] 无法找到 libUE4.so 基址");
-                goto cleanup;
-            }
-            uint64_t ue4Size = getRemoteModuleSize(pid, "libUE4.so");
-            LOG(LOG_LEVEL_INFO, "[Injector] libUE4.so 基址: %llx 大小: 0x%llx",
-                (unsigned long long)ue4Base, (unsigned long long)ue4Size);
+            uint64_t ue4Base = 0, ue4Size = 0;
+            if (!loadModuleInfo(pid, "libUE4.so", &ue4Base, &ue4Size)) goto cleanup;
             if (ue4Size == 0) {
                 LOG(LOG_LEVEL_ERROR, "[Injector] NRC ue4Size=0");
                 goto cleanup;
@@ -841,17 +821,7 @@ int Injector::injectRemote(pid_t pid, const char* soPath, InjectMode mode) {
                 ue4Size,
                 0
             };
-            LOG(LOG_LEVEL_INFO, "[Injector] 调用 MyStartPointNRC...");
-            uint64_t startRet = 0;
-            if (ptrace_call(pid, funcAddr, startParams, 7, &startRet) < 0) {
-                LOG(LOG_LEVEL_ERROR, "[Injector] MyStartPointNRC 调用失败");
-                goto cleanup;
-            }
-            LOG(LOG_LEVEL_INFO, "[Injector] ✓ MyStartPointNRC 返回: %lld", (long long)startRet);
-            if (startRet == 0) {
-                LOG(LOG_LEVEL_ERROR, "[Injector] MyStartPointNRC 返回 0, 视为失败");
-                goto cleanup;
-            }
+            if (!invokeStartPoint(pid, funcAddr, funcName, startParams, 7)) goto cleanup;
             result = 0;
         } else {
         // ═══ LOL (il2cpp) 注入路径 ═══
@@ -869,18 +839,8 @@ int Injector::injectRemote(pid_t pid, const char* soPath, InjectMode mode) {
             static constexpr uint32_t LOL_OFF_META_IMAGES = 0x1D21140;
 
             const char* funcName = "MyStartPointLOL";
-            if (ptrace_writedata(pid, remoteMem, funcName, strlen(funcName) + 1) < 0) {
-                LOG(LOG_LEVEL_ERROR, "[Injector] 写入函数名失败");
-                goto cleanup;
-            }
-
-            uint64_t dlsymParams[2] = { dlopenResult, remoteMem };
-            uint64_t myStartPointAddr = 0;
-            if (ptrace_call(pid, remoteDlsymAddr, dlsymParams, 2, &myStartPointAddr) < 0 || myStartPointAddr == 0) {
-                LOG(LOG_LEVEL_ERROR, "[Injector] dlsym 查找 MyStartPointLOL 失败");
-                goto cleanup;
-            }
-            LOG(LOG_LEVEL_INFO, "[Injector] MyStartPoint 地址: %llx", (unsigned long long)myStartPointAddr);
+            uint64_t myStartPointAddr = resolveStartPoint(pid, dlopenResult, remoteMem, remoteDlsymAddr, funcName);
+            if (myStartPointAddr == 0) goto cleanup;
 
             // ── 7. 获取 libil2cpp.so 基址 ──
             uint64_t il2cppBase = getRemoteModuleBase(pid, "libil2cpp.so");
@@ -909,17 +869,7 @@ int Injector::injectRemote(pid_t pid, const char* soPath, InjectMode mode) {
                 pMetadataImagesTable
             };
 
-            LOG(LOG_LEVEL_INFO, "[Injector] 调用 MyStartPoint...");
-            uint64_t startRet = 0;
-            if (ptrace_call(pid, myStartPointAddr, startParams, 5, &startRet) < 0) {
-                LOG(LOG_LEVEL_ERROR, "[Injector] MyStartPoint 调用失败");
-                goto cleanup;
-            }
-            LOG(LOG_LEVEL_INFO, "[Injector] ✓ MyStartPoint 返回: %lld", (long long)startRet);
-            if (startRet == 0) {
-                LOG(LOG_LEVEL_ERROR, "[Injector] MyStartPoint 返回 0, 视为失败");
-                goto cleanup;
-            }
+            if (!invokeStartPoint(pid, myStartPointAddr, "MyStartPoint", startParams, 5)) goto cleanup;
             result = 0;
         }
         } // end LOL branch
