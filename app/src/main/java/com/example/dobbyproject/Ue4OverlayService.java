@@ -30,6 +30,7 @@ import android.view.View;
 import android.view.WindowManager;
 import android.view.WindowMetrics;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import androidx.core.app.NotificationCompat;
 
@@ -387,7 +388,18 @@ public class Ue4OverlayService extends Service {
         btn.setBackground(bg);
 
         final int sizePx = (int) (56 * getResources().getDisplayMetrics().density);
-        btn.setOnClickListener(v -> setTouchForwardEnabled(!touchForwardEnabled));
+        // 鼠标悬停提示 (Android API 26+, 投屏 scrcpy 鼠标悬停会触发).
+        updateToggleButtonHints(btn);
+        btn.setOnClickListener(v -> {
+            boolean willEnable = !touchForwardEnabled;
+            setTouchForwardEnabled(willEnable);
+            updateToggleButtonHints((TextView) v);
+            // Toast 作为备选提示 (手机点击也能看见当前状态)
+            Toast.makeText(Ue4OverlayService.this,
+                    willEnable ? "菜单触摸: 已开启 (只菜单区响应点击)"
+                               : "菜单触摸: 已关闭 (点击全部穿透到游戏)",
+                    Toast.LENGTH_SHORT).show();
+        });
         // 长按拖动: 简单实现, 让用户能挪走按钮避免遮挡.
         btn.setOnTouchListener(new View.OnTouchListener() {
             float downX, downY;
@@ -462,6 +474,20 @@ public class Ue4OverlayService extends Service {
         toggleButtonLp = null;
     }
 
+    /** 根据当前触摸转发状态更新浮标按钮的 tooltip / contentDescription.
+     *  - tooltip: 鼠标 (scrcpy 投屏) 悬停 ~500ms 后系统会自动弹出文字气泡.
+     *  - contentDescription: 无障碍 / 长按提示, 同样能展示当前状态. */
+    private void updateToggleButtonHints(TextView btn) {
+        if (btn == null) return;
+        final String tip = touchForwardEnabled
+                ? "菜单触摸: 已开启\n点击关闭 (恢复点击穿透到游戏)"
+                : "菜单触摸: 已关闭\n点击开启 (透明捕获窗会自动覆盖每个 ImGui 菜单)";
+        btn.setContentDescription(tip);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            btn.setTooltipText(tip);
+        }
+    }
+
     /** 启动 / 重启 多菜单触摸捕获.
      *  一旦开启, menuRectFollowRunnable 会每 100ms 拉取 server 端最新 rect 列表,
      *  按需要新增 / 删除 / 更新捕获窗 (一窗一菜单). */
@@ -500,10 +526,8 @@ public class Ue4OverlayService extends Service {
                 return true;
             }
         };
-        GradientDrawable border = new GradientDrawable();
-        border.setColor(Color.argb(20, 80, 200, 255));
-        border.setStroke(1, Color.argb(140, 80, 200, 255));
-        capture.setBackground(border);
+        // 不绘制任何视觉效果 (无边框 / 无填充), 捕获窗对用户完全不可见,
+        // 只通过 onTouchEvent 吸收并转发触摸事件.
         return capture;
     }
 
