@@ -5,6 +5,7 @@
  */
 #include "dfm.h"
 #include "../../../core/log/log.h"
+#include "../../../stack_spoof/stack_spoof.h"
 #include "../engine/UE5DfmStruct.h"
 #include "../interface/interface.h"
 #include "dfm_item_registry.h"
@@ -1114,6 +1115,96 @@ std::string DfmMatchMonitor::resolveItemDisplay(uintptr_t pickupActor,
 //  对局状态检测
 // =====================================================================
 
+// IDA 验证 (com.tencent.tmgp.dfm_libUE4.so):
+//   AGameStateBase::execHasMatchStarted UFunction native thunk @ 0x1731CAC0.
+//   反编译伪代码 (sub_1731CAC0):
+//      void thunk(UObject* this, FFrame* Stack, bool* RESULT) {
+//          if (Stack->Code) ++Stack->Code;          // P_FINISH (1 字节)
+//          *RESULT = (vtable[232])(this) & 1;       // 1856/8 = slot 232
+//      }
+//   sdk_dump.cs 标注: bool HasMatchStarted(); // [Addr: 0x1731CAC0] // NumParms: 1
+//   (出现于 Class GameState/GameStateBase 等多个游戏类, NumParms=1 仅返回值, 无入参)
+//
+// 调用思路 (与 pubgmhd 同款):
+//   1) 校验当前 GameState ptr 已就绪;
+//   2) 在 stack_spoof::call_spoofed 伪 FP chain 下调 thunk
+//      → ACE 周期栈采样看到的调用栈全部落在 libc.so / libart.so 白名单模块,
+//        而非本注入 .so + libUE4.so 调用对;
+//   3) sigsetjmp + safeReadGuard 兜底, 一旦 thunk 内部读到非法指针不会崩进程;
+//   4) 失败时缓存 GS ptr 拉黑, 下一局新 GS 出现自动恢复.
+static constexpr uintptr_t kDfmHasMatchStartedThunkOffset = 0x1731CAC0;
+
+namespace {
+
+// stack_spoof::call_spoofed 只接受一参 (void*(*)(void*)), 用上下文结构桥接 thunk
+// 三参 (Context, FFrame*, Result*) 调用. trampoline 内 SP 不切换, 该结构在真栈上
+// 存活整个调用窗口, thunk 写 Result 和读 FFrame.Code 都是合法的栈访问.
+struct DfmHasMatchStartedSpoofCtx {
+    void  (*thunk)(void* /*Context*/, void* /*FFrame*/, void* /*Result*/);
+    void*   context;
+    // FFrame 在腾讯改造的 UE 中内存布局未公开. execHasMatchStarted thunk 体只
+    // 触碰 Stack.Code (P_FINISH), 不做 Logf / Locals 访问, 故全 0 缓冲即可.
+    // 256 字节 >= UE4 主流 FFrame size (~120B), 留足版本余量.
+    alignas(8) uint8_t frameBuf[256];
+    bool    result;
+};
+
+void* dfmHasMatchStartedTrampoline(void* p) {
+    auto* c = static_cast<DfmHasMatchStartedSpoofCtx*>(p);
+    for (auto& b : c->frameBuf) b = 0;
+    c->result = false;
+    c->thunk(c->context, c->frameBuf, &c->result);
+    return nullptr;
+}
+
+} // namespace
+
+// 在栈伪装下调用 AGameStateBase::HasMatchStarted UFunction thunk.
+// 调用方负责保证 gsPtr 是真实 GameState 实例 (类校验已在 getMatchState 完成).
+// 返回 true = thunk 写出 inMatch=1; false = thunk 写出 0 / 调用失败 / 当前 GS 被熔断.
+bool DfmMatchMonitor::callHasMatchStartedSpoofed(uintptr_t gsPtr) const {
+    if (!ok(gsPtr) || m_moduleBase == 0) return false;
+
+    // 熔断: 某次调用 thunk 触发 SIGSEGV/SIGBUS 后, 拉黑当前 GS ptr 直到换局.
+    // 只对发生过崩溃的对象禁用, 不影响下一局新 GS.
+    static std::atomic<uintptr_t> s_disabledGsPtr{0};
+    if (s_disabledGsPtr.load(std::memory_order_acquire) == gsPtr) {
+        return false;
+    }
+
+    using ThunkFn = void(*)(void*, void*, void*);
+    auto* thunk = reinterpret_cast<ThunkFn>(m_moduleBase + kDfmHasMatchStartedThunkOffset);
+    // 校验 thunk 在模块代码段范围内 (避免离谱偏移指向野地址)
+    if (m_moduleSize != 0) {
+        uintptr_t pe = reinterpret_cast<uintptr_t>(thunk);
+        if (pe < m_moduleBase || pe >= (m_moduleBase + m_moduleSize)) {
+            LOG(LOG_LEVEL_WARN, TAG " [matchCall] thunk@%p 超出模块 [%p,%p)",
+                (void*)pe, (void*)m_moduleBase, (void*)(m_moduleBase + m_moduleSize));
+            return false;
+        }
+    }
+
+    DfmHasMatchStartedSpoofCtx ctx{};
+    ctx.thunk   = thunk;
+    ctx.context = reinterpret_cast<void*>(gsPtr);
+
+    installSafeReadGuard();
+    const int sigCaught = sigsetjmp(s_safeReadJmpBuf, 1);
+    if (sigCaught == 0) {
+        s_safeReadActive = 1;
+        // 切换 x29 (FP) 到伪造 chain → BLR thunk → 还原 FP. SP 不动, 局部变量安全.
+        stack_spoof::call_spoofed(&dfmHasMatchStartedTrampoline, &ctx);
+        s_safeReadActive = 0;
+        return ctx.result;
+    }
+    // longjmp 回来: thunk 内部读到非法地址. 拉黑当前 GS, 防止下一帧再炸.
+    s_safeReadActive = 0;
+    s_disabledGsPtr.store(gsPtr, std::memory_order_release);
+    LOG(LOG_LEVEL_ERROR, TAG " [matchCall] HasMatchStarted thunk 触发 sig=%d, gs=%p 已熔断",
+        sigCaught, (void*)gsPtr);
+    return false;
+}
+
 MatchState DfmMatchMonitor::getMatchState() const {
     MatchState ms;
     uintptr_t gworldAddr = m_moduleBase + m_offGWorld;
@@ -1152,10 +1243,15 @@ MatchState DfmMatchMonitor::getMatchState() const {
     // 进入对局时 GWorld 不切换, 而是通过 sublevel streaming 加载战斗场景
     // 因此不能用 worldName 判定大厅, 只能通过 GameState 类名来区分
 
-    // 安全屋 GameState 判定 (仅排除安全屋 GS, 不排除世界名)
+    // 安全屋 / 登录场景 GameState 判定 (仅排除大厅 GS, 不排除世界名)
+    // - gsClass 含 SafeHouse/Lobby/Entry: 安全屋
+    // - worldName == Login / WelcomeMap: 登录场景 (GS 是裸 'GameState')
     if (gsClassName.find("SafeHouse") != std::string::npos ||
         gsClassName.find("Lobby") != std::string::npos ||
-        gsClassName.find("Entry") != std::string::npos) {
+        gsClassName.find("Entry") != std::string::npos ||
+        ms.worldName == "Login" ||
+        ms.worldName == "WelcomeMap" ||
+        ms.worldName == "MainMenu") {
         // 限频: 每 5 秒最多打一条, 避免每帧爆刷把 trace 文件撑到 GB 级
         static std::atomic<uint64_t> lastTickMs{0};
         auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1196,19 +1292,41 @@ MatchState DfmMatchMonitor::getMatchState() const {
                     gsClassName.find("DFMGameState") != std::string::npos ||
                     gsClassName.find("GPGameState") != std::string::npos;
 
-    if (ms.state == "InProgress") { ms.inMatch = true; return ms; }
+    if (ms.state == "InProgress") {
+        // 必须配合战斗类 GS — 登录场景 GS=='GameState' 时 0x3B0 偏移读到的字面量
+        // 也常常是 'InProgress', 单看 FName 会误报. 只有 GS 类名命中战斗关键词
+        // (PVPVE/Battle/Mission/Arena/Raid/DFMGameState/GPGameState) 才采纳.
+        if (isBattle) {
+            ms.inMatch = true;
+            return ms;
+        }
+        LOG(LOG_LEVEL_INFO, TAG " [matchState] state=InProgress 但 gsClass='%s' 非战斗类, 拒绝",
+            gsClassName.c_str());
+    }
     if (isBattle && ms.elapsedTimeSeconds > 0 && (hasBegun & 1) && playerCount > 1) {
         ms.inMatch = true;
         return ms;
     }
-    // 回退: 非大厅 + 战斗 GS + 有玩家 → 视为对局 (MatchState FName 可能在其他偏移)
-    if (isBattle && playerCount > 0) {
-        LOG(LOG_LEVEL_INFO, TAG " [matchState] 回退判定: isBattle=1 players=%d", playerCount);
+
+    // ── 严格兜底: 在 "已经是战斗类 GS" 的前提下用 thunk 复核 ──
+    //   旧的 `isBattle && playerCount>0` 单纯靠类名 + 玩家数, DFM 大厅就常命中
+    //   (GPGameState 在大厅也存在), 是当前误判"对局中"的根因, 已删除.
+    //   现在改为调 AGameStateBase::HasMatchStarted UFunction thunk (栈伪装) 复核;
+    //   UE 语义 = MatchState != EnteringMap, 真正进入 PVPVE 战斗局才会被服务端切到
+    //   InProgress/WaitingPostMatch, 大厅期 thunk 看到的 MatchState 是 EnteringMap,
+    //   会返回 0, 不会误报.
+    //   - hasBegun==1 + players>0 二次过滤减少 thunk 调用频率;
+    //   - 触发 SIGSEGV 自动熔断 (callHasMatchStartedSpoofed 内部处理).
+    if (isBattle && (hasBegun & 1) && playerCount > 0
+        && callHasMatchStartedSpoofed(ms.gameStatePtr)) {
+        LOG(LOG_LEVEL_INFO, TAG " [matchState] HasMatchStarted(spoofed)=1 → 视为对局 (gsClass='%s')",
+            gsClassName.c_str());
         ms.inMatch = true;
         return ms;
     }
 
-    LOG(LOG_LEVEL_INFO, TAG " [matchState] 未判定为对局: isBattle=%d", isBattle ? 1 : 0);
+    LOG(LOG_LEVEL_INFO, TAG " [matchState] 未判定为对局: isBattle=%d hasBegun=%d players=%d elapsed=%d",
+        isBattle ? 1 : 0, (int)hasBegun, playerCount, ms.elapsedTimeSeconds);
     return ms;
 }
 

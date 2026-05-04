@@ -470,6 +470,11 @@ private:
     MatchState getMatchState() const;
     bool checkInMatch() const;
 
+    // 在 stack_spoof 伪 FP chain 下调用 AGameStateBase::HasMatchStarted UFunction
+    // native thunk (DFM @ +0x1731CAC0). 用作 FName/偏移路径全部失效时的兜底.
+    // 触发 SIGSEGV/SIGBUS 时自动熔断当前 GameState ptr (下一局新 GS 自动恢复).
+    bool callHasMatchStartedSpoofed(uintptr_t gsPtr) const;
+
     // ── 角色/物资扫描 ──
     std::vector<uintptr_t> getAllActors() const;
     void scanActors(const std::vector<uintptr_t>& actors, DrawDfmData& outData);
