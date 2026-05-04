@@ -1,6 +1,7 @@
 #include <jni.h>
 #include <android/native_window_jni.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <exception>
@@ -23,6 +24,11 @@ struct RendererInstance {
     std::thread thread;
     std::atomic<bool> stopRequested{false};
     std::atomic<bool> running{false};
+    // 渲染线程在创建 AImGui 后会赋值, 退出前会清空.
+    // JNI 注入触摸通过这个指针调用 InjectExternalTouch.
+    // 注: 用 atomic 指针, 读端先 load 再用; stop 路径会先 join 渲染线程,
+    //    保证在指针失效前不会再有 inject 调用通过 g_instancesMutex 进入.
+    std::atomic<android::AImGui*> imgui{nullptr};
     int port = 0;
 };
 
@@ -73,6 +79,12 @@ void overlayThreadMain(RendererInstance* inst, ANativeWindow* window, int width,
             OLOG(LOG_LEVEL_ERROR, "公开 Overlay 初始化失败 port=%d", inst->port);
             return;
         }
+        inst->imgui.store(imgui.get(), std::memory_order_release);
+        // RAII: 退出前清零, 避免 JNI 访问已销毁的 AImGui.
+        struct ImguiPtrReset {
+            RendererInstance* inst;
+            ~ImguiPtrReset() { inst->imgui.store(nullptr, std::memory_order_release); }
+        } imguiPtrReset{inst};
 
         Clock::time_point lastHeartbeatLog;
         Clock::time_point lastClientLostLog;
@@ -213,6 +225,65 @@ Java_com_example_dobbyproject_PublicOverlayBridge_nativeIsRendererRunning(
     auto it = g_instances.find(port);
     if (it == g_instances.end()) return JNI_FALSE;
     return it->second->running.load(std::memory_order_acquire) ? JNI_TRUE : JNI_FALSE;
+}
+
+// 注入投屏 / Java MotionEvent 触摸事件到指定端口的 RenderServer.
+//   action: 0=Down, 1=Move, 2=Up, 3=Cancel
+//   x, y  : 已经位于 display 像素坐标系 (与 TextureView 相同)
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_example_dobbyproject_PublicOverlayBridge_nativeInjectTouch(
+        JNIEnv*,
+        jclass,
+        jint port,
+        jint action,
+        jfloat x,
+        jfloat y) {
+    std::lock_guard<std::mutex> lock(g_instancesMutex);
+    auto it = g_instances.find(port);
+    if (it == g_instances.end()) return JNI_FALSE;
+    android::AImGui* imgui = it->second->imgui.load(std::memory_order_acquire);
+    if (!imgui) return JNI_FALSE;
+    imgui->InjectExternalTouch(static_cast<int>(action),
+                               static_cast<float>(x),
+                               static_cast<float>(y));
+    return JNI_TRUE;
+}
+
+// 查询 RenderServer 缓存的最近一次菜单 rect 列表 (RenderClient 侧每帧自动上报).
+//   out[0]    = 实际 rect 数量 (0..AImGui::kMaxMenuRects)
+//   out[1..]  = 每个 rect 占 4 个 int: x, y, w, h (display 像素)
+// 返回 false: 端口未运行 / out 为 null / 长度不足.
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_example_dobbyproject_PublicOverlayBridge_nativeGetMenuRect(
+        JNIEnv* env,
+        jclass,
+        jint port,
+        jintArray out) {
+    if (env == nullptr || out == nullptr) return JNI_FALSE;
+    const jsize len = env->GetArrayLength(out);
+    if (len < 1) return JNI_FALSE;
+
+    std::lock_guard<std::mutex> lock(g_instancesMutex);
+    auto it = g_instances.find(port);
+    if (it == g_instances.end()) return JNI_FALSE;
+    android::AImGui* imgui = it->second->imgui.load(std::memory_order_acquire);
+    if (!imgui) return JNI_FALSE;
+
+    const int capacity = std::min<int>(android::AImGui::kMaxMenuRects, (len - 1) / 4);
+    float buf[android::AImGui::kMaxMenuRects * 4];
+    int n = imgui->QueryMenuRects(buf, capacity);
+    if (n < 0) n = 0;
+
+    // 输出布局: [count, x0,y0,w0,h0, x1,y1,w1,h1, ...]
+    jint header = static_cast<jint>(n);
+    env->SetIntArrayRegion(out, 0, 1, &header);
+    if (n > 0) {
+        jint vals[android::AImGui::kMaxMenuRects * 4];
+        for (int i = 0; i < n * 4; ++i)
+            vals[i] = static_cast<jint>(buf[i]);
+        env->SetIntArrayRegion(out, 1, n * 4, vals);
+    }
+    return JNI_TRUE;
 }
 
 OBFU_ATTRS_END

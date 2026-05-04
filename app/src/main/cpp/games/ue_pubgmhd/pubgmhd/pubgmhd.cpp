@@ -5222,9 +5222,9 @@ void MatchMonitor::pollMatchStateLoop() {
                     LOG(LOG_LEVEL_INFO, "Entered match! State=%s World=%s", ms.state.c_str(), ms.worldName.c_str());
                     ue4draw::SharedUE4Data::getInstance().setInMatch(true);
                     // 立即推送空帧标记 inMatch=true, 否则 GUI 端 getData() 取到的
-                    // 双缓冲快照是上一局结束时 push 的 inMatch=false (warmup 60s
+                    // 双缓冲快照是上一局结束时 push 的 inMatch=false (静默期 5s
                     // 内 pollPlayers 不跑, 不会再 pushData), 导致菜单 "已进入对局"
-                    // 提示要等 60s 才出现.
+                    // 提示要等到静默期结束后才出现.
                     {
                         ue4draw::DrawGameData enterData;
                         enterData.inMatch = true;
@@ -5308,23 +5308,30 @@ void MatchMonitor::pollMatchStateLoop() {
         if (m_isInMatch && (lastPlayerPollTime.time_since_epoch().count() == 0
             || now - lastPlayerPollTime >= std::chrono::milliseconds(PLAYER_POLL_INTERVAL_MS))) {
             lastPlayerPollTime = now;
-            // 进入对局后等待 60 秒再开始遍历, 避免 ACE 反作弊在加载期检测到扫描行为
-            constexpr uint64_t kPostEnterWarmupMs = 60000;
+            // 切入对局后的极短静默期 (5s): 仅用于规避 m_matchEnterTickMs 被设置
+            // 后第一个 tick 中游戏自身仍在做世界切换的偶发崩. 真正的反作弊延迟
+            // 已由 pollPlayers() 内部承担:
+            //   1. `if (!isInProgress) return` — 状态非 InProgress 时直接退出.
+            //   2. InProgress 后还有 10s 内部延迟才开始读取玩家数据.
+            //   3. patchActorNetCull / aimAtNearestEnemy 等写入路径各自带 InProgress 闸门.
+            // 之前这里设 60s 会把 Early-phase 角色扫描的前半段全吞掉,
+            // 表现为 "开局只见自己" (与 character-scan-2026-04 记忆一致).
+            constexpr uint64_t kPostEnterSilenceMs = 5000;
             if (m_matchEnterTickMs != 0
-                && (nowMonotonicMs() - m_matchEnterTickMs) < kPostEnterWarmupMs) {
-                static uint64_t s_lastWarmupLogMs = 0;
+                && (nowMonotonicMs() - m_matchEnterTickMs) < kPostEnterSilenceMs) {
+                static uint64_t s_lastSilenceLogMs = 0;
                 const uint64_t nowLogMs = nowMonotonicMs();
-                if (nowLogMs - s_lastWarmupLogMs > 2000) {
-                    s_lastWarmupLogMs = nowLogMs;
-                    const uint64_t leftMs = kPostEnterWarmupMs - (nowLogMs - m_matchEnterTickMs);
-                    LOG(LOG_LEVEL_INFO, "[Warmup] entered match, waiting %llums before traversal",
+                if (nowLogMs - s_lastSilenceLogMs > 1000) {
+                    s_lastSilenceLogMs = nowLogMs;
+                    const uint64_t leftMs = kPostEnterSilenceMs - (nowLogMs - m_matchEnterTickMs);
+                    LOG(LOG_LEVEL_INFO, "[Silence] entered match, waiting %llums before traversal",
                         (unsigned long long)leftMs);
                 }
-                // warmup 期间也要心跳推送, 否则 GUI 端 stale 检查 (>5s) 会把
+                // 静默期也要心跳推送, 否则 GUI 端 stale 检查 (>5s) 会把
                 // inMatch 强制覆写回 false, 让 "对局中" 标签在开局 ~5s 后消失.
-                ue4draw::DrawGameData warmupData;
-                warmupData.inMatch = true;
-                ue4draw::SharedUE4Data::getInstance().pushData(warmupData);
+                ue4draw::DrawGameData silenceData;
+                silenceData.inMatch = true;
+                ue4draw::SharedUE4Data::getInstance().pushData(silenceData);
             } else {
                 pollPlayers();
             }

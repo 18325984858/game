@@ -597,6 +597,24 @@ private:
     // ---- GUObjectArray 扫描 Character ----
     int scanCharacters();
 
+    // ---- 通过 CheckAimCheatComponent::CacheAllCharacter 拿敌人列表 ----
+    // 替代旧的 GUObjectArray 全表遍历:
+    //   1) 一次性扫描 GUObjectArray 找到本机 PlayerController 上的
+    //      CheckAimCheatComponent (按 OwnerController 字段匹配, 命中后缓存),
+    //      之后帧不再扫表.
+    //   2) 每帧只读组件 +0x3C8 处的 CacheAllCharacter (TArray<TWeakObjectPtr<UObject>>),
+    //      逐个 weak-ptr 通过 GUObjectArray 单点查表解出 UObject*. 复杂度 O(角色数).
+    //   3) 整个读取 + 解析过程在 stack_spoof::call_spoofed 伪 FP chain 下执行,
+    //      让任何 frame-pointer 风格的栈回溯器 (libunwindstack/_Unwind_Backtrace)
+    //      看到的栈帧全部落在 libc.so/libart.so 等白名单模块, 看不到本注入 .so 的痕迹.
+    // 返回新发现角色数; 若组件尚未就绪 (大厅/匹配早期) 返回 -1, 由调用方走兜底路径.
+    int scanCharactersViaCacheAllCharacter();
+
+    // 在 GUObjectArray 中一次性查找本机 PlayerController 持有的
+    // CheckAimCheatComponent 实例, 命中后缓存到 m_cachedAimCheatCompPtr.
+    // 失败 (找不到 / PC 未就绪) 时启动 2s 节流, 返回 0.
+    uintptr_t findCheckAimCheatComponentInstance();
+
     // ---- GUObjectArray 扫描场景物体 (物资/载具/空投) ----
     int scanWorldObjects(std::vector<ue4draw::DrawWorldObject>& outObjects);
 
@@ -691,6 +709,14 @@ private:
     int           m_characterScanItemIndex = 0;
     uint32_t      m_characterScanEpoch = 0;
     uint32_t      m_lastCompletedCharacterScanEpoch = 0;
+
+    // ---- CheckAimCheatComponent::CacheAllCharacter 加速路径状态 ----
+    // 一次性发现 + 缓存, 之后帧只读 TArray, 不再扫 GUObjectArray.
+    uintptr_t     m_cachedAimCheatCompPtr = 0;     // 上次命中的 CheckAimCheatComponent 实例
+    uintptr_t     m_cachedAimCheatCompClass = 0;   // 该实例的 ClassPrivate (用于失效校验)
+    uintptr_t     m_cachedAimCheatCompPC = 0;      // 上次绑定的本机 PlayerController, PC 变化时缓存失效
+    uint64_t      m_lastAimCheatCompScanMs = 0;    // 上次空扫时间, 节流避免大厅期空转
+    uint32_t      m_aimCheatCompMissCount = 0;     // 连续读不到 CacheAllCharacter 的次数
 
     PlayerList m_playerList;
     std::unordered_map<uintptr_t, uint64_t> m_lastNetCullPatchMs;

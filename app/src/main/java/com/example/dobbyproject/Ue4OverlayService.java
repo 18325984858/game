@@ -9,9 +9,11 @@ import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
+import android.graphics.Color;
 import android.graphics.Point;
 import android.graphics.PixelFormat;
 import android.graphics.SurfaceTexture;
+import android.graphics.drawable.GradientDrawable;
 import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
@@ -21,11 +23,13 @@ import android.provider.Settings;
 import android.util.Log;
 import android.view.Display;
 import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.Surface;
 import android.view.TextureView;
 import android.view.View;
 import android.view.WindowManager;
 import android.view.WindowMetrics;
+import android.widget.TextView;
 
 import androidx.core.app.NotificationCompat;
 
@@ -74,6 +78,38 @@ public class Ue4OverlayService extends Service {
     /** 同一时刻最多 1 个 (ImGui 全局状态限制). null 表示当前前台不是已知游戏. */
     private GameOverlay activeOverlay;
 
+    /** 触摸转发状态: true = 菜单区域遮罩一个透明捕获窗, 仅该区域点击转发给 ImGui;
+     *  false = 没有捕获窗, 所有点击都穿透到游戏.
+     *  渲染用的 TextureView 始终 FLAG_NOT_TOUCHABLE 不变, 避免遮住游戏操作. */
+    private boolean touchForwardEnabled = false;
+    private View toggleButtonView;
+    private WindowManager.LayoutParams toggleButtonLp;
+    /** 多菜单捕获: 每个 ImGui 顶层菜单一个透明捕获窗, rect 由 RenderClient 自动上报.
+     *  list 与 lpList 索引一一对应; 长度随菜单数量动态变化. */
+    private final java.util.ArrayList<View> captureViews = new java.util.ArrayList<>();
+    private final java.util.ArrayList<WindowManager.LayoutParams> captureLps = new java.util.ArrayList<>();
+    /** 跟随菜单的 padding (向四周扩 N 像素, 让边缘也能命中 ImGui 的 resize handle). */
+    private static final int CAPTURE_PADDING_PX = 12;
+    /** 最多跟随多少个菜单 (与 native AImGui::kMaxMenuRects 同步). */
+    private static final int MAX_MENU_RECTS = 16;
+    /** 跟随轮询频率: 100ms. */
+    private static final long MENU_FOLLOW_INTERVAL_MS = 100L;
+    /** native 返回布局: [count, x0,y0,w0,h0, x1,...]. */
+    private final int[] menuRectScratch = new int[1 + MAX_MENU_RECTS * 4];
+    private final Runnable menuRectFollowRunnable = new Runnable() {
+        @Override
+        public void run() {
+            try {
+                followMenuRectsOnce();
+            } catch (Throwable t) {
+                Log.e(TAG, "menuRectFollow 异常", t);
+            }
+            if (touchForwardEnabled) {
+                mainHandler.postDelayed(this, MENU_FOLLOW_INTERVAL_MS);
+            }
+        }
+    };
+
     private final Runnable foregroundPollRunnable = new Runnable() {
         @Override
         public void run() {
@@ -109,6 +145,7 @@ public class Ue4OverlayService extends Service {
 
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M || Settings.canDrawOverlays(this)) {
             // 不在 onCreate 启动 polling; 等 onStartCommand 决定是显式指定还是 fallback 轮询
+            addToggleButton();
         } else {
             Log.e(TAG, "onCreate: 缺少悬浮窗权限");
         }
@@ -146,6 +183,8 @@ public class Ue4OverlayService extends Service {
     public void onDestroy() {
         mainHandler.removeCallbacks(foregroundPollRunnable);
         teardownActiveOverlay();
+        removeTouchCaptureView();
+        removeToggleButton();
         PublicOverlayBridge.stopAllRenderers();
         if (wakeLock != null && wakeLock.isHeld()) {
             wakeLock.release();
@@ -247,14 +286,28 @@ public class Ue4OverlayService extends Service {
         }
 
         Log.w(TAG, "=== Overlay 已添加 pkg=" + pkg + " port=" + port + " size=" + displaySize.x + "x" + displaySize.y + " ===");
-        return new GameOverlay(pkg, port, view, lp);
+        GameOverlay overlay = new GameOverlay(pkg, port, view, lp);
+
+        // 渲染用 TextureView 永远不吞点击 (FLAG_NOT_TOUCHABLE), 避免遮住游戏操作.
+        // 所有触摸都走独立的 capture views (只覆盖各菜单区域).
+        // 如果触摸转发已经开启 (例如切换游戏前用户已开了 toggle), 重启 follow runnable
+        // 让新 overlay 的 port 立刻被轮询.
+        activeOverlay = overlay;  // 提前赋值, 让 addTouchCaptureView 能拿到 activeOverlay
+        if (touchForwardEnabled) {
+            mainHandler.removeCallbacks(menuRectFollowRunnable);
+            mainHandler.post(menuRectFollowRunnable);
+        }
+        return overlay;
     }
 
     private void teardownActiveOverlay() {
         if (activeOverlay == null) return;
         GameOverlay ov = activeOverlay;
         activeOverlay = null;
-        // 1. 先停 RenderServer (关闭 ImGui context, 释放 BackendRendererUserData)
+        // 0. 先清理触摸捕获窗 (依赖 activeOverlay.port, 必须最早做)
+        mainHandler.removeCallbacks(menuRectFollowRunnable);
+        removeAllCaptureViews();
+        // 1. 停 RenderServer (关闭 ImGui context, 释放 BackendRendererUserData)
         PublicOverlayBridge.stopRenderer(ov.port);
         // 2. 再 removeView (会触发 onSurfaceTextureDestroyed, 但 RenderServer 已停, 不会重复)
         try {
@@ -264,6 +317,286 @@ public class Ue4OverlayService extends Service {
         }
         ov.releaseSurface();
         Log.w(TAG, "=== Overlay 已销毁 pkg=" + ov.pkg + " port=" + ov.port + " ===");
+    }
+
+    // ============================================================
+    //  触摸转发 / 投屏支持
+    // ============================================================
+
+    /** 将 Java 端 MotionEvent 通过 JNI 喂给 RenderServer (ImGui).
+     *  返回 true 表示该事件被消费, 不再下发给其他 view (避免被游戏抢走). */
+    private boolean forwardTouchToServer(int port, MotionEvent event) {
+        if (!touchForwardEnabled) return false;
+
+        int action;
+        switch (event.getActionMasked()) {
+            case MotionEvent.ACTION_DOWN:
+            case MotionEvent.ACTION_POINTER_DOWN:
+                action = 0; break;
+            case MotionEvent.ACTION_MOVE:
+                action = 1; break;
+            case MotionEvent.ACTION_UP:
+            case MotionEvent.ACTION_POINTER_UP:
+                action = 2; break;
+            case MotionEvent.ACTION_CANCEL:
+                action = 3; break;
+            default:
+                return false;
+        }
+        // 用 raw 坐标 (绝对 display 像素), 与 server 端 ImGui DisplaySize 同坐标系.
+        // ACTION_MOVE 的 historicalSize > 0 时也按最新点送一次, 历史点丢弃 (避免抖动).
+        float x = event.getRawX();
+        float y = event.getRawY();
+        PublicOverlayBridge.injectTouch(port, action, x, y);
+        return true;
+    }
+
+    /** 切换某个 overlay 是否拦截触摸事件 (true = 菜单可点 / false = 点击穿透到游戏).
+     *  @deprecated 已改为独立 touchCaptureView, 保留仅供嵌套/调试。 */
+    @SuppressWarnings("unused")
+    private void applyTouchableFlag(GameOverlay overlay, boolean touchable) {
+        // no-op (遺留接口, 避免另外一个 path 调用报错)
+    }
+
+    private void setTouchForwardEnabled(boolean enabled) {
+        if (touchForwardEnabled == enabled) return;
+        touchForwardEnabled = enabled;
+        if (enabled) {
+            addTouchCaptureView();
+        } else {
+            removeTouchCaptureView();
+        }
+        if (toggleButtonView instanceof TextView) {
+            mainHandler.post(() -> ((TextView) toggleButtonView).setText(enabled ? "🖱✓" : "🖱"));
+        }
+    }
+
+    /** 添加始终可点击的小浮标按钮 (无论 overlay 是否吃事件, 这个按钮都收得到 click).
+     *  它就是用户唯一能 "解锁/锁定" 触摸转发的入口. */
+    private void addToggleButton() {
+        if (toggleButtonView != null || windowManager == null) return;
+        TextView btn = new TextView(this);
+        btn.setText("🖱");
+        btn.setTextColor(Color.WHITE);
+        btn.setTextSize(18);
+        btn.setGravity(Gravity.CENTER);
+        GradientDrawable bg = new GradientDrawable();
+        bg.setShape(GradientDrawable.OVAL);
+        bg.setColor(Color.argb(180, 30, 30, 30));
+        bg.setStroke(2, Color.argb(200, 80, 200, 255));
+        btn.setBackground(bg);
+
+        final int sizePx = (int) (56 * getResources().getDisplayMetrics().density);
+        btn.setOnClickListener(v -> setTouchForwardEnabled(!touchForwardEnabled));
+        // 长按拖动: 简单实现, 让用户能挪走按钮避免遮挡.
+        btn.setOnTouchListener(new View.OnTouchListener() {
+            float downX, downY;
+            int origX, origY;
+            boolean dragging = false;
+            @Override
+            public boolean onTouch(View v, MotionEvent event) {
+                switch (event.getActionMasked()) {
+                    case MotionEvent.ACTION_DOWN:
+                        downX = event.getRawX();
+                        downY = event.getRawY();
+                        origX = toggleButtonLp.x;
+                        origY = toggleButtonLp.y;
+                        dragging = false;
+                        return false;  // 让 onClick 也能收到
+                    case MotionEvent.ACTION_MOVE: {
+                        float dx = event.getRawX() - downX;
+                        float dy = event.getRawY() - downY;
+                        if (!dragging && (Math.abs(dx) > 12 || Math.abs(dy) > 12)) {
+                            dragging = true;
+                        }
+                        if (dragging) {
+                            toggleButtonLp.x = origX + (int) dx;
+                            toggleButtonLp.y = origY + (int) dy;
+                            try {
+                                windowManager.updateViewLayout(toggleButtonView, toggleButtonLp);
+                            } catch (Exception ignored) {}
+                            return true;
+                        }
+                        return false;
+                    }
+                    case MotionEvent.ACTION_UP:
+                        return dragging;  // 拖动过则吞掉, 不触发 onClick
+                }
+                return false;
+            }
+        });
+
+        int windowType = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                : WindowManager.LayoutParams.TYPE_PHONE;
+        WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
+                sizePx, sizePx, windowType,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.TRANSLUCENT);
+        lp.gravity = Gravity.TOP | Gravity.START;
+        Point displaySize = getCurrentDisplaySize();
+        lp.x = Math.max(0, displaySize.x - sizePx - 20);
+        lp.y = 200;
+        lp.setTitle("UE4OverlayTouchToggle");
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
+        }
+        try {
+            windowManager.addView(btn, lp);
+            toggleButtonView = btn;
+            toggleButtonLp = lp;
+            Log.w(TAG, "addToggleButton: 触摸切换按钮已添加 pos=(" + lp.x + "," + lp.y + ")");
+        } catch (Exception e) {
+            Log.e(TAG, "addToggleButton 失败", e);
+        }
+    }
+
+    private void removeToggleButton() {
+        if (toggleButtonView == null || windowManager == null) return;
+        try {
+            windowManager.removeViewImmediate(toggleButtonView);
+        } catch (Exception ignored) {}
+        toggleButtonView = null;
+        toggleButtonLp = null;
+    }
+
+    /** 启动 / 重启 多菜单触摸捕获.
+     *  一旦开启, menuRectFollowRunnable 会每 100ms 拉取 server 端最新 rect 列表,
+     *  按需要新增 / 删除 / 更新捕获窗 (一窗一菜单). */
+    private void addTouchCaptureView() {
+        if (windowManager == null || activeOverlay == null) {
+            Log.w(TAG, "addTouchCaptureView: 当前无 active overlay, 不创建捕获窗");
+            return;
+        }
+        // 立刻同步一次 (后续由 runnable 周期跟随)
+        followMenuRectsOnce();
+        mainHandler.removeCallbacks(menuRectFollowRunnable);
+        mainHandler.post(menuRectFollowRunnable);
+    }
+
+    /** 创建一个新的菜单捕获窗 (透明 + 蓝色细边). */
+    private View createCaptureView(final int port) {
+        View capture = new View(this) {
+            @Override
+            public boolean onTouchEvent(MotionEvent ev) {
+                final int action;
+                switch (ev.getActionMasked()) {
+                    case MotionEvent.ACTION_DOWN:
+                    case MotionEvent.ACTION_POINTER_DOWN:
+                        action = 0; break;
+                    case MotionEvent.ACTION_MOVE:
+                        action = 1; break;
+                    case MotionEvent.ACTION_UP:
+                    case MotionEvent.ACTION_POINTER_UP:
+                        action = 2; break;
+                    case MotionEvent.ACTION_CANCEL:
+                        action = 3; break;
+                    default:
+                        return true;
+                }
+                PublicOverlayBridge.injectTouch(port, action, ev.getRawX(), ev.getRawY());
+                return true;
+            }
+        };
+        GradientDrawable border = new GradientDrawable();
+        border.setColor(Color.argb(20, 80, 200, 255));
+        border.setStroke(1, Color.argb(140, 80, 200, 255));
+        capture.setBackground(border);
+        return capture;
+    }
+
+    /** 单次跟随: 查询 server 端最新 rect 列表, 增删/更新捕获窗集合. */
+    private void followMenuRectsOnce() {
+        if (activeOverlay == null || windowManager == null) return;
+
+        if (!PublicOverlayBridge.getMenuRects(activeOverlay.port, menuRectScratch)) {
+            // 端口没运行: 清空所有捕获窗
+            removeAllCaptureViews();
+            return;
+        }
+        final int count = Math.max(0, Math.min(menuRectScratch[0], MAX_MENU_RECTS));
+
+        // 多了: 移除尾部多余
+        while (captureViews.size() > count) {
+            int idx = captureViews.size() - 1;
+            View v = captureViews.remove(idx);
+            captureLps.remove(idx);
+            try { windowManager.removeViewImmediate(v); } catch (Exception ignored) {}
+        }
+        // 少了: 补足
+        final int port = activeOverlay.port;
+        int windowType = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                : WindowManager.LayoutParams.TYPE_PHONE;
+        while (captureViews.size() < count) {
+            View v = createCaptureView(port);
+            WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
+                    1, 1, windowType,
+                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                            | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                            | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                    PixelFormat.TRANSLUCENT);
+            lp.gravity = Gravity.TOP | Gravity.START;
+            lp.setTitle("UE4OverlayTouchCapture#" + captureViews.size());
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
+            }
+            try {
+                windowManager.addView(v, lp);
+                captureViews.add(v);
+                captureLps.add(lp);
+            } catch (Exception e) {
+                Log.e(TAG, "addCaptureView 失败 idx=" + captureViews.size(), e);
+                break;
+            }
+        }
+
+        // 更新位置/尺寸 (抖动过滤)
+        for (int i = 0; i < count && i < captureViews.size(); ++i) {
+            int base = 1 + i * 4;
+            int rx = menuRectScratch[base];
+            int ry = menuRectScratch[base + 1];
+            int rw = menuRectScratch[base + 2];
+            int rh = menuRectScratch[base + 3];
+            int newX = rx - CAPTURE_PADDING_PX;
+            int newY = ry - CAPTURE_PADDING_PX;
+            int newW = rw + CAPTURE_PADDING_PX * 2;
+            int newH = rh + CAPTURE_PADDING_PX * 2;
+            if (newW <= 0 || newH <= 0) continue;
+            WindowManager.LayoutParams lp = captureLps.get(i);
+            if (Math.abs(lp.x - newX) <= 2
+                    && Math.abs(lp.y - newY) <= 2
+                    && Math.abs(lp.width - newW) <= 2
+                    && Math.abs(lp.height - newH) <= 2) {
+                continue;
+            }
+            lp.x = newX;
+            lp.y = newY;
+            lp.width = newW;
+            lp.height = newH;
+            try {
+                windowManager.updateViewLayout(captureViews.get(i), lp);
+            } catch (Exception e) {
+                Log.e(TAG, "follow 更新失败 idx=" + i, e);
+            }
+        }
+    }
+
+    private void removeAllCaptureViews() {
+        for (View v : captureViews) {
+            try { windowManager.removeViewImmediate(v); } catch (Exception ignored) {}
+        }
+        captureViews.clear();
+        captureLps.clear();
+    }
+
+    private void removeTouchCaptureView() {
+        mainHandler.removeCallbacks(menuRectFollowRunnable);
+        if (windowManager == null) return;
+        removeAllCaptureViews();
+        Log.w(TAG, "removeTouchCaptureView: 所有捕获窗已移除");
     }
 
     private void syncOverlayLayout() {

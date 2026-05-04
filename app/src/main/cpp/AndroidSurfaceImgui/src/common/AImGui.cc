@@ -6,6 +6,7 @@
 #include "ATouchEvent.h"
 
 #include <ImGui-SharedDrawData/modules/ImGuiSharedDrawData.h>
+#include <imgui/imgui_internal.h>
 #include <zstd.h>
 #include <netinet/tcp.h>
 #include <dirent.h>
@@ -13,6 +14,9 @@
 #include <strings.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <algorithm>
+#include <cmath>
+#include <cstring>
 
 size_t android::anative_window_creator::detail::compat::SystemVersion = 13;
 
@@ -592,6 +596,19 @@ static unsigned int KeyCodeToCharacter(int32_t keyCode, bool upperCase)
 
 namespace android
 {
+    // RenderClient 单例 (每个进程只有一个 RenderClient AImGui), 供 PublishMenuRectToServer
+    // 全局函数定位激活实例.
+    std::atomic<AImGui*> g_renderClientInstance{nullptr};
+
+    // 旁路 packet 协议: client -> server, 用极不可能的 packetSize 哨兵 + 16 字节 payload (4 floats).
+    static constexpr uint32_t kSidePacketMagic_MenuRect = 0xF1A75001u;
+
+    // 前向声明: 在 EndFrame 中使用, 实现位于 PollInputReady 之后.
+    static void AutoPublishMenusFromImGui(AImGui* self,
+                                          std::vector<float>& scratch,
+                                          uint64_t& outHash,
+                                          float screenW, float screenH);
+
     AImGui::AImGui(const Options &options)
         : m_options(options)
     {
@@ -608,10 +625,21 @@ namespace android
                 m_defaultDisplay,
                 m_eglSurface,
                 m_eglContext);
+        // RenderClient: 注册自己为当前进程的 "菜单 rect 发布者" (单例).
+        if (RenderType::RenderClient == m_options.renderType) {
+            extern std::atomic<AImGui*> g_renderClientInstance;
+            g_renderClientInstance.store(this, std::memory_order_release);
+        }
     }
 
     AImGui::~AImGui()
     {
+        if (RenderType::RenderClient == m_options.renderType) {
+            extern std::atomic<AImGui*> g_renderClientInstance;
+            AImGui* expected = this;
+            g_renderClientInstance.compare_exchange_strong(expected, nullptr,
+                                                           std::memory_order_acq_rel);
+        }
         UnInitEnvironment();
     }
 
@@ -672,6 +700,37 @@ namespace android
 
         if (RenderType::RenderClient == m_options.renderType)
         {
+            // 自动收集 ImGui 顶层菜单 rect, 节流后通过旁路 packet 发给 server.
+            // 必须在 ImGui::Render() 之前调用 (Render 之后 ctx->Windows 仍然保留, 但
+            // 在此处先取最稳妥; 注: 调用顺序对结果无影响, Windows 已在 NewFrame/Begin 阶段更新).
+            {
+                static thread_local std::vector<float> s_menuScratch;
+                uint64_t hash = 0;
+                AutoPublishMenusFromImGui(this, s_menuScratch,
+                                          hash,
+                                          ImGui::GetIO().DisplaySize.x,
+                                          ImGui::GetIO().DisplaySize.y);
+
+                const auto now = std::chrono::steady_clock::now();
+                const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        now - m_menuRectLastSendTime).count();
+                const bool changed = (hash != m_menuRectLastSentHash);
+                // 节流: 100ms 内变化或 1s 心跳 (心跳保证 server 端连接重建后能尽快拿到 rect).
+                if ((changed && elapsedMs >= 100) || elapsedMs >= 1000)
+                {
+                    uint32_t magic = kSidePacketMagic_MenuRect;
+                    uint32_t count = static_cast<uint32_t>(s_menuScratch.size() / 4);
+                    if (count > kMaxMenuRects) count = kMaxMenuRects;
+                    WriteData(&magic, sizeof(magic));
+                    WriteData(&count, sizeof(count));
+                    if (count > 0) {
+                        WriteData(s_menuScratch.data(), count * 4 * sizeof(float));
+                    }
+                    m_menuRectLastSendTime = now;
+                    m_menuRectLastSentHash = hash;
+                }
+            }
+
             ImGui::Render();
             const auto &sharedData = ImGui::GetSharedDrawData();
             if (!sharedData.empty())
@@ -856,6 +915,7 @@ namespace android
             {
                 if (-1 == m_clientFd)
                     return;
+                std::lock_guard<std::mutex> lock(m_writeMutex);
                 WriteData(&event, sizeof(event));
             }
         }
@@ -932,9 +992,128 @@ namespace android
         }
     }
 
-    bool AImGui::PollInputReady(int timeoutMs) const
+    void AImGui::InjectExternalTouch(int action, float x, float y)
     {
-        if (!m_state || m_clientFd == -1)
+        if (!m_state)
+            return;
+
+        ATouchEvent::TouchEvent ev{};
+        ev.x = static_cast<int>(x);
+        ev.y = static_cast<int>(y);
+        ev.scanCode = 0;
+        ev.keyCode  = 0;
+        switch (action)
+        {
+            case 0: ev.type = ATouchEvent::EventType::TouchDown; break;
+            case 1: ev.type = ATouchEvent::EventType::Move;      break;
+            case 2: // Up
+            case 3: // Cancel
+                ev.type = ATouchEvent::EventType::TouchUp;       break;
+            default: return;
+        }
+
+        // 已经在显示坐标系 (Java MotionEvent.getX/Y), 不再做旋转/缩放.
+        // 仅做 clamp 防止越界引发 client 端 ImGui 命中测试异常.
+        if (m_screenWidth > 0)
+            ev.x = std::clamp(ev.x, 0, m_screenWidth - 1);
+        if (m_screenHeight > 0)
+            ev.y = std::clamp(ev.y, 0, m_screenHeight - 1);
+
+        if (RenderType::RenderServer == m_options.renderType)
+        {
+            if (-1 == m_clientFd)
+                return;
+            std::lock_guard<std::mutex> lock(m_writeMutex);
+            // 二次检查 (上锁后)
+            if (-1 == m_clientFd)
+                return;
+            WriteData(&ev, sizeof(ev));
+        }
+        else if (RenderType::RenderNative == m_options.renderType)
+        {
+            auto &io = ImGui::GetIO();
+            switch (ev.type)
+            {
+            case ATouchEvent::EventType::Move:
+                io.AddMousePosEvent(static_cast<float>(ev.x), static_cast<float>(ev.y));
+                break;
+            case ATouchEvent::EventType::TouchDown:
+            case ATouchEvent::EventType::TouchUp:
+                io.AddMousePosEvent(static_cast<float>(ev.x), static_cast<float>(ev.y));
+                io.AddMouseButtonEvent(0, ATouchEvent::EventType::TouchDown == ev.type);
+                break;
+            default:
+                break;
+            }
+        }
+    }
+
+    void AImGui::PublishMenuRect(float x, float y, float w, float h)
+    {
+        // 兼容旧 API: 转发到自动 publish 的内部路径 (不再节流, 由 EndFrame 处统一节流).
+        // 留作未来扩展; 当前业务代码不再调用.
+        (void)x; (void)y; (void)w; (void)h;
+    }
+
+    // 内部: EndFrame 中自动调用, 枚举所有 ImGui 顶层窗口, 过滤出可交互菜单, 发给 server.
+    static void AutoPublishMenusFromImGui(AImGui* /*self*/,
+                                          std::vector<float>& scratch,
+                                          uint64_t& outHash,
+                                          float screenW, float screenH)
+    {
+        scratch.clear();
+        outHash = 0;
+
+        ImGuiContext* ctx = ImGui::GetCurrentContext();
+        if (!ctx) return;
+
+        const float kAlmostFullW = std::max(1.0f, screenW * 0.9f);
+        const float kAlmostFullH = std::max(1.0f, screenH * 0.9f);
+
+        int collected = 0;
+        for (ImGuiWindow* w : ctx->Windows)
+        {
+            if (!w) continue;
+            if (!w->WasActive) continue;
+            if (w->Hidden) continue;
+            // 排除带 NoInputs 标志的"画布"窗口 (ESP / Minimap / WorldObjs / AI 全屏覆盖层都设了它)
+            if (w->Flags & ImGuiWindowFlags_NoInputs) continue;
+            // 排除子/弹窗/Tooltip
+            if (w->Flags & (ImGuiWindowFlags_ChildWindow | ImGuiWindowFlags_Tooltip)) continue;
+            // 排除接近全屏的窗口 (避免吞掉整个游戏画面)
+            if (w->Size.x >= kAlmostFullW && w->Size.y >= kAlmostFullH) continue;
+            if (w->Size.x < 4.0f || w->Size.y < 4.0f) continue;
+
+            scratch.push_back(w->Pos.x);
+            scratch.push_back(w->Pos.y);
+            scratch.push_back(w->Size.x);
+            scratch.push_back(w->Size.y);
+
+            // 简易 hash (FNV-ish), 用于跨帧节流判等
+            auto mix = [&](float v) {
+                uint32_t bits = 0;
+                std::memcpy(&bits, &v, sizeof(bits));
+                outHash ^= bits + 0x9E3779B9ULL + (outHash << 6) + (outHash >> 2);
+            };
+            mix(w->Pos.x); mix(w->Pos.y); mix(w->Size.x); mix(w->Size.y);
+
+            if (++collected >= AImGui::kMaxMenuRects) break;
+        }
+        outHash ^= static_cast<uint64_t>(collected) * 0x100000001B3ULL;
+    }
+
+    int AImGui::QueryMenuRects(float* outXywh, int capacity) const
+    {
+        if (!outXywh || capacity <= 0) return 0;
+        std::lock_guard<std::mutex> lock(m_menuRectsMutex);
+        const int n = std::min<int>(capacity, m_menuRectsCount.load(std::memory_order_relaxed));
+        for (int i = 0; i < n * 4; ++i)
+            outXywh[i] = m_menuRects[i];
+        return n;
+    }
+
+    bool AImGui::PollInputReady(int timeoutMs) const
+    {        if (!m_state || m_clientFd == -1)
             return false;
         pollfd pfd{.fd = m_clientFd, .events = POLLIN};
         return poll(&pfd, 1, timeoutMs) > 0 && (pfd.revents & POLLIN);
@@ -1389,6 +1568,12 @@ namespace android
                 m_lastRenderDecodedSize = 0;
                 m_serverFontPacketReceived = false;
             }
+            // 新连接: 清空菜单 rect 列表 (旧 client 残留的菜单不应继续吸收触摸).
+            {
+                std::lock_guard<std::mutex> lk(m_menuRectsMutex);
+                m_menuRects.clear();
+            }
+            m_menuRectsCount.store(0, std::memory_order_release);
             LogInfo("[AImGui] Server accepted client fd=%d", m_clientFd);
             m_clientConnected.store(true, std::memory_order_release);
 
@@ -1400,6 +1585,36 @@ namespace android
                     if (m_state)
                         LogDebug("[-] Server can not read packet size, %d:%s", errno, strerror(errno));
                     break;
+                }
+                // 旁路 packet (菜单 rect 通知) — 在尺寸校验之前先处理, 因为哨兵值
+                // 远超 m_maxPacketSize, 否则会被误判为非法 packet.
+                if (kSidePacketMagic_MenuRect == packetSize)
+                {
+                    uint32_t count = 0;
+                    if (static_cast<int>(sizeof(count)) > ReadData(&count, sizeof(count)))
+                    {
+                        LogDebug("[-] Side packet count read failed, %d:%s", errno, strerror(errno));
+                        break;
+                    }
+                    if (count > AImGui::kMaxMenuRects)
+                    {
+                        LogDebug("[-] Side packet count too large: %u", count);
+                        break;
+                    }
+                    float payload[AImGui::kMaxMenuRects * 4];
+                    const size_t payloadBytes = static_cast<size_t>(count) * 4 * sizeof(float);
+                    if (payloadBytes > 0 &&
+                        static_cast<int>(payloadBytes) > ReadData(payload, payloadBytes))
+                    {
+                        LogDebug("[-] Side packet payload read failed, %d:%s", errno, strerror(errno));
+                        break;
+                    }
+                    {
+                        std::lock_guard<std::mutex> lk(m_menuRectsMutex);
+                        m_menuRects.assign(payload, payload + count * 4);
+                    }
+                    m_menuRectsCount.store(static_cast<int>(count), std::memory_order_release);
+                    continue;
                 }
                 if (packetSize > m_maxPacketSize)
                 {
@@ -1482,8 +1697,15 @@ namespace android
 
             // 客户端断开: 记录时间, 保留最后一帧数据, 由渲染线程在宽限期后清屏
             m_clientDisconnectTime = std::chrono::steady_clock::now();
-            m_clientConnected.store(false, std::memory_order_release);
-            m_renderState.store(RenderState::ReadData, std::memory_order_release);
+            m_clientConnected.store(false, std::memory_order_release);            m_renderState.store(RenderState::ReadData, std::memory_order_release);
+
+            // 客户端断开: 清空菜单 rect, 让 Java 侧立即移除残留的捕获窗
+            // (避免下一个 client 还没连上前用户仍能在旧菜单位置吃到触摸).
+            {
+                std::lock_guard<std::mutex> lk(m_menuRectsMutex);
+                m_menuRects.clear();
+            }
+            m_menuRectsCount.store(0, std::memory_order_release);
 
             if (m_state)
                 LogInfo("[AImGui] Server client disconnected, waiting next client");

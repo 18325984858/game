@@ -75,6 +75,14 @@ namespace android
 
         void ProcessInputEvent();
 
+        // 注入外部 (Java MotionEvent / 投屏) 触摸事件到 ImGui 输入流.
+        //   action: 0 = TouchDown, 1 = Move, 2 = TouchUp, 3 = Cancel
+        //   x, y  : 已经位于屏幕 (display) 坐标系, 不再做旋转/缩放变换.
+        // RenderServer 模式下会通过 socket 转发给 RenderClient;
+        // RenderNative 模式直接 AddMousePosEvent / AddMouseButtonEvent.
+        // 线程安全: 可在任意线程调用 (典型: Java UI 线程通过 JNI).
+        void InjectExternalTouch(int action, float x, float y);
+
         // 非阻塞检查是否有待处理的输入事件 (用于 RenderClient 同线程调用)
         bool PollInputReady(int timeoutMs = 0) const;
 
@@ -82,6 +90,17 @@ namespace android
 
         bool IsClientConnected() const { return m_clientConnected.load(std::memory_order_acquire); }
 
+        // ---- 旁路: 菜单 rect 发布 (RenderClient -> RenderServer) ----
+
+        // 发送给 server 供 Java 侧触摸捕获窗跟随. 不需要业务代码手动调用.
+        // 最多同时跟随 kMaxMenuRects 个菜单.
+        static constexpr int kMaxMenuRects = 16;
+        // RenderServer 侧查询: 输入最多可容纳 capacity 个 rect 的数组 (每个 4 个 float),
+        // 返回实际填充的数量. 0 表示尚未收到任何 rect.
+        int  QueryMenuRects(float* outXywh, int capacity) const;
+
+        // 兼容: 老的单 rect API (现已被 EndFrame 自动 publish 取代, 保留 noop).
+        void PublishMenuRect(float x, float y, float w, float h);
         constexpr operator bool() const
         {
             return m_state;
@@ -111,10 +130,19 @@ namespace android
         sockaddr_in m_transportAddress{};
         int m_serverFd = -1, m_clientFd = -1;
         std::atomic<bool> m_clientConnected{false};  // 渲染线程安全的连接状态
+        // 旁路: server 端缓存最近收到的菜单 rect 列表.
+        mutable std::mutex m_menuRectsMutex;
+        std::vector<float> m_menuRects;  // [x,y,w,h, x,y,w,h, ...] flat
+        std::atomic<int>   m_menuRectsCount{0};
+        // 客户端节流: 上一次发送的 rect 集 (hash) + 时间戳
+        std::chrono::steady_clock::time_point m_menuRectLastSendTime{};
+        uint64_t m_menuRectLastSentHash = 0;
         std::unique_ptr<std::thread> m_serverWorkerThread;
         std::vector<uint8_t> m_serverFontData;
         std::vector<uint8_t> m_serverRenderData, m_serverRenderDataBack;
         std::mutex m_renderDataMutex;
+        std::mutex m_writeMutex;   // 串行化 server -> client 的 socket write
+                                   // (evdev 触点 + Java MotionEvent 注入两路并发)
         std::atomic<RenderState> m_renderState = RenderState::ReadData;
         uint64_t m_fontPacketCount = 0;
         uint64_t m_renderPacketCount = 0;
@@ -132,6 +160,8 @@ namespace android
         EGLContext m_eglContext = EGL_NO_CONTEXT;
         ImGuiContext *m_imguiContext = nullptr;
     };
+
+    // (旧 单 rect API 已被废弃; 现在由 EndFrame 自动枚举多个菜单.)
 } // namespace android
 
 #endif // !A_IMGUI_H
