@@ -95,7 +95,10 @@ public class Ue4OverlayService extends Service {
     private static final int MAX_MENU_RECTS = 16;
     /** 跟随轮询频率: 100ms. */
     private static final long MENU_FOLLOW_INTERVAL_MS = 100L;
-    /** native 返回布局: [count, x0,y0,w0,h0, x1,...]. */
+    /** 跳过跟随帧计数: 在 follow 却检测到任一捕获窗有活动触摸时, 临时不调 updateViewLayout,
+     *  避免窗口几何变化让 InputDispatcher 中断当前手势, 造成 ImGui 拖动卷动中途卡顿.
+     *  以 captureView.getId() 表示序号, 可多点拖动多菜单. */
+    private final java.util.HashSet<View> activeTouchCaptures = new java.util.HashSet<>();
     private final int[] menuRectScratch = new int[1 + MAX_MENU_RECTS * 4];
     private final Runnable menuRectFollowRunnable = new Runnable() {
         @Override
@@ -507,8 +510,9 @@ public class Ue4OverlayService extends Service {
         View capture = new View(this) {
             @Override
             public boolean onTouchEvent(MotionEvent ev) {
+                final int actMasked = ev.getActionMasked();
                 final int action;
-                switch (ev.getActionMasked()) {
+                switch (actMasked) {
                     case MotionEvent.ACTION_DOWN:
                     case MotionEvent.ACTION_POINTER_DOWN:
                         action = 0; break;
@@ -522,7 +526,17 @@ public class Ue4OverlayService extends Service {
                     default:
                         return true;
                 }
+                // 拖动期间锁住该捕获窗 (在 followMenuRectsOnce 中跳过它),
+                // 避免 updateViewLayout 打断进行中的 ImGui 拖动手势.
+                if (actMasked == MotionEvent.ACTION_DOWN
+                        || actMasked == MotionEvent.ACTION_POINTER_DOWN) {
+                    activeTouchCaptures.add(this);
+                }
                 PublicOverlayBridge.injectTouch(port, action, ev.getRawX(), ev.getRawY());
+                if (actMasked == MotionEvent.ACTION_UP
+                        || actMasked == MotionEvent.ACTION_CANCEL) {
+                    activeTouchCaptures.remove(this);
+                }
                 return true;
             }
         };
@@ -577,7 +591,8 @@ public class Ue4OverlayService extends Service {
             }
         }
 
-        // 更新位置/尺寸 (抖动过滤)
+        // 更新位置/尺寸 (抖动过滤). 正在被触摸的捕获窗暂不更新, 避免
+        // updateViewLayout 中断 InputDispatcher 当前手势造成 ImGui 拖动卡顿.
         for (int i = 0; i < count && i < captureViews.size(); ++i) {
             int base = 1 + i * 4;
             int rx = menuRectScratch[base];
@@ -589,6 +604,10 @@ public class Ue4OverlayService extends Service {
             int newW = rw + CAPTURE_PADDING_PX * 2;
             int newH = rh + CAPTURE_PADDING_PX * 2;
             if (newW <= 0 || newH <= 0) continue;
+            View captureV = captureViews.get(i);
+            if (activeTouchCaptures.contains(captureV)) {
+                continue;  // 当前手势归属此窗, 暂停几何更新
+            }
             WindowManager.LayoutParams lp = captureLps.get(i);
             if (Math.abs(lp.x - newX) <= 2
                     && Math.abs(lp.y - newY) <= 2
@@ -601,7 +620,7 @@ public class Ue4OverlayService extends Service {
             lp.width = newW;
             lp.height = newH;
             try {
-                windowManager.updateViewLayout(captureViews.get(i), lp);
+                windowManager.updateViewLayout(captureV, lp);
             } catch (Exception e) {
                 Log.e(TAG, "follow 更新失败 idx=" + i, e);
             }

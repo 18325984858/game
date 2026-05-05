@@ -389,8 +389,9 @@ int DfmOverlay::drawESP(const dfm::DrawDfmData& data, float screenW, float scree
             // 追加两个虚拟世界点扩展 AABB:
             //   ① head_crown = head bone + 25cm  (UE Head 骨在颅底, 不含头骨+头盔)
             //   ② foot_ground = min(foot_l, foot_r) - 15cm  (Foot 骨在脚踝, 不含脚跟到地面)
-            // 不加这两个点, 骨骼 AABB 只覆盖 ankle→neck (~120cm), 而真实角色身高 ~175cm,
-            // 导致 ESP 框看起来"框在目标脚下"或"短一截"。
+            // 这两个虚拟点必须与 drawBones() 里"头顶延伸线 / 脚底延伸线"使用的偏移
+            // 完全一致 (同 +25 / -15), 否则方框上下边缘和骨架延伸线对不上,
+            // 用户会看到"骨架比方框高一截"或反过来.
             const dfm::FVector3& headBone = p.bones[0];
             const dfm::FVector3& rfootBone = p.bones[13];
             const dfm::FVector3& lfootBone = p.bones[16];
@@ -417,8 +418,12 @@ int DfmOverlay::drawESP(const dfm::DrawDfmData& data, float screenW, float scree
                 if (std::fabs(b.x) <= 1.0f && std::fabs(b.y) <= 1.0f) continue;
                 addVirtualPoint(b.x, b.y, b.z);
             }
-            // 头顶虚拟点
-            if (std::isfinite(headBone.x) && (std::fabs(headBone.x) > 1.0f || std::fabs(headBone.y) > 1.0f)) {
+            // 头顶虚拟点 — 仅在 head 骨可信时加 (与 drawBones 内 headBoneTrustworthy 同准则:
+            // head.z 必须明显高于 pelvis.z, 否则误识别就别瞎扩, 让 AABB 跟着真实骨骼走)
+            const bool headBoneOkForCrown =
+                std::isfinite(headBone.x) && (std::fabs(headBone.x) > 1.0f || std::fabs(headBone.y) > 1.0f)
+                && (!std::isfinite(p.bones[4].x) || (headBone.z + 10.0f >= p.bones[4].z));
+            if (headBoneOkForCrown) {
                 addVirtualPoint(headBone.x, headBone.y, headBone.z + 25.0f);
             }
             // 脚底虚拟点
@@ -466,14 +471,13 @@ int DfmOverlay::drawESP(const dfm::DrawDfmData& data, float screenW, float scree
 
         if (canDrawBox) {
             float boxH = std::fabs(botY - topY);
-            // 框宽: 优先使用骨骼包围盒实际宽度 (与骨架 1:1 对齐),
-            // 否则退回 boxH * 0.48 这种基于身高的固定纵横比估算。
-            // 还要给一个最小宽度防止角色完全正面时极窄的骨骼宽度让框看起来像一根线。
+            // 框宽: 骨骼 AABB 可用时直接用骨骼实际投影宽度 (与骨架 1:1 对齐),
+            // 不再加 boxH * 0.22 这种"最小宽度"补偿 — 那会让正面/侧身的角色框
+            // 比骨架明显宽出一截, 这就是用户感觉"ESP 与骨架比例不一致"的根因.
+            // 没有骨骼时退回身高比例的旧估算.
             float boxW;
             if (useBoneWidth) {
-                float bw = std::fabs(boneRight - boneLeft);
-                float minBoxW = std::clamp(boxH * 0.22f, 6.0f, 64.0f);
-                boxW = std::max(bw, minBoxW);
+                boxW = std::max(std::fabs(boneRight - boneLeft), 4.0f);  // 仅防 0 宽度
             } else {
                 boxW = boxH * 0.48f;
             }
@@ -504,10 +508,13 @@ int DfmOverlay::drawESP(const dfm::DrawDfmData& data, float screenW, float scree
                 float left = cx - boxW * 0.5f;
                 float right = cx + boxW * 0.5f;
 
-                // 黑色描边 + 彩色方框
-                dl->AddRect(ImVec2(left - 1, topY - 1), ImVec2(right + 1, botY + 1),
-                            IM_COL32(0, 0, 0, 150), 0, 0, 2.5f);
-                dl->AddRect(ImVec2(left, topY), ImVec2(right, botY), color, 0, 0, 2.0f);
+                // 黑色描边 + 彩色方框 — 骨架开启时不再画框, 避免重叠 (骨架本身已能定位目标),
+                // 但保留下面的血条/名字/距离/武器/护甲, 这些信息位置仍按 left/right/topY/botY 锚定.
+                if (!m_enableBones) {
+                    dl->AddRect(ImVec2(left - 1, topY - 1), ImVec2(right + 1, botY + 1),
+                                IM_COL32(0, 0, 0, 150), 0, 0, 2.5f);
+                    dl->AddRect(ImVec2(left, topY), ImVec2(right, botY), color, 0, 0, 2.0f);
+                }
 
                 // 射线
                 if (m_enableSnapline)
@@ -921,28 +928,52 @@ void DfmOverlay::drawLootESP(const dfm::DrawDfmData& data, float screenW, float 
                     ImVec2(sx + boxSize, sy + boxSize),
                     color, 0, 0, 1.5f); // 外框
 
-        // 构造显示文本: "名称 x数量 距离m"
-        char label[128];
+        // 构造显示文本. 主标题 "名称 x数量 距离m"; 次标题 (如有) 显示耐久/来源.
+        // 来源映射: 0=World 1=DeadBody 2=AirDrop 3=Container ... 这里保留原值.
+        char label[160];
         if (item.stackCount > 1) {
-            snprintf(label, sizeof(label), "%s x%d %.0fm",
+            snprintf(label, sizeof(label), "%s x%d  %.0fm",
                      item.itemName.c_str(), item.stackCount, dist);
         } else {
-            snprintf(label, sizeof(label), "%s %.0fm",
+            snprintf(label, sizeof(label), "%s  %.0fm",
                      item.itemName.c_str(), dist);
+        }
+        // 副信息: 耐久 + 来源标记 + 隐藏标记 (有值才显示)
+        char extra[96] = {0};
+        int extraLen = 0;
+        if (item.durability > 0) {
+            extraLen += snprintf(extra + extraLen, sizeof(extra) - extraLen,
+                                 "耐久 %d", item.durability);
+        }
+        if (item.sourceType != 0) {
+            extraLen += snprintf(extra + extraLen, sizeof(extra) - extraLen,
+                                 "%s来源 %u", extraLen ? " · " : "", (unsigned)item.sourceType);
+        }
+        if (item.hidden) {
+            extraLen += snprintf(extra + extraLen, sizeof(extra) - extraLen,
+                                 "%s隐藏", extraLen ? " · " : "");
         }
 
         // 文本尺寸 (显示在方框上方)
         ImVec2 textSize = ImGui::CalcTextSize(label);
-        float tx = sx - textSize.x * 0.5f;
-        float ty = sy - boxSize - textSize.y - 3.0f;
+        ImVec2 extraSize = (extraLen > 0) ? ImGui::CalcTextSize(extra) : ImVec2(0, 0);
+        float blockW = std::max(textSize.x, extraSize.x);
+        float blockH = textSize.y + (extraLen > 0 ? (extraSize.y + 1) : 0);
+        float tx = sx - blockW * 0.5f;
+        float ty = sy - boxSize - blockH - 3.0f;
 
-        // 背景框
+        // 背景框 (覆盖主+副两行)
         dl->AddRectFilled(ImVec2(tx - 2, ty - 1),
-                          ImVec2(tx + textSize.x + 2, ty + textSize.y + 1),
-                          IM_COL32(0, 0, 0, 120), 2.0f);
+                          ImVec2(tx + blockW + 2, ty + blockH + 1),
+                          IM_COL32(0, 0, 0, 140), 2.0f);
 
-        // 文本
+        // 主标题
         dl->AddText(ImVec2(tx, ty), color, label);
+        // 副信息 (浅色)
+        if (extraLen > 0) {
+            dl->AddText(ImVec2(tx, ty + textSize.y + 1),
+                        IM_COL32(180, 220, 255, 220), extra);
+        }
     }
 
     // 物资箱 3D 标签

@@ -144,9 +144,16 @@ struct ResolvedOffsets {
 
     // PickupBase (inherits InteractorBase) — sdk_dump 验证
     int32_t Interactor_Name        = 0x790;   // InteractorBase.InteractorName (FText, Size=0x18) — sdk_dump: 0x790
+    int32_t Pickup_HiddenItem     = 0xF48;   // PickupBase.bIsHiddenItem (bool)
+    int32_t Pickup_InventoryGID   = 0xF60;   // PickupBase.InventoryGID (int64) — 实例 GID
+    int32_t Pickup_SourceType     = 0xF68;   // PickupBase.SourceType (EPickupSourceType, uint8)
+    int32_t Pickup_LDMaxDrawDist  = 0xF74;   // PickupBase.LDMaxDrawDistance (float)
     int32_t Pickup_InvIdName      = 0xF78;   // PickupBase.InventoryIdName (FName) — sdk_dump: 0xF78
     int32_t Pickup_InvType        = 0xF80;   // PickupBase.InventoryType (TSubclassOf<Class>) — sdk_dump: 0xF80
     int32_t Pickup_StackCount     = 0xF88;   // PickupBase.StackCount (int32) — sdk_dump: 0xF88
+    int32_t Pickup_CanDestroyed   = 0xF8C;   // PickupBase.CanDestroyed (bool)
+    int32_t Pickup_Durability     = 0xF90;   // PickupBase.Durability (int32)
+    int32_t Pickup_Priority       = 0xFA8;   // PickupBase.Priority (int32)
 
     // GPCharacterBase (sdk_dump 验证)
     int32_t Char_HealthComp       = 0x1068;  // GPCharacterBase.HealthComp (GPHealthDataComponent*) — sdk_dump: 0x1068
@@ -183,7 +190,9 @@ struct ResolvedOffsets {
     int32_t Container_Actors      = 0x28;
 
     // InventoryItemInfo 大小
-    int32_t ItemInfoSize          = 0x690;
+    int32_t ItemInfoSize          = 0x7C0;   // sdk_dump 验证: InventoryItemInfo size
+                                              // (旧值 0x690 跨条目读错 cat/seq, 出现
+                                              // 14 位畸形 ID; 当前版本 sdk 标注 0x7C0)
 
     // ── 相机系统 (SDK dump 确认) ──
     // Controller
@@ -276,10 +285,18 @@ struct HealthInfo {
 //  LootItem — 地面物资信息
 // =====================================================================
 struct LootItem {
-    std::string itemName;
-    std::string className;
+    std::string itemName;     // 解析后的本地化中文名 (优先 GetItemName 虚调)
+    std::string className;    // 蓝图类名 (BP_Wpn_AKM_C 等)
+    std::string invTypeName;  // InventoryType UClass 名 (语义更稳定)
     int64_t     itemId = 0;   // 11 位 (e.g. 11010301001 ~1.1e10), 必须 int64
+    int64_t     gid = 0;      // 实例 GID (服务端追踪用)
     int32_t     stackCount = 0;
+    int32_t     durability = 0;
+    int32_t     priority = 0;     // 显示优先级
+    uint8_t     sourceType = 0;   // EPickupSourceType: 0=World/1=DeadBody/2=AirDrop/...
+    bool        hidden = false;   // bIsHiddenItem
+    bool        canDestroyed = false;
+    bool        recentlyRendered = false;  // 近 200ms 是否被渲染 (可见性)
     FVector3    pos;
 };
 
@@ -475,6 +492,21 @@ private:
     // 触发 SIGSEGV/SIGBUS 时自动熔断当前 GameState ptr (下一局新 GS 自动恢复).
     bool callHasMatchStartedSpoofed(uintptr_t gsPtr) const;
 
+    // 在 stack_spoof 伪 FP chain 下直接虚调 PickupBase::GetItemName (vtable+0x0B10).
+    // IDA 反编译验证: thunk @ 0x1339F49C 内核心是 (*(vtable+2832))(this, &outFText),
+    // 因此可绕过 ProcessEvent / UFunction 反射, 直接 vtable[354] 调用,
+    // ACE hook ProcessEvent 那条路径完全规避. 触发 SIGSEGV/SIGBUS 时熔断该 vtable.
+    // 返回 true = 写入了非空 outName; false = 调用失败/熔断/字段为空.
+    bool callPickupGetItemNameSpoofed(uintptr_t pickupActor, std::string& outName) const;
+
+    // 静态 ID → 名查询: 直接走游戏内部 FDFMCommonItemRow DataTable.
+    // IDA 反编译验证: sub_135B4514(FText* out @x8, int64 itemId @x0) 内部调
+    //   sub_135B41C8(itemId) → sub_135B7B44(GameInstance) → 在 DataTable 查行.
+    // 输出 FText 解析后即真实本地化中文名 (如 "5.56x45 FMJ", "急救包").
+    // 不需要任何 actor 实例, 容器内只有 itemId 的物品也能立刻拿到中文名.
+    // 触发 SIGSEGV/SIGBUS 时熔断该函数, 永久走回退.
+    bool callGetItemNameByIdSpoofed(int64_t itemId, std::string& outName) const;
+
     // ── 角色/物资扫描 ──
     std::vector<uintptr_t> getAllActors() const;
     void scanActors(const std::vector<uintptr_t>& actors, DrawDfmData& outData);
@@ -627,6 +659,27 @@ private:
 
     void enqueueItemNameLookup(uintptr_t actor, const std::string& rawId, int64_t numId) const;
     void processItemNameRequests();
+
+    // [2026-05-05] 一次性 CDO dump 状态机:
+    //  * 进入对局后等 30 秒 (避开匹配/加载/反作弊冷启动期), 跑一次
+    //    dumpAllPickupCDOs() 灌满 ItemRegistry, 让容器内物品 (拿不到 actor)
+    //    也能通过 numId/idName 反查到中文名.
+    //  * 整个 .so 生命周期只跑一次, 用 atomic flag 防 double-dispatch.
+    //  * 扫描结束后落盘到 /data/data/<pkg>/cache/dfm_items.txt, 下次启动
+    //    ItemRegistry::load() 直接加载, 后续运行不再扫描.
+    std::atomic<bool>   m_cdoDumpDone{false};
+    std::chrono::steady_clock::time_point m_cdoDumpDueAt{};   // 进对局时刻 + 30s
+    bool                m_cdoDumpScheduled = false;            // 已设过定时器
+    static constexpr int kCdoDumpDelayMs = 30000;
+    // [2026-05-05] scanActors 见到第一个真 pickup (idName 以数字开头) 时置位.
+    // pollLoop 把它作为触发 CDO dump 的额外门控 — 避免在物品还没 spawn 时空跑.
+    std::atomic<bool>   m_realPickupSeen{false};
+    static constexpr int kCdoDumpAfterPickupMs = 5000;          // 见到真 pickup 后再等 5s
+    // [2026-05-05] 新增上限重试: 第一次扫描时若 BP 类还没 lazy-load 完
+    // (新增=0), 隔 30s 再扫一次, 最多 kCdoDumpMaxAttempts 次. 一旦某次成功新增,
+    // 立即 m_cdoDumpDone=true 停止重试.
+    int                 m_cdoDumpAttempts = 0;
+    static constexpr int kCdoDumpMaxAttempts = 4;
 
     std::atomic<bool> m_running{false};
     std::thread m_pollThread;

@@ -30,7 +30,7 @@ private:
     bool m_enableDistance   = false;    // 距离
     bool m_enableTeammate  = false;    // 显示队友
     bool m_enableMinimap   = false;    // 小地图
-    bool m_enableLoot      = false;    // 物资显示
+    bool m_enableLoot      = true;     // 物资显示 (默认开启)
     bool m_enableLootESP   = false;    // 物资3D名称标签
     bool m_enableContainer = false;    // 物资箱
     bool m_enableRemoteOpen = false;   // 物资箱远程开箱按钮 (默认关 — 风控敏感)

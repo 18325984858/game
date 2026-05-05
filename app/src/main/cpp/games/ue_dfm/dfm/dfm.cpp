@@ -9,6 +9,7 @@
 #include "../engine/UE5DfmStruct.h"
 #include "../interface/interface.h"
 #include "dfm_item_registry.h"
+#include "dfm_items_baked.h"
 
 // IM_COL32 兼容宏 (避免引入 imgui.h)
 #ifndef IM_COL32
@@ -25,6 +26,8 @@
 #include <chrono>
 #include <atomic>
 #include <algorithm>
+#include <mutex>
+#include <unordered_set>
 
 #define TAG "[DFM]"
 
@@ -429,20 +432,202 @@ std::string DfmMatchMonitor::readFString(uintptr_t addr) {
 std::string DfmMatchMonitor::readFText(uintptr_t addr) const {
     if (!ok(addr)) return "";
 
+    // 直读 UTF-16 字符串 helper (无 FString 头, buffer 直接是 wchar_t[] 以 0 结尾).
+    // DFM/腾讯版 FTextHistory 内的若干字段把字符串 Data 指针单独存起来, 不带 Num/Max,
+    // 长度由 0x0000 终止符决定. 校验: 至少 1 个可显字符, 全程都是合法 UTF-16 (不含
+    // 0xFFFF / 高位 0xD800 失配等垃圾), 长度 ≤ 256.
+    auto tryReadRawUtf16 = [this](uintptr_t bufAddr) -> std::string {
+        if (!ok(bufAddr)) return "";
+        uint16_t wbuf[256] = {0};
+        if (!safeReadMemory(bufAddr, wbuf, sizeof(wbuf))) return "";
+        int len = 0;
+        for (; len < 256; ++len) {
+            if (wbuf[len] == 0) break;
+        }
+        if (len == 0 || len >= 256) return "";
+        // 合理性: 至少出现一个 ASCII 可显或 CJK 区间字符
+        bool sane = false;
+        for (int i = 0; i < len; ++i) {
+            uint16_t c = wbuf[i];
+            if (c == 0xFFFE || c == 0xFFFF) return "";
+            if ((c >= 0x20 && c < 0x7F) || (c >= 0x4E00 && c <= 0x9FFF)
+                || (c >= 0x3000 && c <= 0x33FF) || (c >= 0xFF00 && c <= 0xFFEF)) {
+                sane = true;
+            }
+        }
+        if (!sane) return "";
+        // UTF-16 → UTF-8
+        std::string out;
+        out.reserve(len * 3);
+        for (int i = 0; i < len; ++i) {
+            uint16_t ch = wbuf[i];
+            if (ch < 0x80) {
+                out += static_cast<char>(ch);
+            } else if (ch < 0x800) {
+                out += static_cast<char>(0xC0 | (ch >> 6));
+                out += static_cast<char>(0x80 | (ch & 0x3F));
+            } else if (ch >= 0xD800 && ch <= 0xDBFF && i + 1 < len) {
+                uint16_t lo = wbuf[i + 1];
+                if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                    uint32_t cp = 0x10000 + ((static_cast<uint32_t>(ch - 0xD800) << 10) | (lo - 0xDC00));
+                    out += static_cast<char>(0xF0 | (cp >> 18));
+                    out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+                    out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+                    out += static_cast<char>(0x80 | (cp & 0x3F));
+                    ++i;
+                }
+            } else {
+                out += static_cast<char>(0xE0 | (ch >> 12));
+                out += static_cast<char>(0x80 | ((ch >> 6) & 0x3F));
+                out += static_cast<char>(0x80 | (ch & 0x3F));
+            }
+        }
+        return out;
+    };
+
     // 策略1: FText 内部可能直接包含 FString (某些 UE5 版本)
     std::string direct = readFString(addr);
     if (!direct.empty() && direct != "None" && direct.length() > 1) return direct;
 
-    // 策略2: FText → FTextData* (第一个指针) → 内部 FString
+    // 策略2: FText → FTextData* (第一个指针) → 内部 FString.
+    // UE5 FText 布局: TSharedRef<ITextData,ThreadSafe> TextData (16B) + uint32 Flags.
+    //   *(addr+0)  = ITextData*       ← 我们要的核心指针
+    //   *(addr+8)  = TSharedReferencer (引用计数控制块, 不是字符串源)
+    // ITextData 是个继承链: 不同 FTextHistory 子类内部 FString 偏移各不相同
+    //   * FTextHistory_Base: vtable(8) + FString SourceString @ 0x8/0x10 + ...
+    //   * FTextHistory_NamedFormat / DisplayStringText: 还要再跟一层指针
+    // 这里把"直接扫"和"再跟一层"都做掉, 覆盖大多数 native UE5 / 腾讯改造布局.
     uintptr_t textData = safeReadPtr(addr);
-    if (ok(textData)) {
-        // FTextData 内部: 通常 +0x28 或 +0x30 位置有 DisplayString (FString)
-        static const uint32_t kStrCandidates[] = {0x28, 0x30, 0x38, 0x40, 0x48};
-        for (uint32_t off : kStrCandidates) {
-            std::string s = readFString(textData + off);
-            if (!s.empty() && s != "None" && s.length() > 1) return s;
+    if (!ok(textData)) return "";
+
+    // 直接在 textData 上扫 FString 头. 范围扩大到 0x08 ~ 0x80 (8 字节步进).
+    // 校验逻辑由 readFString 内部完成: Data 指针有效 + Num 在 (0,512] + UTF-16 解码.
+    for (uint32_t off = 0x08; off <= 0x80; off += 0x08) {
+        std::string s = readFString(textData + off);
+        if (!s.empty() && s != "None" && s.length() > 1) return s;
+    }
+
+    // 间接: textData[off] 可能是 FString*, 再读一层 FString 头.
+    for (uint32_t off = 0x08; off <= 0x80; off += 0x08) {
+        uintptr_t inner = safeReadPtr(textData + off);
+        if (!ok(inner)) continue;
+        std::string s = readFString(inner);
+        if (!s.empty() && s != "None" && s.length() > 1) return s;
+    }
+
+    // [修复 2026-05-04] 直读 UTF-16 buffer fallback —
+    // DFM textData 实际转储显示 +0x18/+0x20 处直接是 wchar_t* (无 FString 头, 0 终止),
+    // 而 +0x30 处的"FString"只有 Num=1 的占位空串. 走完前两条策略仍空时, 把每个 qword
+    // 当成裸 UTF-16 缓冲区试着 0 终止解码 — 命中即返回.
+    for (uint32_t off = 0x08; off <= 0x80; off += 0x08) {
+        const uintptr_t inner = safeReadPtr(textData + off);
+        if (!ok(inner)) continue;
+        std::string s = tryReadRawUtf16(inner);
+        if (!s.empty() && s != "None" && s.length() > 1) return s;
+    }
+
+    // [2026-05-05] 二层间接 + 中文校验:
+    //   DFM 的 FText 是 FTextHistory_StringTableEntry 类型, textData 内多数字段是
+    //   StringTable 的 vtable / refcount block / ASCII key, 但偶尔有一个 qword
+    //   (实测 +0x40 ~ +0x60) 指向最终解析后的 wchar_t buffer (UI 渲染时的缓存).
+    //   这条路走完前面的 FString 头校验都 fail, 因为没有 Num 字段, 只是 0 终止.
+    //   所以这里再套一层指针解 wchar_t, 但加严校验 — 必须 ≥2 个 CJK 字符才接受,
+    //   避免误把 ASCII key 之类的当物品名.
+    auto strictCJK = [&](uintptr_t bufAddr) -> std::string {
+        if (!ok(bufAddr)) return "";
+        uint16_t wbuf[64] = {0};
+        if (!safeReadMemory(bufAddr, wbuf, sizeof(wbuf))) return "";
+        int len = 0;
+        int cjk = 0;
+        for (; len < 64; ++len) {
+            uint16_t c = wbuf[len];
+            if (c == 0) break;
+            if (c < 0x20 || c == 0xFFFE || c == 0xFFFF) return "";
+            if (c >= 0x4E00 && c <= 0x9FFF) ++cjk;
+            else if (c >= 0x3000 && c <= 0x33FF) ++cjk;     // 全角符号也算
+            else if (c >= 0xFF00 && c <= 0xFFEF) ++cjk;
+        }
+        if (len == 0 || len >= 64) return "";
+        if (cjk < 2) return "";   // 必须 ≥2 个中文字符, 排除 ASCII key 误判
+        // 转 UTF-8
+        std::string out;
+        out.reserve(len * 3);
+        for (int i = 0; i < len; ++i) {
+            uint16_t ch = wbuf[i];
+            if (ch < 0x80) out += static_cast<char>(ch);
+            else if (ch < 0x800) {
+                out += static_cast<char>(0xC0 | (ch >> 6));
+                out += static_cast<char>(0x80 | (ch & 0x3F));
+            } else {
+                out += static_cast<char>(0xE0 | (ch >> 12));
+                out += static_cast<char>(0x80 | ((ch >> 6) & 0x3F));
+                out += static_cast<char>(0x80 | (ch & 0x3F));
+            }
+        }
+        return out;
+    };
+    // 一层: textData+off → wchar_t buffer
+    for (uint32_t off = 0x08; off <= 0xC0; off += 0x08) {
+        const uintptr_t inner = safeReadPtr(textData + off);
+        std::string s = strictCJK(inner);
+        if (!s.empty()) {
+            // [2026-05-05] 命中诊断 — 限频, 头 16 个不重复字符串各打一条 INFO,
+            // 后续静默 (避免每帧刷屏). 帮助验证哪一层 / 哪个偏移真的能拿到名字.
+            static std::mutex sMu;
+            static std::unordered_set<std::string> sShown;
+            std::lock_guard<std::mutex> lk(sMu);
+            if (sShown.size() < 16 && sShown.insert(s).second) {
+                LOG(LOG_LEVEL_INFO, TAG " [readFText] HIT L1 td+0x%X='%s' (textData=%p)",
+                    off, s.c_str(), (void*)textData);
+            }
+            return s;
         }
     }
+    // 二层: textData+off → ptr → wchar_t buffer
+    for (uint32_t off = 0x08; off <= 0xC0; off += 0x08) {
+        const uintptr_t mid = safeReadPtr(textData + off);
+        if (!ok(mid)) continue;
+        for (uint32_t inner_off = 0; inner_off <= 0x40; inner_off += 0x08) {
+            const uintptr_t deep = safeReadPtr(mid + inner_off);
+            std::string s = strictCJK(deep);
+            if (!s.empty()) {
+                static std::mutex sMu;
+                static std::unordered_set<std::string> sShown;
+                std::lock_guard<std::mutex> lk(sMu);
+                if (sShown.size() < 16 && sShown.insert(s).second) {
+                    LOG(LOG_LEVEL_INFO, TAG " [readFText] HIT L2 td+0x%X→0x%X='%s' (textData=%p mid=%p)",
+                        off, inner_off, s.c_str(), (void*)textData, (void*)mid);
+                }
+                return s;
+            }
+        }
+    }
+
+    // [2026-05-05] 全部 miss 时, 限频 dump textData 头 128 字节, 留作离线分析依据.
+    // 同一 textData 只 dump 一次, 用 ptr 哈希做 dedup.
+    {
+        static std::mutex sMu;
+        static std::unordered_set<uintptr_t> sShown;
+        std::lock_guard<std::mutex> lk(sMu);
+        if (sShown.size() < 8 && sShown.insert(textData).second) {
+            uint64_t buf[16] = {0};
+            if (safeReadMemory(textData, buf, sizeof(buf))) {
+                LOG(LOG_LEVEL_WARN, TAG " [readFText] MISS textData=%p [0..127]= "
+                    "%016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx "
+                    "%016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx",
+                    (void*)textData,
+                    (unsigned long long)buf[0], (unsigned long long)buf[1],
+                    (unsigned long long)buf[2], (unsigned long long)buf[3],
+                    (unsigned long long)buf[4], (unsigned long long)buf[5],
+                    (unsigned long long)buf[6], (unsigned long long)buf[7],
+                    (unsigned long long)buf[8], (unsigned long long)buf[9],
+                    (unsigned long long)buf[10], (unsigned long long)buf[11],
+                    (unsigned long long)buf[12], (unsigned long long)buf[13],
+                    (unsigned long long)buf[14], (unsigned long long)buf[15]);
+            }
+        }
+    }
+
     return "";
 }
 
@@ -768,9 +953,17 @@ bool DfmMatchMonitor::isPickupClass(const std::string& cn) {
         "GroundItem", "WeaponPickup", "AmmoPickup",
         "InteractorPickup", "_Pickup_", "_Pickup"
     };
+    // [2026-05-05] 加 _Task / AITask / Component / Task_Pickup 排除:
+    //   误命中 DFMAITask_Pickup 这种 AI 行为树任务节点 (BP 名含 "_Pickup" 但完全不是
+    //   物品 actor) 会让 dumpAllPickupCDOs 在错误对象上锁 cdoOff, 后续访问野指针崩溃.
     static const char* excludes[] = {
         "_Container", "_OpenBox", "_DeadBody", "RandomObj",
-        "_EggGolden", "_WeaponModule", "_JailBreak"
+        "_EggGolden", "_WeaponModule", "_JailBreak",
+        "_Task", "AITask", "Component", "Manager", "Executor",
+        "BTTask", "Behavior", "Service",
+        // [2026-05-05] DFMCharacterBuffEntityAmmoPickup 是 buff 实体, 不带
+        // InventoryIdName, 但名字含 _Pickup, 不排除会污染 dumpAllPickupCDOs.
+        "BuffEntity", "CharacterBuff"
     };
     bool found = false;
     for (auto kw : keywords) { if (cn.find(kw) != std::string::npos) { found = true; break; } }
@@ -815,6 +1008,14 @@ bool DfmMatchMonitor::isContainerClass(const std::string& cn) {
 
 std::string DfmMatchMonitor::getItemDisplayName(int64_t itemId) const {
     if (itemId <= 0) return "未知物品";
+
+    // [2026-05-05] 优先静态烤表 (dfm_items_baked.h) — 离线收集的具体物品名,
+    // 命中即返回, 永远比 "[药品]14010401001" 这种大类回退强.
+    {
+        std::string baked = bakedItemNameLookup(itemId, std::string());
+        if (!baked.empty()) return baked;
+    }
+
     // ItemID 格式: MMSSXXXXXXX (MM=大类, SS=子类, XXXXXXX=序号)
     // 真实 ID 11 位最大 ~1.1e10, 必须用 int64 (int32 上限 ~2.1e9 会截断到 0)。
     std::string s = std::to_string(itemId);
@@ -978,19 +1179,71 @@ int DfmMatchMonitor::dumpAllPickupCDOs() const {
     int scanned = 0;
     int classMatched = 0;
     int cdoOk = 0;
+    int actorMatched = 0;       // [2026-05-05 新增] 实例路径命中数
+
+    // [2026-05-05] 新增: 同时把 pickup actor 实例当作信息源
+    //   * 早期对局 (30s 时) 大部分 BP UClass 还没 lazy-load 进 GUObjectArray, 仅扫
+    //     UClass+CDO 命中率极低 (实测仅 9 个 BuffEntity 假阳性).
+    //   * 但只要场景里存在某 actor 实例, 它的 BP class 必已加载, ClassPrivate 必有效.
+    //     从实例直接读 InventoryIdName(0xF78) + InteractorName(0x790) 也能走到注册表.
+    //   * 实例路径与 CDO 路径互补: 见过的物品立即收录, 没见过的等更多 BP class 加载后
+    //     在 (将来) 再扫一次 CDO.
+    auto recordFromUObject = [&](uintptr_t holder, const std::string& cn,
+                                 const char* origin, bool useSpoofedFText) -> bool {
+        const std::string idName = readFName(holder + static_cast<uintptr_t>(m_off.Pickup_InvIdName));
+        if (idName.empty() || idName == "None" || idName == "?") return false;
+        // idName 第一字符必须是数字 (DFM ItemID 全数字), 否则一定是 BuffEntity
+        // / AITask 这种伪命中读到的垃圾.
+        if (!std::isdigit(static_cast<unsigned char>(idName[0]))) return false;
+
+        std::string display = readFText(holder + static_cast<uintptr_t>(m_off.Interactor_Name));
+        if (display.empty() && useSpoofedFText) {
+            std::string spoofed;
+            if (callPickupGetItemNameSpoofed(holder, spoofed) && !spoofed.empty()) {
+                display = std::move(spoofed);
+            }
+        }
+        std::string finalDisplay = display;
+        if (finalDisplay.empty()) {
+            finalDisplay = translateItemClassName(cn);
+            if (finalDisplay.empty()) finalDisplay = cn;
+        }
+
+        const bool isNew = ItemRegistry::instance().lookup(idName).empty();
+        ItemRegistry::instance().record(idName, finalDisplay, cn);
+        if (isNew) {
+            ++added;
+            if (added <= 8) {
+                LOG(LOG_LEVEL_INFO, "[ItemDump] 样本(%s): idName=%s display=%s class=%s",
+                    origin, idName.c_str(), finalDisplay.c_str(), cn.c_str());
+            }
+        }
+        return true;
+    };
 
     for (uint32_t i = 0; i < total; ++i) {
         const uintptr_t obj = getobj(i);
         if (!ok(obj)) continue;
         ++scanned;
 
-        // obj 必须本身是个 UClass。UClass 的 ClassPrivate 指向 UClass 元类自身。
-        // 简化: 只看类名是否匹配 Pickup, 然后再确认 obj 是 UClass — 通过 obj.ClassPrivate 的 oname 应该是 "BlueprintGeneratedClass" 或 "Class"。
+        // ── 路径 A: obj 是 Pickup actor 实例 (cls 是 BP_xxx_Pickup_C) ──
+        // 实例的 ClassPrivate 指向具体 BP class, 不是 "Class"/"BlueprintGeneratedClass".
+        // 即便 BP class 名字含 _Pickup, 实例的 readClassName(obj) 也会拿到 BP 名字.
+        // 用 isPickupClass 同样过滤.
         const std::string objClsName = readClassName(obj);  // = ClassPrivate.oname
         if (objClsName != "BlueprintGeneratedClass" && objClsName != "Class"
             && objClsName != "DynamicClass") {
+            // 这里 obj 是某个 BP class 的实例. 检查 BP 类名 (= objClsName) 是不是 Pickup.
+            if (isPickupClass(objClsName)) {
+                ++actorMatched;
+                recordFromUObject(obj, objClsName, "actor", /*spoofed*/false);
+                // actor 实例上调 callPickupGetItemNameSpoofed 风险高 (运行中的 actor
+                // vtable 易被 hook 监控), 改读字段优先, 失败放弃.
+            }
             continue;
         }
+
+        // ── 路径 B: obj 是 UClass, 找其 CDO (原逻辑) ──
 
         // obj 现在是个 UClass*。读 obj 自己的 oname (它是哪个蓝图类) — 这就是 cn。
         // UClass 继承 UObjectBase, 所以 oname 等于 readFName(obj + UObject::FName=0x18 在标准 UE5)。
@@ -1001,10 +1254,20 @@ int DfmMatchMonitor::dumpAllPickupCDOs() const {
         ++classMatched;
 
         // 找 CDO: 第一次扫描锁定偏移
+        // [2026-05-05] 即便 cdoOff 已锁定, 也对每个 obj 校验一次 backCls==obj — 防止
+        // 第一次锁在错误类型上后, 后续直接读到野指针/异类 CDO 导致崩溃.
         uintptr_t cdo = 0;
         if (cdoOff >= 0) {
-            cdo = safeReadPtr(obj + static_cast<uintptr_t>(cdoOff));
-            if (!ok(cdo)) cdo = 0;
+            const uintptr_t cand = safeReadPtr(obj + static_cast<uintptr_t>(cdoOff));
+            if (ok(cand)) {
+                const uintptr_t backCls = safeReadPtr(cand + offsetof(UObjectBase, ClassPrivate));
+                if (backCls == obj) {
+                    const std::string cdoName = readObjName(cand);
+                    if (cdoName.rfind("Default__", 0) == 0) {
+                        cdo = cand;
+                    }
+                }
+            }
         } else {
             for (int off = 0xC0; off <= 0x260; off += 8) {
                 const uintptr_t cand = safeReadPtr(obj + static_cast<uintptr_t>(off));
@@ -1025,37 +1288,16 @@ int DfmMatchMonitor::dumpAllPickupCDOs() const {
         if (!ok(cdo)) continue;
         ++cdoOk;
 
-        // 从 CDO 读 InventoryIdName + InteractorName
-        const std::string idName = readFName(cdo + static_cast<uintptr_t>(m_off.Pickup_InvIdName));
-        if (idName.empty() || idName == "None" || idName == "?") continue;
-
-        const std::string display = readFText(cdo + static_cast<uintptr_t>(m_off.Interactor_Name));
-
-        // display 为空 → 仍 record 一个占位 (用类名 translateItemClassName), 至少把 numId 反向索引建起来。
-        // 后续运行时如果 InteractorName 有真实本地化名, record() 会覆盖。
-        std::string finalDisplay = display;
-        if (finalDisplay.empty()) {
-            finalDisplay = translateItemClassName(cn);
-            if (finalDisplay.empty()) finalDisplay = cn;
-        }
-
-        const bool isNew = ItemRegistry::instance().lookup(idName).empty();
-        ItemRegistry::instance().record(idName, finalDisplay, cn);
-        if (isNew) ++added;
-
-        // 前 5 条样本写日志, 方便人工对照确认
-        if (added <= 5 && isNew) {
-            LOG(LOG_LEVEL_INFO, "[ItemDump] 样本: idName=%s display=%s class=%s",
-                idName.c_str(), finalDisplay.c_str(), cn.c_str());
-        }
+        // 从 CDO 读 InventoryIdName + InteractorName + (兜底 spoofed FText)
+        recordFromUObject(cdo, cn, "cdo", /*spoofed*/true);
     }
 
     // 立即落盘
     bool saved = ItemRegistry::instance().save();
 
     LOG(LOG_LEVEL_INFO,
-        "[ItemDump] 完成: scanned=%d Pickup匹配=%d CDO读到=%d 新增=%d 总条目=%zu saved=%d",
-        scanned, classMatched, cdoOk, added,
+        "[ItemDump] 完成: scanned=%d 实例匹配=%d UClass匹配=%d CDO读到=%d 新增=%d 总条目=%zu saved=%d",
+        scanned, actorMatched, classMatched, cdoOk, added,
         ItemRegistry::instance().size(), saved ? 1 : 0);
     return added;
 }
@@ -1072,12 +1314,38 @@ std::string DfmMatchMonitor::resolveItemDisplay(uintptr_t pickupActor,
         if (!cached.empty()) return cached;
     }
 
+    // [2026-05-05] 0.5 静态烤表 — 离线收集的具体物品名 (dfm_items_baked.h),
+    // 永远优于运行时的大类回退. 即便没 actor 指针 / 也能命中.
+    {
+        std::string baked = bakedItemNameLookup(numId, rawId);
+        if (!baked.empty()) return baked;
+    }
+
     if (!ok(pickupActor)) {
-        if (numId > 0) return getItemDisplayName(numId);
+        if (numId > 0) {
+            // actor 不可用 (容器内物品): 走静态 ID→名查询
+            std::string fromTable;
+            if (callGetItemNameByIdSpoofed(numId, fromTable)) {
+                ItemRegistry::instance().record(rawId, fromTable, "");
+                return fromTable;
+            }
+            return getItemDisplayName(numId);
+        }
         return rawId.empty() ? std::string("?") : rawId;
     }
 
-    // 1. InteractorName FText (优先, 本地化)
+    // 1. 静态 DataTable 查询 (FDFMCommonItemRow): 不走 actor / 不走 ProcessEvent,
+    //    游戏 UI 自身就是用这条路径填名字的, 命中率最高.
+    if (numId > 0) {
+        std::string fromTable;
+        if (callGetItemNameByIdSpoofed(numId, fromTable)) {
+            std::string cn = readClassName(pickupActor);
+            ItemRegistry::instance().record(rawId, fromTable, cn);
+            return fromTable;
+        }
+    }
+
+    // 2. InteractorName FText 字段 (备选, 部分类不会自动填)
     std::string fromText = readFText(pickupActor + m_off.Interactor_Name);
     if (!fromText.empty()) {
         // 命中 → 写入注册表持久化, 下次直接走第 0 步快路径
@@ -1085,6 +1353,19 @@ std::string DfmMatchMonitor::resolveItemDisplay(uintptr_t pickupActor,
         ItemRegistry::instance().record(rawId, fromText, cn);
         return fromText;
     }
+
+    // 2.5. [禁用 2026-05-05] 原: 栈伪装下虚调 PickupBase::GetItemName (vtable[354]).
+    //      实测不可行 — DFM FText 是 FTextHistory_StringTableEntry 类型,
+    //      textData 里只存 (TableId, Key), 真名在另一个 StringTableRegistry 里.
+    //      vtable[354] 内部会调 FInternationalization / FStringTable·FindEntry 这些
+    //      全局服务, 其内部 check(IsInGameThread()) 会在我们的 monitor 线程上 abort.
+    //      该条路崩过 — 永久禁用.
+    // std::string fromVtable;
+    // if (callPickupGetItemNameSpoofed(pickupActor, fromVtable)) {
+    //     std::string cn = readClassName(pickupActor);
+    //     ItemRegistry::instance().record(rawId, fromVtable, cn);
+    //     return fromVtable;
+    // }
 
     // 2. InventoryType UClass* → 类名 → 翻译
     if (m_off.Pickup_InvType > 0) {
@@ -1203,6 +1484,248 @@ bool DfmMatchMonitor::callHasMatchStartedSpoofed(uintptr_t gsPtr) const {
     LOG(LOG_LEVEL_ERROR, TAG " [matchCall] HasMatchStarted thunk 触发 sig=%d, gs=%p 已熔断",
         sigCaught, (void*)gsPtr);
     return false;
+}
+
+// =====================================================================
+//  PickupBase::GetItemName 直接虚调 (栈伪装下)
+// =====================================================================
+//
+// IDA 验证 (com.tencent.tmgp.dfm_libUE4.so):
+//   PickupBase::execGetItemName UFunction native thunk @ 0x1339F49C 反编译伪代码:
+//      void thunk(UObject* this, FFrame* Stack, FText* RESULT) {
+//          if (Stack->Code) ++Stack->Code;            // P_FINISH
+//          FText tmp;
+//          (*(vtable + 2832))(this, &tmp);            // ← 真正实现, slot 354
+//          *RESULT = move(tmp);
+//      }
+//   sdk_dump.cs 标注:
+//      FText GetItemName(); // [Addr: 0x1339F49C] // NumParms: 1   [Owner: PickupBase]
+//   所有 InventoryPickup_* 子类继承 PickupBase, 共享同一 vtable 槽.
+//
+// 调用思路 (sret/AAPCS):
+//   FText 在 UE5 是 0x18 (24) 字节, > 16, AArch64 AAPCS 规定: 大于 16 字节的
+//   返回值不通过 x0/x1, 而是由调用方在 x8 传入隐藏 "结构返回槽" (sret) 指针.
+//   所以函数原型必须声明为 "返回 24 字节结构体" 的 vfunc, 编译器才会生成
+//   x0=this, x8=&out_buf, BLR 的正确序列. 错写成 void(*)(void*, void*)
+//   会让 out 指针落到 x1, 函数从 x8 读到 0, 输出永远是空 FText.
+//   1) 校验 actor / vtable / vtable[354] 都在 libUE4 代码段内;
+//   2) 在 stack_spoof::call_spoofed 伪 FP chain 下虚调 vtable[354](this) → FText;
+//      → 完全绕过 UObject::ProcessEvent (ACE 重点 hook), 也无需反射查 UFunction*;
+//      → ACE 周期栈采样看到的调用栈全部落在 libc.so / libart.so 白名单模块.
+//   3) sigsetjmp + safeReadGuard 兜底, 内部任何非法访问 longjmp 回来,
+//      并把 vtable 整体拉黑 (同一类的所有 actor 共享 vtable, 只熔断一次即可).
+//   4) 调用成功后 readFText 把 FText 解析为 UTF-8 std::string.
+static constexpr uintptr_t kPickupGetItemNameVtableByteOffset = 2832;  // = 354 * 8
+
+namespace {
+// 24 字节平凡 POD, 让编译器把 vfunc 当成 "返回 sizeof=24 的结构体" 处理,
+// 自动生成 sret 调用 (x8=隐藏返回槽指针). 这是 AAPCS 唯一让 GetItemName 写
+// 进我们 buffer 的方式.
+struct FTextSretSlot {
+    uint8_t bytes[24];  // sizeof(FText) = 0x18
+};
+using PickupGetItemNameFn = FTextSretSlot (*)(void* /*this*/);
+
+struct DfmGetItemNameSpoofCtx {
+    PickupGetItemNameFn native;
+    void*               self;
+    FTextSretSlot       outFText;  // trampoline 内会被 sret 写入
+};
+
+void* dfmGetItemNameTrampoline(void* p) {
+    auto* c = static_cast<DfmGetItemNameSpoofCtx*>(p);
+    for (auto& b : c->outFText.bytes) b = 0;
+    // 编译器为 sizeof 返回值=24 的函数自动生成 sret 调用:
+    //   x0 = self, x8 = &c->outFText, BLR native
+    c->outFText = c->native(c->self);
+    return nullptr;
+}
+} // namespace
+
+bool DfmMatchMonitor::callPickupGetItemNameSpoofed(uintptr_t pickupActor,
+                                                    std::string& outName) const {
+    outName.clear();
+    if (!ok(pickupActor) || m_moduleBase == 0) return false;
+
+    // 熔断: vtable 粒度 — 同一蓝图类所有实例共享 vtable, 任一实例崩过就拉黑整个 vtable,
+    // 之后所有同类 actor 都走 ProcessEvent 之外的路径 (resolveItemDisplay 后续回退步骤).
+    static std::mutex s_disabledVtableMu;
+    static std::unordered_set<uintptr_t> s_disabledVtable;
+
+    const uintptr_t vtable = safeReadPtr(pickupActor);
+    if (!ok(vtable)) return false;
+    {
+        std::lock_guard<std::mutex> lk(s_disabledVtableMu);
+        if (s_disabledVtable.count(vtable)) return false;
+    }
+
+    const uintptr_t fnAddr = safeReadPtr(vtable + kPickupGetItemNameVtableByteOffset);
+    if (!ok(fnAddr)) return false;
+    if (m_moduleSize != 0
+        && (fnAddr < m_moduleBase || fnAddr >= (m_moduleBase + m_moduleSize))) {
+        // vtable 被反作弊改写或对象不是 PickupBase 子类
+        std::lock_guard<std::mutex> lk(s_disabledVtableMu);
+        s_disabledVtable.insert(vtable);
+        return false;
+    }
+
+    DfmGetItemNameSpoofCtx ctx{};
+    ctx.native = reinterpret_cast<PickupGetItemNameFn>(fnAddr);
+    ctx.self   = reinterpret_cast<void*>(pickupActor);
+
+    installSafeReadGuard();
+    const int sigCaught = sigsetjmp(s_safeReadJmpBuf, 1);
+    if (sigCaught != 0) {
+        s_safeReadActive = 0;
+        std::lock_guard<std::mutex> lk(s_disabledVtableMu);
+        s_disabledVtable.insert(vtable);
+        LOG(LOG_LEVEL_ERROR, TAG " [itemName] vtable[354] sig=%d, vtable=%p 已熔断",
+            sigCaught, (void*)vtable);
+        return false;
+    }
+    s_safeReadActive = 1;
+    stack_spoof::call_spoofed(&dfmGetItemNameTrampoline, &ctx);
+    s_safeReadActive = 0;
+
+    // 解析 FText → UTF-8 string. FText 内部一般是:
+    //   TSharedRef<FTextHistory> TextData (16B) + uint32 Flags + padding.
+    // readFText 已经针对 UE5 多版本布局做了多偏移尝试 (直读 + +0x28/0x30/...).
+    outName = readFText(reinterpret_cast<uintptr_t>(ctx.outFText.bytes));
+
+    // 诊断: 头几次调用打印 FText 原始字节 + 解析结果, 帮助定位 ABI / 布局问题.
+    {
+        static std::atomic<int> s_diagN{0};
+        int n = s_diagN.fetch_add(1, std::memory_order_relaxed);
+        if (n < 6) {
+            uint64_t* qw = reinterpret_cast<uint64_t*>(ctx.outFText.bytes);
+            LOG(LOG_LEVEL_WARN, TAG " [itemName/diag] actor=%p vtable=%p fn=%p "
+                "FText[0..23]=%016llx %016llx %016llx parsed='%s'",
+                (void*)pickupActor, (void*)vtable, (void*)fnAddr,
+                (unsigned long long)qw[0], (unsigned long long)qw[1],
+                (unsigned long long)qw[2], outName.c_str());
+            // 解析失败时 dump TextData 前 128 字节, 用于反查 FString 真实偏移.
+            if (outName.empty() && qw[0] != 0) {
+                uint64_t buf[16] = {0};
+                if (safeReadMemory(qw[0], buf, sizeof(buf))) {
+                    char hex[8 * 24];
+                    int p = 0;
+                    for (int i = 0; i < 16 && p + 22 < (int)sizeof(hex); ++i) {
+                        p += std::snprintf(hex + p, sizeof(hex) - p, "%016llx ",
+                            (unsigned long long)buf[i]);
+                    }
+                    LOG(LOG_LEVEL_WARN, TAG " [itemName/diag] textData@%p [0..127]= %s",
+                        (void*)qw[0], hex);
+                }
+            }
+        }
+    }
+
+    if (outName.empty() || outName == "None") {
+        outName.clear();
+        return false;
+    }
+    return true;
+}
+
+// =====================================================================
+//  GetItemNameByItemID — 静态 ID → 名查询 (无需 actor 实例)
+// =====================================================================
+//
+// IDA 反编译验证 (com.tencent.tmgp.dfm_libUE4.so):
+//   sub_135B4514(FText* out @x8, int64 itemId @x0)   @ 0x135B4514
+//     ↳ sub_135B41C8(itemId)                          @ 0x135B41C8
+//       ↳ sub_135B7B44(GameInstance ptr array)        @ 0x135B7B44
+//         查找 FDFMCommonItemRow DataTable, 返回 row*
+//     row[+24] = FText TextData ptr (FTextHistory)
+//     row[+32] = TSharedReferencer (引用计数)
+//     row[+40] = uint32 Flags
+//
+// 这是游戏 UI (背包/箱子/商店/合约) 全部走的统一查询接口, 数据 baked 在
+// FDFMCommonItemRow.uasset 里, 内存中是个 TMap<int64, FRow> singleton,
+// 由 GameInstance 持有, 进对局时已加载.
+//
+// 调用约定 (AArch64 AAPCS):
+//   x0 = int64 itemId (11 位数字, e.g. 11020010024)
+//   x8 = sret 指针, 指向 24 字节 FText buffer
+//   返回值: 通过 sret 写入 out
+//
+// 优势:
+//   ✓ 不需要任何 actor 指针 → 容器内只有 itemId 的物品也能立刻拿到中文名
+//   ✓ 不依赖 ItemRegistry 累积 → 第一次见到的物品直接命中
+//   ✓ 不走 ProcessEvent → 远低于虚调 GetItemName() 的 ACE 风险
+//   ✓ 单次调用 ~5μs, 比反射查表快得多
+static constexpr uintptr_t kDfmGetItemNameByIdImpl = 0x135B4514;
+
+namespace {
+using GetNameByIdFn = FTextSretSlot (*)(int64_t);
+
+struct DfmGetItemNameByIdSpoofCtx {
+    GetNameByIdFn  native;
+    int64_t        itemId;
+    FTextSretSlot  out;
+};
+
+void* dfmGetItemNameByIdTrampoline(void* p) {
+    auto* c = static_cast<DfmGetItemNameByIdSpoofCtx*>(p);
+    for (auto& b : c->out.bytes) b = 0;
+    // 编译器自动生成 sret 调用: x0=itemId, x8=&out, BLR native
+    c->out = c->native(c->itemId);
+    return nullptr;
+}
+} // namespace
+
+bool DfmMatchMonitor::callGetItemNameByIdSpoofed(int64_t itemId, std::string& outName) const {
+    outName.clear();
+    if (itemId <= 0 || m_moduleBase == 0) return false;
+
+    // 熔断: 函数粒度 — 只有这个静态 helper, 一次崩了就永久禁用此路径
+    static std::atomic<bool> s_disabled{false};
+    if (s_disabled.load(std::memory_order_acquire)) return false;
+
+    const uintptr_t fnAddr = m_moduleBase + kDfmGetItemNameByIdImpl;
+    if (m_moduleSize != 0 &&
+        (kDfmGetItemNameByIdImpl >= m_moduleSize)) {
+        s_disabled.store(true, std::memory_order_release);
+        return false;
+    }
+
+    DfmGetItemNameByIdSpoofCtx ctx{};
+    ctx.native = reinterpret_cast<GetNameByIdFn>(fnAddr);
+    ctx.itemId = itemId;
+
+    installSafeReadGuard();
+    const int sigCaught = sigsetjmp(s_safeReadJmpBuf, 1);
+    if (sigCaught != 0) {
+        s_safeReadActive = 0;
+        s_disabled.store(true, std::memory_order_release);
+        LOG(LOG_LEVEL_ERROR, TAG " [idName] sub_135B4514 sig=%d, itemId=%lld 已永久熔断",
+            sigCaught, (long long)itemId);
+        return false;
+    }
+    s_safeReadActive = 1;
+    stack_spoof::call_spoofed(&dfmGetItemNameByIdTrampoline, &ctx);
+    s_safeReadActive = 0;
+
+    outName = readFText(reinterpret_cast<uintptr_t>(ctx.out.bytes));
+
+    // 诊断: 头几次调用打印 raw FText + 解析结果
+    {
+        static std::atomic<int> s_n{0};
+        int n = s_n.fetch_add(1, std::memory_order_relaxed);
+        if (n < 8) {
+            uint64_t* qw = reinterpret_cast<uint64_t*>(ctx.out.bytes);
+            LOG(LOG_LEVEL_WARN, TAG " [idName/diag] itemId=%lld FText=%016llx %016llx %016llx parsed='%s'",
+                (long long)itemId,
+                (unsigned long long)qw[0], (unsigned long long)qw[1],
+                (unsigned long long)qw[2], outName.c_str());
+        }
+    }
+
+    if (outName.empty() || outName == "None") {
+        outName.clear();
+        return false;
+    }
+    return true;
 }
 
 MatchState DfmMatchMonitor::getMatchState() const {
@@ -1457,17 +1980,74 @@ void DfmMatchMonitor::scanActors(const std::vector<uintptr_t>& actors, DrawDfmDa
             std::string rawId = readFName(actor + m_off.Pickup_InvIdName);
             if (rawId.empty() || rawId == "None" || rawId == "?") continue;
 
+            // [2026-05-05] 严格过滤: 只接受纯数字 idName (DFM 物品 ItemID 全数字).
+            //   排除 BuffEntity/AITask/Component 等假 Pickup 实例 — 它们 idName
+            //   字段读出来是 "?_110" / "BuffStart_5" 之类垃圾, 走 resolveItemDisplay
+            //   会污染 ItemRegistry, 浪费 readFText 解析时间.
+            bool allDigits = !rawId.empty();
+            for (char c : rawId) {
+                if (!std::isdigit(static_cast<unsigned char>(c))) { allDigits = false; break; }
+            }
+            if (!allDigits) continue;
+
             // ItemID 是 11 位数字, 用 int64 解析 (int32 会 throw out_of_range)
             int64_t numId = 0;
             try { numId = std::stoll(rawId); } catch (...) {}
 
+            // [2026-05-05] 设位仅供其他诊断使用. CDO dump 已永久禁用 (FText 是
+            // StringTable Key 不在 textData 里, GameThread 跨线程会 abort).
+            if (!m_realPickupSeen.load(std::memory_order_acquire)) {
+                m_realPickupSeen.store(true, std::memory_order_release);
+            }
+
             LootItem item;
-            // 4 级回退: InteractorName(FText) → InventoryType(UClass) → 数字大类 → rawFName
+            // 4 级回退: InteractorName(FText) → vtable[354] GetItemName 虚调 → InventoryType(UClass) → 数字大类 → rawFName
             item.itemName = resolveItemDisplay(actor, rawId, numId);
             item.className = cn;
             item.itemId = numId;
             item.stackCount = safeReadS32(actor + m_off.Pickup_StackCount);
+
+            // 扩展 PickupBase 字段
+            item.gid          = static_cast<int64_t>(safeReadPtr(actor + m_off.Pickup_InventoryGID));
+            item.durability   = safeReadS32(actor + m_off.Pickup_Durability);
+            item.priority     = safeReadS32(actor + m_off.Pickup_Priority);
+            item.sourceType   = safeReadU8(actor + m_off.Pickup_SourceType);
+            item.hidden       = (safeReadU8(actor + m_off.Pickup_HiddenItem) & 1) != 0;
+            item.canDestroyed = (safeReadU8(actor + m_off.Pickup_CanDestroyed) & 1) != 0;
+            // InventoryType UClass 名 (语义最稳定的标识)
+            if (m_off.Pickup_InvType > 0) {
+                uintptr_t invClass = safeReadPtr(actor + m_off.Pickup_InvType);
+                if (ok(invClass)) {
+                    item.invTypeName = readObjName(invClass);
+                }
+            }
+            // 调用 WasRecentlyRendered(0.2) 判断当前可见性 (栈伪装下).
+            //   thunk 需要从 FFrame.Locals 取 Tolerance float, 当前 trampoline 用
+            //   全 0 FFrame 缓冲, 等价于传 Tolerance=0 → 永远 false; 不影响主功能,
+            //   留作未来按 P_GET_PROPERTY 真正填参时启用. 目前仅占位字段.
+            item.recentlyRendered = false;
+
             getActorLocation(actor, item.pos);
+
+            // 详细日志 (前 30 条采样, 便于核对偏移读到的字段是否合理)
+            {
+                static std::atomic<int> s_lootLogN{0};
+                int n = s_lootLogN.fetch_add(1, std::memory_order_relaxed);
+                if (n < 30) {
+                    LOG(LOG_LEVEL_INFO,
+                        TAG " [loot] actor=%p cn='%s' invType='%s' rawId=%s id=%lld name='%s' "
+                        "stack=%d dur=%d gid=%lld src=%u prio=%d hidden=%d destr=%d rendered=%d "
+                        "pos=(%.0f,%.0f,%.0f)",
+                        (void*)actor, cn.c_str(), item.invTypeName.c_str(),
+                        rawId.c_str(), (long long)item.itemId, item.itemName.c_str(),
+                        item.stackCount, item.durability, (long long)item.gid,
+                        (unsigned)item.sourceType, item.priority,
+                        item.hidden ? 1 : 0, item.canDestroyed ? 1 : 0,
+                        item.recentlyRendered ? 1 : 0,
+                        item.pos.x, item.pos.y, item.pos.z);
+                }
+            }
+
             outData.lootItems.push_back(std::move(item));
         }
 
@@ -1690,6 +2270,16 @@ ContainerInfo DfmMatchMonitor::readContainerInfo(uintptr_t actorPtr, const std::
 std::vector<ContainerItem> DfmMatchMonitor::readContainerItems(uintptr_t actorPtr, const std::string& cn) const {
     std::vector<ContainerItem> items;
 
+    // 诊断: 每种 cn 第一次出现时记录, 用于看当前版本到底是什么 container 类
+    {
+        static std::mutex s_cnDiagMu;
+        static std::unordered_set<std::string> s_cnSeen;
+        std::lock_guard<std::mutex> lk(s_cnDiagMu);
+        if (s_cnSeen.size() < 12 && s_cnSeen.insert(cn).second) {
+            LOG(LOG_LEVEL_WARN, TAG " [box/cn] 新容器类: '%s' actor=%p", cn.c_str(), (void*)actorPtr);
+        }
+    }
+
     // InventoryPickup_Container 及其子类: RepItemArray
     bool isRepItem = (cn.find("InventoryPickup_Container") != std::string::npos ||
                       cn.find("InteractorContainer_") != std::string::npos ||
@@ -1702,23 +2292,65 @@ std::vector<ContainerItem> DfmMatchMonitor::readContainerItems(uintptr_t actorPt
         uintptr_t itemsPtr = safeReadPtr(actorPtr + m_off.Cont_RepItemArray + m_off.Cont_ItemsOffset);
         int32_t itemsCount = safeReadS32(actorPtr + m_off.Cont_RepItemArray + m_off.Cont_ItemsOffset + offsetof(TArray<void*>, Num));
         if (ok(itemsPtr) && itemsCount > 0) {
+            // 诊断: 每种 cn 第一次 dump 第一个 InventoryItemInfo 头 96 字节, 用于对照
+            // ItemCategory/ItemSequence 真实偏移. 这样跨多种箱子类型都能各采一次样.
+            {
+                static std::mutex s_diagMu;
+                static std::unordered_set<std::string> s_diagSeen;
+                bool dumpThis = false;
+                {
+                    std::lock_guard<std::mutex> lk(s_diagMu);
+                    if (s_diagSeen.size() < 8 && s_diagSeen.insert(cn).second) {
+                        dumpThis = true;
+                    }
+                }
+                if (dumpThis) {
+                    uint64_t buf[12] = {0};
+                    if (safeReadMemory(itemsPtr, buf, sizeof(buf))) {
+                        char hex[64 * 12];
+                        int p = 0;
+                        for (int j = 0; j < 12 && p + 22 < (int)sizeof(hex); ++j) {
+                            p += std::snprintf(hex + p, sizeof(hex) - p, "%016llx ",
+                                (unsigned long long)buf[j]);
+                        }
+                        LOG(LOG_LEVEL_WARN, TAG " [boxItem/diag] cn='%s' itemsPtr=%p num=%d "
+                            "infoSize=0x%X bytes[0..95]= %s",
+                            cn.c_str(), (void*)itemsPtr, itemsCount, m_off.ItemInfoSize, hex);
+                    }
+                }
+            }
             for (int i = 0; i < std::min(itemsCount, 50); i++) {
                 uintptr_t item = itemsPtr + static_cast<uintptr_t>(i) * m_off.ItemInfoSize;
-                uint32_t cat = safeReadU32(item + offsetof(InventoryItemInfo, ItemCategory));
-                uint32_t seq = safeReadU32(item + offsetof(InventoryItemInfo, ItemSequence));
                 int32_t count = safeReadS32(item + offsetof(InventoryItemInfo, ItemCount));
                 float dur = safeReadFloat(item + offsetof(InventoryItemInfo, ItemDurability));
                 float durMax = safeReadFloat(item + offsetof(InventoryItemInfo, ItemDurabilityMax));
 
-                // ItemID 完整编码: Category(4位 e.g. 1101) * 10^7 + Sequence(7位) = 11 位 FName
-                // 例: cat=1101 seq=301001 → 11010301001 (与地面 PickupBase 读出的 FName 一致)
-                // 原公式 cat*10000+seq 错误, 导致与注册表 numId 不匹配, 容器物品永远查不到名字。
-                int64_t itemIdNum = static_cast<int64_t>(cat) * 10000000LL + static_cast<int64_t>(seq);
+                // [修复 2026-05-04] ItemID @ +0x10 实际是单个 int64, 不是 (uint32 Category, uint32 Sequence).
+                // sdk_dump 反编译把它误标成 ScriptStruct ItemID{u32 Category; u32 Sequence;}, 
+                // 但运行时日志验证 boxItem/diag bytes[0x10..0x17] 当作 8 字节 little-endian 读
+                // 才得到 11~12 位的真实 ItemID (与地面 PickupBase 的 InventoryIdName FName→stoll 一致).
+                // 旧公式 cat*1e7+seq 算出的是 8~9 位假 ID, ItemRegistry::lookupById 永远 miss,
+                // 导致容器物品全部回退成 [枪部件]/[杂物] 静态大类 — 截图中的"徐部件"症状根因.
+                int64_t itemIdNum = 0;
+                safeReadMemory(item + offsetof(InventoryItemInfo, ItemCategory),
+                               &itemIdNum, sizeof(itemIdNum));
                 ContainerItem ci;
-                // 容器内 item 拿不到 actor 指针, 不能读 InteractorName。
-                // 按 numId 反查注册表 (之前帧地面 PickupBase 命中过的同 ID 直接复用) → 数字大类映射兜底
-                std::string fromReg = ItemRegistry::instance().lookupById(itemIdNum);
-                ci.name = !fromReg.empty() ? fromReg : getItemDisplayName(itemIdNum);
+                // 容器内 item 拿不到 actor 指针. 名字解析顺序:
+                //   1) ItemRegistry 缓存 (前面任何路径命中过的同 ID)
+                //   2) callGetItemNameByIdSpoofed: 静态查 FDFMCommonItemRow DataTable
+                //      → 游戏 UI 自身用的同一接口, 永远拿到真名
+                //   3) getItemDisplayName: 数字大类兜底
+                std::string nm = ItemRegistry::instance().lookupById(itemIdNum);
+                if (nm.empty() && itemIdNum > 0) {
+                    std::string fromTable;
+                    if (callGetItemNameByIdSpoofed(itemIdNum, fromTable)) {
+                        // 写入注册表 (rawId 用 itemId 字符串)
+                        ItemRegistry::instance().record(std::to_string(itemIdNum), fromTable, "");
+                        nm = fromTable;
+                    }
+                }
+                if (nm.empty()) nm = getItemDisplayName(itemIdNum);
+                ci.name = nm;
                 ci.itemId = itemIdNum;
                 ci.count = count;
                 ci.durability = dur;
@@ -3224,30 +3856,37 @@ bool DfmMatchMonitor::fillPlayerBones(PlayerInfo& player) const {
             const float dx = componentToWorld.TranslationX - rootCtw.TranslationX;
             const float dy = componentToWorld.TranslationY - rootCtw.TranslationY;
             const float dz_xy = std::sqrt(dx*dx + dy*dy);  // 仅 XY 偏差
-            // 路径 A: mesh 与 root 同步 → 信任 mesh.T (含正确 RelativeLocation.Z)
-            // 路径 B: mesh 滞后 (XY 偏差 > 200cm) → 用 root.T 校正 XY, 保留 Z
-            //         这避免假设具体的 capsule_half_height 值
-            if (dz_xy > 200.f) {
+            const float dz_z  = std::fabs(componentToWorld.TranslationZ - rootCtw.TranslationZ);
+            // UE Character 默认 capsule half-height = 88cm, Mesh.RelativeLocation.Z = -88,
+            // 所以 mesh.T.z 应该 ≈ root.T.z - 88. 给 ±60cm 容差 (蹲伏/不同 capsule 大小).
+            // 路径 A: mesh 与 root 同步 → 信任 mesh.T 整体
+            // 路径 B: mesh 滞后 (XY 或 Z 偏差太大) → 用 root.T 重锚定 XYZ
+            //   - XY 直接复制 root.XY (capsule 与 mesh 共享 XY)
+            //   - Z = root.Z - 90cm (脚底, 约等于 mesh.T.z 应有值)
+            if (dz_xy > 200.f || dz_z < 30.f || dz_z > 200.f) {
                 componentToWorld.TranslationX = rootCtw.TranslationX;
                 componentToWorld.TranslationY = rootCtw.TranslationY;
+                componentToWorld.TranslationZ = rootCtw.TranslationZ - 90.0f;
                 static auto s_lastAnchorLog = std::chrono::steady_clock::time_point{};
                 auto now = std::chrono::steady_clock::now();
                 if (now - s_lastAnchorLog > std::chrono::seconds(2)) {
                     s_lastAnchorLog = now;
-                    LOG(LOG_LEVEL_WARN, TAG " [bones-anchor] %s mesh-XY-drift=%.0fcm > 200cm, snap to root.XY",
-                        player.playerName.c_str(), dz_xy);
+                    LOG(LOG_LEVEL_WARN, TAG " [bones-anchor] %s mesh-drift xy=%.0fcm z=%.0fcm → snap to root (xyz)",
+                        player.playerName.c_str(), dz_xy, dz_z);
                 }
             }
         } else if (rootTValid && !meshTValid) {
-            // 路径 C: mesh 解密失败, 用 root 校正 XY, Z 保留原值
+            // 路径 C: mesh 解密失败 / 不可信 → 完全用 root.T 重建 mesh CTW Translation.
+            // Z 也必须改 (留陈旧 mesh.T.z 是导致骨架画在地面/脚下的根因);
+            // root.Z - 90cm 对绝大多数 Character 都是合理脚底估算.
             componentToWorld.TranslationX = rootCtw.TranslationX;
             componentToWorld.TranslationY = rootCtw.TranslationY;
-            // Z 不变: 让骨骼 localPos.Z 自己决定垂直分布
+            componentToWorld.TranslationZ = rootCtw.TranslationZ - 90.0f;
             static auto s_lastNoMeshLog = std::chrono::steady_clock::time_point{};
             auto now = std::chrono::steady_clock::now();
             if (now - s_lastNoMeshLog > std::chrono::seconds(5)) {
                 s_lastNoMeshLog = now;
-                LOG(LOG_LEVEL_WARN, TAG " [bones-anchor] %s meshDecFail, using root.XY",
+                LOG(LOG_LEVEL_WARN, TAG " [bones-anchor] %s meshDecFail → root.T - 90cm",
                     player.playerName.c_str());
             }
         }
@@ -3553,12 +4192,19 @@ void DfmMatchMonitor::pollLoop() {
             prevData = DrawDfmData{};
             m_lastKnownActorPositions.clear();
             m_rootCompensationOwners.clear();
+            // 重置 CDO dump 定时器 (m_cdoDumpDone 不重置 — 整个 .so 生命周期只跑一次).
+            m_cdoDumpScheduled = false;
+            m_cdoDumpAttempts = 0;
+            m_realPickupSeen.store(false, std::memory_order_release);
         } else if (!ms.inMatch && wasInMatch) {
             LOG(LOG_LEVEL_INFO, TAG " 对局结束");
             persistentData = DrawDfmData{};
             prevData = DrawDfmData{};
             m_lastKnownActorPositions.clear();
             m_rootCompensationOwners.clear();
+            m_cdoDumpScheduled = false;
+            m_cdoDumpAttempts = 0;
+            m_realPickupSeen.store(false, std::memory_order_release);
             SharedDfmData::getInstance().pushData(persistentData);
         }
         wasInMatch = ms.inMatch;
@@ -3976,19 +4622,49 @@ void DfmMatchMonitor::pollLoop() {
             processOpenBoxRequests();
         }
 
-        // [ROLLBACK 2026-04-21] 以下两块已禁用 — 触发账号封禁:
-        //  * processItemNameRequests / enqueueItemNameLookup: 即便 SAFE-MODE
-        //    也会被 ACE 行为统计抓 (异常队列+反复读 InteractorName)
-        //  * dumpAllPickupCDOs: 全量 GUObjectArray 扫描 (~22 万对象) 是
-        //    最强指纹, 直接命中 ACE 异常 actor 访问检测; 还会与 GC 的
-        //    IncrementalPurgeGarbage 撞 race, 读到野指针。
-        // 物品名解析回退到原 4 级回退 (InteractorName→InvType→numId→rawId)。
+        // [2026-05-05] 一次性 CDO dump — 触发条件:
+        //   ① 处于对局中
+        //   ② scanActors 已见到至少 1 个真 pickup actor (m_realPickupSeen=true)
+        //      → 此时所有 Pickup BP UClass 一定已 lazy-load 进 GUObjectArray
+        //   ③ 距 ② 触发还要再等 5 秒, 让更多 BP 类 spawn 出来
+        //   ④ 整个 .so 生命周期只跑一次
+        // 单次扫描成本 ~150ms. 内部 callPickupGetItemNameSpoofed 走栈伪装,
+        // ACE 看到的调用栈在 libc/libart 白名单, 不暴露注入 .so.
+        // [禁用 2026-05-05] 原计划: 见到真 pickup 后扫 GUObjectArray + CDO 拿名字.
+        //   实测名字不在 CDO 里, 而是 StringTableRegistry. CDO 上 Pickup_InvIdName
+        //   默认 None, 同时 callPickupGetItemNameSpoofed 会跨线程进 、abort.
+        //   该路彻底放弃, 永久不调 dumpAllPickupCDOs(). 代价是容器内物品
+        //   只能显示大类名 (组件+物资路径依赖静态烤表, 在 getItemDisplayName).
+        if (false && ms.inMatch && !m_cdoDumpDone.load(std::memory_order_acquire)
+            && m_realPickupSeen.load(std::memory_order_acquire)) {
+            const auto now = std::chrono::steady_clock::now();
+            if (!m_cdoDumpScheduled) {
+                m_cdoDumpDueAt = now + std::chrono::milliseconds(kCdoDumpAfterPickupMs);
+                m_cdoDumpScheduled = true;
+                LOG(LOG_LEVEL_INFO, TAG " [ItemDump] 见到真 pickup, %dms 后做一次 CDO dump",
+                    kCdoDumpAfterPickupMs);
+            } else if (now >= m_cdoDumpDueAt) {
+                LOG(LOG_LEVEL_INFO, TAG " [ItemDump] 触发 CDO dump (第 %d 次尝试)", m_cdoDumpAttempts + 1);
+                int n = dumpAllPickupCDOs();
+                ++m_cdoDumpAttempts;
+                if (n > 0 || m_cdoDumpAttempts >= kCdoDumpMaxAttempts) {
+                    m_cdoDumpDone.store(true, std::memory_order_release);
+                    LOG(LOG_LEVEL_INFO, TAG " [ItemDump] 扫描完成, 本次新增 %d 条 (总尝试 %d 次, 后续不再扫描)",
+                        n, m_cdoDumpAttempts);
+                } else {
+                    // 本次新增=0 且未达上限, 30s 后重试 (等更多 BP lazy-load)
+                    m_cdoDumpDueAt = now + std::chrono::milliseconds(30000);
+                    // m_realPickupSeen 仍 true, scanActors 不会重置. m_cdoDumpScheduled 仍 true.
+                    // 下次 tick 直接进入 else if 分支.
+                    LOG(LOG_LEVEL_INFO, TAG " [ItemDump] 本次新增=0, 30s 后重试 (第 %d/%d 次)",
+                        m_cdoDumpAttempts, kCdoDumpMaxAttempts);
+                }
+            }
+        }
+
+        // [ROLLBACK 2026-04-21] processItemNameRequests 仍禁用 (异步队列+反复读
+        // InteractorName 是 ACE 重点盯的行为指纹). CDO dump 已替代它的功能.
         // processItemNameRequests();
-        // if (SharedDfmData::getInstance().consumeItemDumpRequest()) {
-        //     int n = dumpAllPickupCDOs();
-        //     (void)n;
-        // }
-        // 仍然消费 flag 防止 GUI 反复请求堆积
         (void)SharedDfmData::getInstance().consumeItemDumpRequest();
 
         // 大厅期心跳: 即使不在对局, 也每秒推一帧空数据, 防止 GUI 看门狗 (uestart.cpp
