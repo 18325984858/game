@@ -772,18 +772,9 @@ public class MainActivity extends AppCompatActivity {
 
     /** 从 files/.kp_key 读出 key；不存在或读失败返回 null。 */
     private String readKpKeyFromFiles() {
-        File f = getKpKeyFile();
-        if (!f.exists() || f.length() == 0 || f.length() > 128) return null;
-        try (FileInputStream fis = new FileInputStream(f)) {
-            byte[] buf = new byte[(int) f.length()];
-            int n = fis.read(buf);
-            if (n <= 0) return null;
-            String s = new String(buf, 0, n, "UTF-8").trim();
-            return s.isEmpty() ? null : s;
-        } catch (Exception e) {
-            LogUtil.e("readKpKeyFromFiles", e);
-            return null;
-        }
+        // 走 KpKeyStore （AES-256-GCM 加密 + Android Keystore 主密钥）
+        // 旧明文文件会在 read 返回后被静默迫到密文重写。
+        return KpKeyStore.read(this);
     }
 
     /**
@@ -791,23 +782,15 @@ public class MainActivity extends AppCompatActivity {
      * 不需要 root；该路径只有本 app 可访问（uid 隔离）。
      */
     private void saveKpKeyToFile(String key) {
-        File f = getKpKeyFile();
-        try (FileOutputStream fos = new FileOutputStream(f, false)) {
-            fos.write(key.getBytes("UTF-8"));
-            fos.flush();
-            // 显式收紧权限（同 uid 本来就读不到，但去掉 group/other 以防万一）
-            try { f.setReadable(false, false); f.setReadable(true, true); } catch (Throwable ignored) {}
-            try { f.setWritable(false, false); f.setWritable(true, true); } catch (Throwable ignored) {}
-            LogUtil.i("saveKpKeyToFile -> " + f.getAbsolutePath() + " len=" + key.length());
-        } catch (Exception e) {
-            LogUtil.e("saveKpKeyToFile 异常", e);
-        }
+        // 走 KpKeyStore 加密写入 (AES-256-GCM + Android Keystore)
+        boolean ok = KpKeyStore.write(this, key);
+        LogUtil.i("saveKpKeyToFile encrypted -> " + KpKeyStore.file(this).getAbsolutePath()
+                + " plain_len=" + key.length() + " ok=" + ok);
     }
 
     /** 删除 files/.kp_key (验证失败时调用)。 */
     private void deleteKpKeyFile() {
-        try { File f = getKpKeyFile(); if (f.exists()) f.delete(); }
-        catch (Throwable t) { LogUtil.e("deleteKpKeyFile", t); }
+        KpKeyStore.clear(this);
     }
 
     /**

@@ -250,6 +250,11 @@ Java_com_example_dobbyproject_InjectHideActivity_nativeKpmUnload(JNIEnv* env, jo
     return KpCtl::unloadKpm(jstr(env, jName)) ? JNI_TRUE : JNI_FALSE;
 }
 
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_example_dobbyproject_InjectHideActivity_nativeGameKpmIsLoaded(JNIEnv*, jobject) {
+    return KpCtl::gameKpmIsLoaded() ? JNI_TRUE : JNI_FALSE;
+}
+
 // ─── proc_hide (PID �? ──────────────────────────────────
 JNI_METHOD(jboolean, nativeEnableProcHide)(JNIEnv*, jobject) {
     return KpCtl::enableProcHide() ? JNI_TRUE : JNI_FALSE;

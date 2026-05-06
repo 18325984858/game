@@ -732,6 +732,9 @@ public class InjectHideActivity extends AppCompatActivity {
 
     /** 卸载指定 KPM (root supercall)。name = KPM_NAME，例如 "kpm-svc"。 */
     public native boolean nativeKpmUnload(@NonNull String name);
+
+    /** 查询 game-kpm 是否已加载（用于卸载 kpm-svc 前的依赖检查）。 */
+    public native boolean nativeGameKpmIsLoaded();
     public native String  nativeRawCtl(@NonNull String cmd);
     public native String  nativeGetStatus();
 
@@ -824,6 +827,45 @@ public class InjectHideActivity extends AppCompatActivity {
     }
 
     private void uninstallKpmSvc() {
+        // 依赖检查：kpm-svc 是 game-kpm 的底座，先卸下层会让 game-kpm 的
+        // 委托命令（add_hide_pkg / hide_so 等）失效。提示用户先卸 game-kpm。
+        boolean gameKpmLoaded = false;
+        try { gameKpmLoaded = nativeGameKpmIsLoaded(); } catch (Throwable ignored) {}
+
+        if (gameKpmLoaded) {
+            new AlertDialog.Builder(this)
+                .setTitle("检测到 GameKpm 仍在运行")
+                .setMessage("kpm-svc (inject-hide) 是 GameKpm 反作弊穿透的底座。\n\n" +
+                            "建议先卸载 GameKpm 再卸载 kpm-svc，否则 GameKpm 内部的隐藏委托会失效。\n\n" +
+                            "请选择：")
+                .setPositiveButton("一键依次卸载（GameKpm → kpm-svc）", (d, w) -> doCascadeUninstall())
+                .setNeutralButton("仅卸 kpm-svc（不推荐）", (d, w) -> doUninstallKpmSvcOnly())
+                .setNegativeButton("取消", null)
+                .setCancelable(true)
+                .show();
+            return;
+        }
+        // game-kpm 未加载，直接卸 kpm-svc
+        doUninstallKpmSvcOnly();
+    }
+
+    /** 顺序卸载 game-kpm → kpm-svc */
+    private void doCascadeUninstall() {
+        new Thread(() -> {
+            boolean okGk = false, okSvc = false;
+            try { okGk = nativeKpmUnload("game-kpm"); } catch (Throwable ignored) {}
+            try { okSvc = nativeKpmUnload("kpm-svc"); } catch (Throwable ignored) {}
+            final boolean okGkF = okGk, okSvcF = okSvc;
+            runOnUiThread(() -> {
+                Toast.makeText(this,
+                    "GameKpm: " + (okGkF ? "✅" : "❌") + "  |  kpm-svc: " + (okSvcF ? "✅" : "❌"),
+                    Toast.LENGTH_LONG).show();
+                refreshAll();
+            });
+        }).start();
+    }
+
+    private void doUninstallKpmSvcOnly() {
         new Thread(() -> {
             boolean ok;
             try { ok = nativeKpmUnload("kpm-svc"); }
