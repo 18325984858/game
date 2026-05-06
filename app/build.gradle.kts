@@ -125,3 +125,104 @@ dependencies {
     androidTestImplementation(libs.ext.junit)
     androidTestImplementation(libs.espresso.core)
 }
+
+// ─────────────────────────────────────────────────────────────────
+//  KPM 自动同步：assembleDebug 之前先 make 重编 KPM 并拷到 assets
+//
+//  目标产物:
+//    app/src/main/assets/game-kpm.kpm  (反作弊)
+//    app/src/main/assets/svc.kpm       (inject-hide 通用隐藏)
+//
+//  跳过条件:
+//   * 源目录不存在 → 仅警告
+//   * skipKpmBuild=true 通过 -PskipKpmBuild=true 命令行禁用
+//
+//  用法:
+//   ./gradlew assembleDebug                              # 自动重编 + 同步两个 KPM
+//   ./gradlew installDebug                               # 一条命令: 重编 → 同步 → APK → 安装到设备
+//   ./gradlew assembleDebug -PskipKpmBuild=true          # 跳过编译
+//   ./gradlew syncAllKpm                                 # 仅同步不打 APK
+// ─────────────────────────────────────────────────────────────────
+val gameKpmSrcDir   = rootProject.file("../FrideHide-kpm/kpms/GameKpm")
+val injectHideSrcDir = rootProject.file("../FrideHide-kpm/kpms/inject-hide")
+val gameKpmAssetTarget    = file("src/main/assets/game-kpm.kpm")
+val injectHideAssetTarget = file("src/main/assets/svc.kpm")
+
+// ── GameKpm ──
+tasks.register<Exec>("buildGameKpm") {
+    group = "GameKpm"
+    description = "make 重编 GameKpm → game-kpm.kpm"
+    workingDir = gameKpmSrcDir
+    commandLine = listOf("make")
+
+    onlyIf {
+        val skip = (project.findProperty("skipKpmBuild") as? String) == "true"
+        if (skip) { logger.lifecycle("[GameKpm] skipKpmBuild=true → 跳过 make"); return@onlyIf false }
+        if (!gameKpmSrcDir.exists()) { logger.warn("[GameKpm] 源目录不存在: $gameKpmSrcDir"); return@onlyIf false }
+        if (!file("${gameKpmSrcDir}/Makefile").exists()) { logger.warn("[GameKpm] Makefile 缺失"); return@onlyIf false }
+        true
+    }
+}
+
+tasks.register<Copy>("syncGameKpm") {
+    group = "GameKpm"
+    description = "把 GameKpm 编译产物拷到 assets/game-kpm.kpm"
+    dependsOn("buildGameKpm")
+    from(file("${gameKpmSrcDir}/game-kpm.kpm"))
+    into(gameKpmAssetTarget.parentFile)
+    rename { "game-kpm.kpm" }
+
+    onlyIf {
+        val src = file("${gameKpmSrcDir}/game-kpm.kpm")
+        if (!src.exists()) { logger.warn("[GameKpm] 编译产物不存在 → 跳过同步"); return@onlyIf false }
+        if (!gameKpmAssetTarget.exists() || src.lastModified() > gameKpmAssetTarget.lastModified()) {
+            logger.lifecycle("[GameKpm] 同步: $src → $gameKpmAssetTarget (${src.length() / 1024} KB)"); true
+        } else { logger.lifecycle("[GameKpm] assets 已是最新，跳过"); false }
+    }
+}
+
+// ── inject-hide (svc.kpm) ──
+tasks.register<Exec>("buildInjectHide") {
+    group = "GameKpm"
+    description = "make 重编 inject-hide → svc.kpm"
+    workingDir = injectHideSrcDir
+    commandLine = listOf("make")
+
+    onlyIf {
+        val skip = (project.findProperty("skipKpmBuild") as? String) == "true"
+        if (skip) { logger.lifecycle("[InjectHide] skipKpmBuild=true → 跳过 make"); return@onlyIf false }
+        if (!injectHideSrcDir.exists()) { logger.warn("[InjectHide] 源目录不存在: $injectHideSrcDir"); return@onlyIf false }
+        if (!file("${injectHideSrcDir}/Makefile").exists()) { logger.warn("[InjectHide] Makefile 缺失"); return@onlyIf false }
+        true
+    }
+}
+
+tasks.register<Copy>("syncInjectHide") {
+    group = "GameKpm"
+    description = "把 inject-hide 编译产物拷到 assets/svc.kpm"
+    dependsOn("buildInjectHide")
+    from(file("${injectHideSrcDir}/svc.kpm"))
+    into(injectHideAssetTarget.parentFile)
+    rename { "svc.kpm" }
+
+    onlyIf {
+        val src = file("${injectHideSrcDir}/svc.kpm")
+        if (!src.exists()) { logger.warn("[InjectHide] 编译产物不存在 → 跳过同步"); return@onlyIf false }
+        if (!injectHideAssetTarget.exists() || src.lastModified() > injectHideAssetTarget.lastModified()) {
+            logger.lifecycle("[InjectHide] 同步: $src → $injectHideAssetTarget (${src.length() / 1024} KB)"); true
+        } else { logger.lifecycle("[InjectHide] assets 已是最新，跳过"); false }
+    }
+}
+
+// 聚合任务：一次同步两个 KPM
+tasks.register("syncAllKpm") {
+    group = "GameKpm"
+    description = "同步 GameKpm + inject-hide 两个 KPM 到 assets"
+    dependsOn("syncGameKpm", "syncInjectHide")
+}
+
+afterEvaluate {
+    listOf("preBuild", "mergeDebugAssets", "mergeReleaseAssets").forEach { name ->
+        tasks.findByName(name)?.dependsOn("syncAllKpm")
+    }
+}

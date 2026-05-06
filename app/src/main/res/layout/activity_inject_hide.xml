@@ -29,6 +29,26 @@
             android:textSize="12sp"
             android:layout_marginBottom="12dp" />
 
+        <!-- KPM 安装 / 卸载（kpm-svc / inject-hide） -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginBottom="8dp">
+            <Button
+                android:id="@+id/ih_btn_install"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:text="📥 安装 KPM" />
+            <Button
+                android:id="@+id/ih_btn_uninstall"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:text="🗑️ 卸载 KPM" />
+        </LinearLayout>
+
         <!-- 全局开关：单按钮自适应当前状态 -->
         <LinearLayout
             android:layout_width="match_parent"

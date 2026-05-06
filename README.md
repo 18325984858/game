@@ -305,3 +305,107 @@ $env:ENABLE_WINDOWS_LLVM_OBFUSCATION="true"
 ```
 
 > 安装时若遇到 `INSTALL_FAILED_UPDATE_INCOMPATIBLE`（旧 APK 签名不同），脚本会自动卸载旧包后重试。
+
+---
+
+## 集成 KernelPatch / KPM 反作弊穿透
+
+本项目已与 [FrideHide-kpm](https://github.com/18325984858/FrideHide-kpm) 深度集成。APK 内已 bundle 两个 KPM：
+
+| KPM | 路径 | 作用 |
+|---|---|---|
+| **kpm-svc** (inject-hide) | `app/src/main/assets/svc.kpm` | 通用隐藏：hide_pkg / hide_so / hide_pid / hide_comm / 路径过滤 / frida 端口屏蔽 |
+| **game-kpm** (GameKpm) | `app/src/main/assets/game-kpm.kpm` | 游戏反作弊穿透：ptrace / prctl / mincore / inotify / TracerPid / uname / 私有目录观测 |
+
+### 使用流程（普通用户）
+
+1. 设备：Pixel 8 (Android 14) + APatch / KernelPatch + 已知 superkey
+2. `./gradlew installDebug` → 自动重编 KPM + 同步 assets + 打 APK + 推到设备
+3. 打开 dobbyproject app → 输入 superkey
+4. **必须先装 inject-hide**：💎 INJECT-HIDE 管理 (KPM) → 📥 安装 KPM
+5. **再装 GameKpm**：⚙ GameKpm 高级设置 → 📥 安装 KPM（如未装 svc 会弹"一键先装 svc + GameKpm"对话框）
+6. 启动 PUBG / DFM 时勾选"启用 GameKpm 反检测 (TerSafe/TPRT)"，CheckBox 默认勾选
+
+### 一条命令开发流程
+
+```bash
+# 改 KPM 源码或 Java 后：
+./gradlew installDebug
+
+# 自动执行：
+#   1. make GameKpm     →  game-kpm.kpm
+#   2. make inject-hide →  svc.kpm
+#   3. 同步到 assets/
+#   4. 打 APK
+#   5. push + install 到设备
+```
+
+跳过 KPM 编译只重打 APK：
+```bash
+./gradlew installDebug -PskipKpmBuild=true
+```
+
+仅同步 KPM：
+```bash
+./gradlew syncAllKpm
+```
+
+### Gradle Task 矩阵
+
+| Task | 行为 |
+|---|---|
+| `buildGameKpm` | 在 `../FrideHide-kpm/kpms/GameKpm/` 跑 `make` |
+| `syncGameKpm` | 把 `game-kpm.kpm` 拷到 `assets/`（按时间戳增量） |
+| `buildInjectHide` | 在 `../FrideHide-kpm/kpms/inject-hide/` 跑 `make` |
+| `syncInjectHide` | 把 `svc.kpm` 拷到 `assets/` |
+| `syncAllKpm` | 聚合：syncGameKpm + syncInjectHide |
+| `assembleDebug` / `installDebug` | 自动依赖 syncAllKpm（preBuild 阶段触发） |
+
+### 主页 UI（MainActivity）
+
+```
+─── Superkey 输入区（首次启动）
+─── ▼ ⚙ 环境准备 (宽容模式 / 输入权限 / 字体)
+─── 📝 启用日志输出
+─── ▼ lol 手游 / 和平精英(★含反检测☑) / 三角洲(★含反检测☑) / 洛克王国
+─── 🟣 SO Dumper / 🔍 内存读取器 / 💎 INJECT-HIDE 管理 (KPM)
+─── ▼ ⚙ GameKpm 高级设置 (10 反检测开关 + DFM/PUBG 预设 + 安装/卸载)
+─── 状态栏
+```
+
+### 反检测能力矩阵
+
+| 检测点（TerSafe / TPRT） | 拦截方式 | 状态 |
+|---|---|---|
+| `prctl(PR_GET_DUMPABLE)` 反调试 | game-kpm hook 返回 1 | ✅ 实测 60s 命中 3700+ 次 |
+| `mincore` 页驻留探测 | game-kpm vec 全填 1 | ✅ 命中 70+ 次 |
+| `/proc/self/status` TracerPid | game-kpm read 后 → "0" | ✅ 命中 3+ 次 |
+| `inotify_add_watch` 文件监控 | game-kpm 返回伪 wd | ✅ 防御性挡板 |
+| `/dev/pts/*` PTY 探测 | game-kpm openat → -ENOENT | ✅ 防御性挡板 |
+| frida-agent 27042 端口 | inject-hide connect 拦截 | ✅ 实测命中 |
+| dobby/frida SO 路径暴露 | inject-hide hide_so 列表 | ✅ /proc/maps 行隐藏 |
+| dobbyproject 自家 APK 加载 | inject-hide 自家路径豁免 | ✅ /com.example.dobbyproject 全路径放行 |
+| 系统属性 ro.boot.verifiedbootstate | ⚠ 需 APM resetprop 模块 | 计划外 |
+| 硬件 Key Attestation | ⚠ 需 Tricky Store + keybox | 计划外 |
+
+### 稳定性
+
+- DFM 60 秒冷启动 + 登录界面：0 闪退 0 panic
+- KPM 装卸压测 40 轮：0 失败 0 重启
+- dobbyproject + kpm-svc + game-kpm 三方共存稳定
+
+### 故障排查
+
+| 现象 | 原因 | 解决 |
+|---|---|---|
+| 安装 KPM 失败 | superkey 错误或未输入 | 主页输入正确的 APatch SuperKey |
+| game-kpm 安装但反检测无效果 | 没装 inject-hide / 没勾 cb_*_anticheat | UI 弹"一键先装 svc + GameKpm"按钮 |
+| dobbyproject 启动闪退 "library not found" | inject-hide hide_so 误拦了 dobbyproject 自家 SO | 已修复（任何 `/com.example.dobbyproject` 路径都豁免） |
+| 设备重启 | 旧 build 的 stack overflow / lazy lookup race | 升级到最新 GameKpm（已在 init 一次性解析符号） |
+
+### 配套项目
+
+- 内核侧 KPM 源码：[FrideHide-kpm](https://github.com/18325984858/FrideHide-kpm)
+- 上游：[KernelPatch](https://github.com/bmax121/KernelPatch) / [APatch](https://github.com/bmax121/APatch)
+
+仅供安全研究学习。**滥用本项目导致的封号 / 法律责任，作者概不承担**。

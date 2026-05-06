@@ -81,45 +81,67 @@
         </LinearLayout>
     </LinearLayout>
 
-    <!-- 设置宽容模式 -->
-    <Button
-        android:id="@+id/btn_selinux"
+    <!-- ⚙ 环境准备（折叠） -->
+    <LinearLayout
+        android:id="@+id/section_env"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="① 设置宽容模式"
-        android:layout_marginBottom="8dp" />
+        android:orientation="vertical"
+        android:background="#1AFFFFFF"
+        android:padding="10dp"
+        android:layout_marginBottom="10dp">
 
-    <!-- 修改输入设备权限 -->
-    <Button
-        android:id="@+id/btn_input_perm"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="② 修改输入设备权限"
-        android:layout_marginBottom="8dp" />
+        <TextView
+            android:id="@+id/tv_section_env_header"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="▶ ⚙ 环境准备 (宽容模式 / 输入权限 / 字体)"
+            android:textSize="15sp"
+            android:textStyle="bold"
+            android:textColor="#FFFFFF"
+            android:clickable="true"
+            android:focusable="true"
+            android:padding="4dp" />
 
-    <!-- 部署中文字体 -->
-    <Button
-        android:id="@+id/btn_deploy_font"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="③ 部署中文字体"
-        android:layout_marginBottom="16dp" />
+        <LinearLayout
+            android:id="@+id/layout_env_content"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:visibility="gone"
+            android:paddingTop="6dp">
 
-    <!-- 分隔线 -->
-    <View
-        android:layout_width="match_parent"
-        android:layout_height="1dp"
-        android:background="#CCCCCC"
-        android:layout_marginBottom="16dp" />
+            <Button
+                android:id="@+id/btn_selinux"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="① 设置宽容模式"
+                android:layout_marginBottom="6dp" />
 
-    <!-- 全局日志开关 -->
+            <Button
+                android:id="@+id/btn_input_perm"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="② 修改输入设备权限"
+                android:layout_marginBottom="6dp" />
+
+            <Button
+                android:id="@+id/btn_deploy_font"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="③ 部署中文字体" />
+        </LinearLayout>
+    </LinearLayout>
+
+    <!-- 全局日志开关（与状态栏并排） -->
     <CheckBox
         android:id="@+id/cb_log"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="启用日志输出"
+        android:text="📝 启用日志输出"
         android:checked="true"
-        android:layout_marginBottom="12dp" />
+        android:textSize="13sp"
+        android:layout_marginBottom="10dp" />
 
     <!-- 可折叠区域: lol手游 -->
     <LinearLayout
@@ -128,8 +150,8 @@
         android:layout_height="wrap_content"
         android:orientation="vertical"
         android:background="#1AFFFFFF"
-        android:padding="12dp"
-        android:layout_marginBottom="16dp">
+        android:padding="10dp"
+        android:layout_marginBottom="8dp">
 
         <TextView
             android:id="@+id/tv_section_lol_header"
@@ -186,8 +208,8 @@
         android:layout_height="wrap_content"
         android:orientation="vertical"
         android:background="#1AFFFFFF"
-        android:padding="12dp"
-        android:layout_marginBottom="16dp">
+        android:padding="10dp"
+        android:layout_marginBottom="8dp">
 
         <TextView
             android:id="@+id/tv_section_pubg_header"
@@ -225,6 +247,14 @@
                 android:checked="false"
                 android:layout_marginBottom="8dp" />
 
+            <CheckBox
+                android:id="@+id/cb_pubg_anticheat"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="启用 GameKpm 反检测 (TerSafe/TPRT)"
+                android:checked="true"
+                android:layout_marginBottom="8dp" />
+
             <Button
                 android:id="@+id/btn_pubg_launch"
                 android:layout_width="match_parent"
@@ -242,8 +272,8 @@
         android:layout_height="wrap_content"
         android:orientation="vertical"
         android:background="#1AFFFFFF"
-        android:padding="12dp"
-        android:layout_marginBottom="16dp">
+        android:padding="10dp"
+        android:layout_marginBottom="8dp">
 
         <TextView
             android:id="@+id/tv_section_dfm_header"
@@ -281,6 +311,14 @@
                 android:checked="false"
                 android:layout_marginBottom="8dp" />
 
+            <CheckBox
+                android:id="@+id/cb_dfm_anticheat"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="启用 GameKpm 反检测 (TerSafe/TPRT)"
+                android:checked="true"
+                android:layout_marginBottom="8dp" />
+
             <Button
                 android:id="@+id/btn_dfm_launch"
                 android:layout_width="match_parent"
@@ -298,8 +336,8 @@
         android:layout_height="wrap_content"
         android:orientation="vertical"
         android:background="#1AFFFFFF"
-        android:padding="12dp"
-        android:layout_marginBottom="16dp">
+        android:padding="10dp"
+        android:layout_marginBottom="8dp">
 
         <TextView
             android:id="@+id/tv_section_nrc_header"
@@ -378,6 +416,132 @@
         android:layout_height="wrap_content"
         android:text="🛡️ Inject-Hide 管理 (KPM)"
         android:layout_marginBottom="16dp" />
+
+    <!-- ⚙ GameKpm 高级设置 (10 个开关) -->
+    <LinearLayout
+        android:id="@+id/section_gk_adv"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:background="#1AFFFFFF"
+        android:padding="12dp"
+        android:layout_marginBottom="16dp">
+
+        <TextView
+            android:id="@+id/tv_section_gk_adv_header"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="▶ ⚙ GameKpm 高级设置 (反检测开关)"
+            android:textSize="16sp"
+            android:textStyle="bold"
+            android:textColor="#FFFFFF"
+            android:clickable="true"
+            android:focusable="true"
+            android:padding="4dp" />
+
+        <LinearLayout
+            android:id="@+id/layout_gk_adv_content"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:visibility="gone"
+            android:paddingTop="8dp">
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="勾选即时同步到 game-kpm。preset_dfm/pubgmhd 会一键打开前 8 项。"
+                android:textSize="11sp"
+                android:textColor="#AAAAAA"
+                android:layout_marginBottom="6dp" />
+
+            <CheckBox android:id="@+id/cb_gk_anti_ptrace"
+                android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:text="anti_ptrace — TRACEME / 自附加静默"
+                android:layout_marginBottom="2dp" />
+            <CheckBox android:id="@+id/cb_gk_anti_prctl"
+                android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:text="anti_prctl — PR_SET/GET_DUMPABLE 伪造"
+                android:layout_marginBottom="2dp" />
+            <CheckBox android:id="@+id/cb_gk_pts_block"
+                android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:text="pts_block — 拦 /dev/pts/* (jdb / scrcpy 探测)"
+                android:layout_marginBottom="2dp" />
+            <CheckBox android:id="@+id/cb_gk_mincore_lie"
+                android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:text="mincore_lie — 谎报全页驻留"
+                android:layout_marginBottom="2dp" />
+            <CheckBox android:id="@+id/cb_gk_exec_block"
+                android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:text="exec_block — 拦 su / id / mount / getprop"
+                android:layout_marginBottom="2dp" />
+            <CheckBox android:id="@+id/cb_gk_inotify_swallow"
+                android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:text="inotify_swallow — inotify_add_watch 静默"
+                android:layout_marginBottom="2dp" />
+            <CheckBox android:id="@+id/cb_gk_uname_spoof"
+                android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:text="uname_spoof — uname.release 抹掉 KernelPatch"
+                android:layout_marginBottom="2dp" />
+            <CheckBox android:id="@+id/cb_gk_status_filter"
+                android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:text="status_filter — /proc/self/status TracerPid → 0"
+                android:layout_marginBottom="2dp" />
+            <CheckBox android:id="@+id/cb_gk_private_dir_watch"
+                android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:text="private_dir_watch — 私有目录访问观测 (默认关)"
+                android:layout_marginBottom="2dp" />
+            <CheckBox android:id="@+id/cb_gk_log"
+                android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:text="log — KPM 日志总开关"
+                android:layout_marginBottom="6dp" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <Button android:id="@+id/btn_gk_refresh"
+                    android:layout_width="0dp" android:layout_weight="1"
+                    android:layout_height="wrap_content"
+                    android:text="🔄 刷新" />
+                <Button android:id="@+id/btn_gk_preset_dfm"
+                    android:layout_width="0dp" android:layout_weight="1"
+                    android:layout_height="wrap_content"
+                    android:text="DFM" />
+                <Button android:id="@+id/btn_gk_preset_pubg"
+                    android:layout_width="0dp" android:layout_weight="1"
+                    android:layout_height="wrap_content"
+                    android:text="PUBG" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:layout_marginTop="4dp">
+
+                <Button android:id="@+id/btn_gk_install"
+                    android:layout_width="0dp" android:layout_weight="1"
+                    android:layout_height="wrap_content"
+                    android:text="📥 安装 KPM" />
+                <Button android:id="@+id/btn_gk_uninstall"
+                    android:layout_width="0dp" android:layout_weight="1"
+                    android:layout_height="wrap_content"
+                    android:text="🗑️ 卸载 KPM" />
+            </LinearLayout>
+
+            <TextView android:id="@+id/tv_gk_status"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="点击刷新读取 game-kpm 状态"
+                android:textSize="11sp"
+                android:fontFamily="monospace"
+                android:textColor="#88FF88"
+                android:layout_marginTop="6dp" />
+
+        </LinearLayout>
+    </LinearLayout>
 
     <!-- 状态显示 -->
     <TextView

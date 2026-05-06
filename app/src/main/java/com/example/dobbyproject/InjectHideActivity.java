@@ -137,6 +137,12 @@ public class InjectHideActivity extends AppCompatActivity {
         String cachedKey = KpKeyStore.read(this);
         if (cachedKey != null) nativeSetSuperkey(cachedKey);
 
+        // ── KPM 安装/卸载 ──
+        Button btnInstall = findViewById(R.id.ih_btn_install);
+        Button btnUninstall = findViewById(R.id.ih_btn_uninstall);
+        if (btnInstall != null) btnInstall.setOnClickListener(v -> installKpmSvc());
+        if (btnUninstall != null) btnUninstall.setOnClickListener(v -> uninstallKpmSvc());
+
         // ── 全局开关（单按钮） ──
         btnToggleProc.setOnClickListener(v -> toggleProcHide());
         btnToggleFile.setOnClickListener(v -> toggleFileHide());
@@ -720,6 +726,12 @@ public class InjectHideActivity extends AppCompatActivity {
     // ── Native 绑定 ─────────────────────────────────────────
     public native boolean nativeIsModuleLoaded();
     public native void    nativeSetSuperkey(@NonNull String key);
+
+    /** 加载任意 KPM (root supercall)。path = 设备绝对路径，args 可空。 */
+    public native boolean nativeKpmLoad(@NonNull String path, String args);
+
+    /** 卸载指定 KPM (root supercall)。name = KPM_NAME，例如 "kpm-svc"。 */
+    public native boolean nativeKpmUnload(@NonNull String name);
     public native String  nativeRawCtl(@NonNull String cmd);
     public native String  nativeGetStatus();
 
@@ -782,4 +794,61 @@ public class InjectHideActivity extends AppCompatActivity {
     public native boolean nativeEnableLog();
     public native boolean nativeDisableLog();
     public native String  nativeGetStatusLog();
+
+    // ─────────────────────────────────────────────────────────────
+    //  KPM 安装 / 卸载（kpm-svc / inject-hide）
+    //  从 APK assets/svc.kpm 拷到 app 私有目录后通过 supercall 加载
+    // ─────────────────────────────────────────────────────────────
+    private void installKpmSvc() {
+        new Thread(() -> {
+            java.io.File kpmFile = new java.io.File(getFilesDir(), "svc.kpm");
+            String err = copyAssetToFile("svc.kpm", kpmFile);
+            if (err != null) {
+                runOnUiThread(() -> Toast.makeText(this, "拷贝失败: " + err, Toast.LENGTH_LONG).show());
+                return;
+            }
+            // 幂等：先卸载再装
+            try { nativeKpmUnload("kpm-svc"); } catch (Throwable ignored) {}
+            boolean ok;
+            try { ok = nativeKpmLoad(kpmFile.getAbsolutePath(), ""); }
+            catch (Throwable t) { ok = false; }
+            final boolean okFinal = ok;
+            runOnUiThread(() -> {
+                Toast.makeText(this,
+                    okFinal ? "✅ inject-hide (kpm-svc) 已加载 (" + (kpmFile.length()/1024) + "KB)"
+                            : "❌ 加载失败 — 检查 superkey",
+                    Toast.LENGTH_LONG).show();
+                refreshAll();
+            });
+        }).start();
+    }
+
+    private void uninstallKpmSvc() {
+        new Thread(() -> {
+            boolean ok;
+            try { ok = nativeKpmUnload("kpm-svc"); }
+            catch (Throwable t) { ok = false; }
+            final boolean okFinal = ok;
+            runOnUiThread(() -> {
+                Toast.makeText(this,
+                    okFinal ? "✅ kpm-svc 已卸载" : "❌ 卸载失败 (未加载？)",
+                    Toast.LENGTH_LONG).show();
+                refreshAll();
+            });
+        }).start();
+    }
+
+    private String copyAssetToFile(String assetName, java.io.File dst) {
+        try {
+            java.io.InputStream in = getAssets().open(assetName);
+            java.io.FileOutputStream out = new java.io.FileOutputStream(dst);
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+            out.close(); in.close();
+            return null;
+        } catch (Throwable t) {
+            return t.getMessage();
+        }
+    }
 }

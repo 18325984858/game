@@ -203,6 +203,53 @@ Java_com_example_dobbyproject_MainActivity_nativeKpmRawCtl(JNIEnv* env, jobject,
     return env->NewStringUTF(r.c_str());
 }
 
+// ─── GameKpm 反作弊 KPM 桥（com.tencent.tmgp.dfm / pubgmhd）──
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_example_dobbyproject_MainActivity_nativeGameKpmCtl(JNIEnv* env, jobject, jstring jCmd) {
+    std::string out;
+    bool ok = KpCtl::gameKpmCtl(jstr(env, jCmd), &out);
+    std::string r = (ok ? "OK: " : "FAIL: ") + out;
+    return env->NewStringUTF(r.c_str());
+}
+
+// ─── GameKpm 加载 / 卸载（root supercall） ──
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_example_dobbyproject_MainActivity_nativeKpmLoad(JNIEnv* env, jobject,
+                                                          jstring jPath, jstring jArgs) {
+    std::string path = jstr(env, jPath);
+    std::string args = jArgs ? jstr(env, jArgs) : std::string();
+    return KpCtl::loadKpm(path, args) ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_example_dobbyproject_MainActivity_nativeKpmUnload(JNIEnv* env, jobject, jstring jName) {
+    return KpCtl::unloadKpm(jstr(env, jName)) ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_example_dobbyproject_MainActivity_nativeGameKpmIsLoaded(JNIEnv*, jobject) {
+    return KpCtl::gameKpmIsLoaded() ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_example_dobbyproject_MainActivity_nativeKpmSvcIsLoaded(JNIEnv*, jobject) {
+    return KpCtl::isModuleLoaded() ? JNI_TRUE : JNI_FALSE;
+}
+
+// 同样的 3 个 JNI 也挂到 InjectHideActivity，方便那个 Activity 调用
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_example_dobbyproject_InjectHideActivity_nativeKpmLoad(JNIEnv* env, jobject,
+                                                               jstring jPath, jstring jArgs) {
+    std::string path = jstr(env, jPath);
+    std::string args = jArgs ? jstr(env, jArgs) : std::string();
+    return KpCtl::loadKpm(path, args) ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_example_dobbyproject_InjectHideActivity_nativeKpmUnload(JNIEnv* env, jobject, jstring jName) {
+    return KpCtl::unloadKpm(jstr(env, jName)) ? JNI_TRUE : JNI_FALSE;
+}
+
 // ─── proc_hide (PID �? ──────────────────────────────────
 JNI_METHOD(jboolean, nativeEnableProcHide)(JNIEnv*, jobject) {
     return KpCtl::enableProcHide() ? JNI_TRUE : JNI_FALSE;

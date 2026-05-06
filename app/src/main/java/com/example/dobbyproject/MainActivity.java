@@ -122,6 +122,11 @@ public class MainActivity extends AppCompatActivity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
+        // 立即隐藏主功能区，等异步 superkey 校验通过再显示。避免在校验完成
+        // 前用户能操作 inject-hide / GameKpm 面板（那些面板会调 nativeKpmRawCtl
+        // 触发 sc_hello 失败 → 反复弹"未检测到 Superkey"Toast）。
+        setMainContentVisible(false);
+
         g_nativeLibPath = getApplicationContext().getApplicationInfo().nativeLibraryDir;
 
         // ── AI 屏幕检测: 解压模型并启动后台线程 (默认 disabled, 通过 ImGui 菜单开启) ──
@@ -174,6 +179,21 @@ public class MainActivity extends AppCompatActivity {
             }
             LogUtil.i("[LogSwitch] UI -> C++ g_runtimeLogEnabled=" + isChecked);
         });
+
+        // ── 折叠区域: ⚙ 环境准备 ──
+        TextView tvEnvHeader = findViewById(R.id.tv_section_env_header);
+        LinearLayout layoutEnvContent = findViewById(R.id.layout_env_content);
+        if (tvEnvHeader != null && layoutEnvContent != null) {
+            tvEnvHeader.setOnClickListener(v -> {
+                if (layoutEnvContent.getVisibility() == View.VISIBLE) {
+                    layoutEnvContent.setVisibility(View.GONE);
+                    tvEnvHeader.setText("▶ ⚙ 环境准备 (宽容模式 / 输入权限 / 字体)");
+                } else {
+                    layoutEnvContent.setVisibility(View.VISIBLE);
+                    tvEnvHeader.setText("▼ ⚙ 环境准备 (宽容模式 / 输入权限 / 字体)");
+                }
+            });
+        }
 
         // ── 折叠区域: lol手游 ──
         TextView tvSectionHeader = findViewById(R.id.tv_section_lol_header);
@@ -256,15 +276,22 @@ public class MainActivity extends AppCompatActivity {
             startActivity(ihIntent);
         });
 
+        // ── ⚙ GameKpm 高级设置面板 ──
+        wireGameKpmAdvancedPanel();
+
         // ── 和平精英启动按钮 ──
+        CheckBox cbPubgAntiCheat = findViewById(R.id.cb_pubg_anticheat);
         wireGameButton(btnPubgLaunch, GAME_PUBG, "和平精英",
-                cbPubgDumper, cbPubgHeader, cbLog, "[UE4 Dumper]", "[UE4 Header]");
+                cbPubgDumper, cbPubgHeader, cbLog, "[UE4 Dumper]", "[UE4 Header]",
+                cbPubgAntiCheat, "pubgmhd");
 
         // ── 三角洲启动按钮 ──
+        CheckBox cbDfmAntiCheat = findViewById(R.id.cb_dfm_anticheat);
         wireGameButton(btnDfmLaunch, GAME_DFM, "三角洲",
-                cbDfmDumper, cbDfmHeader, cbLog, "[UE5 Dumper]", "[UE5 Header]");
+                cbDfmDumper, cbDfmHeader, cbLog, "[UE5 Dumper]", "[UE5 Header]",
+                cbDfmAntiCheat, "dfm");
 
-        // ── 洛克王国手游 (NRC) 启动按钮 ──
+        // ── 洛克王国手游 (NRC) 启动按钮 ── (无反检测需求)
         wireGameButton(btnNrcLaunch, GAME_NRC, "洛克王国手游",
                 cbNrcDumper, cbNrcHeader, cbLog, "[UE4 Dumper]", null);
 
@@ -626,6 +653,21 @@ public class MainActivity extends AppCompatActivity {
     public native String stringFromJNI();
     public native int injectSoToTarget(String packageName, String soPath);
     public native String nativeKpmRawCtl(String cmd);
+
+    /** 向 game-kpm 发送 control0 命令（GameKpm 反作弊 KPM）。返回 "OK: ..." / "FAIL: ..."。 */
+    public native String nativeGameKpmCtl(String cmd);
+
+    /** 加载 KPM (root supercall)。path = 设备绝对路径，args 可空。 */
+    public native boolean nativeKpmLoad(String path, String args);
+
+    /** 卸载 KPM (root supercall)。name = KPM_NAME，例如 "game-kpm"。 */
+    public native boolean nativeKpmUnload(String name);
+
+    /** 查询 game-kpm 是否已加载。 */
+    public native boolean nativeGameKpmIsLoaded();
+
+    /** 查询 kpm-svc (inject-hide) 是否已加载。 */
+    public native boolean nativeKpmSvcIsLoaded();
 
     /**
      * 校验 KernelPatch superkey：空串表示用 /data/local/tmp/.kp_key 等文件里的 key。
@@ -1174,6 +1216,22 @@ public class MainActivity extends AppCompatActivity {
                                 String displayName,
                                 CheckBox cbDumper, CheckBox cbHeader, CheckBox cbLog,
                                 String dumperLabel, String headerLabel) {
+        wireGameButton(btn, spec, displayName, cbDumper, cbHeader, cbLog,
+                       dumperLabel, headerLabel, null, null);
+    }
+
+    /**
+     * 增强版：增加 GameKpm 反检测开关 cbAntiCheat（可空）。
+     *   - cbAntiCheat 勾上 → 启动游戏前先发 preset_<presetTag> 给 game-kpm 启用
+     *     ptrace/prctl/pts/mincore/inotify/uname/status_filter 全部反检测开关
+     *     + 委托 inject-hide 注册 hide_pkg/comm/so + enable_file_hide
+     *   - 不勾 → 完全不接触 game-kpm，只装 dobby（用于对比/排查反作弊副作用）
+     */
+    private void wireGameButton(android.widget.Button btn, GameLauncher.GameSpec spec,
+                                String displayName,
+                                CheckBox cbDumper, CheckBox cbHeader, CheckBox cbLog,
+                                String dumperLabel, String headerLabel,
+                                CheckBox cbAntiCheat, String presetTag) {
         btn.setOnClickListener(v -> {
             if (!selinuxDone) {
                 Toast.makeText(this, "请先设置宽容模式", Toast.LENGTH_SHORT).show();
@@ -1194,6 +1252,22 @@ public class MainActivity extends AppCompatActivity {
             boolean enableUeDumper = cbDumper.isChecked();
             boolean enableUeHeader = cbHeader.isChecked();
             boolean enableLog = cbLog.isChecked();
+            boolean enableAntiCheat = (cbAntiCheat != null && cbAntiCheat.isChecked());
+
+            // ── GameKpm 反检测：勾选则在启动游戏前应用 preset ──
+            // 启动顺序很重要：preset 先于游戏进程出现，确保 hook 在 zygote fork
+            // 出 game tgid 之前已就绪，is_target_current 命中 comm 前缀立即自动
+            // 注册 tgid，所有反作弊 syscall 都能被拦截。
+            if (enableAntiCheat && presetTag != null) {
+                try {
+                    String r1 = nativeGameKpmCtl("enable_log");
+                    String r2 = nativeGameKpmCtl("preset_" + presetTag);
+                    LogUtil.i("[GameKpm] enable_log -> " + r1);
+                    LogUtil.i("[GameKpm] preset_" + presetTag + " -> " + r2);
+                } catch (Throwable t) {
+                    LogUtil.e("[GameKpm] preset failed", t);
+                }
+            }
 
             clearDumpMarkers();
             GameLauncher.launch(spec, enableUeDumper, enableUeHeader, enableLog,
@@ -1202,6 +1276,7 @@ public class MainActivity extends AppCompatActivity {
             String options = "";
             if (enableUeDumper) options += " " + dumperLabel;
             if (enableUeHeader && headerLabel != null) options += " " + headerLabel;
+            if (enableAntiCheat && presetTag != null) options += " [反检测]";
             btn.setText("✅ 游戏已启动" + options);
             updateStatus(UE4_OVERLAY_STATUS + " | " + displayName + "启动中..." + options);
             Toast.makeText(this, "正在启动" + displayName + "并注入..." + options, Toast.LENGTH_SHORT).show();
@@ -1234,4 +1309,291 @@ public class MainActivity extends AppCompatActivity {
         };
     }
 
+    // ─────────────────────────────────────────────────────────────
+    //  ⚙ GameKpm 高级设置面板
+    //
+    //  10 个 CheckBox 即时同步到 game-kpm（control0 命令）。
+    //  名字与 GameKpm.c 的 SWITCH 宏对齐：
+    //    anti_ptrace / anti_prctl / pts_block / mincore_lie /
+    //    exec_block / inotify_swallow / uname_spoof / status_filter /
+    //    private_dir_watch / log
+    //
+    //  + 刷新按钮：解析 nativeGameKpmCtl("status") 把当前值回填到 UI
+    //  + DFM/PUBG 预设按钮：一键 preset_dfm/pubgmhd（前 8 项全开）
+    // ─────────────────────────────────────────────────────────────
+    private CheckBox[] gkSwitchBoxes;
+    private String[]   gkSwitchNames;
+
+    private void wireGameKpmAdvancedPanel() {
+        // 1. 折叠头
+        TextView header = findViewById(R.id.tv_section_gk_adv_header);
+        LinearLayout content = findViewById(R.id.layout_gk_adv_content);
+        if (header == null || content == null) return;
+        header.setOnClickListener(v -> {
+            if (content.getVisibility() == View.VISIBLE) {
+                content.setVisibility(View.GONE);
+                header.setText("▶ ⚙ GameKpm 高级设置 (反检测开关)");
+            } else {
+                content.setVisibility(View.VISIBLE);
+                header.setText("▼ ⚙ GameKpm 高级设置 (反检测开关)");
+                refreshGameKpmStatus();
+            }
+        });
+
+        // 2. CheckBox 注册（顺序 = 显示顺序）
+        gkSwitchBoxes = new CheckBox[]{
+            findViewById(R.id.cb_gk_anti_ptrace),
+            findViewById(R.id.cb_gk_anti_prctl),
+            findViewById(R.id.cb_gk_pts_block),
+            findViewById(R.id.cb_gk_mincore_lie),
+            findViewById(R.id.cb_gk_exec_block),
+            findViewById(R.id.cb_gk_inotify_swallow),
+            findViewById(R.id.cb_gk_uname_spoof),
+            findViewById(R.id.cb_gk_status_filter),
+            findViewById(R.id.cb_gk_private_dir_watch),
+            findViewById(R.id.cb_gk_log),
+        };
+        gkSwitchNames = new String[]{
+            "anti_ptrace", "anti_prctl", "pts_block", "mincore_lie",
+            "exec_block", "inotify_swallow", "uname_spoof", "status_filter",
+            "private_dir_watch", "log",
+        };
+
+        for (int i = 0; i < gkSwitchBoxes.length; i++) {
+            final int idx = i;
+            CheckBox cb = gkSwitchBoxes[i];
+            if (cb == null) continue;
+            cb.setOnCheckedChangeListener((buttonView, isChecked) -> {
+                if (!buttonView.isPressed() && !buttonView.isFocused()) {
+                    // 程序刷新触发的 setChecked 不要往 KPM 发
+                    return;
+                }
+                String cmd = (isChecked ? "enable_" : "disable_") + gkSwitchNames[idx];
+                String resp = safeGameKpmCtl(cmd);
+                Toast.makeText(this, gkSwitchNames[idx] + " → " + (isChecked ? "ON" : "OFF"),
+                        Toast.LENGTH_SHORT).show();
+                LogUtil.i("[GameKpm] " + cmd + " -> " + resp);
+            });
+        }
+
+        // 3. 刷新按钮
+        Button btnRefresh = findViewById(R.id.btn_gk_refresh);
+        if (btnRefresh != null) btnRefresh.setOnClickListener(v -> refreshGameKpmStatus());
+
+        // 4. 预设按钮
+        Button btnDfm = findViewById(R.id.btn_gk_preset_dfm);
+        if (btnDfm != null) btnDfm.setOnClickListener(v -> {
+            String r = safeGameKpmCtl("preset_dfm");
+            Toast.makeText(this, "preset_dfm: " + r, Toast.LENGTH_SHORT).show();
+            refreshGameKpmStatus();
+        });
+        Button btnPubg = findViewById(R.id.btn_gk_preset_pubg);
+        if (btnPubg != null) btnPubg.setOnClickListener(v -> {
+            String r = safeGameKpmCtl("preset_pubgmhd");
+            Toast.makeText(this, "preset_pubgmhd: " + r, Toast.LENGTH_SHORT).show();
+            refreshGameKpmStatus();
+        });
+
+        // 5. 安装 / 卸载 KPM
+        Button btnInstall = findViewById(R.id.btn_gk_install);
+        if (btnInstall != null) btnInstall.setOnClickListener(v -> installGameKpm());
+        Button btnUninstall = findViewById(R.id.btn_gk_uninstall);
+        if (btnUninstall != null) btnUninstall.setOnClickListener(v -> uninstallGameKpm());
+    }
+
+    /**
+     * 安装 GameKpm：从 APK assets/game-kpm.kpm 拷到 app 私有目录
+     * /data/data/com.example.dobbyproject/files/game-kpm.kpm 然后
+     * supercall(SUPERCALL_KPM_LOAD)。已加载会先卸载再装（幂等）。
+     *
+     * 不再使用 /data/local/tmp（避免污染共享路径 + 不需 su cp）。
+     * 内核态 filp_open() 用 root cred 直接读 app 私有目录文件，不存在权限问题。
+     *
+     * 依赖检查：game-kpm 的 preset_dfm/pubgmhd 通过用户态脚本派发命令到
+     * kpm-svc（inject-hide），所以必须先加载 kpm-svc。本方法在加载 game-kpm
+     * 前会先检查 kpm-svc 是否在线，未加载会弹对话框让用户选择：
+     *   - 一键先装 kpm-svc 再装 game-kpm（推荐）
+     *   - 仅装 game-kpm（没有通用隐藏，反作弊命中率会下降）
+     *   - 取消
+     */
+    private void installGameKpm() {
+        boolean svcLoaded = false;
+        try { svcLoaded = nativeKpmSvcIsLoaded(); } catch (Throwable ignored) {}
+
+        if (!svcLoaded) {
+            new AlertDialog.Builder(this)
+                .setTitle("缺少前置 KPM: kpm-svc")
+                .setMessage("GameKpm 反作弊功能依赖 inject-hide (kpm-svc) 提供的通用隐藏（路径/SO/PID/线程名 等）。\n\n" +
+                            "推荐先安装 kpm-svc 再装 GameKpm。")
+                .setPositiveButton("一键安装 kpm-svc + GameKpm", (d, w) -> doInstallKpmSvcThenGame())
+                .setNeutralButton("仅装 GameKpm（不推荐）", (d, w) -> doInstallGameKpmOnly())
+                .setNegativeButton("取消", null)
+                .setCancelable(true)
+                .show();
+            return;
+        }
+        // kpm-svc 已加载，直接装 game-kpm
+        doInstallGameKpmOnly();
+    }
+
+    /** 顺序加载 kpm-svc → game-kpm */
+    private void doInstallKpmSvcThenGame() {
+        new Thread(() -> {
+            // 1. 装 kpm-svc
+            java.io.File svcFile = new java.io.File(getFilesDir(), "svc.kpm");
+            String err = copyAsset("svc.kpm", svcFile);
+            if (err != null) {
+                runOnUiThread(() -> Toast.makeText(this, "kpm-svc 拷贝失败: " + err, Toast.LENGTH_LONG).show());
+                return;
+            }
+            try { nativeKpmUnload("kpm-svc"); } catch (Throwable ignored) {}
+            boolean okSvc;
+            try { okSvc = nativeKpmLoad(svcFile.getAbsolutePath(), ""); }
+            catch (Throwable t) { okSvc = false; }
+
+            if (!okSvc) {
+                runOnUiThread(() -> Toast.makeText(this, "❌ kpm-svc 加载失败，停止", Toast.LENGTH_LONG).show());
+                return;
+            }
+            LogUtil.i("[KpmSvc] loaded ok (" + svcFile.length() + " bytes)");
+
+            // 2. 装 game-kpm（同 doInstallGameKpmOnly 内部逻辑）
+            doInstallGameKpmOnlyBlocking();
+        }).start();
+    }
+
+    /** 仅在 kpm-svc 已加载时调；不阻塞，自己开线程 */
+    private void doInstallGameKpmOnly() {
+        new Thread(this::doInstallGameKpmOnlyBlocking).start();
+    }
+
+    /** game-kpm 的实际加载逻辑（已在工作线程内调用） */
+    private void doInstallGameKpmOnlyBlocking() {
+        java.io.File kpmFile = new java.io.File(getFilesDir(), "game-kpm.kpm");
+        String err = copyAsset("game-kpm.kpm", kpmFile);
+        if (err != null) {
+            runOnUiThread(() -> Toast.makeText(this, "GameKpm 拷贝失败: " + err, Toast.LENGTH_LONG).show());
+            return;
+        }
+        String absPath = kpmFile.getAbsolutePath();
+        LogUtil.i("[GameKpm] kpm file at " + absPath + " size=" + kpmFile.length());
+
+        try { nativeKpmUnload("game-kpm"); } catch (Throwable ignored) {}
+
+        boolean ok;
+        try { ok = nativeKpmLoad(absPath, ""); }
+        catch (Throwable t) { ok = false; }
+        final boolean okFinal = ok;
+
+        runOnUiThread(() -> {
+            Toast.makeText(this,
+                okFinal ? "✅ GameKpm 已加载 (" + (kpmFile.length()/1024) + "KB)"
+                        : "❌ 加载失败 — 检查 superkey",
+                Toast.LENGTH_LONG).show();
+            refreshGameKpmStatus();
+        });
+    }
+
+    private void uninstallGameKpm() {
+        new Thread(() -> {
+            boolean ok;
+            try { ok = nativeKpmUnload("game-kpm"); }
+            catch (Throwable t) { ok = false; }
+            final boolean okFinal = ok;
+            runOnUiThread(() -> {
+                Toast.makeText(this, okFinal ? "✅ GameKpm 已卸载" : "❌ 卸载失败 (未加载？)",
+                        Toast.LENGTH_LONG).show();
+                refreshGameKpmStatus();
+            });
+        }).start();
+    }
+
+    /** 把 assets/<name> 拷到 dstFile（app 私有目录）。返回 null 表示成功。 */
+    private String copyAsset(String assetName, java.io.File dstFile) {
+        try {
+            java.io.InputStream in = getAssets().open(assetName);
+            java.io.FileOutputStream out = new java.io.FileOutputStream(dstFile);
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+            out.close(); in.close();
+            // app 私有目录默认 0600，root 内核仍可读
+            return null;
+        } catch (Throwable t) {
+            return t.getMessage();
+        }
+    }
+
+    /**
+     * 调 nativeGameKpmCtl("status") 解析返回文本，把每个开关值回填到对应 CheckBox。
+     */
+    private void refreshGameKpmStatus() {
+        TextView tv = findViewById(R.id.tv_gk_status);
+        String resp = safeGameKpmCtl("status");
+
+        // 在 status 文本顶部加一行 "前置依赖" 状态：kpm-svc 是否在线
+        boolean svcLoaded = false;
+        try { svcLoaded = nativeKpmSvcIsLoaded(); } catch (Throwable ignored) {}
+        boolean gkLoaded = false;
+        try { gkLoaded = nativeGameKpmIsLoaded(); } catch (Throwable ignored) {}
+
+        StringBuilder banner = new StringBuilder();
+        banner.append("[依赖] kpm-svc=").append(svcLoaded ? "✅" : "❌缺失");
+        banner.append("  game-kpm=").append(gkLoaded ? "✅" : "❌");
+        banner.append('\n');
+        if (!svcLoaded && gkLoaded) {
+            banner.append("⚠ kpm-svc 未加载，反检测命中率会下降\n");
+        }
+        if (tv != null) tv.setText(banner.toString() + (resp == null ? "" : resp));
+
+        if (gkSwitchBoxes == null || gkSwitchNames == null) return;
+
+        for (int i = 0; i < gkSwitchNames.length; i++) {
+            CheckBox cb = gkSwitchBoxes[i];
+            if (cb == null) continue;
+            int v = parseSwitchValue(resp, gkSwitchNames[i]);
+            // 不触发 listener
+            cb.setOnCheckedChangeListener(null);
+            cb.setChecked(v == 1);
+            final int idx = i;
+            cb.setOnCheckedChangeListener((buttonView, isChecked) -> {
+                if (!buttonView.isPressed() && !buttonView.isFocused()) return;
+                String cmd = (isChecked ? "enable_" : "disable_") + gkSwitchNames[idx];
+                String r2 = safeGameKpmCtl(cmd);
+                Toast.makeText(this, gkSwitchNames[idx] + " → " + (isChecked ? "ON" : "OFF"),
+                        Toast.LENGTH_SHORT).show();
+                LogUtil.i("[GameKpm] " + cmd + " -> " + r2);
+            });
+        }
+    }
+
+    /** 在 status 文本里抓 "  <key>  = <0|1>" 行；找不到返回 -1 */
+    private static int parseSwitchValue(String resp, String key) {
+        if (resp == null || key == null) return -1;
+        String[] lines = resp.split("\n");
+        for (String line : lines) {
+            // 形如  "  anti_ptrace      = 1"
+            int eq = line.indexOf('=');
+            if (eq <= 0) continue;
+            String left = line.substring(0, eq).trim();
+            // 关键名带前缀如 "anti_ptrace"，要等于
+            if (!left.equals(key) && !left.equalsIgnoreCase(key)) continue;
+            String right = line.substring(eq + 1).trim();
+            if (right.startsWith("1")) return 1;
+            if (right.startsWith("0")) return 0;
+        }
+        return -1;
+    }
+
+    private String safeGameKpmCtl(String cmd) {
+        try {
+            String r = nativeGameKpmCtl(cmd);
+            return (r == null) ? "" : r;
+        } catch (Throwable t) {
+            return "FAIL: " + t.getMessage();
+        }
+    }
+
+
 }
+

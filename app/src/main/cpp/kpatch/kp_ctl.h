@@ -40,6 +40,26 @@ namespace KpCtl {
     bool isModuleLoaded();
     bool rawCtl(const std::string& cmd, std::string* out = nullptr);
 
+    // 通用：向任意 KPM 模块发命令（用于 game-kpm 等其它 KPM）
+    bool rawCtlModule(const std::string& module_name,
+                      const std::string& cmd,
+                      std::string* out = nullptr);
+
+    // 便捷封装：操作 game-kpm（com.tencent.tmgp.dfm/pubgmhd 反作弊）
+    bool gameKpmCtl(const std::string& cmd, std::string* out = nullptr);
+    bool gameKpmIsLoaded();
+
+    /**
+     * 加载 KPM 模块（root supercall，需要 superkey 已设置）。
+     * @param kpm_path 设备本地绝对路径，如 /sdcard/Download/game-kpm.kpm
+     * @param args     传给模块 init 的参数字符串，可空
+     * @return true 加载成功
+     */
+    bool loadKpm(const std::string& kpm_path, const std::string& args = "");
+
+    /** 卸载指定 name 的 KPM（与模块 KPM_NAME 一致，例如 "game-kpm"）。 */
+    bool unloadKpm(const std::string& kpm_name);
+
     void setSuperkey(const std::string& key);
     bool verifyKey(const std::string& key);
 

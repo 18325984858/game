@@ -26,6 +26,8 @@
 #define KP_NR_SUPERCALL          45
 #define KP_SUPERCALL_HELLO       0x1000
 #define KP_SUPERCALL_HELLO_MAGIC 0x11581158
+#define KP_SUPERCALL_KPM_LOAD    0x1020
+#define KP_SUPERCALL_KPM_UNLOAD  0x1021
 #define KP_SUPERCALL_KPM_CONTROL 0x1022
 
 static inline long ver_and_cmd(long cmd) {
@@ -139,6 +141,29 @@ static bool sc_kpm_ctl(const std::string& cmd, std::string* out) {
     return ret == 0;
 }
 
+/* 通用版：自由指定 KPM 模块名 */
+static bool sc_kpm_ctl_module(const std::string& module_name,
+                              const std::string& cmd,
+                              std::string* out) {
+    const std::string& key = get_key();
+    constexpr size_t RESP_CAP = 16 * 1024;
+    std::vector<char> resp(RESP_CAP, 0);
+    long ret = syscall(KP_NR_SUPERCALL,
+                       key.c_str(),
+                       ver_and_cmd(KP_SUPERCALL_KPM_CONTROL),
+                       module_name.c_str(),
+                       cmd.c_str(),
+                       resp.data(),
+                       (long)resp.size());
+    if (out) {
+        resp[resp.size() - 1] = '\0';
+        *out = resp.data();
+    }
+    LOG(LOG_LEVEL_INFO, HTAG " ctl[%s] <- %s | ret=%ld out=%s",
+        module_name.c_str(), cmd.c_str(), ret, resp.data());
+    return ret == 0;
+}
+
 static std::string join_int(const std::vector<int>& v) {
     std::string s;
     for (size_t i = 0; i < v.size(); i++) {
@@ -175,6 +200,47 @@ bool isModuleLoaded() {
 
 bool rawCtl(const std::string& cmd, std::string* out) {
     return sc_kpm_ctl(cmd, out);
+}
+
+bool rawCtlModule(const std::string& module_name,
+                  const std::string& cmd,
+                  std::string* out) {
+    return sc_kpm_ctl_module(module_name, cmd, out);
+}
+
+bool gameKpmCtl(const std::string& cmd, std::string* out) {
+    return sc_kpm_ctl_module("game-kpm", cmd, out);
+}
+
+bool gameKpmIsLoaded() {
+    if (g_kp_ready < 0) g_kp_ready = sc_hello_ok() ? 1 : 0;
+    if (!g_kp_ready) return false;
+    std::string out;
+    bool ok = sc_kpm_ctl_module("game-kpm", "status", &out);
+    return ok && out.find("GameKpm status:") != std::string::npos;
+}
+
+bool loadKpm(const std::string& kpm_path, const std::string& args) {
+    const std::string& key = get_key();
+    long ret = syscall(KP_NR_SUPERCALL,
+                       key.c_str(),
+                       ver_and_cmd(KP_SUPERCALL_KPM_LOAD),
+                       kpm_path.c_str(),
+                       args.empty() ? (const char*)nullptr : args.c_str(),
+                       (void*)nullptr);
+    LOG(LOG_LEVEL_INFO, HTAG " kpm_load(%s) ret=%ld", kpm_path.c_str(), ret);
+    return ret == 0;
+}
+
+bool unloadKpm(const std::string& kpm_name) {
+    const std::string& key = get_key();
+    long ret = syscall(KP_NR_SUPERCALL,
+                       key.c_str(),
+                       ver_and_cmd(KP_SUPERCALL_KPM_UNLOAD),
+                       kpm_name.c_str(),
+                       (void*)nullptr);
+    LOG(LOG_LEVEL_INFO, HTAG " kpm_unload(%s) ret=%ld", kpm_name.c_str(), ret);
+    return ret == 0;
 }
 
 bool enableProcHide()  { return sc_kpm_ctl("enable_proc_hide",  nullptr); }
