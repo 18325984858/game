@@ -64,6 +64,14 @@ namespace KpCtl {
     bool verifyKey(const std::string& key);
 
     /**
+     * 探测设备是否安装了 APatch / KernelPatch (即 KPM 通道是否可用).
+     * 实现: 用 root shell 检查 /data/adb/ap, /data/adb/apd, /data/adb/kp 等
+     * APatch / KernelPatch 标志路径是否存在. 不依赖 superkey 已就绪, 因此
+     * 可在用户输入 key 之前就能判定. 结果会被缓存; 调用方需保证设备已 root.
+     */
+    bool isAvailable();
+
+    /**
      * 订阅“KPM 已可用”事件。
      *
      * 背景: libdobbyproject.so 被 Java VM 加载时 (JNI_OnLoad), 用户还没

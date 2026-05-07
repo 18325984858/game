@@ -102,6 +102,16 @@ public class InjectHideActivity extends AppCompatActivity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        // 没装 APatch (KPM 通道不可用) 直接退回, 避免后续所有 native 调用都
+        // 因 sc_hello 失败而反复弹错.
+        try {
+            if (!MainActivity.nativeIsApatchAvailable()) {
+                Toast.makeText(this, "未检测到 APatch，KPM 功能不可用",
+                        Toast.LENGTH_LONG).show();
+                finish();
+                return;
+            }
+        } catch (Throwable ignored) {}
         if (!KpKeyStore.requireOrRedirect(this)) return;
         setContentView(R.layout.activity_inject_hide);
 

@@ -20,7 +20,21 @@
         android:text="DobbyProject"
         android:textSize="20sp"
         android:textStyle="bold"
-        android:layout_marginBottom="24dp" />
+        android:layout_marginBottom="8dp" />
+
+    <!-- ───────── 当前运行环境: 真机 / 模拟器 ───────── -->
+    <TextView
+        android:id="@+id/tv_device_env"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center"
+        android:padding="8dp"
+        android:text="环境检测中…"
+        android:textSize="14sp"
+        android:textStyle="bold"
+        android:textColor="#FFFFFF"
+        android:background="#666666"
+        android:layout_marginBottom="16dp" />
 
     <!-- ───────── KernelPatch Superkey 状态 ─────────
          打开 App 时：如果 /data/local/tmp/.kp_key 里的 key 能通过 sc_hello，

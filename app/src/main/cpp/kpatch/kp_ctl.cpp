@@ -39,6 +39,7 @@ namespace {
 
 static std::string g_superkey;
 static int g_kp_ready = -1;
+static int g_kp_avail = -1;  // -1 未探测 / 0 无 APatch / 1 有 APatch (KPM 通道可用)
 
 // onReady 订阅者清单。所有注册者会在 verifyKey() 首次返回 true 时
 // 被依次同步调用。为了避免重复发送 (Java 可能多次 verifyKey),
@@ -335,6 +336,21 @@ void onReady(ReadyHook fn) {
         g_ready_fired.back() = true;
         fn();
     }
+}
+
+bool isAvailable() {
+    if (g_kp_avail >= 0) return g_kp_avail == 1;
+    // APatch 主目录 / 守护进程二进制. 任一存在视为 KPM 通道可用.
+    // /data/adb 是 root:root 700, 必须走 root shell.
+    std::string out = popen_su(
+        "for p in /data/adb/ap /data/adb/apd /data/adb/ap/bin/apd "
+        "/data/adb/kp /data/adb/kpatch; do "
+        "[ -e \"$p\" ] && echo HIT_$p; done");
+    bool hit = out.find("HIT_") != std::string::npos;
+    g_kp_avail = hit ? 1 : 0;
+    LOG(LOG_LEVEL_INFO, HTAG " isAvailable=%d probe='%s'",
+        hit ? 1 : 0, out.c_str());
+    return hit;
 }
 
 } // namespace KpCtl

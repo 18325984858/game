@@ -148,6 +148,16 @@ val injectHideSrcDir = rootProject.file("../FrideHide-kpm/kpms/inject-hide")
 val gameKpmAssetTarget    = file("src/main/assets/game-kpm.kpm")
 val injectHideAssetTarget = file("src/main/assets/svc.kpm")
 
+// Windows 无 make 时跳过 KPM 重编 (Linux/WSL/Cygwin 才有). 等价于 `where make`.
+val makeOnPath: Boolean = run {
+    val sep = System.getProperty("path.separator") ?: ":"
+    val exts = if (org.gradle.internal.os.OperatingSystem.current().isWindows)
+        listOf("make.exe", "make.bat", "make.cmd", "make") else listOf("make")
+    (System.getenv("PATH") ?: "").split(sep).any { dir ->
+        dir.isNotBlank() && exts.any { File(dir, it).canExecute() }
+    }
+}
+
 // ── GameKpm ──
 tasks.register<Exec>("buildGameKpm") {
     group = "GameKpm"
@@ -160,6 +170,7 @@ tasks.register<Exec>("buildGameKpm") {
         if (skip) { logger.lifecycle("[GameKpm] skipKpmBuild=true → 跳过 make"); return@onlyIf false }
         if (!gameKpmSrcDir.exists()) { logger.warn("[GameKpm] 源目录不存在: $gameKpmSrcDir"); return@onlyIf false }
         if (!file("${gameKpmSrcDir}/Makefile").exists()) { logger.warn("[GameKpm] Makefile 缺失"); return@onlyIf false }
+        if (!makeOnPath) { logger.warn("[GameKpm] PATH 上无 make → 跳过重编 (用现有 assets/game-kpm.kpm)"); return@onlyIf false }
         true
     }
 }
@@ -193,6 +204,7 @@ tasks.register<Exec>("buildInjectHide") {
         if (skip) { logger.lifecycle("[InjectHide] skipKpmBuild=true → 跳过 make"); return@onlyIf false }
         if (!injectHideSrcDir.exists()) { logger.warn("[InjectHide] 源目录不存在: $injectHideSrcDir"); return@onlyIf false }
         if (!file("${injectHideSrcDir}/Makefile").exists()) { logger.warn("[InjectHide] Makefile 缺失"); return@onlyIf false }
+        if (!makeOnPath) { logger.warn("[InjectHide] PATH 上无 make → 跳过重编 (用现有 assets/svc.kpm)"); return@onlyIf false }
         true
     }
 }

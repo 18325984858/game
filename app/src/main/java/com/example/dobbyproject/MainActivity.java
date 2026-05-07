@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ═══════════════════════════════════════════════════════════════════════
  *  DobbyProject - 注入流程说明
  * ═══════════════════════════════════════════════════════════════════════
@@ -94,6 +94,104 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    // --- 模拟器检测 ---
+    public static class DeviceCheck {
+        /** 检测结果, 包含布尔判定与命中的具体信号, 便于在 UI 上展示. */
+        public static class Result {
+            public final boolean isEmulator;
+            public final java.util.List<String> hits;
+            Result(boolean e, java.util.List<String> h) { isEmulator = e; hits = h; }
+        }
+
+        /**
+         * 综合 Build 字段 + ABI + 模拟器特征文件判定当前进程是否运行在模拟器内.
+         * 命中任一关键信号即返回 isEmulator=true, 命中详情通过 LogUtil.i 输出.
+         * 注意: 纯 Java 层信号都可被 Xposed/Frida hook, 仅作为弱判定使用.
+         */
+        public static Result detect() {
+            java.util.List<String> hits = new java.util.ArrayList<>();
+
+            String fp           = String.valueOf(Build.FINGERPRINT);
+            String model        = String.valueOf(Build.MODEL);
+            String manufacturer = String.valueOf(Build.MANUFACTURER);
+            String hardware     = String.valueOf(Build.HARDWARE);
+            String product      = String.valueOf(Build.PRODUCT);
+            String brand        = String.valueOf(Build.BRAND);
+            String device       = String.valueOf(Build.DEVICE);
+            String board        = String.valueOf(Build.BOARD);
+
+            if (fp.startsWith("generic") || fp.startsWith("unknown")
+                    || fp.contains("vbox") || fp.contains("test-keys")
+                    || fp.contains("Emulator") || fp.contains("Genymotion")) {
+                hits.add("FINGERPRINT=" + fp);
+            }
+            if (model.contains("google_sdk") || model.contains("Emulator")
+                    || model.contains("Android SDK built for") || model.contains("sdk_gphone")) {
+                hits.add("MODEL=" + model);
+            }
+            if (manufacturer.equalsIgnoreCase("Genymotion")
+                    || manufacturer.equalsIgnoreCase("unknown")) {
+                hits.add("MANUFACTURER=" + manufacturer);
+            }
+            if (hardware.matches("(?i).*(ranchu|goldfish|vbox86|ttvm_x86|nox|ldgrt|cancro|intel).*")) {
+                hits.add("HARDWARE=" + hardware);
+            }
+            if (product.matches("(?i).*(sdk_|google_sdk|sdk_gphone|vbox86p|emulator|simulator).*")) {
+                hits.add("PRODUCT=" + product);
+            }
+            if (brand.startsWith("generic") && device.startsWith("generic")) {
+                hits.add("BRAND/DEVICE=generic");
+            }
+            String boardLower = board.toLowerCase();
+            if (boardLower.contains("nox") || boardLower.contains("vbox")) {
+                hits.add("BOARD=" + board);
+            }
+
+            // 99% 的国产手游真机为 ARM, x86/x86_64 ABI 几乎肯定是模拟器
+            try {
+                for (String abi : Build.SUPPORTED_ABIS) {
+                    if ("x86".equalsIgnoreCase(abi) || "x86_64".equalsIgnoreCase(abi)) {
+                        hits.add("ABI=" + abi);
+                        break;
+                    }
+                }
+            } catch (Throwable ignored) {}
+
+            // 模拟器特有的设备节点 / so / 配置文件
+            String[] markers = {
+                    "/dev/qemu_pipe",
+                    "/dev/socket/qemud",
+                    "/dev/socket/baseband_genyd",
+                    "/dev/socket/genyd",
+                    "/system/lib/libdroid4x.so",
+                    "/system/lib/libnoxd.so",
+                    "/system/lib/libnoxspeedup.so",
+                    "/system/lib/libldutils.so",        // 雷电
+                    "/system/bin/nox-prop",
+                    "/system/bin/ldinit",
+                    "/data/.bluestacks.prop",
+                    "/system/lib/libhoudini.so",        // ARM 翻译层
+                    "/system/lib/libndk_translation.so" // ARM 翻译层 (Mumu Pro / Waydroid)
+            };
+            for (String p : markers) {
+                try {
+                    if (new java.io.File(p).exists()) hits.add("FILE=" + p);
+                } catch (Throwable ignored) {}
+            }
+
+            boolean emu = !hits.isEmpty();
+            LogUtil.i("[DeviceCheck] isEmulator=" + emu
+                    + (emu ? " hits=" + hits : "")
+                    + " brand=" + brand + " model=" + model + " hw=" + hardware);
+            return new Result(emu, hits);
+        }
+
+        /** 简便接口, 仅返回 bool. */
+        public static boolean isEmulator() {
+            return detect().isEmulator;
+        }
+    }
+
     // --- 2. 静态块加载 SO ---
     static {
         System.loadLibrary("dobbyproject");
@@ -108,6 +206,8 @@ public class MainActivity extends AppCompatActivity {
     private boolean inputPermDone = false;
     private boolean fontDone = false;
     private boolean launchDone = false;
+    /** APatch / KernelPatch 是否可用 (KPM 通道). 由启动检测填充, 默认 true 兼容旧逻辑. */
+    private volatile boolean mApatchAvailable = true;
     private TextView tvStatus;
     private CheckBox cbPubgDumper;
     private CheckBox cbPubgHeader;
@@ -154,6 +254,34 @@ public class MainActivity extends AppCompatActivity {
         TextView tv = findViewById(R.id.sample_text);
         tv.setText(stringFromJNI());
         tvStatus = findViewById(R.id.tv_status);
+
+        // ── 当前运行环境: 真机 / 模拟器 ──
+        TextView tvDeviceEnv = findViewById(R.id.tv_device_env);
+        if (tvDeviceEnv != null) {
+            try {
+                boolean isEmu = DeviceCheck.isEmulator();
+                try {
+                    String nativeRaw = nativeDetectEmulator();
+                    if (nativeRaw != null && nativeRaw.startsWith("EMU")) isEmu = true;
+                } catch (UnsatisfiedLinkError ule) {
+                    LogUtil.e("nativeDetectEmulator 未导出", ule);
+                } catch (Throwable t) {
+                    LogUtil.e("nativeDetectEmulator 异常", t);
+                }
+
+                if (isEmu) {
+                    tvDeviceEnv.setText("⚠ 模拟器");
+                    tvDeviceEnv.setBackgroundColor(0xFFD32F2F); // 红
+                } else {
+                    tvDeviceEnv.setText("✅ 真机");
+                    tvDeviceEnv.setBackgroundColor(0xFF2E7D32); // 绿
+                }
+            } catch (Throwable t) {
+                tvDeviceEnv.setText("环境检测失败");
+                tvDeviceEnv.setBackgroundColor(0xFF757575); // 灰
+                LogUtil.e("DeviceCheck.detect 异常", t);
+            }
+        }
 
         CheckBox cbDumper = findViewById(R.id.cb_dumper);
         CheckBox cbHeader = findViewById(R.id.cb_header);
@@ -272,6 +400,11 @@ public class MainActivity extends AppCompatActivity {
         // ── Inject-Hide KPM 管理入口 ──
         Button btnInjectHide = findViewById(R.id.btn_inject_hide);
         btnInjectHide.setOnClickListener(v -> {
+            if (!mApatchAvailable) {
+                Toast.makeText(this, "未检测到 APatch，KPM 功能不可用",
+                        Toast.LENGTH_LONG).show();
+                return;
+            }
             Intent ihIntent = new Intent(this, InjectHideActivity.class);
             startActivity(ihIntent);
         });
@@ -312,33 +445,54 @@ public class MainActivity extends AppCompatActivity {
                 return;
             }
 
-            // ── Root 校验通过后：验证 KernelPatch superkey ──
-            // 唯一真源: /data/data/<pkg>/files/.kp_key (app 私有, 不需 root)。
-            // 缺失或验证失败 → 删除 + 弹输入框。
-            String savedKey = readKpKeyFromFiles();
-            boolean keyOk = false;
-            String promptMsg = "未检测到 Superkey，请输入 APatch Super Key：";
-            if (savedKey != null) {
-                try { keyOk = nativeValidateKpKey(savedKey); }
-                catch (Throwable t) { LogUtil.e("nativeValidateKpKey 调用异常", t); }
-                if (!keyOk) {
-                    deleteKpKeyFile();
-                    promptMsg = "❌ 保存的 Superkey 已失效，请重新输入 APatch Super Key：";
-                }
-            }
-            final boolean keyOkFinal = keyOk;
-            final String promptMsgFinal = promptMsg;
-            runOnUiThread(() -> {
-                if (keyOkFinal) {
-                    // key 有效：彻底隐藏这块 UI
+            // ── Root 校验通过后：先探测 APatch / KernelPatch 是否安装 ──
+            // 没有 APatch (无 KPM 通道) → 跳过 superkey 流程, 隐藏 KPM 入口,
+            // 让用户直接使用其他不依赖 KPM 的功能 (Dumper / MemReader / 注入 等).
+            boolean apatchAvail = false;
+            try { apatchAvail = nativeIsApatchAvailable(); }
+            catch (Throwable t) { LogUtil.e("nativeIsApatchAvailable 异常", t); }
+            mApatchAvailable = apatchAvail;
+            LogUtil.i("[ApatchCheck] available=" + apatchAvail);
+
+            if (!apatchAvail) {
+                runOnUiThread(() -> {
                     View layoutKp = findViewById(R.id.layout_kpkey);
                     if (layoutKp != null) layoutKp.setVisibility(View.GONE);
+                    applyNoApatchUi();
                     setMainContentVisible(true);
-                } else {
-                    setMainContentVisible(false);
-                    showKpKeyPrompt(promptMsgFinal);
+                    Toast.makeText(this,
+                            "未检测到 APatch，KPM 反检测功能不可用 (其他功能正常)",
+                            Toast.LENGTH_LONG).show();
+                });
+            } else {
+                // ── 有 APatch: 验证 KernelPatch superkey ──
+                // 唯一真源: /data/data/<pkg>/files/.kp_key (app 私有, 不需 root)。
+                // 缺失或验证失败 → 删除 + 弹输入框。
+                String savedKey = readKpKeyFromFiles();
+                boolean keyOk = false;
+                String promptMsg = "未检测到 Superkey，请输入 APatch Super Key：";
+                if (savedKey != null) {
+                    try { keyOk = nativeValidateKpKey(savedKey); }
+                    catch (Throwable t) { LogUtil.e("nativeValidateKpKey 调用异常", t); }
+                    if (!keyOk) {
+                        deleteKpKeyFile();
+                        promptMsg = "❌ 保存的 Superkey 已失效，请重新输入 APatch Super Key：";
+                    }
                 }
-            });
+                final boolean keyOkFinal = keyOk;
+                final String promptMsgFinal = promptMsg;
+                runOnUiThread(() -> {
+                    if (keyOkFinal) {
+                        // key 有效：彻底隐藏这块 UI
+                        View layoutKp = findViewById(R.id.layout_kpkey);
+                        if (layoutKp != null) layoutKp.setVisibility(View.GONE);
+                        setMainContentVisible(true);
+                    } else {
+                        setMainContentVisible(false);
+                        showKpKeyPrompt(promptMsgFinal);
+                    }
+                });
+            }
 
             boolean selinuxOk = checkSelinuxPermissive();
             boolean inputOk = checkInputPermission();
@@ -676,11 +830,23 @@ public class MainActivity extends AppCompatActivity {
      */
     public native boolean nativeValidateKpKey(String key);
 
+    /**
+     * 探测设备是否安装了 APatch / KernelPatch (KPM 通道是否可用).
+     * 需要设备已 root. 用于决定是否启用 inject-hide / GameKpm 等 KPM 相关功能.
+     */
+    public static native boolean nativeIsApatchAvailable();
+
     // ─── 日志运行时开关 (Java <-> C++ 双向同步) ──────────────────────
     /** 读取 C++ 端 g_runtimeLogEnabled 当前值 (用于初始化 UI) */
     public static native boolean nativeIsLogEnabled();
     /** 把 UI 状态同步到 C++ 端 g_runtimeLogEnabled */
     public static native void nativeSetLogEnabled(boolean enabled);
+
+    /**
+     * Native 层模拟器检测 (system_property + uname + /proc, 难被 Java Hook 干扰).
+     * 返回 "REAL" 表示真机, 否则形如 "EMU|<hit>|<hit>...".
+     */
+    public static native String nativeDetectEmulator();
 
     // ─── KernelPatch Superkey UI / 持久化 ────────────────────────────
     /**
@@ -698,6 +864,18 @@ public class MainActivity extends AppCompatActivity {
                 child.setVisibility(vis);
             }
         }
+    }
+
+    /**
+     * 设备未安装 APatch 时, 把所有依赖 KPM 通道的入口 (InjectHide / GameKpm 高级面板)
+     * 隐藏掉, 避免用户误触后看到一片 "未检测到 Superkey" 错误.
+     * 与 layout_kpkey 一样在 root 检测线程结束的 runOnUiThread 里调用.
+     */
+    private void applyNoApatchUi() {
+        View btnIH = findViewById(R.id.btn_inject_hide);
+        if (btnIH != null) btnIH.setVisibility(View.GONE);
+        View gkSection = findViewById(R.id.section_gk_adv);
+        if (gkSection != null) gkSection.setVisibility(View.GONE);
     }
 
     /**
