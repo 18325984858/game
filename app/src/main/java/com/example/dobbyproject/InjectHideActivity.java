@@ -16,6 +16,13 @@
  *
  * 与内核交互的通道由 InjectHideCtl (JNI) 统一封装，底层通过
  * SUPERCALL_KPM_CONTROL 向 KernelPatch 的 kpm-inject-hide 模块发命令。
+ *
+ * ── APatch 依赖（双轨策略下的"KPM 专属页面"）────────────────────
+ * 本页面的所有功能都是 KernelPatch supercall, 必须有 APatch / KernelPatch
+ * 才能工作. 没有 APatch 的设备, MainActivity 已经把入口按钮 GONE 掉, 用户
+ * 通常进不来; 但万一通过 Intent / 其他路径绕过, onCreate 第一行还会再查
+ * 一次 nativeIsApatchAvailable() 并 finish() 兜底. 不依赖 KPM 的功能
+ * (Dumper / MemReader / 注入) 走 SuShell+常规 root 通道, 不会进本页面.
  */
 package com.example.dobbyproject;
 
@@ -102,8 +109,13 @@ public class InjectHideActivity extends AppCompatActivity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        // ── APatch 兜底闸门 ────────────────────────────────────────
         // 没装 APatch (KPM 通道不可用) 直接退回, 避免后续所有 native 调用都
         // 因 sc_hello 失败而反复弹错.
+        // 双轨策略: MainActivity 启动时若 nativeIsApatchAvailable()=false, 已经
+        // 把入口按钮 (R.id.btn_inject_hide) GONE 掉, 用户正常路径进不来. 这里
+        // 是第二道防线, 防止有人通过 Intent / adb am start / 第三方 launcher
+        // 绕过主页直接拉起本 Activity.
         try {
             if (!MainActivity.nativeIsApatchAvailable()) {
                 Toast.makeText(this, "未检测到 APatch，KPM 功能不可用",
@@ -112,6 +124,7 @@ public class InjectHideActivity extends AppCompatActivity {
                 return;
             }
         } catch (Throwable ignored) {}
+        // 有 APatch 的情况下才需要 superkey: 没 superkey 弹回主页让用户输入.
         if (!KpKeyStore.requireOrRedirect(this)) return;
         setContentView(R.layout.activity_inject_hide);
 
