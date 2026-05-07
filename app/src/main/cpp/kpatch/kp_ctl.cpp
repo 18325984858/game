@@ -115,6 +115,10 @@ static const std::string& get_key() {
 }
 
 static bool sc_hello_ok() {
+    // 没装 APatch / KernelPatch 时直接短路, 避免发一个必然失败的 syscall
+    // 还要打一行 "sc_hello ret=0xfffffff... (expect 0x11581158)" 错误日志.
+    // KpCtl::isAvailable() 内部带缓存, 后续调用零开销.
+    if (!KpCtl::isAvailable()) return false;
     const std::string& key = get_key();
     long ret = syscall(KP_NR_SUPERCALL, key.c_str(), ver_and_cmd(KP_SUPERCALL_HELLO));
     LOG(LOG_LEVEL_INFO, HTAG " sc_hello ret=0x%lx (expect 0x%x) key_len=%zu",
@@ -123,6 +127,12 @@ static bool sc_hello_ok() {
 }
 
 static bool sc_kpm_ctl(const std::string& cmd, std::string* out) {
+    // 没 APatch → 整条链不存在, 不需要构造 16KB resp / 进 syscall.
+    // 直接 false; out 留给调用方默认空串.
+    if (!KpCtl::isAvailable()) {
+        if (out) out->clear();
+        return false;
+    }
     const std::string& key = get_key();
     constexpr size_t RESP_CAP = 16 * 1024;
     std::vector<char> resp(RESP_CAP, 0);
@@ -146,6 +156,11 @@ static bool sc_kpm_ctl(const std::string& cmd, std::string* out) {
 static bool sc_kpm_ctl_module(const std::string& module_name,
                               const std::string& cmd,
                               std::string* out) {
+    // 与 sc_kpm_ctl 同理, 没 APatch 直接短路.
+    if (!KpCtl::isAvailable()) {
+        if (out) out->clear();
+        return false;
+    }
     const std::string& key = get_key();
     constexpr size_t RESP_CAP = 16 * 1024;
     std::vector<char> resp(RESP_CAP, 0);
@@ -222,6 +237,11 @@ bool gameKpmIsLoaded() {
 }
 
 bool loadKpm(const std::string& kpm_path, const std::string& args) {
+    // 无 APatch 时 supercall 不存在, 强行调会让内核返回 ENOSYS 之外的脏值.
+    if (!isAvailable()) {
+        LOG(LOG_LEVEL_WARN, HTAG " loadKpm skipped: APatch not installed");
+        return false;
+    }
     const std::string& key = get_key();
     long ret = syscall(KP_NR_SUPERCALL,
                        key.c_str(),
@@ -234,6 +254,10 @@ bool loadKpm(const std::string& kpm_path, const std::string& args) {
 }
 
 bool unloadKpm(const std::string& kpm_name) {
+    if (!isAvailable()) {
+        LOG(LOG_LEVEL_WARN, HTAG " unloadKpm skipped: APatch not installed");
+        return false;
+    }
     const std::string& key = get_key();
     long ret = syscall(KP_NR_SUPERCALL,
                        key.c_str(),

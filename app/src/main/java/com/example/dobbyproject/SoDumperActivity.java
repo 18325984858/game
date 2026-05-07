@@ -157,7 +157,10 @@ public class SoDumperActivity extends AppCompatActivity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        if (!KpKeyStore.requireOrRedirect(this)) return;
+        // SO Dumper 走常规 root (读远程 /proc/PID/mem + ELF 修复), 不依赖 KPM/superkey.
+        // 同 MemReader: 有 APatch 才走 superkey 检查; 没装 APatch 跳过拦截.
+        if (MainActivity.nativeIsApatchAvailable()
+                && !KpKeyStore.requireOrRedirect(this)) return;
         setContentView(R.layout.activity_so_dumper);
 
         etSearch = findViewById(R.id.et_search);

@@ -110,7 +110,11 @@ public class MemoryReaderActivity extends AppCompatActivity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        if (!KpKeyStore.requireOrRedirect(this)) return;
+        // 本页面使用 process_vm_readv (普通 root 即可), 不依赖 KPM/superkey.
+        // 在装了 APatch 的设备上仍走原有 superkey 闸门 (供 InjectHide 复用);
+        // 没装 APatch 的设备跳过该门, 避免被 "请输入 Super Key" Toast 拦住.
+        if (MainActivity.nativeIsApatchAvailable()
+                && !KpKeyStore.requireOrRedirect(this)) return;
         setContentView(R.layout.activity_memory_reader);
         setTitle("内存读取器");
 

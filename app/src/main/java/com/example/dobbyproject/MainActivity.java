@@ -1,4 +1,4 @@
-﻿/*
+/*
  * ═══════════════════════════════════════════════════════════════════════
  *  DobbyProject - 注入流程说明
  * ═══════════════════════════════════════════════════════════════════════
@@ -458,8 +458,11 @@ public class MainActivity extends AppCompatActivity {
                 runOnUiThread(() -> {
                     View layoutKp = findViewById(R.id.layout_kpkey);
                     if (layoutKp != null) layoutKp.setVisibility(View.GONE);
-                    applyNoApatchUi();
+                    // 顺序: 先 setMainContentVisible(true) 把所有主功能区显示出来,
+                    // 再 applyNoApatchUi() 单独 GONE 掉 KPM 入口. 反过来的话,
+                    // setMainContentVisible 会把刚 GONE 的子 view 全部重置回 VISIBLE.
                     setMainContentVisible(true);
+                    applyNoApatchUi();
                     Toast.makeText(this,
                             "未检测到 APatch，KPM 反检测功能不可用 (其他功能正常)",
                             Toast.LENGTH_LONG).show();
@@ -869,6 +872,10 @@ public class MainActivity extends AppCompatActivity {
     /**
      * 设备未安装 APatch 时, 把所有依赖 KPM 通道的入口 (InjectHide / GameKpm 高级面板)
      * 隐藏掉, 避免用户误触后看到一片 "未检测到 Superkey" 错误.
+     *
+     * 双轨设计: 本函数只隐藏 KPM 专属入口, 不动 SuShell / popen_su 走的
+     * 常规注入路径 (LoL/PUBG/DFM/NRC 启动按钮、Dumper、MemReader、SoDumper).
+     * 为避免误勾选后静默失败, 同时把 PUBG/DFM 的 [反检测] 复选框 disable+取消勾选.
      * 与 layout_kpkey 一样在 root 检测线程结束的 runOnUiThread 里调用.
      */
     private void applyNoApatchUi() {
@@ -876,6 +883,17 @@ public class MainActivity extends AppCompatActivity {
         if (btnIH != null) btnIH.setVisibility(View.GONE);
         View gkSection = findViewById(R.id.section_gk_adv);
         if (gkSection != null) gkSection.setVisibility(View.GONE);
+        // 反检测开关 = GameKpm 内核级 hook, 没 APatch 完全不可能生效. 取消勾选 + disable.
+        int[] antiCheatBoxes = { R.id.cb_pubg_anticheat, R.id.cb_dfm_anticheat };
+        for (int id : antiCheatBoxes) {
+            View v = findViewById(id);
+            if (v instanceof CheckBox) {
+                CheckBox cb = (CheckBox) v;
+                cb.setChecked(false);
+                cb.setEnabled(false);
+                cb.setText(cb.getText() + " (需 APatch)");
+            }
+        }
     }
 
     /**
@@ -1419,6 +1437,14 @@ public class MainActivity extends AppCompatActivity {
             // 启动顺序很重要：preset 先于游戏进程出现，确保 hook 在 zygote fork
             // 出 game tgid 之前已就绪，is_target_current 命中 comm 前缀立即自动
             // 注册 tgid，所有反作弊 syscall 都能被拦截。
+            //
+            // 双保险: applyNoApatchUi() 已经把 cb_pubg/dfm_anticheat disable 了,
+            // 正常路径这里 enableAntiCheat 不可能为 true. 但以防 UI 状态不同步
+            // (例如后台线程还没走完用户提前点击), 这里再查一次 mApatchAvailable.
+            if (enableAntiCheat && presetTag != null && !mApatchAvailable) {
+                LogUtil.i("[GameKpm] preset skipped: APatch not installed");
+                enableAntiCheat = false;
+            }
             if (enableAntiCheat && presetTag != null) {
                 try {
                     String r1 = nativeGameKpmCtl("enable_log");
