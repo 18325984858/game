@@ -308,10 +308,24 @@ public class InjectHideActivity extends AppCompatActivity {
     //（su/magisk/kernelsu/apatch/zygisk/…）注入 hide_so，并启用 file_hide，
     // 从而让 openat/faccessat 对这些路径返回 -ENOENT。关闭时则撤销这些
     // 注入项（不影响用户自行添加的其它 hide_so 关键词）。
+    //
+    // 与本开关联动: SpoofProps (resetprop 改 verified-boot / OEM unlock 属性)
+    //   - 启用时: apply() 先做 snapshot 再改写, 让 __system_property_find
+    //     的 mmap 共享内存路径也看到伪装 (KPM 内核 hook 拦不到这条路径)。
+    //   - 关闭时: restore() 按 snapshot 还原, 不留痕。
+    //   - 失败不影响 KPM 主开关结果, 只 toast 提示。
     private void toggleRootHide() {
         final boolean target = !(curRootHide == 1);
         runNativeAsync((target ? "enable" : "disable") + "_root_hide",
-                () -> target ? nativeEnableRootHide() : nativeDisableRootHide());
+                () -> {
+                    boolean kpmOk = target ? nativeEnableRootHide() : nativeDisableRootHide();
+                    boolean propOk = target ? SpoofProps.apply() : SpoofProps.restore();
+                    if (!propOk) {
+                        runOnUiThread(() -> toast(
+                                "属性伪装 " + (target ? "应用" : "还原") + " 失败 (检查 resetprop)"));
+                    }
+                    return kpmOk;
+                });
     }
     // 系统进程豁免切换：豁免开启时，installd/system_server 等系统
     // UID 直接放行，避免 adb install / am start 被隐藏规则误拦。默认开启。
