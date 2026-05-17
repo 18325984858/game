@@ -477,13 +477,21 @@ public class InjectHideActivity extends AppCompatActivity {
                 //   重启后第一次进入 KPM 管理时, 内核默认 root_hide=on,
                 //   但 SpoofProps / ApatchHide 是非持久化的, 需要在这里补 apply,
                 //   否则 UI 显示"已开启"但 verifiedbootstate / APatch 图标都没动。
-                //   apply 会跑 su 子进程, 必须放到后台线程, 不能阻塞 UI。
+                //
+                //   ⚠ 已停用: 实测在 KPM autoRefresh (unload+load) 之后紧跟 apply
+                //   17 条 ro.* + pm hide 7 个包, 会触发 system_server / zygote /
+                //   apd 的某些异常路径, 导致整机卡死 (用户报告). 现在改为
+                //   "仅在用户手动点 ROOT 隐藏开关" 时才走 toggleRootHide 路径
+                //   触发 SpoofProps / ApatchHide. autoRefresh KPM 本身依然保留,
+                //   它只更新内核模块, 没有用户态副作用。
+                /*
                 final boolean wantSync = (rootHide == 1);
                 new Thread(() -> {
                     boolean did = RootHideGuard.syncOnceFromKernel(wantSync);
                     if (did) runOnUiThread(() -> toast(
                             "已对齐用户态: SpoofProps + pm hide root 管理器"));
                 }, "RootHideGuard-BootSync").start();
+                */
 
                 StringBuilder bar = new StringBuilder();
                 bar.append(fLoaded0 ? "✅ KPM 已加载" : "❌ KPM 未加载");
