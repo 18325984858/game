@@ -141,12 +141,31 @@ public class InjectHideActivity extends AppCompatActivity {
             new Thread(RootHideGuard::recoverIfDirty, "RootHideGuard-Recover").start();
         } catch (Throwable ignored) {}
 
-        // ── 自动升级 KPM ──────────────────────────────────────
-        //   比较 assets/svc.kpm 与开机自动加载的 /data/adb/svc.kpm 是否一致;
-        //   不一致说明用户升级了 game, 但 boot 时加载的还是旧版 (没有最新
-        //   的 root_kw 关键字, 比如 "/debug_ramdisk" 等)。静默 reload 新版,
-        //   并把 /data/adb/svc.kpm 同步替换, 下次开机直接用新版。
-        try { autoRefreshKpmIfStale(); } catch (Throwable ignored) {}
+        // ── ⚠ KPM 自动升级已禁用 ──────────────────────────────────
+        //   原本进 InjectHide 会调 autoRefreshKpmIfStale() 强制 unload + load
+        //   kpm-svc, 让 boot.img 烧入的旧版被换成 assets 里的新版。
+        //
+        //   2026-05-17 实测 kernel panic, last_kmsg 显示:
+        //     KP: Oops - Undefined instruction: Fatal exception:
+        //       comm: Health-trigger-
+        //       PC: 0xfffffff65d2054d0   <- 内核模块 (kpm-svc) 代码段
+        //       LR: 0xfffffff65d2053c0
+        //     Reboot reason: 0xbaba - Kernel PANIC
+        //
+        //   原因: nativeKpmUnload("kpm-svc") 把 KPM 占的 inline-hook trampoline
+        //   释放掉, 但 Pixel vendor 内核线程 Health-trigger- 当时正在被 hook
+        //   的 syscall 路径里执行 -> 跳进已释放代码 -> Undefined instruction.
+        //   inline-hook 没法对其他 CPU 上正在跑 trampoline 的内核线程做引用计数,
+        //   force unload+load 在多线程内核里本质上是 unsafe 操作。
+        //
+        //   修复策略: KPM 加载与卸载必须由用户显式触发 ("安装 KPM" / "卸载 KPM"
+        //   按钮, 走 installKpmSvc / doUninstallKpmSvcOnly). 用户操作前已经看到
+        //   GameKpm 状态, 风险自负。进入页面时绝不静默 reload。
+        //
+        //   如果 game asset 里的 svc.kpm 比内核里加载的版本新, 用户可以在 UI
+        //   上看到 root_kw_count 数值, 自行决定是否手动 "卸载 KPM" + "安装 KPM"
+        //   完成升级 (建议先把当前应用退掉, 避免 hook 中触发上述 panic)。
+        // try { autoRefreshKpmIfStale(); } catch (Throwable ignored) {}
 
         tvStatus       = findViewById(R.id.ih_tv_status);
         tvRawResp      = findViewById(R.id.ih_tv_raw_resp);
