@@ -348,40 +348,17 @@ public class InjectHideActivity extends AppCompatActivity {
     };
     private void toggleRootHide() {
         final boolean target = !(curRootHide == 1);
+        // 全部步骤收敛到 RootHideOrchestrator。所有"打开 root 隐藏要做什么、
+        // 关闭时要还原什么"的真相只此一份, 保证 toggle / uninstall KPM /
+        // 异常守护三条触发路径走同一份代码, 不会出现"开过的东西关时漏还原"。
         runNativeAsync((target ? "enable" : "disable") + "_root_hide",
                 () -> {
-                    boolean kpmOk = target ? nativeEnableRootHide() : nativeDisableRootHide();
-                     boolean propOk = target ? SpoofProps.apply() : SpoofProps.restore();
-                    if (!propOk) {
-                        runOnUiThread(() -> toast(
-                                "属性伪装 " + (target ? "应用" : "还原") + " 失败 (检查 resetprop)"));
-                    }
-                    // hide_pkg 联动: 启用时把所有 root 管理器包名加进去, 关闭时移除。
-                    int pkgChanged = 0;
-                    for (String p : ROOT_MGR_PKGS) {
-                        try {
-                            boolean ok = target ? nativeAddHidePkg(p) : nativeRemoveHidePkg(p);
-                            if (ok) pkgChanged++;
-                        } catch (Throwable ignored) {}
-                    }
-                    final int finalChanged = pkgChanged;
-                    runOnUiThread(() -> toast((target ? "联动添加 " : "联动移除 ")
-                            + finalChanged + " 个 root 管理器包名到 hide_pkg"));
-                    // PackageManager 默认结果联动: pm hide / pm unhide
-                    //   击败 reveny v7.7.0 等用 pm.getInstalledPackages(0) 的检测。
-                    //   hide 期间 APatch Manager 桌面图标消失, 但 APatch 内核补丁
-                    //   和 game 的 KPM 通道完全不受影响 (走 supercall, 不依赖 pm)。
-                    int pmChanged = target ? ApatchHide.apply() : ApatchHide.restore();
-                    final int finalPm = pmChanged;
+                    boolean ok = target ? RootHideOrchestrator.applyAll()
+                                        : RootHideOrchestrator.restoreAll();
                     runOnUiThread(() -> toast(
-                            (target ? "已 pm hide " : "已 pm unhide ") + finalPm + " 个 root 管理器包"));
-                    // 脏标记: 启用成功后写, 关闭成功后删。
-                    //   下次启动若发现脏标记残留 (说明上次没干净退出) 会自动 restore。
-                    try {
-                        if (target) RootHideGuard.armDirtyFlag();
-                        else        RootHideGuard.disarmDirtyFlag();
-                    } catch (Throwable ignored) {}
-                    return kpmOk;
+                            (target ? "Root 隐藏已启用" : "Root 隐藏已关闭")
+                                    + (ok ? "" : " (部分子步骤失败, 看 logcat)")));
+                    return ok;
                 });
     }
     // 系统进程豁免切换：豁免开启时，installd/system_server 等系统
@@ -1050,16 +1027,20 @@ public class InjectHideActivity extends AppCompatActivity {
         doUninstallKpmSvcOnly();
     }
 
-    /** 顺序卸载 game-kpm → kpm-svc */
+    /** 顺序卸载 game-kpm → kpm-svc。卸载前先 restoreAll 还原用户态 (resetprop / pm unhide), 避免 KPM 卸了之后 raw ctl 没法发, 留下系统不一致。 */
     private void doCascadeUninstall() {
         new Thread(() -> {
+            // 卸 KPM 之前先 restoreAll: 这一步必须在 raw ctl 还能用时跑,
+            // 否则 disable_root_hide / remove_hide_pkg 都会失败。
+            try { RootHideOrchestrator.restoreAll(); } catch (Throwable ignored) {}
             boolean okGk = false, okSvc = false;
             try { okGk = nativeKpmUnload("game-kpm"); } catch (Throwable ignored) {}
             try { okSvc = nativeKpmUnload("kpm-svc"); } catch (Throwable ignored) {}
             final boolean okGkF = okGk, okSvcF = okSvc;
             runOnUiThread(() -> {
                 Toast.makeText(this,
-                    "GameKpm: " + (okGkF ? "✅" : "❌") + "  |  kpm-svc: " + (okSvcF ? "✅" : "❌"),
+                    "已还原 Root 环境  |  GameKpm: " + (okGkF ? "✅" : "❌")
+                            + "  |  kpm-svc: " + (okSvcF ? "✅" : "❌"),
                     Toast.LENGTH_LONG).show();
                 refreshAll();
             });
@@ -1068,13 +1049,17 @@ public class InjectHideActivity extends AppCompatActivity {
 
     private void doUninstallKpmSvcOnly() {
         new Thread(() -> {
+            // 卸 KPM 之前先 restoreAll: SpoofProps 写回真实值、pm unhide
+            // root 管理器、撤 hide_pkg / disable_root_hide。
+            try { RootHideOrchestrator.restoreAll(); } catch (Throwable ignored) {}
             boolean ok;
             try { ok = nativeKpmUnload("kpm-svc"); }
             catch (Throwable t) { ok = false; }
             final boolean okFinal = ok;
             runOnUiThread(() -> {
                 Toast.makeText(this,
-                    okFinal ? "✅ kpm-svc 已卸载" : "❌ 卸载失败 (未加载？)",
+                    okFinal ? "✅ 已还原环境并卸载 kpm-svc"
+                            : "❌ 还原已尝试; kpm-svc 卸载失败 (未加载?)",
                     Toast.LENGTH_LONG).show();
                 refreshAll();
             });

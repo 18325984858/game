@@ -173,19 +173,12 @@ public final class RootHideGuard {
         if (!bootSyncDone.compareAndSet(false, true)) return false;
 
         Log.i(TAG, "syncOnceFromKernel: kernel root_hide=on but userspace empty → applying");
-        Log.i(TAG, "  step1 SpoofProps.apply ...");
-        try { SpoofProps.apply(); } catch (Throwable t) { Log.w(TAG, "SpoofProps.apply", t); }
-        Log.i(TAG, "  step2 ApatchHide.apply ...");
-        try { ApatchHide.apply(); } catch (Throwable t) { Log.w(TAG, "ApatchHide.apply", t); }
-        Log.i(TAG, "  step3 add_hide_pkg ...");
         try {
-            for (String p : InjectHideActivity.ROOT_MGR_PKGS) {
-                try { nativeRawCtl("add_hide_pkg:" + p); } catch (Throwable ignored) {}
-            }
-        } catch (Throwable t) { Log.w(TAG, "add_hide_pkg", t); }
-        Log.i(TAG, "  step4 armDirtyFlag ...");
-        try { armDirtyFlag(); } catch (Throwable t) { Log.w(TAG, "armDirtyFlag", t); }
-        Log.i(TAG, "syncOnceFromKernel: done");
+            boolean ok = RootHideOrchestrator.applyAll();
+            Log.i(TAG, "syncOnceFromKernel: RootHideOrchestrator.applyAll -> " + ok);
+        } catch (Throwable t) {
+            Log.w(TAG, "syncOnceFromKernel: applyAll failed", t);
+        }
         return true;
     }
 
@@ -196,29 +189,15 @@ public final class RootHideGuard {
         return exists[0];
     }
 
-    /** 真正的清理动作。每一步独立 try/catch, 互不影响。 */
+    /** 真正的清理动作。委托给 RootHideOrchestrator.restoreAll, 保证跟用户
+     *  手动关闭 ROOT 隐藏走同一份代码。每一子步骤独立 try/catch。 */
     private static void doRestore(String reason) {
         Log.i(TAG, "doRestore reason=" + reason);
-
-        // ① 关掉 KPM root_hide (撤销 root_kw 注入 + file_hide)
-        try { Log.i(TAG, "rawCtl disable_root_hide -> " + nativeRawCtl("disable_root_hide")); }
-        catch (Throwable t) { Log.w(TAG, "disable root_hide failed", t); }
-
-        // ② 撤销 hide_pkg 里的 root 管理器
         try {
-            for (String p : InjectHideActivity.ROOT_MGR_PKGS) {
-                try { nativeRawCtl("remove_hide_pkg:" + p); } catch (Throwable ignored2) {}
-            }
-        } catch (Throwable t) { Log.w(TAG, "remove hide_pkg failed", t); }
-
-        // ③ 还原 verified-boot / OEM unlock 属性
-        try { SpoofProps.restore(); } catch (Throwable t) {
-            Log.w(TAG, "SpoofProps.restore failed", t);
-        }
-
-        // ④ pm unhide root 管理器, 让 launcher 图标回来
-        try { ApatchHide.restore(); } catch (Throwable t) {
-            Log.w(TAG, "ApatchHide.restore failed", t);
+            boolean ok = RootHideOrchestrator.restoreAll();
+            Log.i(TAG, "doRestore RootHideOrchestrator.restoreAll -> " + ok);
+        } catch (Throwable t) {
+            Log.w(TAG, "doRestore RootHideOrchestrator.restoreAll failed", t);
         }
     }
 
