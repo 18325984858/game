@@ -203,6 +203,16 @@ Java_com_example_dobbyproject_MainActivity_nativeKpmRawCtl(JNIEnv* env, jobject,
     return env->NewStringUTF(r.c_str());
 }
 
+// ─── RootHideGuard 异常守护用的直通入口 ──
+//   异常清理路径不依赖 Activity 实例, 单独走 raw ctl 文本命令更解耦。
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_example_dobbyproject_RootHideGuard_nativeRawCtl(JNIEnv* env, jobject, jstring jCmd) {
+    std::string out;
+    bool ok = KpCtl::rawCtl(jstr(env, jCmd), &out);
+    std::string r = (ok ? "OK: " : "FAIL: ") + out;
+    return env->NewStringUTF(r.c_str());
+}
+
 // ─── GameKpm 反作弊 KPM 桥（com.tencent.tmgp.dfm / pubgmhd）──
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_example_dobbyproject_MainActivity_nativeGameKpmCtl(JNIEnv* env, jobject, jstring jCmd) {

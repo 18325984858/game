@@ -128,6 +128,16 @@ public class InjectHideActivity extends AppCompatActivity {
         if (!KpKeyStore.requireOrRedirect(this)) return;
         setContentView(R.layout.activity_inject_hide);
 
+        // ── Root 隐藏异常守护 ──────────────────────────────────────
+        //   ① 装链式 UncaughtExceptionHandler + JVM shutdown hook;
+        //   ② 检查 /data/local/tmp/dobby_roothide.dirty: 若上一次启用 root hide
+        //      后 Java 进程没干净退出 (crash / swipe / OOM kill), 本次启动
+        //      自动 SpoofProps.restore + pm unhide + disable_root_hide, 抹掉脏数据。
+        try {
+            RootHideGuard.install();
+            new Thread(RootHideGuard::recoverIfDirty, "RootHideGuard-Recover").start();
+        } catch (Throwable ignored) {}
+
         tvStatus       = findViewById(R.id.ih_tv_status);
         tvRawResp      = findViewById(R.id.ih_tv_raw_resp);
         etSo           = findViewById(R.id.ih_et_so);
@@ -320,7 +330,7 @@ public class InjectHideActivity extends AppCompatActivity {
     //   从而在 /proc/<pid>、ps、/proc/<pid>/cmdline 中"消失"。
     //   注意: 这只能拦 *枚举进程* 类检测; "pm.getInstalledPackages()" 走 Binder
     //   到 system_server 内存查表, KPM 拦不到, 仍需要"改 APatch 包名 / HMA"。
-    private static final String[] ROOT_MGR_PKGS = new String[] {
+    static final String[] ROOT_MGR_PKGS = new String[] {
             "me.bmax.apatch",                  // APatch
             "com.topjohnwu.magisk",            // Magisk
             "io.github.huskydg.magisk",        // Magisk Delta
@@ -358,6 +368,12 @@ public class InjectHideActivity extends AppCompatActivity {
                     final int finalPm = pmChanged;
                     runOnUiThread(() -> toast(
                             (target ? "已 pm hide " : "已 pm unhide ") + finalPm + " 个 root 管理器包"));
+                    // 脏标记: 启用成功后写, 关闭成功后删。
+                    //   下次启动若发现脏标记残留 (说明上次没干净退出) 会自动 restore。
+                    try {
+                        if (target) RootHideGuard.armDirtyFlag();
+                        else        RootHideGuard.disarmDirtyFlag();
+                    } catch (Throwable ignored) {}
                     return kpmOk;
                 });
     }
