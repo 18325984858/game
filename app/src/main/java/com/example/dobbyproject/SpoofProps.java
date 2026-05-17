@@ -30,8 +30,9 @@ public final class SpoofProps {
 
     private static final String TAG = "SpoofProps";
 
-    /** snapshot 文件路径, 用 /data/local/tmp 避开 SELinux. */
-    private static final String SNAPSHOT = "/data/local/tmp/spoof_props.snapshot";
+    /** snapshot 路径由 RootHidePaths 提供 (默认 <filesDir>/roothide/spoof_props.snapshot,
+     *  未 init 时退化 /data/local/tmp/spoof_props.snapshot)。 */
+    private static String snapshotPath() { return RootHidePaths.spoofSnapshot(); }
 
     /**
      * 需要伪装的属性列表; null 值表示需要 --delete (锁定设备本不该有的属性).
@@ -62,8 +63,27 @@ public final class SpoofProps {
         {"ro.oem_unlock_supported",         null},
     };
 
-    /** 启用属性伪装。返回 true 表示 su 退出码为 0。 */
+    /** 启用属性伪装。snapshot 由 SecureFile 加密落盘到 App 私有目录。 */
     public static boolean apply() {
+        // 1) 先用 Java 侧 getprop 读出每个属性的真值, 写入加密 snapshot;
+        //    仅当 snapshot 不存在时写, 避免重复 apply 把已伪装值当真值留底。
+        if (!com.example.dobbyproject.io.SecureFile.exists(snapshotPath())) {
+            StringBuilder probe = new StringBuilder("set +e\n");
+            for (String[] kv : SPOOF) {
+                probe.append("printf '%s=' \"").append(kv[0]).append("\"; getprop ")
+                     .append(kv[0]).append("; echo\n");
+            }
+            final StringBuilder snap = new StringBuilder();
+            SuShell.runWithLines(probe.toString(), line -> {
+                if (line == null) return;
+                int eq = line.indexOf('=');
+                if (eq <= 0) return;
+                snap.append(line).append('\n');
+            });
+            com.example.dobbyproject.io.SecureFile.writeText(snapshotPath(), snap.toString());
+        }
+
+        // 2) 跑 resetprop 应用伪装
         StringBuilder sh = new StringBuilder();
         sh.append("set -u\n");
         sh.append("RP=\"\"; for p in /data/adb/ap/bin/resetprop ")
@@ -72,23 +92,6 @@ public final class SpoofProps {
         sh.append("if [ -z \"$RP\" ]; then ")
           .append("echo \"[").append(TAG).append("] resetprop not found\" 1>&2; ")
           .append("exit 2; fi\n");
-
-        // 1) 写 snapshot (仅当不存在时), 以避免重复 apply 把已伪装的值当真值保存
-        sh.append("SNAP=").append(SNAPSHOT).append("\n");
-        sh.append("if [ ! -f \"$SNAP\" ]; then\n");
-        sh.append("  : > \"$SNAP.tmp\"\n");
-        for (String[] kv : SPOOF) {
-            String key = kv[0];
-            // base64 编码当前值, 防止特殊字符 / 多行 break shell
-            sh.append("  V=$(getprop ").append(key).append(" 2>/dev/null)\n");
-            sh.append("  B=$(printf %s \"$V\" | base64 -w0 2>/dev/null || printf %s \"$V\" | base64)\n");
-            sh.append("  echo \"").append(key).append("=$B\" >> \"$SNAP.tmp\"\n");
-        }
-        sh.append("  mv \"$SNAP.tmp\" \"$SNAP\"\n");
-        sh.append("  chmod 600 \"$SNAP\"\n");
-        sh.append("fi\n");
-
-        // 2) 应用伪装
         for (String[] kv : SPOOF) {
             String key = kv[0];
             String val = kv[1];
@@ -99,13 +102,14 @@ public final class SpoofProps {
             }
         }
         sh.append("echo \"[").append(TAG).append("] apply done\"\n");
-
         int rc = SuShell.run(sh.toString());
         return rc == 0;
     }
 
-    /** 关闭属性伪装。按 snapshot 还原; 没有 snapshot 时退化为 --delete 全部伪装项。 */
+    /** 关闭属性伪装。snapshot 走 SecureFile 解密读取后跑 resetprop 还原。 */
     public static boolean restore() {
+        String snapText = com.example.dobbyproject.io.SecureFile.readText(snapshotPath());
+
         StringBuilder sh = new StringBuilder();
         sh.append("set -u\n");
         sh.append("RP=\"\"; for p in /data/adb/ap/bin/resetprop ")
@@ -115,34 +119,33 @@ public final class SpoofProps {
           .append("echo \"[").append(TAG).append("] resetprop not found\" 1>&2; ")
           .append("exit 2; fi\n");
 
-        sh.append("SNAP=").append(SNAPSHOT).append("\n");
-        // 无 snapshot: 直接 --delete 所有伪装项; 让属性回到 "不存在/由 init 重新填"
-        sh.append("if [ ! -f \"$SNAP\" ]; then\n");
-        for (String[] kv : SPOOF) {
-            sh.append("  \"$RP\" --delete ").append(kv[0]).append(" 2>/dev/null\n");
+        if (snapText == null || snapText.isEmpty()) {
+            // 无 snapshot: 一律 --delete (让 init 重新填或回到不存在)
+            for (String[] kv : SPOOF) {
+                sh.append("\"$RP\" --delete ").append(kv[0]).append(" 2>/dev/null\n");
+            }
+            sh.append("echo \"[").append(TAG).append("] restore (no snapshot) done\"\n");
+            int rc = SuShell.run(sh.toString());
+            return rc == 0;
         }
-        sh.append("  echo \"[").append(TAG).append("] restore (no snapshot) done\"\n");
-        sh.append("  exit 0\n");
-        sh.append("fi\n");
 
-        // 有 snapshot: 逐行恢复
-        sh.append("while IFS='=' read -r K B; do\n");
-        sh.append("  [ -z \"$K\" ] && continue\n");
-        sh.append("  if [ -z \"$B\" ]; then\n");
-        sh.append("    \"$RP\" --delete \"$K\" 2>/dev/null\n");
-        sh.append("  else\n");
-        sh.append("    V=$(printf %s \"$B\" | base64 -d 2>/dev/null)\n");
-        sh.append("    if [ -z \"$V\" ]; then\n");
-        sh.append("      \"$RP\" --delete \"$K\" 2>/dev/null\n");
-        sh.append("    else\n");
-        sh.append("      \"$RP\" -n \"$K\" \"$V\"\n");
-        sh.append("    fi\n");
-        sh.append("  fi\n");
-        sh.append("done < \"$SNAP\"\n");
-        sh.append("rm -f \"$SNAP\"\n");
+        // 解密后按 key=val 逐行恢复
+        for (String line : snapText.split("\n")) {
+            int eq = line.indexOf('=');
+            if (eq <= 0) continue;
+            String k = line.substring(0, eq).trim();
+            String v = line.substring(eq + 1).trim();
+            if (k.isEmpty()) continue;
+            if (v.isEmpty()) {
+                sh.append("\"$RP\" --delete ").append(k).append(" 2>/dev/null\n");
+            } else {
+                sh.append("\"$RP\" -n ").append(k).append(" ").append(shellQuote(v)).append("\n");
+            }
+        }
         sh.append("echo \"[").append(TAG).append("] restore done\"\n");
-
         int rc = SuShell.run(sh.toString());
+        // 还原完成后 snapshot 文件不再需要, 删除
+        com.example.dobbyproject.io.SecureFile.delete(snapshotPath());
         return rc == 0;
     }
 

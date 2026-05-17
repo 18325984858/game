@@ -77,4 +77,23 @@ public final class ApatchHide {
         });
         return count[0];
     }
+
+    /** 单包 pm hide。包不存在时返回 false; 已经 hidden 也返回 true (幂等)。 */
+    public static boolean applyOne(String pkg) { return one(pkg, true); }
+    /** 单包 pm unhide。 */
+    public static boolean restoreOne(String pkg) { return one(pkg, false); }
+
+    private static boolean one(String pkg, boolean hide) {
+        if (pkg == null || pkg.isEmpty()) return false;
+        String op = hide ? "hide" : "unhide";
+        String sh = "if pm list packages -u " + pkg
+                + " 2>/dev/null | grep -q \"^package:" + pkg + "$\"; then\n"
+                + "  pm " + op + " " + pkg + " >/dev/null 2>&1 && echo 1\n"
+                + "fi";
+        final boolean[] ok = {false};
+        SuShell.runWithLines(sh, line -> {
+            if (line != null && line.trim().equals("1")) ok[0] = true;
+        });
+        return ok[0];
+    }
 }

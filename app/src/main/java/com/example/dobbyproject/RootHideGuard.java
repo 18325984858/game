@@ -39,9 +39,10 @@ public final class RootHideGuard {
 
     private static final String TAG = "RootHideGuard";
 
-    /** snapshot 文件路径, 用 /data/local/tmp 避开 SELinux. */
-    private static final String DIRTY_FLAG = "/data/local/tmp/dobby_roothide.dirty";
-    private static final String SPOOF_SNAPSHOT = "/data/local/tmp/spoof_props.snapshot";
+    /** 路径都由 RootHidePaths 提供。默认 App 私有目录, 未 init() 时
+     *  退化到 /data/local/tmp 以保证旧部署能恢复。 */
+    private static String dirtyFlag()     { return RootHidePaths.dirtyFlag(); }
+    private static String spoofSnapshot() { return RootHidePaths.spoofSnapshot(); }
 
     private static volatile boolean installed = false;
     private static final java.util.concurrent.atomic.AtomicBoolean bootSyncDone =
@@ -50,26 +51,22 @@ public final class RootHideGuard {
     /** 标记 root hide 已启用; 任意一处异常退出后, 下次启动会自动 restore。 */
     public static void armDirtyFlag() {
         int pid = android.os.Process.myPid();
-        // 用 su 写, 避免 SELinux 拒绝普通 App 写 /data/local/tmp
-        SuShell.run("echo " + pid + " > " + DIRTY_FLAG + " && chmod 644 " + DIRTY_FLAG);
+        com.example.dobbyproject.io.SecureFile.writeText(dirtyFlag(), String.valueOf(pid));
     }
 
     /** root hide 已干净关闭, 抹掉脏标记。 */
     public static void disarmDirtyFlag() {
-        SuShell.run("rm -f " + DIRTY_FLAG);
+        com.example.dobbyproject.io.SecureFile.delete(dirtyFlag());
     }
 
     /**
      * 应用启动早期调用。若发现脏标记 PID 不属于本进程 → 上轮没干净退出 → 还原。
      */
     public static void recoverIfDirty() {
-        StringBuilder sb = new StringBuilder();
-        SuShell.runWithLines("cat " + DIRTY_FLAG + " 2>/dev/null", line -> {
-            if (line != null) sb.append(line.trim());
-        });
-        String text = sb.toString().trim();
+        String text = com.example.dobbyproject.io.SecureFile.readText(dirtyFlag());
+        if (text != null) text = text.trim();
         Log.i(TAG, "recoverIfDirty read flag='" + text + "' pid=" + android.os.Process.myPid());
-        if (text.isEmpty()) return;
+        if (text == null || text.isEmpty()) return;
         int oldPid;
         try { oldPid = Integer.parseInt(text); } catch (NumberFormatException e) {
             Log.w(TAG, "recoverIfDirty bad flag content: " + text);
@@ -163,7 +160,8 @@ public final class RootHideGuard {
 
         // 已经 armed 过 (snapshot 已存在或 dirty flag 存在) → 这一轮 boot 已经同步过,
         // 不要重复 apply (会用已伪装值覆盖 snapshot)。
-        if (fileExistsAsRoot(DIRTY_FLAG) || fileExistsAsRoot(SPOOF_SNAPSHOT)) {
+        if (com.example.dobbyproject.io.SecureFile.exists(dirtyFlag())
+                || com.example.dobbyproject.io.SecureFile.exists(spoofSnapshot())) {
             Log.i(TAG, "syncOnceFromKernel: already armed (dirty/snapshot present), skip");
             // 这种情况也要消费 token, 避免下一次 refreshAll 重复探测。
             bootSyncDone.set(true);

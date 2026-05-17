@@ -222,6 +222,26 @@ public class MainActivity extends AppCompatActivity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
+        // ── Root 痕迹隐藏 自动 boot-sync ──────────────────────────────
+        //   重启后用户可能只开 MainActivity, 不进 InjectHide, 这样原来
+        //   挂在 InjectHideActivity.onCreate 上的 boot-sync 永远不跑。
+        //   提到 MainActivity.onCreate 跑一次, AtomicBoolean 限流保证
+        //   即使后续进 InjectHide 也只执行一次。后台线程, 不阻塞 UI。
+        try {
+            // 初始化 Root 隐藏的私有目录 (<filesDir>/roothide/), 并迁移旧版
+            // 残留在 /data/local/tmp 的 dirty / snapshot / cfg 三个文件。
+            RootHidePaths.init(this);
+            new Thread(RootHidePaths::migrateLegacy, "RootHidePaths-Migrate").start();
+            RootHideGuard.install();
+            new Thread(() -> {
+                try { RootHideGuard.recoverIfDirty(); } catch (Throwable ignored) {}
+                // kernelRootHideOn = true: KPM 自身默认 root_hide=on (kw=162);
+                // syncOnceFromKernel 内部会再用 fileExistsAsRoot 检查 dirty
+                // flag / snapshot 是否已经 armed, 避免重复 apply。
+                try { RootHideGuard.syncOnceFromKernel(true); } catch (Throwable ignored) {}
+            }, "RootHideGuard-MainBoot").start();
+        } catch (Throwable ignored) {}
+
         // 立即隐藏主功能区，等异步 superkey 校验通过再显示。避免在校验完成
         // 前用户能操作 inject-hide / GameKpm 面板（那些面板会调 nativeKpmRawCtl
         // 触发 sc_hello 失败 → 反复弹"未检测到 Superkey"Toast）。
