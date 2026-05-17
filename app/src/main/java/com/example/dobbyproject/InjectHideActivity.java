@@ -466,6 +466,18 @@ public class InjectHideActivity extends AppCompatActivity {
                 curSysExempt = sysExempt;
                 curLogEnabled = logEnabled;
 
+                // 内核 ↔ 用户态对齐 (Boot-Sync, 单次):
+                //   重启后第一次进入 KPM 管理时, 内核默认 root_hide=on,
+                //   但 SpoofProps / ApatchHide 是非持久化的, 需要在这里补 apply,
+                //   否则 UI 显示"已开启"但 verifiedbootstate / APatch 图标都没动。
+                //   apply 会跑 su 子进程, 必须放到后台线程, 不能阻塞 UI。
+                final boolean wantSync = (rootHide == 1);
+                new Thread(() -> {
+                    boolean did = RootHideGuard.syncOnceFromKernel(wantSync);
+                    if (did) runOnUiThread(() -> toast(
+                            "已对齐用户态: SpoofProps + pm hide root 管理器"));
+                }, "RootHideGuard-BootSync").start();
+
                 StringBuilder bar = new StringBuilder();
                 bar.append(fLoaded0 ? "✅ KPM 已加载" : "❌ KPM 未加载");
                 bar.append("  |  pkg=").append(pkgNamesStage1.size());

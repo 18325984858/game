@@ -39,10 +39,13 @@ public final class RootHideGuard {
 
     private static final String TAG = "RootHideGuard";
 
-    /** 脏标记: 上一次 enable_root_hide 留下的"还没干净退出"凭证。内容是当时的 PID。 */
+    /** snapshot 文件路径, 用 /data/local/tmp 避开 SELinux. */
     private static final String DIRTY_FLAG = "/data/local/tmp/dobby_roothide.dirty";
+    private static final String SPOOF_SNAPSHOT = "/data/local/tmp/spoof_props.snapshot";
 
     private static volatile boolean installed = false;
+    private static final java.util.concurrent.atomic.AtomicBoolean bootSyncDone =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
 
     /** 标记 root hide 已启用; 任意一处异常退出后, 下次启动会自动 restore。 */
     public static void armDirtyFlag() {
@@ -65,9 +68,13 @@ public final class RootHideGuard {
             if (line != null) sb.append(line.trim());
         });
         String text = sb.toString().trim();
+        Log.i(TAG, "recoverIfDirty read flag='" + text + "' pid=" + android.os.Process.myPid());
         if (text.isEmpty()) return;
         int oldPid;
-        try { oldPid = Integer.parseInt(text); } catch (NumberFormatException e) { return; }
+        try { oldPid = Integer.parseInt(text); } catch (NumberFormatException e) {
+            Log.w(TAG, "recoverIfDirty bad flag content: " + text);
+            return;
+        }
 
         int curPid = android.os.Process.myPid();
         if (oldPid == curPid) {
@@ -128,6 +135,52 @@ public final class RootHideGuard {
         } catch (IllegalStateException ignored) {
             // 已在 shutdown 阶段, 忽略
         }
+    }
+
+    /**
+     * 内核 ↔ 用户态对齐 (Boot-Sync): 每个进程仅跑一次。
+     *
+     * 场景: 手机重启后, KPM 自身重新加载 → root_hide_enabled 默认 1
+     *       (root_kw_count=161). 但用户态那两层 (SpoofProps 改 verified-boot 属性、
+     *       ApatchHide pm hide root 管理器) 都是非持久化的, 重启就丢。
+     *       结果用户进 KPM 管理页, 看到 "Root 痕迹隐藏: 已开启" 但 verifiedbootstate
+     *       还是 orange, APatch 图标也还在, 跟 UI 显示完全不一致。
+     *
+     * 本方法在 refreshAll 第一次拿到内核状态后调用:
+     *   - kernelRootHideOn == true 且 dirty flag / snapshot 都不存在
+     *     → 重启后首次进入, 自动 apply 用户态两层 + add_hide_pkg + arm dirty flag;
+     *   - 其它情况 (用户已手动关过 / 本轮已 armed) 不动, 避免污染 snapshot。
+     *
+     * @return 是否真的执行了 apply 动作; UI 可据此 toast。
+     */
+    public static boolean syncOnceFromKernel(boolean kernelRootHideOn) {
+        if (!bootSyncDone.compareAndSet(false, true)) return false;
+        if (!kernelRootHideOn) return false;
+
+        // 已经 armed 过 (snapshot 已存在或 dirty flag 存在) → 这一轮 boot 已经同步过,
+        // 不要重复 apply (会用已伪装值覆盖 snapshot)。
+        if (fileExistsAsRoot(DIRTY_FLAG) || fileExistsAsRoot(SPOOF_SNAPSHOT)) {
+            Log.i(TAG, "syncOnceFromKernel: already armed (dirty/snapshot present), skip");
+            return false;
+        }
+
+        Log.i(TAG, "syncOnceFromKernel: kernel root_hide=on but userspace empty → applying");
+        try { SpoofProps.apply(); } catch (Throwable t) { Log.w(TAG, "SpoofProps.apply", t); }
+        try { ApatchHide.apply(); } catch (Throwable t) { Log.w(TAG, "ApatchHide.apply", t); }
+        try {
+            for (String p : InjectHideActivity.ROOT_MGR_PKGS) {
+                try { nativeRawCtl("add_hide_pkg:" + p); } catch (Throwable ignored) {}
+            }
+        } catch (Throwable t) { Log.w(TAG, "add_hide_pkg", t); }
+        try { armDirtyFlag(); } catch (Throwable t) { Log.w(TAG, "armDirtyFlag", t); }
+        return true;
+    }
+
+    private static boolean fileExistsAsRoot(String path) {
+        final boolean[] exists = {false};
+        SuShell.runWithLines("[ -e " + path + " ] && echo yes",
+                line -> { if (line != null && line.trim().equals("yes")) exists[0] = true; });
+        return exists[0];
     }
 
     /** 真正的清理动作。每一步独立 try/catch, 互不影响。 */
