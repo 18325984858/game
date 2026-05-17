@@ -942,7 +942,7 @@ public class InjectHideActivity extends AppCompatActivity {
         if (!kpmAutoRefreshDone.compareAndSet(false, true)) return;
         new Thread(() -> {
             try {
-                // 1) 把 asset 写到 app 私有目录, 顺便算 md5
+                // 1) 把 asset 写到 app 私有目录
                 java.io.File asset = new java.io.File(getFilesDir(), "svc.kpm");
                 String err = copyAssetToFile("svc.kpm", asset);
                 if (err != null) {
@@ -952,24 +952,20 @@ public class InjectHideActivity extends AppCompatActivity {
                 String assetMd5 = md5OfFile(asset);
                 if (assetMd5 == null) return;
 
-                // 2) 读 /data/adb/svc.kpm 的 md5 (没有就视为不同)
-                final String[] bootMd5Holder = {""};
-                SuShell.runWithLines("md5sum /data/adb/svc.kpm 2>/dev/null | awk '{print $1}'",
-                        line -> { if (line != null && !line.trim().isEmpty()) bootMd5Holder[0] = line.trim(); });
-                String bootMd5 = bootMd5Holder[0];
-
-                if (assetMd5.equalsIgnoreCase(bootMd5)) {
-                    android.util.Log.i("InjectHide", "autoRefreshKpm: in-sync md5=" + assetMd5);
-                    return;
-                }
-                android.util.Log.w("InjectHide", "autoRefreshKpm: stale  asset=" + assetMd5
-                        + "  boot=" + bootMd5 + " → reloading");
-
-                // 3) 同步内核 + 覆盖 boot 副本
+                // 2) APatch boot 加载的 KPM 来自 boot.img 里内置的版本 (kpimg, 0.003s
+                //    极早期 succeed, 无 load_module_path), **不是** /data/adb/svc.kpm。
+                //    所以仅比 /data/adb 副本的 hash 是不够的: 那个副本即使是新版,
+                //    内核里跑的可能还是 boot.img 烧入的旧版。
+                //    每个进程首次进入时无条件 unload + load asset, 把内核里的
+                //    替换成 APK 自带的最新版本。100ms 级开销, 幂等。
+                android.util.Log.i("InjectHide", "autoRefreshKpm: force reload asset md5=" + assetMd5);
                 try { nativeKpmUnload("kpm-svc"); } catch (Throwable ignored) {}
                 boolean ok;
                 try { ok = nativeKpmLoad(asset.getAbsolutePath(), ""); }
                 catch (Throwable t) { ok = false; }
+
+                // 3) 顺便覆盖 /data/adb/svc.kpm, 让下次重启如果 APatch 走外置加载
+                //    路径 (某些版本支持) 时也用新版。
                 if (ok) {
                     SuShell.run("cp -f " + asset.getAbsolutePath() + " /data/adb/svc.kpm "
                             + "&& chmod 644 /data/adb/svc.kpm "
@@ -978,7 +974,8 @@ public class InjectHideActivity extends AppCompatActivity {
                 final boolean okFinal = ok;
                 runOnUiThread(() -> {
                     Toast.makeText(this,
-                            okFinal ? "已自动升级 KPM 到新版 (重启后保留)" : "自动升级 KPM 失败",
+                            okFinal ? "KPM 已切到 APK 自带最新版 (md5=" + assetMd5.substring(0, 8) + ")"
+                                    : "KPM 自动升级失败",
                             Toast.LENGTH_SHORT).show();
                     refreshAll();
                 });
