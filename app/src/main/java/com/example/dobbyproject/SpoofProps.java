@@ -35,25 +35,28 @@ public final class SpoofProps {
 
     /**
      * 需要伪装的属性列表; null 值表示需要 --delete (锁定设备本不该有的属性).
+     *
+     * ⚠ 这是经过删减的"安全子集": 只保留 reveny / Magisk Detector 等实际查询的
+     *   verified-boot / dm-verity / OEM unlock 链。删掉了运行时高危项, 因为
+     *   2026-05-17 实测在已启动的系统上改 ro.debuggable / ro.secure /
+     *   ro.build.type 等会触发 system_server / zygote 卡死。这些项启动时
+     *   就已经被各服务读完并缓存了, 运行时再改是有害无益。
+     *
+     *   被删掉的项 (供 review): ro.debuggable, ro.secure, ro.build.type,
+     *   ro.build.tags, ro.boot.warranty_bit, ro.warranty_bit, ro.boot.selinux。
+     *   如果以后碰到需要这些的检测器, 优先用 APatch 模块在 post-fs-data
+     *   阶段 (init 起来之前) 改它们, 而不是在 App 运行时改。
      */
     private static final String[][] SPOOF = new String[][] {
-        // verified boot / dm-verity / flash lock
+        // verified boot / dm-verity / flash lock — 启动后改这些不影响已加载的服务
         {"ro.boot.verifiedbootstate",       "green"},
         {"ro.boot.vbmeta.device_state",     "locked"},
         {"ro.boot.flash.locked",            "1"},
         {"ro.boot.veritymode",              "enforcing"},
         {"vendor.boot.verifiedbootstate",   "green"},
         {"vendor.boot.vbmeta.device_state", "locked"},
-        {"ro.boot.realmebootstate",         "green"},
-        {"ro.boot.mibootstate",             "green"},
-        // warranty / debuggable / secure
-        {"ro.boot.warranty_bit",            "0"},
-        {"ro.warranty_bit",                 "0"},
-        {"ro.debuggable",                   "0"},
-        {"ro.secure",                       "1"},
-        {"ro.build.type",                   "user"},
-        {"ro.build.tags",                   "release-keys"},
-        {"ro.boot.selinux",                 "enforcing"},
+        {"ro.boot.realmebootstate",         "green"},   // Realme
+        {"ro.boot.mibootstate",             "green"},   // 小米
         // OEM unlock - 锁定设备应不存在, value=null => --delete
         {"sys.oem_unlock_allowed",          null},
         {"ro.oem_unlock_supported",         null},

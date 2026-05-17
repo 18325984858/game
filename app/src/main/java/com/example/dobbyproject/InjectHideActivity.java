@@ -455,20 +455,19 @@ public class InjectHideActivity extends AppCompatActivity {
                 //   但 SpoofProps / ApatchHide 是非持久化的, 需要在这里补 apply,
                 //   否则 UI 显示"已开启"但 verifiedbootstate / APatch 图标都没动。
                 //
-                //   ⚠ 已停用: 实测在 KPM autoRefresh (unload+load) 之后紧跟 apply
-                //   17 条 ro.* + pm hide 7 个包, 会触发 system_server / zygote /
-                //   apd 的某些异常路径, 导致整机卡死 (用户报告). 现在改为
-                //   "仅在用户手动点 ROOT 隐藏开关" 时才走 toggleRootHide 路径
-                //   触发 SpoofProps / ApatchHide. autoRefresh KPM 本身依然保留,
-                //   它只更新内核模块, 没有用户态副作用。
-                /*
+                //   之前曾因 SpoofProps 改 ro.debuggable / ro.secure / ro.build.type
+                //   等运行时高危属性导致 system_server 卡死, 已在 SpoofProps.SPOOF
+                //   里把那些项删掉, 只保留 verifiedboot / oem_unlock 等"启动后改也
+                //   安全"的字段。现在可以放心地自动 apply 了。
+                //
+                //   syncOnceFromKernel 内部委托 RootHideOrchestrator.applyAll,
+                //   跟用户手动点 ROOT 隐藏开关走同一份代码; 进程内只跑一次。
                 final boolean wantSync = (rootHide == 1);
                 new Thread(() -> {
                     boolean did = RootHideGuard.syncOnceFromKernel(wantSync);
                     if (did) runOnUiThread(() -> toast(
-                            "已对齐用户态: SpoofProps + pm hide root 管理器"));
+                            "已自动启用 Root 隐藏 (SpoofProps + pm hide)"));
                 }, "RootHideGuard-BootSync").start();
-                */
 
                 StringBuilder bar = new StringBuilder();
                 bar.append(fLoaded0 ? "✅ KPM 已加载" : "❌ KPM 未加载");
