@@ -158,12 +158,17 @@ public final class RootHideGuard {
         //   现象就是 "默认装 KPM 时 Root 隐藏 UI 已开, 但 SpoofProps 不生效"。
         if (!kernelRootHideOn) return false;
 
-        // 已经 armed 过 (snapshot 已存在或 dirty flag 存在) → 这一轮 boot 已经同步过,
-        // 不要重复 apply (会用已伪装值覆盖 snapshot)。
-        if (com.example.dobbyproject.io.SecureFile.exists(dirtyFlag())
-                || com.example.dobbyproject.io.SecureFile.exists(spoofSnapshot())) {
-            Log.i(TAG, "syncOnceFromKernel: already armed (dirty/snapshot present), skip");
-            // 这种情况也要消费 token, 避免下一次 refreshAll 重复探测。
+        // 已经 armed 过 → 跳过, 避免重复 apply 把已伪装值当真值覆盖 snapshot。
+        //
+        // 关键: 这里只看 dirty flag, 不再看 snapshot。
+        //   dirty flag 是 "applyAll 跑完 + 没干净 restore" 的真正凭证, restoreAll
+        //   会在结尾删除它; 而 snapshot 仅在 SpoofProps.apply 写入、SpoofProps.restore
+        //   删除。如果 snapshot 因为某些救援操作残留 (比如用户手动 pm unhide /
+        //   resetprop 恢复了真实状态) 而 dirty flag 已经没了, 之前的逻辑会误以为
+        //   "已 armed" 而跳过 apply, 导致用户态隐藏永远启动不了, 进而 reveny 等
+        //   检测器仍能看到 verifiedbootstate / apatch 等。
+        if (com.example.dobbyproject.io.SecureFile.exists(dirtyFlag())) {
+            Log.i(TAG, "syncOnceFromKernel: already armed (dirty flag present), skip");
             bootSyncDone.set(true);
             return false;
         }
@@ -171,6 +176,14 @@ public final class RootHideGuard {
         if (!bootSyncDone.compareAndSet(false, true)) return false;
 
         Log.i(TAG, "syncOnceFromKernel: kernel root_hide=on but userspace empty → applying");
+        // 已确认 dirty flag 不存在 → 我们当前 NOT applied; 残留的 snapshot 都是过期数据
+        // (来自上一次进程的 apply, 重启后 props 已回到真值)。先删掉, 让 SpoofProps.apply
+        // 重新基于真值采样, 否则 restore 会写回过期值, 造成 "verifiedbootstate 还原为空"
+        // 之类的诡异结果。
+        try {
+            com.example.dobbyproject.io.SecureFile.delete(spoofSnapshot());
+            Log.i(TAG, "syncOnceFromKernel: wiped stale snapshot before apply");
+        } catch (Throwable ignored) {}
         try {
             boolean ok = RootHideOrchestrator.applyAll();
             Log.i(TAG, "syncOnceFromKernel: RootHideOrchestrator.applyAll -> " + ok);
