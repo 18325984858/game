@@ -314,6 +314,21 @@ public class InjectHideActivity extends AppCompatActivity {
     //     的 mmap 共享内存路径也看到伪装 (KPM 内核 hook 拦不到这条路径)。
     //   - 关闭时: restore() 按 snapshot 还原, 不留痕。
     //   - 失败不影响 KPM 主开关结果, 只 toast 提示。
+    //
+    // 另: 把常见 root 管理器包名 (me.bmax.apatch / topjohnwu.magisk / kernelsu/...)
+    //   一并加入 hide_pkg, 命中后 KPM 会自动把它们的 PID 列入 hide_pid,
+    //   从而在 /proc/<pid>、ps、/proc/<pid>/cmdline 中"消失"。
+    //   注意: 这只能拦 *枚举进程* 类检测; "pm.getInstalledPackages()" 走 Binder
+    //   到 system_server 内存查表, KPM 拦不到, 仍需要"改 APatch 包名 / HMA"。
+    private static final String[] ROOT_MGR_PKGS = new String[] {
+            "me.bmax.apatch",                  // APatch
+            "com.topjohnwu.magisk",            // Magisk
+            "io.github.huskydg.magisk",        // Magisk Delta
+            "io.github.vvb2060.magisk",        // Magisk Alpha
+            "me.weishu.kernelsu",              // KernelSU
+            "com.rifsxd.ksunext",              // KernelSU Next
+            "com.sukisu.ultra",                // SukiSU
+    };
     private void toggleRootHide() {
         final boolean target = !(curRootHide == 1);
         runNativeAsync((target ? "enable" : "disable") + "_root_hide",
@@ -324,6 +339,17 @@ public class InjectHideActivity extends AppCompatActivity {
                         runOnUiThread(() -> toast(
                                 "属性伪装 " + (target ? "应用" : "还原") + " 失败 (检查 resetprop)"));
                     }
+                    // hide_pkg 联动: 启用时把所有 root 管理器包名加进去, 关闭时移除。
+                    int pkgChanged = 0;
+                    for (String p : ROOT_MGR_PKGS) {
+                        try {
+                            boolean ok = target ? nativeAddHidePkg(p) : nativeRemoveHidePkg(p);
+                            if (ok) pkgChanged++;
+                        } catch (Throwable ignored) {}
+                    }
+                    final int finalChanged = pkgChanged;
+                    runOnUiThread(() -> toast((target ? "联动添加 " : "联动移除 ")
+                            + finalChanged + " 个 root 管理器包名到 hide_pkg"));
                     return kpmOk;
                 });
     }
