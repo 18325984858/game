@@ -334,7 +334,7 @@ public class InjectHideActivity extends AppCompatActivity {
         runNativeAsync((target ? "enable" : "disable") + "_root_hide",
                 () -> {
                     boolean kpmOk = target ? nativeEnableRootHide() : nativeDisableRootHide();
-                    boolean propOk = target ? SpoofProps.apply() : SpoofProps.restore();
+                     boolean propOk = target ? SpoofProps.apply() : SpoofProps.restore();
                     if (!propOk) {
                         runOnUiThread(() -> toast(
                                 "属性伪装 " + (target ? "应用" : "还原") + " 失败 (检查 resetprop)"));
@@ -350,6 +350,14 @@ public class InjectHideActivity extends AppCompatActivity {
                     final int finalChanged = pkgChanged;
                     runOnUiThread(() -> toast((target ? "联动添加 " : "联动移除 ")
                             + finalChanged + " 个 root 管理器包名到 hide_pkg"));
+                    // PackageManager 默认结果联动: pm hide / pm unhide
+                    //   击败 reveny v7.7.0 等用 pm.getInstalledPackages(0) 的检测。
+                    //   hide 期间 APatch Manager 桌面图标消失, 但 APatch 内核补丁
+                    //   和 game 的 KPM 通道完全不受影响 (走 supercall, 不依赖 pm)。
+                    int pmChanged = target ? ApatchHide.apply() : ApatchHide.restore();
+                    final int finalPm = pmChanged;
+                    runOnUiThread(() -> toast(
+                            (target ? "已 pm hide " : "已 pm unhide ") + finalPm + " 个 root 管理器包"));
                     return kpmOk;
                 });
     }
