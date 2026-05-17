@@ -138,6 +138,13 @@ public class InjectHideActivity extends AppCompatActivity {
             new Thread(RootHideGuard::recoverIfDirty, "RootHideGuard-Recover").start();
         } catch (Throwable ignored) {}
 
+        // ── 自动升级 KPM ──────────────────────────────────────
+        //   比较 assets/svc.kpm 与开机自动加载的 /data/adb/svc.kpm 是否一致;
+        //   不一致说明用户升级了 game, 但 boot 时加载的还是旧版 (没有最新
+        //   的 root_kw 关键字, 比如 "/debug_ramdisk" 等)。静默 reload 新版,
+        //   并把 /data/adb/svc.kpm 同步替换, 下次开机直接用新版。
+        try { autoRefreshKpmIfStale(); } catch (Throwable ignored) {}
+
         tvStatus       = findViewById(R.id.ih_tv_status);
         tvRawResp      = findViewById(R.id.ih_tv_raw_resp);
         etSo           = findViewById(R.id.ih_et_so);
@@ -914,6 +921,13 @@ public class InjectHideActivity extends AppCompatActivity {
             boolean ok;
             try { ok = nativeKpmLoad(kpmFile.getAbsolutePath(), ""); }
             catch (Throwable t) { ok = false; }
+            // 同步把同一份 svc.kpm 覆盖到 /data/adb/svc.kpm —
+            //   下次重启 APatch 自动加载 KPM 时也用新版, 否则每次重启都退回旧的。
+            if (ok) {
+                int rc = SuShell.run("cp -f " + kpmFile.getAbsolutePath() + " /data/adb/svc.kpm "
+                        + "&& chmod 644 /data/adb/svc.kpm && chcon u:object_r:adb_data_file:s0 /data/adb/svc.kpm 2>/dev/null; true");
+                if (rc != 0) android.util.Log.w("InjectHide", "copy svc.kpm to /data/adb failed rc=" + rc);
+            }
             final boolean okFinal = ok;
             runOnUiThread(() -> {
                 Toast.makeText(this,
@@ -923,6 +937,86 @@ public class InjectHideActivity extends AppCompatActivity {
                 refreshAll();
             });
         }).start();
+    }
+
+    /**
+     * 进入 InjectHide 时自动比较 assets/svc.kpm 与开机自动加载的
+     * /data/adb/svc.kpm 是否一致; 不一致就静默 unload + load asset 版本,
+     * 同时覆盖 /data/adb/svc.kpm, 让下次重启也用新版。
+     *
+     * 触发场景: 用户升级了 game (assets 里 svc.kpm 比手机上的新), 重启后
+     * APatch 把旧 /data/adb/svc.kpm 加载进内核, 用户进 InjectHide 但发现
+     * 新功能 (如 /debug_ramdisk mountinfo 过滤) 没生效。本方法解决该 gap。
+     *
+     * 走后台线程, 慢操作不阻塞 UI; 一次启动只跑一次 (用 static atomic 限流)。
+     */
+    private static final java.util.concurrent.atomic.AtomicBoolean kpmAutoRefreshDone
+            = new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    private void autoRefreshKpmIfStale() {
+        if (!kpmAutoRefreshDone.compareAndSet(false, true)) return;
+        new Thread(() -> {
+            try {
+                // 1) 把 asset 写到 app 私有目录, 顺便算 md5
+                java.io.File asset = new java.io.File(getFilesDir(), "svc.kpm");
+                String err = copyAssetToFile("svc.kpm", asset);
+                if (err != null) {
+                    android.util.Log.w("InjectHide", "autoRefreshKpm: copyAsset failed: " + err);
+                    return;
+                }
+                String assetMd5 = md5OfFile(asset);
+                if (assetMd5 == null) return;
+
+                // 2) 读 /data/adb/svc.kpm 的 md5 (没有就视为不同)
+                final String[] bootMd5Holder = {""};
+                SuShell.runWithLines("md5sum /data/adb/svc.kpm 2>/dev/null | awk '{print $1}'",
+                        line -> { if (line != null && !line.trim().isEmpty()) bootMd5Holder[0] = line.trim(); });
+                String bootMd5 = bootMd5Holder[0];
+
+                if (assetMd5.equalsIgnoreCase(bootMd5)) {
+                    android.util.Log.i("InjectHide", "autoRefreshKpm: in-sync md5=" + assetMd5);
+                    return;
+                }
+                android.util.Log.w("InjectHide", "autoRefreshKpm: stale  asset=" + assetMd5
+                        + "  boot=" + bootMd5 + " → reloading");
+
+                // 3) 同步内核 + 覆盖 boot 副本
+                try { nativeKpmUnload("kpm-svc"); } catch (Throwable ignored) {}
+                boolean ok;
+                try { ok = nativeKpmLoad(asset.getAbsolutePath(), ""); }
+                catch (Throwable t) { ok = false; }
+                if (ok) {
+                    SuShell.run("cp -f " + asset.getAbsolutePath() + " /data/adb/svc.kpm "
+                            + "&& chmod 644 /data/adb/svc.kpm "
+                            + "&& chcon u:object_r:adb_data_file:s0 /data/adb/svc.kpm 2>/dev/null; true");
+                }
+                final boolean okFinal = ok;
+                runOnUiThread(() -> {
+                    Toast.makeText(this,
+                            okFinal ? "已自动升级 KPM 到新版 (重启后保留)" : "自动升级 KPM 失败",
+                            Toast.LENGTH_SHORT).show();
+                    refreshAll();
+                });
+            } catch (Throwable t) {
+                android.util.Log.e("InjectHide", "autoRefreshKpm fatal", t);
+            }
+        }, "Kpm-AutoRefresh").start();
+    }
+
+    /** 简易 md5: 读整个文件 (svc.kpm 约 90KB, 一次性可读)。 */
+    private static String md5OfFile(java.io.File f) {
+        try {
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("MD5");
+            try (java.io.InputStream in = new java.io.FileInputStream(f)) {
+                byte[] buf = new byte[8192];
+                int n;
+                while ((n = in.read(buf)) > 0) md.update(buf, 0, n);
+            }
+            byte[] dg = md.digest();
+            StringBuilder sb = new StringBuilder(dg.length * 2);
+            for (byte b : dg) sb.append(String.format("%02x", b));
+            return sb.toString();
+        } catch (Throwable t) { return null; }
     }
 
     private void uninstallKpmSvc() {
