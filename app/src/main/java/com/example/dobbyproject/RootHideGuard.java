@@ -154,25 +154,38 @@ public final class RootHideGuard {
      * @return 是否真的执行了 apply 动作; UI 可据此 toast。
      */
     public static boolean syncOnceFromKernel(boolean kernelRootHideOn) {
-        if (!bootSyncDone.compareAndSet(false, true)) return false;
+        // 注意 token 顺序: 先做 "条件不满足就返回" 的廉价检查, 最后才占用 token。
+        //   早期版本把 compareAndSet 放在最前面, 结果导致 KPM 还没装好的第一次
+        //   refreshAll 已经把 token 消耗掉 (rootHide=0, no-op 但占了名额),
+        //   等用户随后点 "安装 KPM" KPM 加载后再 refreshAll, sync 直接跳过,
+        //   现象就是 "默认装 KPM 时 Root 隐藏 UI 已开, 但 SpoofProps 不生效"。
         if (!kernelRootHideOn) return false;
 
         // 已经 armed 过 (snapshot 已存在或 dirty flag 存在) → 这一轮 boot 已经同步过,
         // 不要重复 apply (会用已伪装值覆盖 snapshot)。
         if (fileExistsAsRoot(DIRTY_FLAG) || fileExistsAsRoot(SPOOF_SNAPSHOT)) {
             Log.i(TAG, "syncOnceFromKernel: already armed (dirty/snapshot present), skip");
+            // 这种情况也要消费 token, 避免下一次 refreshAll 重复探测。
+            bootSyncDone.set(true);
             return false;
         }
 
+        if (!bootSyncDone.compareAndSet(false, true)) return false;
+
         Log.i(TAG, "syncOnceFromKernel: kernel root_hide=on but userspace empty → applying");
+        Log.i(TAG, "  step1 SpoofProps.apply ...");
         try { SpoofProps.apply(); } catch (Throwable t) { Log.w(TAG, "SpoofProps.apply", t); }
+        Log.i(TAG, "  step2 ApatchHide.apply ...");
         try { ApatchHide.apply(); } catch (Throwable t) { Log.w(TAG, "ApatchHide.apply", t); }
+        Log.i(TAG, "  step3 add_hide_pkg ...");
         try {
             for (String p : InjectHideActivity.ROOT_MGR_PKGS) {
                 try { nativeRawCtl("add_hide_pkg:" + p); } catch (Throwable ignored) {}
             }
         } catch (Throwable t) { Log.w(TAG, "add_hide_pkg", t); }
+        Log.i(TAG, "  step4 armDirtyFlag ...");
         try { armDirtyFlag(); } catch (Throwable t) { Log.w(TAG, "armDirtyFlag", t); }
+        Log.i(TAG, "syncOnceFromKernel: done");
         return true;
     }
 
