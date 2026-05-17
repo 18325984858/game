@@ -134,6 +134,9 @@ public class InjectHideActivity extends AppCompatActivity {
         //      后 Java 进程没干净退出 (crash / swipe / OOM kill), 本次启动
         //      自动 SpoofProps.restore + pm unhide + disable_root_hide, 抹掉脏数据。
         try {
+            // 初始化 root-hide state 私有目录 (MainActivity 通常已经 init 过,
+            // 这里是兜底, 防止有人直接通过 Intent 拉本 Activity)。
+            RootHidePaths.init(this);
             RootHideGuard.install();
             new Thread(RootHideGuard::recoverIfDirty, "RootHideGuard-Recover").start();
         } catch (Throwable ignored) {}

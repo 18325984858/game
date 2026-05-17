@@ -222,24 +222,25 @@ public class MainActivity extends AppCompatActivity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
-        // ── Root 痕迹隐藏 自动 boot-sync ──────────────────────────────
-        //   重启后用户可能只开 MainActivity, 不进 InjectHide, 这样原来
-        //   挂在 InjectHideActivity.onCreate 上的 boot-sync 永远不跑。
-        //   提到 MainActivity.onCreate 跑一次, AtomicBoolean 限流保证
-        //   即使后续进 InjectHide 也只执行一次。后台线程, 不阻塞 UI。
+        // ── Root 痕迹隐藏 仅做"低风险初始化" ─────────────────────────
+        //   实测在 MainActivity onCreate 阶段就触发 autoRefresh + boot-sync
+        //   (unload+load kpm-svc 紧接着 17 条 resetprop + 7 次 pm hide) 会
+        //   在某些系统状态下让 system_server / zygote 异常, 整机软重启。
+        //
+        //   这里只做"绝对无副作用"的初始化:
+        //     ① 把 root-hide state dir 指到 App 私有目录 (<filesDir>/roothide)
+        //     ② 异步迁移 /data/local/tmp 旧文件到新目录
+        //     ③ 装 UncaughtException + ShutdownHook 守护, 让崩溃可恢复
+        //
+        //   ★ 不在此触发 syncOnceFromKernel / SpoofProps.apply / ApatchHide.apply
+        //     用户需要 root 隐藏时, 进入 InjectHide 页面会自动触发那一套。
         try {
-            // 初始化 Root 隐藏的私有目录 (<filesDir>/roothide/), 并迁移旧版
-            // 残留在 /data/local/tmp 的 dirty / snapshot / cfg 三个文件。
             RootHidePaths.init(this);
             new Thread(RootHidePaths::migrateLegacy, "RootHidePaths-Migrate").start();
             RootHideGuard.install();
             new Thread(() -> {
                 try { RootHideGuard.recoverIfDirty(); } catch (Throwable ignored) {}
-                // kernelRootHideOn = true: KPM 自身默认 root_hide=on (kw=162);
-                // syncOnceFromKernel 内部会再用 fileExistsAsRoot 检查 dirty
-                // flag / snapshot 是否已经 armed, 避免重复 apply。
-                try { RootHideGuard.syncOnceFromKernel(true); } catch (Throwable ignored) {}
-            }, "RootHideGuard-MainBoot").start();
+            }, "RootHideGuard-Recover").start();
         } catch (Throwable ignored) {}
 
         // 立即隐藏主功能区，等异步 superkey 校验通过再显示。避免在校验完成
