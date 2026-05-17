@@ -165,7 +165,7 @@ public class InjectHideActivity extends AppCompatActivity {
         //   如果 game asset 里的 svc.kpm 比内核里加载的版本新, 用户可以在 UI
         //   上看到 root_kw_count 数值, 自行决定是否手动 "卸载 KPM" + "安装 KPM"
         //   完成升级 (建议先把当前应用退掉, 避免 hook 中触发上述 panic)。
-        // try { autoRefreshKpmIfStale(); } catch (Throwable ignored) {}
+        try { autoRefreshKpmIfStale(); } catch (Throwable ignored) {}
 
         tvStatus       = findViewById(R.id.ih_tv_status);
         tvRawResp      = findViewById(R.id.ih_tv_raw_resp);
@@ -472,24 +472,29 @@ public class InjectHideActivity extends AppCompatActivity {
                 curSysExempt = sysExempt;
                 curLogEnabled = logEnabled;
 
-                // 内核 ↔ 用户态对齐 (Boot-Sync, 单次):
-                //   重启后第一次进入 KPM 管理时, 内核默认 root_hide=on,
-                //   但 SpoofProps / ApatchHide 是非持久化的, 需要在这里补 apply,
-                //   否则 UI 显示"已开启"但 verifiedbootstate / APatch 图标都没动。
+                // ── 默认自动启用 Root 隐藏 ──────────────────────────────
+                //   进入页面后, 若检测到 "未 armed" (dirty flag 不存在), 主动
+                //   走一次 RootHideOrchestrator.applyAll(): 把 KPM root_hide /
+                //   hide_pkg / SpoofProps / pm hide root 管理器 / dirty flag
+                //   全部打开, 用户无需手动点按钮。
                 //
-                //   之前曾因 SpoofProps 改 ro.debuggable / ro.secure / ro.build.type
-                //   等运行时高危属性导致 system_server 卡死, 已在 SpoofProps.SPOOF
-                //   里把那些项删掉, 只保留 verifiedboot / oem_unlock 等"启动后改也
-                //   安全"的字段。现在可以放心地自动 apply 了。
-                //
-                //   syncOnceFromKernel 内部委托 RootHideOrchestrator.applyAll,
-                //   跟用户手动点 ROOT 隐藏开关走同一份代码; 进程内只跑一次。
-                final boolean wantSync = (rootHide == 1);
-                new Thread(() -> {
-                    boolean did = RootHideGuard.syncOnceFromKernel(wantSync);
-                    if (did) runOnUiThread(() -> toast(
-                            "已自动启用 Root 隐藏 (SpoofProps + pm hide)"));
-                }, "RootHideGuard-BootSync").start();
+                //   只在 KPM 已加载 (fLoaded0) 时触发, 否则 raw ctl 必失败。
+                //   AtomicBoolean 限流, 一个进程生命周期只跑一次。
+                if (fLoaded0 && !bootDefaultOffDone.getAndSet(true)) {
+                    new Thread(() -> {
+                        try {
+                            boolean hasDirty = com.example.dobbyproject.io.SecureFile
+                                    .exists(com.example.dobbyproject.RootHidePaths.dirtyFlag());
+                            if (!hasDirty) {
+                                boolean ok = RootHideOrchestrator.applyAll();
+                                runOnUiThread(() -> {
+                                    toast("默认已自动启用 Root 隐藏" + (ok ? "" : " (部分子步骤失败)"));
+                                    refreshAll();
+                                });
+                            }
+                        } catch (Throwable ignored) {}
+                    }, "RootHide-DefaultOn").start();
+                }
 
                 StringBuilder bar = new StringBuilder();
                 bar.append(fLoaded0 ? "✅ KPM 已加载" : "❌ KPM 未加载");
@@ -915,6 +920,8 @@ public class InjectHideActivity extends AppCompatActivity {
     //  从 APK assets/svc.kpm 拷到 app 私有目录后通过 supercall 加载
     // ─────────────────────────────────────────────────────────────
     private void installKpmSvc() {
+        // 用户主动点击安装 → 重新允许自动安装 (覆盖之前可能写下的 0)
+        writeAutoInstallKpm(true);
         new Thread(() -> {
             java.io.File kpmFile = new java.io.File(getFilesDir(), "svc.kpm");
             String err = copyAssetToFile("svc.kpm", kpmFile);
@@ -959,10 +966,56 @@ public class InjectHideActivity extends AppCompatActivity {
     private static final java.util.concurrent.atomic.AtomicBoolean kpmAutoRefreshDone
             = new java.util.concurrent.atomic.AtomicBoolean(false);
 
+    /** 进程内只跑一次的"默认 Root 隐藏关闭"对齐 — 见 refreshAll 注释。 */
+    private static final java.util.concurrent.atomic.AtomicBoolean bootDefaultOffDone
+            = new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    /** 自动安装 KPM 的开关配置 (加密存储于 files/auto_install_kpm.cfg)。
+     *  - 文件不存在 → 默认 1 (允许自动安装, 兼容旧用户)
+     *  - 用户手动 "卸载 KPM" 后 → 写 0, 下次进入页面不再自动安装
+     *  - 用户手动 "安装 KPM" 后 → 写 1, 重新允许自动安装
+     *  - KPM 已加载时根本不读这个配置 (autoRefreshKpmIfStale 的 early-return)
+     */
+    private static final String AUTO_INSTALL_CFG = "auto_install_kpm.cfg";
+
+    private boolean readAutoInstallKpm() {
+        try {
+            String p = new java.io.File(getFilesDir(), AUTO_INSTALL_CFG).getAbsolutePath();
+            String s = com.example.dobbyproject.io.SecureFile.readText(p);
+            if (s == null) return true; // 未配置 → 默认允许
+            return !s.trim().startsWith("0");
+        } catch (Throwable t) { return true; }
+    }
+
+    private void writeAutoInstallKpm(boolean enabled) {
+        try {
+            String p = new java.io.File(getFilesDir(), AUTO_INSTALL_CFG).getAbsolutePath();
+            com.example.dobbyproject.io.SecureFile.writeText(p, enabled ? "1\n" : "0\n");
+        } catch (Throwable ignored) {}
+    }
+
     private void autoRefreshKpmIfStale() {
         if (!kpmAutoRefreshDone.compareAndSet(false, true)) return;
         new Thread(() -> {
             try {
+                // 0) 已加载就跳过 — 用户要求: 验证加载过了不要重复 unload+load,
+                //    避免每次进入页面都触发一次内核 hook 替换 (可能 panic, 见
+                //    onCreate 顶部 KPM 自动升级注释)。仅在 kpm-svc 未加载时才把
+                //    APK assets 里的 svc.kpm 灌进内核。
+                boolean loaded = false;
+                try { loaded = nativeIsModuleLoaded(); } catch (Throwable ignored) {}
+                if (loaded) {
+                    android.util.Log.i("InjectHide", "autoRefreshKpm: kpm-svc already loaded, skip");
+                    return;
+                }
+
+                // 0.5) 未加载场景才读配置: 用户曾手动卸载过, 不再自动重装
+                if (!readAutoInstallKpm()) {
+                    android.util.Log.i("InjectHide", "autoRefreshKpm: auto-install disabled by user, skip");
+                    runOnUiThread(() -> toast("KPM 自动安装已关闭 (上次手动卸载) — 需手动点击 '安装 KPM'"));
+                    return;
+                }
+
                 // 1) 把 asset 写到 app 私有目录
                 java.io.File asset = new java.io.File(getFilesDir(), "svc.kpm");
                 String err = copyAssetToFile("svc.kpm", asset);
@@ -973,14 +1026,9 @@ public class InjectHideActivity extends AppCompatActivity {
                 String assetMd5 = md5OfFile(asset);
                 if (assetMd5 == null) return;
 
-                // 2) APatch boot 加载的 KPM 来自 boot.img 里内置的版本 (kpimg, 0.003s
-                //    极早期 succeed, 无 load_module_path), **不是** /data/adb/svc.kpm。
-                //    所以仅比 /data/adb 副本的 hash 是不够的: 那个副本即使是新版,
-                //    内核里跑的可能还是 boot.img 烧入的旧版。
-                //    每个进程首次进入时无条件 unload + load asset, 把内核里的
-                //    替换成 APK 自带的最新版本。100ms 级开销, 幂等。
-                android.util.Log.i("InjectHide", "autoRefreshKpm: force reload asset md5=" + assetMd5);
-                try { nativeKpmUnload("kpm-svc"); } catch (Throwable ignored) {}
+                // 2) 仅在未加载时执行 load (不再做 unload), 把 APK assets 自带版本
+                //    灌进内核。已加载场景由上面的 early-return 处理。
+                android.util.Log.i("InjectHide", "autoRefreshKpm: load asset md5=" + assetMd5);
                 boolean ok;
                 try { ok = nativeKpmLoad(asset.getAbsolutePath(), ""); }
                 catch (Throwable t) { ok = false; }
@@ -995,8 +1043,8 @@ public class InjectHideActivity extends AppCompatActivity {
                 final boolean okFinal = ok;
                 runOnUiThread(() -> {
                     Toast.makeText(this,
-                            okFinal ? "KPM 已切到 APK 自带最新版 (md5=" + assetMd5.substring(0, 8) + ")"
-                                    : "KPM 自动升级失败",
+                            okFinal ? "KPM 已加载 APK 自带版本 (md5=" + assetMd5.substring(0, 8) + ")"
+                                    : "KPM 自动加载失败",
                             Toast.LENGTH_SHORT).show();
                     refreshAll();
                 });
@@ -1047,6 +1095,8 @@ public class InjectHideActivity extends AppCompatActivity {
 
     /** 顺序卸载 game-kpm → kpm-svc。卸载前先 restoreAll 还原用户态 (resetprop / pm unhide), 避免 KPM 卸了之后 raw ctl 没法发, 留下系统不一致。 */
     private void doCascadeUninstall() {
+        // 用户手动卸载 → 关闭自动安装, 下次进入页面不再自动重装 KPM
+        writeAutoInstallKpm(false);
         new Thread(() -> {
             // 卸 KPM 之前先 restoreAll: 这一步必须在 raw ctl 还能用时跑,
             // 否则 disable_root_hide / remove_hide_pkg 都会失败。
@@ -1066,6 +1116,8 @@ public class InjectHideActivity extends AppCompatActivity {
     }
 
     private void doUninstallKpmSvcOnly() {
+        // 用户手动卸载 → 关闭自动安装, 下次进入页面不再自动重装 KPM
+        writeAutoInstallKpm(false);
         new Thread(() -> {
             // 卸 KPM 之前先 restoreAll: SpoofProps 写回真实值、pm unhide
             // root 管理器、撤 hide_pkg / disable_root_hide。
