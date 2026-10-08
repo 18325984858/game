@@ -1,4 +1,4 @@
-# Dobby Project
+# Game Project
 
 一个基于 Android NDK + 自定义 Windows-LLVM 前端（带 OLLVM/Polaris 混淆）的多游戏运行时分析 / Overlay 框架。
 项目同时支持 Unity（IL2CPP）与 Unreal Engine（UE4 / UE5）目标，集成了内存读取、SO Dump、注入器、KernelPatch 控制、反调试 / 反 Frida、AI 屏检（NCNN + NanoDet）等模块。
